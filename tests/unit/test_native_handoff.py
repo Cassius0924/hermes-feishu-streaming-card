@@ -381,6 +381,64 @@ def test_fresh_pending_records_are_never_silently_evicted(tmp_path):
     assert reloaded.get(_identity(3)) is None
 
 
+@pytest.mark.parametrize("notice_state", ["none", "pending", "committed"])
+def test_acked_handoff_fence_survives_retry_window_then_becomes_evictable(
+    tmp_path,
+    notice_state,
+):
+    now = [100.0]
+    store = NativeHandoffStore(
+        tmp_path / "state",
+        max_records=1,
+        now=lambda: now[0],
+    )
+    identity = _identity(1)
+    if notice_state == "none":
+        record, _ = store.begin_no_card(
+            identity,
+            event_created_at=90.0,
+            generation=_generation(1),
+            ack_capable=True,
+            obligation_key=_obligation(1),
+        )
+    else:
+        record, _ = store.begin(
+            identity,
+            feishu_message_id="fake-card-private",
+            bot_id="fake-bot-private",
+            event_created_at=90.0,
+            generation=_generation(1),
+            ack_capable=True,
+            obligation_key=_obligation(1),
+        )
+        if notice_state == "committed":
+            record = store.mark_card_committed(identity, expected_record=record)
+    store.acknowledge(record.descriptor(now=now[0]))
+
+    with pytest.raises(NativeHandoffStoreError, match="cannot be bounded"):
+        store.begin_no_card(
+            _identity(2),
+            event_created_at=99.0,
+            generation=_generation(2),
+            ack_capable=True,
+            obligation_key=_obligation(2),
+        )
+    assert store.get(identity).delivery_state == "acked"
+
+    now[0] = 3701.0
+    fresh, created = store.begin_no_card(
+        _identity(2),
+        event_created_at=3700.0,
+        generation=_generation(2),
+        ack_capable=True,
+        obligation_key=_obligation(2),
+    )
+
+    assert created is True
+    assert fresh.delivery_state == "pending"
+    assert store.get(identity) is None
+
+
 def test_store_clear_allows_same_identity_to_begin_new_lifecycle(tmp_path):
     store = NativeHandoffStore(tmp_path / "state")
     identity = _identity()

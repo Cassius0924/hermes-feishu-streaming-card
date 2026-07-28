@@ -608,20 +608,34 @@ class NativeHandoffStore:
         protected_key: str,
     ) -> bool:
         now = self._timestamp()
-        candidates = [
-            (key, record)
-            for key, record in records.items()
-            if key != protected_key
-            and record.delivery_state != "pending"
-            and (
-                record.delivery_state != "lifecycle"
-                or now - record.updated_at >= LIFECYCLE_FENCE_TTL_SECONDS
-            )
-            and (
-                record.card_state != "pending"
-                or record.delivery_state == "uncertain"
-            )
-        ]
+        candidates: list[tuple[str, NativeHandoffRecord]] = []
+        for key, record in records.items():
+            if key == protected_key or record.delivery_state == "pending":
+                continue
+            age = now - record.updated_at
+            if record.delivery_state == "uncertain":
+                candidates.append((key, record))
+                continue
+            if record.delivery_state == "lifecycle":
+                if age >= LIFECYCLE_FENCE_TTL_SECONDS:
+                    candidates.append((key, record))
+                continue
+            if record.delivery_state == "acked":
+                # The ACK is the dedupe fence for the same one-hour window as
+                # the stable descriptor, independent of whether the optional
+                # in-process card notice finished. Never evict it early, but
+                # also never let an abandoned notice pin capacity forever.
+                if now > record.expires_at:
+                    candidates.append((key, record))
+                continue
+            if record.card_state == "pending":
+                # Legacy hooks have no ACK descriptor. Preserve their terminal
+                # fence for one bounded window, then allow an unrepairable
+                # post-crash decorative notice to age out.
+                if age >= LIFECYCLE_FENCE_TTL_SECONDS:
+                    candidates.append((key, record))
+                continue
+            candidates.append((key, record))
         if not candidates:
             return False
         key, _ = min(
