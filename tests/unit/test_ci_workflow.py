@@ -52,18 +52,44 @@ def test_docker_compose_example_documents_container_paths():
     assert "install-docker.sh" in compose
 
 
-def test_docker_compose_runtime_smoke_is_unprivileged_and_health_checked():
+def test_docker_compose_runtime_smoke_bootstraps_before_unprivileged_sidecar():
     compose = (ROOT / "docker-compose.smoke.yml").read_text(encoding="utf-8")
     config = (
         ROOT / "tests" / "fixtures" / "docker-smoke-config.yaml"
     ).read_text(encoding="utf-8")
 
     assert "python:3.12-slim" in compose
+    assert "setup:" in compose
     assert "sidecar:" in compose
     assert "probe:" in compose
+    assert "condition: service_completed_successfully" in compose
     assert "condition: service_healthy" in compose
+    assert 'user: "65532:65532"' in compose
+    assert "python -m venv /venv" in compose
+    assert "- /venv/bin/python" in compose
+    assert "- hermes_feishu_card.runner" in compose
+    assert "python -m pip install" not in compose
+    assert "chmod 700 /state" not in compose
     assert "HERMES_FEISHU_CARD_STATE_DIR" in compose
     assert "privileged:" not in compose
     assert "systemd" not in compose.lower()
     assert "allow_non_loopback: true" in config
     assert "manager: detached" in config
+
+
+def test_docker_compose_runtime_smoke_sends_authenticated_event_from_shared_state():
+    compose = (ROOT / "docker-compose.smoke.yml").read_text(encoding="utf-8")
+    config = (
+        ROOT / "tests" / "fixtures" / "docker-smoke-config.yaml"
+    ).read_text(encoding="utf-8")
+
+    assert "read_transport_root_secret" in compose
+    assert "sign_event_request" in compose
+    assert 'opener.open(request, timeout=5)' in compose
+    assert 'assert result["disposition"] == "native"' in compose
+    assert 'assert health["metrics"]["events_received"] == 1' in compose
+    assert 'assert health["metrics"]["event_auth_rejections"] == 0' in compose
+    assert "hfc-smoke-runtime:/venv" in compose
+    assert "hfc-smoke-state:/state:ro" in compose
+    assert "native_chats:" in config
+    assert "smoke-native-chat" in config

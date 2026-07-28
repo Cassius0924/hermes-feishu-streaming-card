@@ -1,26 +1,46 @@
 name: hfc-runtime-smoke
 
 services:
-  sidecar:
+  setup:
     image: python:3.12-slim
+    user: "0:0"
     working_dir: /work
-    environment:
-      HERMES_FEISHU_CARD_STATE_DIR: /state
-      PYTHONDONTWRITEBYTECODE: "1"
     volumes:
       - .:/src:ro
+      - hfc-smoke-runtime:/venv
       - hfc-smoke-state:/state
     command:
       - sh
       - -ec
       - |
-        chmod 700 /state
-        python -m pip install --disable-pip-version-check --no-cache-dir /src
-        exec python -m hermes_feishu_card.runner --config /src/tests/fixtures/docker-smoke-config.yaml
+        python -m venv /venv
+        /venv/bin/pip install --disable-pip-version-check --no-cache-dir /src
+        install -d -m 0700 -o 65532 -g 65532 /state
+
+  sidecar:
+    image: python:3.12-slim
+    user: "65532:65532"
+    working_dir: /work
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      HERMES_FEISHU_CARD_STATE_DIR: /state
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - .:/src:ro
+      - hfc-smoke-runtime:/venv:ro
+      - hfc-smoke-state:/state
+    command:
+      - /venv/bin/python
+      - -m
+      - hermes_feishu_card.runner
+      - --config
+      - /src/tests/fixtures/docker-smoke-config.yaml
     healthcheck:
       test:
         - CMD
-        - python
+        - /venv/bin/python
         - -c
         - "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8765/health', timeout=2).read()"
       interval: 2s
@@ -30,22 +50,68 @@ services:
 
   probe:
     image: python:3.12-slim
+    user: "65532:65532"
     depends_on:
       sidecar:
         condition: service_healthy
+    environment:
+      HERMES_FEISHU_CARD_STATE_DIR: /state
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - hfc-smoke-runtime:/venv:ro
+      - hfc-smoke-state:/state:ro
     command:
-      - python
+      - /venv/bin/python
       - -c
       - |
         import json
+        import time
         import urllib.request
+
+        from hermes_feishu_card.event_auth import sign_event_request
+        from hermes_feishu_card.operations_transport import read_transport_root_secret
+
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        secret = read_transport_root_secret("/state")
+        assert secret is not None
+        body = json.dumps(
+            {
+                "schema_version": "1",
+                "event": "message.completed",
+                "conversation_id": "smoke-conversation",
+                "message_id": "smoke-message",
+                "chat_id": "smoke-native-chat",
+                "platform": "feishu",
+                "sequence": 1,
+                "created_at": time.time(),
+                "data": {"answer": "runtime smoke"},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            "http://sidecar:8765/events",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                **sign_event_request(secret, body),
+            },
+            method="POST",
+        )
+        with opener.open(request, timeout=5) as response:
+            assert response.status == 200
+            result = json.load(response)
+        assert result["disposition"] == "native", result
+
         with opener.open("http://sidecar:8765/health", timeout=5) as response:
             health = json.load(response)
         assert health["status"] in {"healthy", "degraded"}, health
         assert health["delivery"] == {"mode": "noop"}, health
         assert health["event_auth_required"] is True, health
         assert health["readiness"]["status"] == "disabled", health
+        assert health["metrics"]["events_received"] == 1, health
+        assert health["metrics"]["event_auth_rejections"] == 0, health
+        assert health["metrics"]["native_bypass_events"] == 1, health
 
 volumes:
+  hfc-smoke-runtime:
   hfc-smoke-state:
