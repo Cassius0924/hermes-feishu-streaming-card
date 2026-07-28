@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import secrets
 
+import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
+from hermes_feishu_card import server as sidecar_server
 from hermes_feishu_card.runtime_control import (
     RUNTIME_HOOK_GENERATION,
     sign_runtime_request,
@@ -21,6 +23,16 @@ class NeverCalledFeishuClient:
 
     async def update_card_message(self, *_args, **_kwargs):
         raise AssertionError("runtime control must not update a card")
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime_integrity_state(tmp_path, monkeypatch):
+    state_directory = tmp_path / "private-state"
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_STATE_DIR",
+        str(state_directory),
+    )
+    return state_directory
 
 
 def _payload(**changes):
@@ -105,6 +117,35 @@ async def test_runtime_endpoint_accepts_signed_hello_and_health_becomes_ready():
         "last_seen_age_seconds": 0,
     }
     assert replay.status == 401
+
+
+def test_create_app_recovers_persisted_gateway_restart_fence(
+    isolated_runtime_integrity_state,
+):
+    first = create_app(
+        NeverCalledFeishuClient(),
+        operations_transport_root_secret=ROOT_SECRET,
+        integrity_mode="safe",
+        expected_runtime_package_version="4.1.0",
+        runtime_integrity_state_directory=isolated_runtime_integrity_state,
+    )
+    first_supervisor = first[sidecar_server.RUNTIME_INTEGRITY_SUPERVISOR_KEY]
+    assert first_supervisor.record(
+        sidecar_server.RuntimeControlEvent.from_dict(_payload())
+    )
+    first_supervisor.mark_restart_required()
+
+    restarted = create_app(
+        NeverCalledFeishuClient(),
+        operations_transport_root_secret=ROOT_SECRET,
+        integrity_mode="safe",
+        expected_runtime_package_version="4.1.0",
+        runtime_integrity_state_directory=isolated_runtime_integrity_state,
+    )
+
+    assert restarted[
+        sidecar_server.RUNTIME_INTEGRITY_SUPERVISOR_KEY
+    ].snapshot()["reason"] == "gateway_restart_required"
 
 
 async def test_runtime_generation_mismatch_degrades_readiness_not_liveness():

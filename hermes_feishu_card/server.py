@@ -251,6 +251,7 @@ def create_app(
     noop_mode: bool = False,
     integrity_mode: str = "notify",
     expected_runtime_package_version: str = "",
+    runtime_integrity_state_directory: str | Path | None = None,
     delivery_policy: Any = None,
     native_handoff_store: NativeHandoffStore | None = None,
 ) -> web.Application:
@@ -286,6 +287,7 @@ def create_app(
         mode=integrity_mode,
         expected_hook_generation=RUNTIME_HOOK_GENERATION,
         expected_package_version=expected_runtime_package_version,
+        state_directory=runtime_integrity_state_directory,
     )
     app[RUNTIME_INTEGRITY_SUPERVISOR_KEY] = runtime_supervisor
     if valid_transport_root:

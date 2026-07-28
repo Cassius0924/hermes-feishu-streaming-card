@@ -19,6 +19,7 @@ from .operations_transport import (
     ensure_transport_root_secret,
     transport_root_privacy_verified,
 )
+from .process import state_dir
 
 
 logger = logging.getLogger(__name__)
@@ -268,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
                 (config.get("integrity") or {}).get("mode") or "notify"
             ),
             expected_runtime_package_version=__version__,
+            runtime_integrity_state_directory=state_dir(),
             delivery_policy=delivery_policy,
         ),
         host=server["host"],

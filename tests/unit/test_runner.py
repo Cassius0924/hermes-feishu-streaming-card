@@ -96,7 +96,10 @@ def test_feishu_boundary_router_accepts_optional_event_data_fields():
     assert result.bot_id == "sales"
 
 
-def test_main_passes_boundary_to_create_app_when_bot_credentials_exist(monkeypatch):
+def test_main_passes_boundary_to_create_app_when_bot_credentials_exist(
+    monkeypatch,
+    tmp_path,
+):
     config = {
         "server": {"host": "127.0.0.1", "port": 0},
         "feishu": {"app_id": "cli_default", "app_secret": "default-secret"},
@@ -105,6 +108,8 @@ def test_main_passes_boundary_to_create_app_when_bot_credentials_exist(monkeypat
     captured = {}
 
     monkeypatch.setattr(runner, "load_config", lambda path, **_kwargs: config)
+    private_state = tmp_path / "private-state"
+    monkeypatch.setattr(runner, "state_dir", lambda: private_state, raising=False)
 
     def fake_create_app(feishu_client, **kwargs):
         captured["feishu_client"] = feishu_client
@@ -123,6 +128,7 @@ def test_main_passes_boundary_to_create_app_when_bot_credentials_exist(monkeypat
     assert captured["kwargs"]["operations_config_path"] == "config.yaml"
     assert captured["kwargs"]["integrity_mode"] == "notify"
     assert captured["kwargs"]["expected_runtime_package_version"] == runner.__version__
+    assert captured["kwargs"]["runtime_integrity_state_directory"] == private_state
     assert isinstance(
         captured["kwargs"]["delivery_policy"],
         ReloadingDeliveryPolicyProvider,
