@@ -2116,6 +2116,15 @@ def test_v4021_release_docs_preserve_content_integrity_and_pending_feishu_smoke(
     assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
     for doc in (readme, readme_en, install_doc, guide, guide_en):
         assert "HFC_VERSION=v4.0.21" in doc
+    assert "`v4.0.21`（Compose 示例）" in guide
+    assert "The Compose example defaults `HFC_VERSION` to `v4.0.21`." in guide_en
+    for doc in (guide, guide_en):
+        assert re.search(
+            r"(?:Compose|Compose 示例).*v4\.0\.(?:0|[1-9]|1[0-9]|20)(?!\d)"
+            r"|v4\.0\.(?:0|[1-9]|1[0-9]|20)(?!\d).*?(?:Compose|Compose 示例)",
+            doc,
+            re.IGNORECASE,
+        ) is None
     assert "| [v4.0.21](release-notes-v4.0.21.md) | 2026-07-28 |" in guide
     assert "| [v4.0.21](release-notes-v4.0.21.en.md) | 2026-07-28 |" in guide_en
     assert "当前发布候选为 `4.0.21`" in readiness

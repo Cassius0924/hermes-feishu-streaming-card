@@ -454,6 +454,8 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
+The Compose example defaults `HFC_VERSION` to `v4.0.21`.
+
 Example:
 
 ```bash
