@@ -34,7 +34,13 @@ from hermes_feishu_card.events import SidecarEvent
 from hermes_feishu_card.feishu_client import FeishuAPIError, FeishuClient, FeishuClientConfig
 from hermes_feishu_card.install.detect import HermesDetection, detect_hermes
 from hermes_feishu_card.install.envfile import read_hfc_env, update_hfc_env
-from hermes_feishu_card.install.manifest import file_sha256
+from hermes_feishu_card.install.manifest import (
+    BASE_INSTALL_MANIFEST_FIELDS,
+    CRON_INSTALL_MANIFEST_FIELDS,
+    CURRENT_INSTALL_MANIFEST_VERSION,
+    file_sha256,
+    validate_install_manifest,
+)
 from hermes_feishu_card.install.integrity import (
     IntegrityRepairRefused,
     build_integrity_provenance,
@@ -47,8 +53,10 @@ from hermes_feishu_card.install.recovery import (
     plan_recovery,
 )
 from hermes_feishu_card.install.patcher import (
+    apply_base_patch,
     apply_patch,
     apply_cron_patch,
+    remove_base_patch,
     remove_patch,
     remove_cron_patch,
     remove_patch_lenient,
@@ -61,6 +69,9 @@ from hermes_feishu_card.session import CardSession
 
 BACKUP_SUFFIX = ".hermes_feishu_card.bak"
 MANIFEST_NAME = ".hermes_feishu_card_manifest"
+INSTALL_MANIFEST_VERSION = CURRENT_INSTALL_MANIFEST_VERSION
+_BASE_MANIFEST_FIELDS = BASE_INSTALL_MANIFEST_FIELDS
+_CRON_MANIFEST_FIELDS = CRON_INSTALL_MANIFEST_FIELDS
 DEFAULT_EVENT_URL = "http://127.0.0.1:8765/events"
 PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 COMPOSE_HOST_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")
@@ -535,6 +546,8 @@ _DOCTOR_JSON_PATH_KEYS = frozenset(
         "config_path",
         "cron_backup_path",
         "cron_py",
+        "base_backup_path",
+        "base_py",
         "manifest_path",
         "path",
         "python",
@@ -1041,6 +1054,11 @@ def _doctor_hermes_report(detection: HermesDetection) -> dict[str, Any]:
         "run_py_exists": detection.run_py_exists,
         "cron_py": str(detection.cron_py) if detection.cron_py is not None else None,
         "cron_py_exists": detection.cron_py_exists,
+        "base_py": str(detection.base_py) if detection.base_py is not None else None,
+        "base_py_exists": detection.base_py_exists,
+        "base_required": detection.base_required,
+        "base_hook_strategy": detection.base_hook_strategy,
+        "exact_delivery_contract": _exact_delivery_contract_status(detection),
         "version_source": detection.version_source,
         "version": detection.version,
         "minimum_supported_version": detection.minimum_version,
@@ -1056,6 +1074,14 @@ def _doctor_hermes_report(detection: HermesDetection) -> dict[str, Any]:
         ),
         "suggestion_reason": detection.suggestion_reason,
     }
+
+
+def _exact_delivery_contract_status(detection: HermesDetection) -> str:
+    if not detection.base_required:
+        return "not_required"
+    if detection.capabilities.get("exact_base_delivery") is True:
+        return "ready"
+    return "missing_or_unsupported"
 
 
 def _doctor_streaming_report(hermes_root: Path) -> dict[str, str]:
@@ -1510,10 +1536,15 @@ def _diagnose_install_state(detection: HermesDetection) -> dict[str, Any]:
     manifest_path = _manifest_path(detection.root)
     cron_py = detection.cron_py
     cron_backup_path = _backup_path(cron_py) if cron_py is not None else None
+    base_py = detection.base_py if detection.base_required else None
+    base_backup_path = _backup_path(base_py) if base_py is not None else None
     backup_exists = backup_path.exists()
     manifest_exists = manifest_path.exists()
     cron_backup_exists = (
         cron_backup_path.exists() if cron_backup_path is not None else False
+    )
+    base_backup_exists = (
+        base_backup_path.exists() if base_backup_path is not None else False
     )
     base: dict[str, Any] = {
         "checked": True,
@@ -1525,6 +1556,10 @@ def _diagnose_install_state(detection: HermesDetection) -> dict[str, Any]:
             str(cron_backup_path) if cron_backup_path is not None else None
         ),
         "cron_backup_exists": cron_backup_exists,
+        "base_backup_path": (
+            str(base_backup_path) if base_backup_path is not None else None
+        ),
+        "base_backup_exists": base_backup_exists,
         "automatic_repair_available": False,
     }
 
@@ -1535,6 +1570,9 @@ def _diagnose_install_state(detection: HermesDetection) -> dict[str, Any]:
             manifest_path,
             cron_py=cron_py,
             cron_backup_path=cron_backup_path,
+            base_py=base_py,
+            base_backup_path=base_backup_path,
+            require_base_manifest=detection.base_required,
         )
     except ValueError as exc:
         message = str(exc)
@@ -1555,7 +1593,7 @@ def _diagnose_install_state(detection: HermesDetection) -> dict[str, Any]:
             "manual_action_required": True,
         }
 
-    if backup_exists or manifest_exists or cron_backup_exists:
+    if backup_exists or manifest_exists or cron_backup_exists or base_backup_exists:
         return {
             **base,
             "status": "installed",
@@ -1667,6 +1705,9 @@ def _format_doctor_explanation(report: dict[str, Any]) -> str:
             details.append(f"compatibility {hermes['compatibility']}")
         suffix = f" ({', '.join(details)})" if details else ""
         lines.append(f"- Hermes: {hermes_status}{suffix}")
+        exact_contract = hermes.get("exact_delivery_contract")
+        if exact_contract:
+            lines.append(f"- Exact delivery contract: {exact_contract}")
     else:
         lines.append(f"- Hermes: {hermes_status}")
 
@@ -1735,6 +1776,11 @@ def _format_hermes_detection(detection: HermesDetection) -> str:
         f"minimum_supported_version: {detection.minimum_version}",
         f"hook_strategy: {detection.hook_strategy}",
         f"cron_hook_strategy: {detection.cron_hook_strategy}",
+        f"base_py: {detection.base_py}",
+        f"base_py_exists: {'yes' if detection.base_py_exists else 'no'}",
+        f"base_required: {'yes' if detection.base_required else 'no'}",
+        f"base_hook_strategy: {detection.base_hook_strategy}",
+        f"exact_delivery_contract: {_exact_delivery_contract_status(detection)}",
         f"compatibility: {detection.compatibility}",
         f"suggested_root: {detection.suggested_root or ''}",
         f"suggestion_reason: {detection.suggestion_reason}",
@@ -2581,6 +2627,12 @@ def _run_install(args: argparse.Namespace) -> int:
         return 1
 
     try:
+        _read_manifest(_manifest_path(detection.root))
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
         _ensure_hermes_runtime_package(detection)
         _ensure_hermes_feishu_sdk(detection)
     except ValueError as exc:
@@ -2622,12 +2674,16 @@ def _run_install(args: argparse.Namespace) -> int:
     backup_path = _backup_path(run_py)
     cron_py = detection.cron_py if detection.cron_py_exists else None
     cron_backup_path = _backup_path(cron_py) if cron_py is not None else None
+    base_py = detection.base_py if detection.base_required else None
+    base_backup_path = _backup_path(base_py) if base_py is not None else None
     manifest_path = _manifest_path(detection.root)
     original: str | None = None
     cron_original: str | None = None
+    base_original: str | None = None
     manifest_existed = False
     backup_existed = False
     cron_backup_existed = False
+    base_backup_existed = False
     gateway_restart_required = False
 
     try:
@@ -2635,15 +2691,21 @@ def _run_install(args: argparse.Namespace) -> int:
         cron_original = (
             _read_text_preserve_newlines(cron_py) if cron_py is not None else None
         )
+        base_original = (
+            _read_text_preserve_newlines(base_py) if base_py is not None else None
+        )
         manifest_existed = manifest_path.exists()
         backup_existed = backup_path.exists()
         cron_backup_existed = bool(cron_backup_path and cron_backup_path.exists())
+        base_backup_existed = bool(base_backup_path and base_backup_path.exists())
         _validate_existing_install_state(
             run_py,
             backup_path,
             manifest_path,
             cron_py=cron_py,
             cron_backup_path=cron_backup_path,
+            base_py=base_py,
+            base_backup_path=base_backup_path,
         )
         patched = apply_patch(
             original, strategy=detection.hook_strategy or "legacy_gateway_run"
@@ -2653,6 +2715,11 @@ def _run_install(args: argparse.Namespace) -> int:
             if cron_py is not None and cron_original is not None
             else None
         )
+        base_patched = (
+            apply_base_patch(base_original)
+            if base_py is not None and base_original is not None
+            else None
+        )
         gateway_restart_required = bool(
             patched != original
             or (
@@ -2660,11 +2727,26 @@ def _run_install(args: argparse.Namespace) -> int:
                 and cron_original is not None
                 and cron_patched != cron_original
             )
+            or (
+                base_patched is not None
+                and base_original is not None
+                and base_patched != base_original
+            )
         )
+        if base_py is not None and base_backup_path is not None and not base_backup_existed:
+            _atomic_write_text(base_backup_path, base_original or "")
         if not backup_existed:
             _atomic_write_text(backup_path, original)
         if cron_py is not None and cron_backup_path is not None and not cron_backup_existed:
             _atomic_write_text(cron_backup_path, cron_original or "")
+        # The Base contract must exist before run.py can stage exact completion.
+        if (
+            base_py is not None
+            and base_patched is not None
+            and base_original is not None
+            and base_patched != base_original
+        ):
+            _atomic_write_text(base_py, base_patched)
         if patched != original:
             _atomic_write_text(run_py, patched)
         if (
@@ -2674,20 +2756,36 @@ def _run_install(args: argparse.Namespace) -> int:
             and cron_patched != cron_original
         ):
             _atomic_write_text(cron_py, cron_patched)
-        _write_manifest(manifest_path, run_py, backup_path, cron_py, cron_backup_path)
-    except (OSError, UnicodeError, ValueError) as exc:
-        _rollback_install(
-            run_py,
-            original,
-            backup_path,
-            backup_existed,
+        _write_manifest(
             manifest_path,
-            manifest_existed,
-            cron_py=cron_py,
-            cron_original=cron_original,
-            cron_backup_path=cron_backup_path,
-            cron_backup_existed=cron_backup_existed,
+            run_py,
+            backup_path,
+            cron_py,
+            cron_backup_path,
+            base_py,
+            base_backup_path,
         )
+    except (OSError, UnicodeError, ValueError) as exc:
+        try:
+            _rollback_install(
+                run_py,
+                original,
+                backup_path,
+                backup_existed,
+                manifest_path,
+                manifest_existed,
+                cron_py=cron_py,
+                cron_original=cron_original,
+                cron_backup_path=cron_backup_path,
+                cron_backup_existed=cron_backup_existed,
+                base_py=base_py,
+                base_original=base_original,
+                base_backup_path=base_backup_path,
+                base_backup_existed=base_backup_existed,
+            )
+        except (OSError, UnicodeError, ValueError) as rollback_exc:
+            print(f"error: {exc}; {rollback_exc}", file=sys.stderr)
+            return 1
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
@@ -2703,6 +2801,7 @@ def _run_repair(args: argparse.Namespace) -> int:
         print(_format_hermes_detection(detection), file=sys.stderr)
         return 1
     try:
+        _read_manifest(_manifest_path(detection.root))
         actions = _repair_install_state(
             detection,
             accept_hermes_upgrade=bool(
@@ -2801,6 +2900,9 @@ def _repair_action_message(action: str) -> str:
         "restore_verified_cron_backup": "cron scheduler: restored verified backup",
         "reapply_current_cron_hook": "cron scheduler: reapplied current hook",
         "rebuild_cron_backup": "cron backup: recreated",
+        "restore_verified_base_backup": "exact Base: restored verified backup",
+        "reapply_current_base_hook": "exact Base: reapplied current hook",
+        "rebuild_base_backup": "exact Base backup: recreated",
         "clear_stale_install_state": "install state: cleared stale unpatched state",
     }
     return messages[action]
@@ -2809,25 +2911,45 @@ def _repair_action_message(action: str) -> str:
 def _restore(hermes_root: Path) -> None:
     run_py = hermes_root / "gateway" / "run.py"
     cron_py = hermes_root / "cron" / "scheduler.py"
+    base_py = hermes_root / "gateway" / "platforms" / "base.py"
     backup_path = _backup_path(run_py)
     cron_backup_path = _backup_path(cron_py)
+    base_backup_path = _backup_path(base_py)
     manifest_path = _manifest_path(hermes_root)
+    manifest = _read_manifest(manifest_path)
     if run_py.is_symlink():
         raise ValueError("gateway/run.py must not be a symlink")
     if backup_path.exists():
-        manifest = _read_manifest(manifest_path)
         if manifest is None:
+            if _managed_restore_evidence_exists(
+                cron_py,
+                cron_backup_path,
+                remove_owned_patch=remove_cron_patch,
+            ):
+                raise ValueError(
+                    "install state incomplete; cron evidence exists without "
+                    "manifest; refusing to restore"
+                )
+            if _managed_restore_evidence_exists(
+                base_py,
+                base_backup_path,
+                remove_owned_patch=remove_base_patch,
+            ):
+                raise ValueError(
+                    "install state incomplete; exact Base evidence exists without "
+                    "manifest; refusing to restore"
+                )
             backup_text = _read_text_preserve_newlines(backup_path)
             _validate_backup_contains_original(backup_text, "restore")
             if run_py.exists() and _read_text_preserve_newlines(run_py) == backup_text:
-                _clear_install_state(backup_path, manifest_path)
+                _clear_install_state(backup_path, manifest_path, manifest=None)
                 return
 
             current = _read_text_preserve_newlines(run_py) if run_py.exists() else ""
             try:
                 if run_py.exists() and remove_patch(current) == backup_text:
                     _atomic_write_text(run_py, backup_text)
-                    _clear_install_state(backup_path, manifest_path)
+                    _clear_install_state(backup_path, manifest_path, manifest=None)
                     return
             except ValueError:
                 pass
@@ -2837,7 +2959,7 @@ def _restore(hermes_root: Path) -> None:
                 raise ValueError("run.py changed since install; refusing to restore")
 
             _atomic_write_text(run_py, backup_text)
-            _clear_install_state(backup_path, manifest_path)
+            _clear_install_state(backup_path, manifest_path, manifest=None)
             return
 
         backup_text = _validate_restorable_install_state(
@@ -2847,26 +2969,69 @@ def _restore(hermes_root: Path) -> None:
             "restore",
             cron_py=cron_py,
             cron_backup_path=cron_backup_path,
+            base_py=base_py,
+            base_backup_path=base_backup_path,
         )
         cron_backup_text = (
             _read_text_preserve_newlines(cron_backup_path)
             if _manifest_has_cron(manifest) and cron_backup_path.exists()
             else None
         )
-        _atomic_write_text(run_py, backup_text)
+        base_backup_text = (
+            _read_text_preserve_newlines(base_backup_path)
+            if _manifest_has_base(manifest) and base_backup_path.exists()
+            else None
+        )
+        target_changes = []
+        if base_backup_text is not None:
+            target_changes.append((base_py, base_backup_text))
+        target_changes.append((run_py, backup_text))
         if cron_backup_text is not None:
-            _atomic_write_text(cron_py, cron_backup_text)
-        _clear_install_state(backup_path, manifest_path)
+            target_changes.append((cron_py, cron_backup_text))
+        _write_targets_transactionally(target_changes)
+        _clear_install_state(backup_path, manifest_path, manifest=manifest)
         return
+
+    if manifest is not None and _manifest_has_cron(manifest):
+        raise ValueError(
+            "install state incomplete; owned cron state but run.py backup is "
+            "missing; refusing to restore"
+        )
+    if manifest is not None and _manifest_has_base(manifest):
+        raise ValueError(
+            "install state incomplete; owned exact Base state but run.py backup is "
+            "missing; refusing to restore"
+        )
+    if _managed_restore_evidence_exists(
+        cron_py,
+        cron_backup_path,
+        remove_owned_patch=remove_cron_patch,
+    ):
+        raise ValueError(
+            "install state incomplete; cron evidence exists without restorable "
+            "run.py state; refusing to restore"
+        )
+    if _managed_restore_evidence_exists(
+        base_py,
+        base_backup_path,
+        remove_owned_patch=remove_base_patch,
+    ):
+        raise ValueError(
+            "install state incomplete; exact Base evidence exists without restorable "
+            "run.py state; refusing to restore"
+        )
     if not run_py.exists():
         return
 
     current = _read_text_preserve_newlines(run_py)
     if manifest_path.exists() and remove_patch(current) == current:
-        _clear_install_state(backup_path, manifest_path)
+        if manifest is not None and (_manifest_has_cron(manifest) or _manifest_has_base(manifest)):
+            raise ValueError(
+                "install state incomplete; owned target backup missing; refusing to restore"
+            )
+        _clear_install_state(backup_path, manifest_path, manifest=manifest)
         return
 
-    manifest = _read_manifest(manifest_path)
     if manifest is not None:
         patched_sha256 = manifest.get("patched_sha256")
         if not isinstance(patched_sha256, str) or not patched_sha256:
@@ -2877,22 +3042,83 @@ def _restore(hermes_root: Path) -> None:
 
     restored = _restore_by_removing_owned_patch(run_py, current)
     if restored or backup_path.exists() or manifest_path.exists():
-        _clear_install_state(backup_path, manifest_path)
+        _clear_install_state(backup_path, manifest_path, manifest=manifest)
 
 
 def _backup_path(run_py: Path) -> Path:
     return run_py.with_name(f"{run_py.name}{BACKUP_SUFFIX}")
 
 
+def _managed_restore_evidence_exists(
+    target_py: Path,
+    target_backup_path: Path,
+    *,
+    remove_owned_patch,
+) -> bool:
+    if target_backup_path.is_symlink() or target_backup_path.exists():
+        return True
+    if target_py.is_symlink():
+        return True
+    if not target_py.exists():
+        return False
+    try:
+        current = _read_text_preserve_newlines(target_py)
+        return remove_owned_patch(current) != current
+    except (OSError, UnicodeError, ValueError):
+        return True
+
+
 def _manifest_path(hermes_root: Path) -> Path:
     return hermes_root / MANIFEST_NAME
 
 
-def _clear_install_state(backup_path: Path, manifest_path: Path) -> None:
+def _clear_install_state(
+    backup_path: Path,
+    manifest_path: Path,
+    *,
+    manifest: dict[str, object] | None,
+) -> None:
     backup_path.unlink(missing_ok=True)
-    cron_backup_path = backup_path.parent.parent / "cron" / f"scheduler.py{BACKUP_SUFFIX}"
-    cron_backup_path.unlink(missing_ok=True)
+    if manifest is not None and _manifest_has_cron(manifest):
+        cron_backup_path = (
+            backup_path.parent.parent / "cron" / f"scheduler.py{BACKUP_SUFFIX}"
+        )
+        cron_backup_path.unlink(missing_ok=True)
+    if manifest is not None and _manifest_has_base(manifest):
+        base_backup_path = (
+            backup_path.parent / "platforms" / f"base.py{BACKUP_SUFFIX}"
+        )
+        base_backup_path.unlink(missing_ok=True)
     manifest_path.unlink(missing_ok=True)
+
+
+def _write_targets_transactionally(changes: list[tuple[Path, str]]) -> None:
+    snapshots = [
+        (path, _read_text_preserve_newlines(path) if path.exists() else None)
+        for path, _contents in changes
+    ]
+    written: list[Path] = []
+    try:
+        for path, contents in changes:
+            _atomic_write_text(path, contents)
+            written.append(path)
+    except (OSError, UnicodeError, ValueError) as exc:
+        rollback_failed = False
+        snapshot_by_path = dict(snapshots)
+        for path in reversed(written):
+            previous = snapshot_by_path[path]
+            try:
+                if previous is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _atomic_write_text(path, previous)
+            except (OSError, UnicodeError, ValueError):
+                rollback_failed = True
+        if rollback_failed:
+            raise ValueError(
+                "restore transaction rollback failed; manual review required"
+            ) from exc
+        raise
 
 
 def _write_manifest(
@@ -2901,8 +3127,11 @@ def _write_manifest(
     backup_path: Path,
     cron_py: Path | None = None,
     cron_backup_path: Path | None = None,
+    base_py: Path | None = None,
+    base_backup_path: Path | None = None,
 ) -> None:
     manifest = {
+        "manifest_version": INSTALL_MANIFEST_VERSION,
         "run_py": str(run_py.relative_to(manifest_path.parent)),
         "patched_sha256": file_sha256(run_py),
         "backup": str(backup_path.relative_to(manifest_path.parent)),
@@ -2917,6 +3146,19 @@ def _write_manifest(
                 "cron_backup_sha256": file_sha256(cron_backup_path),
             }
         )
+    if base_py is not None and base_backup_path is not None and base_py.exists():
+        if not base_backup_path.exists():
+            raise ValueError("exact Base backup missing; refusing to write manifest")
+        manifest.update(
+            {
+                "base_py": str(base_py.relative_to(manifest_path.parent)),
+                "base_patched_sha256": file_sha256(base_py),
+                "base_backup": str(
+                    base_backup_path.relative_to(manifest_path.parent)
+                ),
+                "base_backup_sha256": file_sha256(base_backup_path),
+            }
+        )
     try:
         manifest["integrity"] = build_integrity_provenance(
             manifest_path.parent,
@@ -2926,6 +3168,12 @@ def _write_manifest(
             cron_source=(
                 _read_text_preserve_newlines(cron_backup_path)
                 if cron_backup_path is not None and cron_backup_path.exists()
+                else None
+            ),
+            base_py=(base_py if base_backup_path is not None else None),
+            base_source=(
+                _read_text_preserve_newlines(base_backup_path)
+                if base_backup_path is not None and base_backup_path.exists()
                 else None
             ),
         )
@@ -2948,38 +3196,67 @@ def _rollback_install(
     cron_original: str | None = None,
     cron_backup_path: Path | None = None,
     cron_backup_existed: bool = False,
+    base_py: Path | None = None,
+    base_original: str | None = None,
+    base_backup_path: Path | None = None,
+    base_backup_existed: bool = False,
 ) -> None:
-    if original is not None:
+    rollback_failures: list[tuple[str, Exception]] = []
+
+    def restore_target(label: str, path: Path, contents: str | None) -> None:
+        if contents is None:
+            return
         try:
-            _atomic_write_text(run_py, original)
-        except OSError:
+            if path.exists() and _read_text_preserve_newlines(path) == contents:
+                return
+        except (OSError, UnicodeError):
             pass
-    if cron_py is not None and cron_original is not None:
         try:
-            _atomic_write_text(cron_py, cron_original)
-        except OSError:
-            pass
-    if not backup_existed:
+            _atomic_write_text(path, contents)
+        except (OSError, UnicodeError, ValueError) as exc:
+            rollback_failures.append((label, exc))
+
+    if base_py is not None:
+        restore_target("exact Base", base_py, base_original)
+    restore_target("run.py", run_py, original)
+    if cron_py is not None:
+        restore_target("cron scheduler", cron_py, cron_original)
+
+    # If any source cannot be restored, keep every backup and manifest as
+    # forensic/recovery evidence. Deleting ownership evidence here would turn
+    # a recoverable partial install into an ambiguous user-owned state.
+    if rollback_failures:
+        labels = ", ".join(label for label, _exc in rollback_failures)
+        raise ValueError(
+            "install rollback failed; manual review required; preserved ownership "
+            f"evidence for: {labels}"
+        ) from rollback_failures[0][1]
+
+    cleanup_failures: list[tuple[str, Exception]] = []
+
+    def remove_created_evidence(label: str, path: Path | None, existed: bool) -> None:
+        if path is None or existed:
+            return
         try:
-            backup_path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
-    if cron_backup_path is not None and not cron_backup_existed:
-        try:
-            cron_backup_path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
-    if not manifest_existed:
-        try:
-            manifest_path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
+            path.unlink(missing_ok=True)
+        except (OSError, UnicodeError, ValueError) as exc:
+            cleanup_failures.append((label, exc))
+
+    remove_created_evidence("run.py backup", backup_path, backup_existed)
+    remove_created_evidence(
+        "cron backup", cron_backup_path, cron_backup_existed
+    )
+    remove_created_evidence(
+        "exact Base backup", base_backup_path, base_backup_existed
+    )
+    remove_created_evidence("install manifest", manifest_path, manifest_existed)
+
+    if cleanup_failures:
+        labels = ", ".join(label for label, _exc in cleanup_failures)
+        raise ValueError(
+            "install rollback failed; manual review required; ownership evidence "
+            f"cleanup failed for: {labels}"
+        ) from cleanup_failures[0][1]
 
 
 def _validate_existing_install_state(
@@ -2989,6 +3266,9 @@ def _validate_existing_install_state(
     *,
     cron_py: Path | None = None,
     cron_backup_path: Path | None = None,
+    base_py: Path | None = None,
+    base_backup_path: Path | None = None,
+    require_base_manifest: bool = False,
 ) -> None:
     backup_exists = backup_path.exists()
     manifest_exists = manifest_path.exists()
@@ -3001,6 +3281,7 @@ def _validate_existing_install_state(
                 "restore or remove patch before installing"
             )
         _validate_cron_install_state_without_manifest(cron_py, cron_backup_path)
+        _validate_base_install_state_without_manifest(base_py, base_backup_path)
         return
 
     if backup_exists and not manifest_exists:
@@ -3023,12 +3304,40 @@ def _validate_existing_install_state(
             "install",
             cron_py=cron_py,
             cron_backup_path=cron_backup_path,
+            base_py=base_py,
+            base_backup_path=base_backup_path,
         )
+        if manifest is not None and not _manifest_has_base(manifest):
+            if require_base_manifest and base_py is not None:
+                raise ValueError(
+                    "install state incomplete; exact Base ownership missing "
+                    "from manifest"
+                )
+            _validate_base_install_state_without_manifest(
+                base_py, base_backup_path
+            )
     except ValueError as exc:
-        if "run.py changed since install" not in str(
-            exc
-        ) or not _current_matches_backup_lenient(run_py, backup_path):
+        lenient_owned_gateway_upgrade = bool(
+            "run.py changed since install" in str(exc)
+            and _current_matches_backup_lenient(run_py, backup_path)
+        )
+        if not lenient_owned_gateway_upgrade:
             raise
+        _validate_complete_cron_install_state(
+            cron_py, cron_backup_path, manifest, "install"
+        )
+        if (
+            require_base_manifest
+            and base_py is not None
+            and manifest is not None
+            and not _manifest_has_base(manifest)
+        ):
+            raise ValueError(
+                "install state incomplete; exact Base ownership missing from manifest"
+            )
+        _validate_complete_base_install_state(
+            base_py, base_backup_path, manifest, "install"
+        )
 
 
 def _validate_manifest_matches_run_py(
@@ -3051,6 +3360,8 @@ def _validate_complete_install_state(
     *,
     cron_py: Path | None = None,
     cron_backup_path: Path | None = None,
+    base_py: Path | None = None,
+    base_backup_path: Path | None = None,
 ) -> str:
     if manifest is None:
         backup_text = _read_text_preserve_newlines(backup_path)
@@ -3079,6 +3390,9 @@ def _validate_complete_install_state(
     _validate_complete_cron_install_state(
         cron_py, cron_backup_path, manifest, operation
     )
+    _validate_complete_base_install_state(
+        base_py, base_backup_path, manifest, operation
+    )
     return backup_text
 
 
@@ -3090,6 +3404,8 @@ def _validate_restorable_install_state(
     *,
     cron_py: Path | None = None,
     cron_backup_path: Path | None = None,
+    base_py: Path | None = None,
+    base_backup_path: Path | None = None,
 ) -> str:
     backup_sha256 = manifest.get("backup_sha256")
     if not isinstance(backup_sha256, str) or not backup_sha256:
@@ -3104,6 +3420,12 @@ def _validate_restorable_install_state(
 
     current = _read_text_preserve_newlines(run_py)
     if current == backup_text:
+        _validate_complete_cron_install_state(
+            cron_py, cron_backup_path, manifest, operation
+        )
+        _validate_complete_base_install_state(
+            base_py, base_backup_path, manifest, operation
+        )
         return backup_text
 
     patched_sha256 = manifest.get("patched_sha256")
@@ -3115,6 +3437,9 @@ def _validate_restorable_install_state(
     _validate_current_matches_backup(current, backup_text, operation)
     _validate_complete_cron_install_state(
         cron_py, cron_backup_path, manifest, operation
+    )
+    _validate_complete_base_install_state(
+        base_py, base_backup_path, manifest, operation
     )
     return backup_text
 
@@ -3135,6 +3460,26 @@ def _validate_cron_install_state_without_manifest(
             return
         raise ValueError(
             "install state incomplete; cron scheduler already contains patch; "
+            "restore or remove patch before installing"
+        )
+
+
+def _validate_base_install_state_without_manifest(
+    base_py: Path | None, base_backup_path: Path | None
+) -> None:
+    if base_py is None:
+        return
+    if base_backup_path is not None and base_backup_path.exists():
+        raise ValueError(
+            "install state incomplete; exact Base backup exists without manifest; "
+            "restore or remove patch before installing"
+        )
+    if base_py.exists():
+        current_base = _read_text_preserve_newlines(base_py)
+        if remove_base_patch(current_base) == current_base:
+            return
+        raise ValueError(
+            "install state incomplete; exact Base already contains patch; "
             "restore or remove patch before installing"
         )
 
@@ -3181,7 +3526,71 @@ def _validate_complete_cron_install_state(
 
 
 def _manifest_has_cron(manifest: dict[str, object]) -> bool:
-    return "cron_py" in manifest or "cron_patched_sha256" in manifest
+    present = _CRON_MANIFEST_FIELDS.intersection(manifest)
+    if present and present != _CRON_MANIFEST_FIELDS:
+        raise ValueError(
+            "manifest cron ownership fields are incomplete; refusing to mutate"
+        )
+    return bool(present)
+
+
+def _manifest_has_base(manifest: dict[str, object]) -> bool:
+    present = _BASE_MANIFEST_FIELDS.intersection(manifest)
+    if present and present != _BASE_MANIFEST_FIELDS:
+        raise ValueError(
+            "manifest exact Base ownership fields are incomplete; refusing to mutate"
+        )
+    return bool(present)
+
+
+def _validate_complete_base_install_state(
+    base_py: Path | None,
+    base_backup_path: Path | None,
+    manifest: dict[str, object] | None,
+    operation: str,
+) -> None:
+    if manifest is None or not _manifest_has_base(manifest):
+        return
+    if base_py is None or base_backup_path is None:
+        raise ValueError(f"exact Base changed since install; refusing to {operation}")
+    expected_base = "gateway/platforms/base.py"
+    expected_backup = f"gateway/platforms/base.py{BACKUP_SUFFIX}"
+    if manifest.get("base_py") != expected_base or manifest.get(
+        "base_backup"
+    ) != expected_backup:
+        raise ValueError("manifest exact Base ownership paths are invalid")
+    if not base_py.exists():
+        raise ValueError(f"exact Base changed since install; refusing to {operation}")
+    if not base_backup_path.exists():
+        raise ValueError(f"exact Base backup changed since install; refusing to {operation}")
+
+    patched_hash = manifest.get("base_patched_sha256")
+    if not isinstance(patched_hash, str) or not patched_hash:
+        raise ValueError("manifest missing exact Base patched sha256")
+    if file_sha256(base_py) != patched_hash:
+        raise ValueError(f"exact Base changed since install; refusing to {operation}")
+    backup_hash = manifest.get("base_backup_sha256")
+    if not isinstance(backup_hash, str) or not backup_hash:
+        raise ValueError("manifest missing exact Base backup sha256")
+    if file_sha256(base_backup_path) != backup_hash:
+        raise ValueError(
+            f"exact Base backup changed since install; refusing to {operation}"
+        )
+
+    current = _read_text_preserve_newlines(base_py)
+    backup = _read_text_preserve_newlines(base_backup_path)
+    if remove_base_patch(backup) != backup:
+        raise ValueError(
+            f"exact Base backup changed since install; refusing to {operation}"
+        )
+    try:
+        restored = remove_base_patch(current)
+    except ValueError as exc:
+        raise ValueError(
+            f"exact Base changed since install; refusing to {operation}"
+        ) from exc
+    if restored != backup:
+        raise ValueError(f"exact Base changed since install; refusing to {operation}")
 
 
 def _validate_backup_contains_original(backup_text: str, operation: str) -> None:
@@ -3221,6 +3630,7 @@ def _read_manifest(manifest_path: Path) -> dict[str, object] | None:
         raise ValueError("manifest could not be parsed") from exc
     if not isinstance(manifest, dict):
         raise ValueError("manifest could not be parsed")
+    validate_install_manifest(manifest)
     return manifest
 
 

@@ -8,6 +8,7 @@ import subprocess
 
 import pytest
 
+from hermes_feishu_card import cli
 import hermes_feishu_card.install.integrity as integrity_module
 from hermes_feishu_card.install.detect import detect_hermes
 from hermes_feishu_card.install.integrity import (
@@ -19,6 +20,7 @@ from hermes_feishu_card.install.integrity import (
     plan_integrity_repair,
 )
 from hermes_feishu_card.install.patcher import (
+    remove_base_patch,
     apply_cron_patch,
     apply_patch,
     remove_cron_patch,
@@ -32,6 +34,9 @@ CRON_FIXTURE = (
     / "fixtures"
     / "hermes_cron"
     / "scheduler.py"
+)
+EXACT_BASE_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base.py"
 )
 
 
@@ -121,6 +126,46 @@ def test_integrity_plan_accepts_only_clean_descendant_git_upgrade(git_installed_
     assert plan.fingerprint
     assert upgraded_run.rstrip("\n") == _git(root, "show", "HEAD:gateway/run.py")
     assert upgraded_cron.rstrip("\n") == _git(root, "show", "HEAD:cron/scheduler.py")
+
+
+def test_integrity_repair_tracks_exact_base_source_and_reinstalls_it(tmp_path):
+    root = tmp_path / "hermes"
+    shutil.copytree(FIXTURE, root)
+    (root / "VERSION").write_text("v0.19.0\n", encoding="utf-8")
+    base_py = root / "gateway" / "platforms" / "base.py"
+    base_py.parent.mkdir(parents=True)
+    shutil.copy2(EXACT_BASE_FIXTURE, base_py)
+    _git(root, "init", "-q")
+    _git(root, "config", "user.name", "HFC Test")
+    _git(root, "config", "user.email", "hfc@example.invalid")
+    _git(root, "add", "gateway/run.py", "gateway/platforms/base.py", "VERSION")
+    _git(root, "commit", "-qm", "initial exact Hermes")
+    assert cli.main(["install", "--hermes-dir", str(root), "--yes"]) == 0
+    manifest = json.loads(
+        (root / ".hermes_feishu_card_manifest").read_text(encoding="utf-8")
+    )
+    assert "base_blob_sha256" in manifest["integrity"]
+
+    run_py = root / "gateway" / "run.py"
+    upgraded_run = remove_patch(run_py.read_text(encoding="utf-8")) + "\n# upgrade\n"
+    upgraded_base = (
+        remove_base_patch(base_py.read_text(encoding="utf-8")) + "\n# upgrade\n"
+    )
+    run_py.write_text(upgraded_run, encoding="utf-8")
+    base_py.write_text(upgraded_base, encoding="utf-8")
+    _git(root, "add", "gateway/run.py", "gateway/platforms/base.py")
+    _git(root, "commit", "-qm", "upgrade exact Hermes")
+    detection = detect_hermes(root)
+    plan = plan_integrity_repair(detection)
+
+    assert plan.executable is True
+    result = execute_integrity_repair(
+        detection, expected_fingerprint=plan.fingerprint
+    )
+
+    assert result.status == "repaired"
+    assert remove_patch(run_py.read_text(encoding="utf-8")) == upgraded_run
+    assert remove_base_patch(base_py.read_text(encoding="utf-8")) == upgraded_base
 
 
 def test_integrity_plan_refuses_legacy_manifest_until_explicit_migration(

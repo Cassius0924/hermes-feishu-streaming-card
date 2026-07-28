@@ -16,9 +16,18 @@ from typing import Dict, Iterator, List, Optional, Tuple
 from uuid import uuid4
 
 from .detect import HermesDetection
+from .manifest import (
+    CURRENT_INSTALL_MANIFEST_VERSION,
+    ManifestStructureError,
+    ManifestVersionError,
+    UNSUPPORTED_INSTALL_MANIFEST_VERSION_MESSAGE,
+    validate_install_manifest,
+)
 from .patcher import (
+    apply_base_patch,
     apply_cron_patch,
     apply_patch,
+    remove_base_patch,
     remove_cron_patch,
     remove_patch,
 )
@@ -56,6 +65,9 @@ _ACTION_MESSAGES = {
     "restore_verified_cron_backup": "cron scheduler: restored verified backup",
     "reapply_current_cron_hook": "cron scheduler: reapplied current hook",
     "rebuild_cron_backup": "cron backup: recreated",
+    "restore_verified_base_backup": "exact Base: restored verified backup",
+    "reapply_current_base_hook": "exact Base: reapplied current hook",
+    "rebuild_base_backup": "exact Base backup: recreated",
     "clear_stale_install_state": "install state: cleared stale unpatched state",
 }
 
@@ -80,6 +92,11 @@ class RecoveryEvidence:
     cron_backup_text: Optional[str]
     cron_backup_sha256: str
     cron_marker_error: str
+    base_current_text: Optional[str]
+    base_current_sha256: str
+    base_backup_text: Optional[str]
+    base_backup_sha256: str
+    base_marker_error: str
 
 
 @dataclass(frozen=True)
@@ -120,6 +137,8 @@ class _RecoveryState:
     backup_text: Optional[str]
     cron_text: Optional[str]
     cron_backup_text: Optional[str]
+    base_text: Optional[str]
+    base_backup_text: Optional[str]
     clear_install_state: bool = False
 
 
@@ -161,6 +180,9 @@ def execute_recovery(
     accept_hermes_upgrade: bool = False,
 ) -> RecoveryResult:
     with _root_lock(detection.root):
+        manifest = _read_manifest_evidence(detection.root / MANIFEST_NAME)
+        if manifest is not None and manifest.get(_MANIFEST_ERROR) == "unsupported_version":
+            raise RecoveryRefused(UNSUPPORTED_INSTALL_MANIFEST_VERSION_MESSAGE)
         fresh = plan_recovery(
             detection,
             accept_hermes_upgrade=accept_hermes_upgrade,
@@ -198,6 +220,8 @@ def _execute_fresh_plan(
         backup_text=evidence.backup_text,
         cron_text=evidence.cron_current_text,
         cron_backup_text=evidence.cron_backup_text,
+        base_text=evidence.base_current_text,
+        base_backup_text=evidence.base_backup_text,
     )
     quarantine_sources: List[Tuple[Path, str]] = []
     for action in plan.actions:
@@ -304,11 +328,27 @@ def _apply_recovery_action(
         if state.cron_text is None:
             raise RecoveryRefused("Cron source is unavailable.")
         state.cron_backup_text = remove_cron_patch(state.cron_text)
+    elif action == "restore_verified_base_backup":
+        if state.base_text is None or state.base_backup_text is None:
+            raise RecoveryRefused("Verified exact Base backup is unavailable.")
+        state.base_text = state.base_backup_text
+    elif action == "reapply_current_base_hook":
+        if state.base_text is None:
+            raise RecoveryRefused("Exact Base source is unavailable.")
+        source = state.base_backup_text
+        if source is None:
+            source = remove_base_patch(state.base_text)
+        state.base_text = apply_base_patch(source)
+    elif action == "rebuild_base_backup":
+        if state.base_text is None:
+            raise RecoveryRefused("Exact Base source is unavailable.")
+        state.base_backup_text = remove_base_patch(state.base_text)
     elif action == "rebuild_manifest":
         pass
     elif action == "clear_stale_install_state":
         state.backup_text = None
         state.cron_backup_text = None
+        state.base_backup_text = None
         state.clear_install_state = True
     else:
         raise RecoveryRefused("Unknown recovery action; refusing to mutate files.")
@@ -354,6 +394,25 @@ def _validate_recovery_state(
                     or remove_cron_patch(state.cron_text) != state.cron_backup_text
                 ):
                     raise ValueError("cron candidate does not match verified source")
+
+        if state.base_text is not None:
+            ast.parse(state.base_text)
+            base_unpatched = remove_base_patch(state.base_text)
+            if state.clear_install_state:
+                if base_unpatched != state.base_text:
+                    raise ValueError("owned exact Base patch remains")
+            elif state.base_backup_text is not None:
+                ast.parse(state.base_backup_text)
+                if remove_base_patch(state.base_backup_text) != state.base_backup_text:
+                    raise ValueError("exact Base backup contains owned patch")
+                expected_base = apply_base_patch(state.base_backup_text)
+                if (
+                    state.base_text != expected_base
+                    or remove_base_patch(state.base_text) != state.base_backup_text
+                ):
+                    raise ValueError(
+                        "exact Base candidate does not match verified source"
+                    )
     except (SyntaxError, ValueError) as exc:
         raise RecoveryRefused(
             "staged recovery validation failed; no files were changed"
@@ -406,6 +465,23 @@ def _build_recovery_changes(
             state.cron_backup_text,
         )
 
+    if detection.base_py is not None:
+        base_backup_path = detection.base_py.with_name(
+            f"{detection.base_py.name}{BACKUP_SUFFIX}"
+        )
+        _append_optional_change(
+            changes,
+            detection.base_py,
+            evidence.base_current_text,
+            state.base_text,
+        )
+        _append_optional_change(
+            changes,
+            base_backup_path,
+            evidence.base_backup_text,
+            state.base_backup_text,
+        )
+
     old_manifest = _read_text(manifest_path) if manifest_path.exists() else None
     new_manifest = None
     if not state.clear_install_state:
@@ -445,6 +521,7 @@ def _render_manifest(
         f"{detection.run_py.name}{BACKUP_SUFFIX}"
     )
     manifest = {
+        "manifest_version": CURRENT_INSTALL_MANIFEST_VERSION,
         "run_py": _relative_path(detection.root, detection.run_py),
         "patched_sha256": _text_sha256(state.run_text),
         "backup": _relative_path(detection.root, backup_path),
@@ -464,10 +541,33 @@ def _render_manifest(
                 "cron_backup_sha256": _text_sha256(state.cron_backup_text),
             }
         )
+    has_base = bool(
+        detection.base_required
+        and detection.base_py is not None
+        and state.base_text is not None
+        and state.base_backup_text is not None
+        and remove_base_patch(state.base_text) != state.base_text
+    )
+    if has_base:
+        base_py = detection.base_py
+        if base_py is None or state.base_backup_text is None:
+            raise RecoveryRefused(
+                "Exact Base backup is required for the install manifest."
+            )
+        base_backup_path = base_py.with_name(f"{base_py.name}{BACKUP_SUFFIX}")
+        manifest.update(
+            {
+                "base_py": _relative_path(detection.root, base_py),
+                "base_patched_sha256": _text_sha256(state.base_text or ""),
+                "base_backup": _relative_path(detection.root, base_backup_path),
+                "base_backup_sha256": _text_sha256(state.base_backup_text),
+            }
+        )
     integrity = _preserved_integrity_provenance(
         previous_manifest,
         state,
         has_cron=detection.cron_py is not None and state.cron_text is not None,
+        has_base=has_base,
     )
     if integrity is not None:
         manifest["integrity"] = integrity
@@ -479,6 +579,7 @@ def _preserved_integrity_provenance(
     state: _RecoveryState,
     *,
     has_cron: bool,
+    has_base: bool,
 ) -> Optional[Dict[str, object]]:
     if not isinstance(manifest, dict) or state.backup_text is None:
         return None
@@ -511,6 +612,16 @@ def _preserved_integrity_provenance(
         ):
             return None
         preserved["cron_blob_sha256"] = cron_hash
+    if has_base:
+        base_hash = value.get("base_blob_sha256")
+        if (
+            state.base_backup_text is None
+            or not isinstance(base_hash, str)
+            or _HASH_RE.fullmatch(base_hash) is None
+            or base_hash != _text_sha256(state.base_backup_text)
+        ):
+            return None
+        preserved["base_blob_sha256"] = base_hash
     return preserved
 
 
@@ -707,6 +818,19 @@ def _read_evidence(detection: HermesDetection) -> RecoveryEvidence:
         cron_backup_sha256,
         cron_marker_error,
     ) = _read_cron_evidence(detection)
+    (
+        base_current_text,
+        base_current_sha256,
+        base_backup_text,
+        base_backup_sha256,
+        base_marker_error,
+    ) = _read_base_evidence(detection)
+    if not detection.base_required and not _base_manifest_fields(manifest):
+        base_current_text = None
+        base_current_sha256 = ""
+        base_backup_text = None
+        base_backup_sha256 = ""
+        base_marker_error = ""
 
     if run_py.is_symlink():
         return RecoveryEvidence(
@@ -721,6 +845,11 @@ def _read_evidence(detection: HermesDetection) -> RecoveryEvidence:
             cron_backup_text=cron_backup_text,
             cron_backup_sha256=cron_backup_sha256,
             cron_marker_error=cron_marker_error,
+            base_current_text=base_current_text,
+            base_current_sha256=base_current_sha256,
+            base_backup_text=base_backup_text,
+            base_backup_sha256=base_backup_sha256,
+            base_marker_error=base_marker_error,
         )
 
     try:
@@ -738,6 +867,11 @@ def _read_evidence(detection: HermesDetection) -> RecoveryEvidence:
             cron_backup_text=cron_backup_text,
             cron_backup_sha256=cron_backup_sha256,
             cron_marker_error=cron_marker_error,
+            base_current_text=base_current_text,
+            base_current_sha256=base_current_sha256,
+            base_backup_text=base_backup_text,
+            base_backup_sha256=base_backup_sha256,
+            base_marker_error=base_marker_error,
         )
 
     marker_error = ""
@@ -769,6 +903,11 @@ def _read_evidence(detection: HermesDetection) -> RecoveryEvidence:
         cron_backup_text=cron_backup_text,
         cron_backup_sha256=cron_backup_sha256,
         cron_marker_error=cron_marker_error,
+        base_current_text=base_current_text,
+        base_current_sha256=base_current_sha256,
+        base_backup_text=base_backup_text,
+        base_backup_sha256=base_backup_sha256,
+        base_marker_error=base_marker_error,
     )
 
 
@@ -788,6 +927,10 @@ def _classify_evidence(
         read_findings.append(_finding("cron_symlink_refused", "error"))
     elif evidence.cron_marker_error == "current_read_error":
         read_findings.append(_finding("cron_current_read_error", "error"))
+    if evidence.base_marker_error == "symlink_refused":
+        read_findings.append(_finding("base_symlink_refused", "error"))
+    elif evidence.base_marker_error == "current_read_error":
+        read_findings.append(_finding("base_current_read_error", "error"))
     if read_findings:
         return _classification("refused", False, (), read_findings, parts)
 
@@ -802,7 +945,154 @@ def _classify_evidence(
         gateway.state,
         accept_hermes_upgrade=accept_hermes_upgrade,
     )
-    return _merge_classifications(gateway, cron, parts)
+    base = _classify_base_evidence(
+        detection,
+        evidence,
+        gateway.state,
+        accept_hermes_upgrade=accept_hermes_upgrade,
+    )
+    return _merge_classifications(gateway, cron, base, parts)
+
+
+def _classify_base_evidence(
+    detection: HermesDetection,
+    evidence: RecoveryEvidence,
+    gateway_state: str,
+    *,
+    accept_hermes_upgrade: bool,
+) -> RecoveryClassification:
+    parts = _fingerprint_parts(detection, evidence)
+    findings = []
+    manifest = evidence.manifest
+    manifest_fields = _base_manifest_fields(manifest)
+    manifest_has_any = bool(manifest_fields)
+    manifest_complete = len(manifest_fields) == 4
+    backup_present = evidence.base_backup_text is not None
+    backup_error = evidence.base_backup_sha256.startswith(_STATUS_PREFIX)
+    current = evidence.base_current_text
+    artifacts_present = manifest_has_any or backup_present or backup_error
+
+    if evidence.base_marker_error in {"symlink_refused", "current_read_error"}:
+        findings.append(_finding("base_evidence_unavailable", "error"))
+        return _classification("refused", False, (), findings, parts)
+    if current is None:
+        if detection.base_required or artifacts_present:
+            findings.append(_finding("base_source_missing", "error"))
+            return _classification("refused", False, (), findings, parts)
+        return _classification("clean", False, (), findings, parts)
+    if manifest_has_any and not manifest_complete:
+        findings.append(_finding("base_manifest_incomplete", "error"))
+        return _classification("owned_incomplete", False, (), findings, parts)
+    if backup_error:
+        findings.append(_finding("base_backup_unavailable", "error"))
+        return _classification("refused", False, (), findings, parts)
+
+    marker_corrupt = evidence.base_marker_error == "corrupt_patch_markers"
+    unpatched = current
+    has_patch = False
+    if not marker_corrupt:
+        try:
+            unpatched = remove_base_patch(current)
+            has_patch = unpatched != current
+        except ValueError:
+            marker_corrupt = True
+
+    if not artifacts_present and not has_patch:
+        if not detection.base_required:
+            return _classification("clean", False, (), findings, parts)
+        findings.append(_finding("base_install_state_incomplete", "error"))
+        reapply_error = _validate_base_reapplication(current)
+        if reapply_error:
+            findings.append(_finding("base_source_mismatch", "error"))
+        can_extend_owned_install = gateway_state in {
+            "installed",
+            "owned_incomplete",
+            "corrupt_owned",
+        }
+        actions = (
+            "rebuild_base_backup",
+            "reapply_current_base_hook",
+            "rebuild_manifest",
+        )
+        return _classification(
+            "owned_incomplete",
+            bool(can_extend_owned_install and not reapply_error),
+            actions if can_extend_owned_install else (),
+            findings,
+            parts,
+        )
+    checks = _check_base_manifest(detection, evidence)
+    findings.extend(checks.findings)
+    backup_checks = _check_base_backup(evidence)
+    findings.extend(backup_checks.findings)
+
+    if marker_corrupt:
+        executable = bool(
+            manifest_complete
+            and checks.valid
+            and checks.current_matches
+            and checks.backup_matches
+            and backup_checks.valid
+        )
+        findings.append(_finding("base_marker_error", "error"))
+        return _classification(
+            "corrupt_owned",
+            executable,
+            (
+                "restore_verified_base_backup",
+                "reapply_current_base_hook",
+                "rebuild_manifest",
+            ),
+            findings,
+            parts,
+        )
+
+    if has_patch:
+        candidate_matches = False
+        if backup_checks.valid and evidence.base_backup_text is not None:
+            try:
+                candidate_matches = (
+                    apply_base_patch(evidence.base_backup_text) == current
+                    and unpatched == evidence.base_backup_text
+                )
+            except ValueError:
+                candidate_matches = False
+        complete = bool(
+            manifest_complete
+            and checks.valid
+            and checks.current_matches
+            and checks.backup_matches
+            and backup_checks.valid
+            and candidate_matches
+        )
+        if complete:
+            return _classification("installed", False, (), findings, parts)
+        findings.append(_finding("base_patch_mismatch", "error"))
+        return _classification("owned_incomplete", False, (), findings, parts)
+
+    if not manifest_complete or not backup_checks.valid or not checks.valid:
+        findings.append(_finding("base_install_state_incomplete", "error"))
+        return _classification("owned_incomplete", False, (), findings, parts)
+    reapply_error = _validate_base_reapplication(current)
+    source_matches = evidence.base_backup_text == current
+    accepted_replacement = bool(
+        accept_hermes_upgrade and detection.supported and not reapply_error
+    )
+    executable = bool(not reapply_error and (source_matches or accepted_replacement))
+    if not executable:
+        findings.append(_finding("base_source_mismatch", "error"))
+    elif accepted_replacement and not source_matches:
+        findings.append(_finding("hermes_upgrade_base_source_accepted", "warning"))
+    actions = ["reapply_current_base_hook", "rebuild_manifest"]
+    if not source_matches:
+        actions.insert(0, "rebuild_base_backup")
+    return _classification(
+        "stale_unpatched",
+        executable,
+        tuple(actions),
+        findings,
+        parts,
+    )
 
 
 def _classify_gateway_evidence(
@@ -1304,9 +1594,10 @@ def _classify_cron_evidence(
 def _merge_classifications(
     gateway: RecoveryClassification,
     cron: RecoveryClassification,
+    base: RecoveryClassification,
     parts: Dict[str, str],
 ) -> RecoveryClassification:
-    states = {gateway.state, cron.state}
+    states = {gateway.state, cron.state, base.state}
     if "refused" in states:
         state = "refused"
     elif "corrupt_owned" in states:
@@ -1320,16 +1611,18 @@ def _merge_classifications(
     else:
         state = "clean"
 
-    actions, actions_safe = _merge_actions(gateway, cron)
-    findings = gateway.findings + cron.findings
+    actions, actions_safe = _merge_actions(gateway, cron, base)
+    findings = gateway.findings + cron.findings + base.findings
     healthy = {"clean", "installed"}
     executable = bool(
         state not in healthy
         and actions_safe
         and gateway.state != "refused"
         and cron.state != "refused"
+        and base.state != "refused"
         and (gateway.state in healthy or gateway.executable)
         and (cron.state in healthy or cron.executable)
+        and (base.state in healthy or base.executable)
     )
     return _classification(state, executable, actions, findings, parts)
 
@@ -1337,18 +1630,28 @@ def _merge_classifications(
 def _merge_actions(
     gateway: RecoveryClassification,
     cron: RecoveryClassification,
+    base: RecoveryClassification,
 ) -> Tuple[Tuple[str, ...], bool]:
     clear_action = "clear_stale_install_state"
     if clear_action not in gateway.actions:
-        return tuple(dict.fromkeys(gateway.actions + cron.actions)), True
+        return tuple(
+            dict.fromkeys(gateway.actions + cron.actions + base.actions)
+        ), True
 
-    if cron.state in {"clean", "stale_unpatched"}:
-        return (clear_action,), True
+    restore_actions = []
     if cron.state == "installed" or (
         cron.state == "corrupt_owned" and cron.executable
     ):
-        return ("restore_verified_cron_backup", clear_action), True
-    return (), False
+        restore_actions.append("restore_verified_cron_backup")
+    elif cron.state not in {"clean", "stale_unpatched"}:
+        return (), False
+    if base.state == "installed" or (
+        base.state == "corrupt_owned" and base.executable
+    ):
+        restore_actions.append("restore_verified_base_backup")
+    elif base.state not in {"clean", "stale_unpatched"}:
+        return (), False
+    return tuple((*restore_actions, clear_action)), True
 
 
 def _check_manifest(
@@ -1504,6 +1807,65 @@ def _check_cron_manifest(
     )
 
 
+def _base_manifest_fields(
+    manifest: Optional[Dict[str, object]],
+) -> set[str]:
+    if manifest is None or manifest.get(_MANIFEST_ERROR):
+        return set()
+    keys = {
+        "base_py",
+        "base_patched_sha256",
+        "base_backup",
+        "base_backup_sha256",
+    }
+    return keys.intersection(manifest)
+
+
+def _check_base_manifest(
+    detection: HermesDetection,
+    evidence: RecoveryEvidence,
+) -> _ManifestChecks:
+    manifest = evidence.manifest
+    if manifest is None or len(_base_manifest_fields(manifest)) != 4:
+        return _ManifestChecks(False, False, False, False, "", ())
+    base_py = detection.base_py
+    if base_py is None:
+        return _ManifestChecks(False, False, False, False, "", ())
+    backup_path = base_py.with_name(f"{base_py.name}{BACKUP_SUFFIX}")
+    paths_valid = bool(
+        manifest.get("base_py") == _relative_path(detection.root, base_py)
+        and manifest.get("base_backup")
+        == _relative_path(detection.root, backup_path)
+    )
+    findings = []
+    if not paths_valid:
+        findings.append(_finding("base_manifest_path_mismatch", "error"))
+    current_hash = _manifest_hash(manifest, "base_patched_sha256")
+    backup_hash = _manifest_hash(manifest, "base_backup_sha256")
+    if not current_hash:
+        findings.append(_finding("base_manifest_current_hash_invalid", "error"))
+    if not backup_hash:
+        findings.append(_finding("base_manifest_backup_hash_invalid", "error"))
+    current_matches = bool(
+        current_hash and evidence.base_current_sha256 == current_hash
+    )
+    backup_matches = bool(
+        backup_hash
+        and evidence.base_backup_text is not None
+        and evidence.base_backup_sha256 == backup_hash
+    )
+    if evidence.base_backup_text is not None and backup_hash and not backup_matches:
+        findings.append(_finding("base_backup_hash_mismatch", "error"))
+    return _ManifestChecks(
+        bool(paths_valid and current_hash and backup_hash),
+        paths_valid,
+        current_matches,
+        backup_matches,
+        backup_hash,
+        tuple(findings),
+    )
+
+
 def _check_backup(evidence: RecoveryEvidence) -> _BackupChecks:
     if evidence.backup_sha256 == f"{_STATUS_PREFIX}symlink":
         return _BackupChecks(False, (_finding("symlink_refused", "error"),))
@@ -1540,6 +1902,23 @@ def _check_cron_backup(evidence: RecoveryEvidence) -> _BackupChecks:
     return _BackupChecks(True, ())
 
 
+def _check_base_backup(evidence: RecoveryEvidence) -> _BackupChecks:
+    if evidence.base_backup_sha256 == f"{_STATUS_PREFIX}symlink":
+        return _BackupChecks(False, (_finding("base_backup_symlink_refused", "error"),))
+    if evidence.base_backup_sha256 == f"{_STATUS_PREFIX}read_error":
+        return _BackupChecks(False, (_finding("base_backup_read_error", "error"),))
+    if evidence.base_backup_text is None:
+        return _BackupChecks(False, ())
+    try:
+        ast.parse(evidence.base_backup_text)
+        if remove_base_patch(evidence.base_backup_text) != evidence.base_backup_text:
+            raise ValueError("owned exact Base patch in backup")
+        apply_base_patch(evidence.base_backup_text)
+    except (SyntaxError, ValueError):
+        return _BackupChecks(False, (_finding("base_backup_invalid", "error"),))
+    return _BackupChecks(True, ())
+
+
 def _validate_reapplication(
     detection: HermesDetection, source_text: Optional[str]
 ) -> str:
@@ -1566,6 +1945,22 @@ def _validate_cron_reapplication(source_text: Optional[str]) -> str:
             return "unsupported_anchors"
         ast.parse(candidate)
         if remove_cron_patch(candidate) != source_text:
+            return "marker_validation"
+    except (SyntaxError, ValueError):
+        return "unsupported_anchors"
+    return ""
+
+
+def _validate_base_reapplication(source_text: Optional[str]) -> str:
+    if source_text is None:
+        return "unsupported_anchors"
+    try:
+        ast.parse(source_text)
+        candidate = apply_base_patch(source_text)
+        if candidate == source_text:
+            return "unsupported_anchors"
+        ast.parse(candidate)
+        if remove_base_patch(candidate) != source_text:
             return "marker_validation"
     except (SyntaxError, ValueError):
         return "unsupported_anchors"
@@ -1619,20 +2014,28 @@ def _fingerprint_parts(
         manifest_backup_hash = ""
         manifest_cron_current_hash = ""
         manifest_cron_backup_hash = ""
+        manifest_base_current_hash = ""
+        manifest_base_backup_hash = ""
         run_path_matches = "false"
         backup_path_matches = "false"
         cron_path_matches = "false"
         cron_backup_path_matches = "false"
+        base_path_matches = "false"
+        base_backup_path_matches = "false"
     elif manifest.get(_MANIFEST_ERROR):
         manifest_state = str(manifest[_MANIFEST_ERROR])
         manifest_current_hash = ""
         manifest_backup_hash = ""
         manifest_cron_current_hash = ""
         manifest_cron_backup_hash = ""
+        manifest_base_current_hash = ""
+        manifest_base_backup_hash = ""
         run_path_matches = "false"
         backup_path_matches = "false"
         cron_path_matches = "false"
         cron_backup_path_matches = "false"
+        base_path_matches = "false"
+        base_backup_path_matches = "false"
     else:
         manifest_state = "present"
         manifest_current_hash = _manifest_hash(manifest, "patched_sha256")
@@ -1642,6 +2045,12 @@ def _fingerprint_parts(
         )
         manifest_cron_backup_hash = _manifest_hash(
             manifest, "cron_backup_sha256"
+        )
+        manifest_base_current_hash = _manifest_hash(
+            manifest, "base_patched_sha256"
+        )
+        manifest_base_backup_hash = _manifest_hash(
+            manifest, "base_backup_sha256"
         )
         expected_backup = detection.run_py.with_name(
             f"{detection.run_py.name}{BACKUP_SUFFIX}"
@@ -1668,10 +2077,31 @@ def _fingerprint_parts(
                 manifest.get("cron_backup")
                 == _relative_path(detection.root, expected_cron_backup)
             ).lower()
+        base_py = detection.base_py
+        if base_py is None:
+            base_path_matches = "false"
+            base_backup_path_matches = "false"
+        else:
+            expected_base_backup = base_py.with_name(
+                f"{base_py.name}{BACKUP_SUFFIX}"
+            )
+            base_path_matches = str(
+                manifest.get("base_py")
+                == _relative_path(detection.root, base_py)
+            ).lower()
+            base_backup_path_matches = str(
+                manifest.get("base_backup")
+                == _relative_path(detection.root, expected_base_backup)
+            ).lower()
 
     return {
         "backup_path_matches": backup_path_matches,
         "backup_sha256": evidence.backup_sha256,
+        "base_backup_path_matches": base_backup_path_matches,
+        "base_backup_sha256": evidence.base_backup_sha256,
+        "base_current_sha256": evidence.base_current_sha256,
+        "base_marker_error": evidence.base_marker_error,
+        "base_path_matches": base_path_matches,
         "cron_backup_path_matches": cron_backup_path_matches,
         "cron_backup_sha256": evidence.cron_backup_sha256,
         "cron_current_sha256": evidence.cron_current_sha256,
@@ -1682,6 +2112,8 @@ def _fingerprint_parts(
         "manifest_backup_sha256": manifest_backup_hash,
         "manifest_cron_backup_sha256": manifest_cron_backup_hash,
         "manifest_cron_current_sha256": manifest_cron_current_hash,
+        "manifest_base_backup_sha256": manifest_base_backup_hash,
+        "manifest_base_current_sha256": manifest_base_current_hash,
         "manifest_current_sha256": manifest_current_hash,
         "manifest_state": manifest_state,
         "marker_error": evidence.marker_error,
@@ -1732,6 +2164,46 @@ def _read_cron_evidence(
     )
 
 
+def _read_base_evidence(
+    detection: HermesDetection,
+) -> Tuple[Optional[str], str, Optional[str], str, str]:
+    base_py = detection.base_py
+    if base_py is None:
+        return None, "", None, "", ""
+    backup_path = base_py.with_name(f"{base_py.name}{BACKUP_SUFFIX}")
+    backup_text: Optional[str] = None
+    backup_sha256 = ""
+    if backup_path.is_symlink():
+        backup_sha256 = f"{_STATUS_PREFIX}symlink"
+    elif backup_path.exists():
+        try:
+            backup_text = _read_text(backup_path)
+            backup_sha256 = _text_sha256(backup_text)
+        except (OSError, UnicodeError):
+            backup_sha256 = f"{_STATUS_PREFIX}read_error"
+
+    if base_py.is_symlink():
+        return None, "", backup_text, backup_sha256, "symlink_refused"
+    if not base_py.exists():
+        return None, "", backup_text, backup_sha256, ""
+    try:
+        current_text = _read_text(base_py)
+    except (OSError, UnicodeError):
+        return None, "", backup_text, backup_sha256, "current_read_error"
+    marker_error = ""
+    try:
+        remove_base_patch(current_text)
+    except ValueError:
+        marker_error = "corrupt_patch_markers"
+    return (
+        current_text,
+        _text_sha256(current_text),
+        backup_text,
+        backup_sha256,
+        marker_error,
+    )
+
+
 def _manifest_has_cron_evidence(
     manifest: Optional[Dict[str, object]],
 ) -> bool:
@@ -1758,6 +2230,12 @@ def _read_manifest_evidence(path: Path) -> Optional[Dict[str, object]]:
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {_MANIFEST_ERROR: "invalid"}
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        return {_MANIFEST_ERROR: "invalid"}
+    try:
+        validate_install_manifest(value)
+    except ManifestVersionError:
+        return {_MANIFEST_ERROR: "unsupported_version"}
+    except ManifestStructureError:
         return {_MANIFEST_ERROR: "invalid"}
     return value
 

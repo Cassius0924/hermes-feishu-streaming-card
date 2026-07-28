@@ -12,7 +12,15 @@ import tempfile
 from typing import Any, Callable
 
 from .detect import HermesDetection
-from .patcher import apply_cron_patch, apply_patch, remove_cron_patch, remove_patch
+from .manifest import CURRENT_INSTALL_MANIFEST_VERSION, validate_install_manifest
+from .patcher import (
+    apply_base_patch,
+    apply_cron_patch,
+    apply_patch,
+    remove_base_patch,
+    remove_cron_patch,
+    remove_patch,
+)
 from .recovery import (
     BACKUP_SUFFIX,
     MANIFEST_NAME,
@@ -54,6 +62,8 @@ def build_integrity_provenance(
     run_source: str,
     cron_py: str | Path | None = None,
     cron_source: str | None = None,
+    base_py: str | Path | None = None,
+    base_source: str | None = None,
 ) -> dict[str, Any]:
     root_path = _exact_git_root(Path(root))
     head = _git_head(root_path)
@@ -72,12 +82,20 @@ def build_integrity_provenance(
         if _git_blob(root_path, head, cron_relative) != cron_source:
             raise IntegrityRepairRefused("cron source does not match Git HEAD")
         provenance["cron_blob_sha256"] = _text_sha256(cron_source)
+    if base_py is not None:
+        if base_source is None:
+            raise IntegrityRepairRefused("exact Base provenance is incomplete")
+        base_relative = _relative_regular_path(root_path, Path(base_py))
+        if _git_blob(root_path, head, base_relative) != base_source:
+            raise IntegrityRepairRefused("exact Base source does not match Git HEAD")
+        provenance["base_blob_sha256"] = _text_sha256(base_source)
     return provenance
 
 
 def plan_integrity_repair(detection: HermesDetection) -> IntegrityRepairPlan:
     base_plan = plan_recovery(detection, accept_hermes_upgrade=True)
     cron_py = _active_cron_py(detection)
+    base_py = _active_base_py(detection)
     evidence: dict[str, str] = {
         "base_fingerprint": base_plan.fingerprint,
         "state": base_plan.state,
@@ -87,7 +105,9 @@ def plan_integrity_repair(detection: HermesDetection) -> IntegrityRepairPlan:
 
     manifest = _read_manifest(detection.root / MANIFEST_NAME)
     integrity = manifest.get("integrity") if manifest is not None else None
-    if not _valid_integrity_manifest(integrity, cron_py is not None):
+    if not _valid_integrity_manifest(
+        integrity, cron_py is not None, base_py is not None
+    ):
         reason = "integrity_migration_required"
         evidence["integrity"] = "missing_or_invalid"
         return _plan(base_plan, executable, reason, evidence)
@@ -119,6 +139,15 @@ def plan_integrity_repair(detection: HermesDetection) -> IntegrityRepairPlan:
                 str(integrity["run_blob_sha256"]),
             )
         ]
+        if base_py is not None:
+            targets.insert(
+                0,
+                (
+                    base_py,
+                    base_py.with_name(f"{base_py.name}{BACKUP_SUFFIX}"),
+                    str(integrity["base_blob_sha256"]),
+                ),
+            )
         if cron_py is not None:
             targets.append(
                 (
@@ -130,7 +159,7 @@ def plan_integrity_repair(detection: HermesDetection) -> IntegrityRepairPlan:
                 )
             )
 
-        current_sources: list[str] = []
+        current_sources: dict[Path, str] = {}
         for target, old_backup, old_blob_hash in targets:
             relative = _relative_regular_path(root, target)
             if old_backup.is_symlink() or not old_backup.is_file():
@@ -150,10 +179,15 @@ def plan_integrity_repair(detection: HermesDetection) -> IntegrityRepairPlan:
             if current_source != _git_blob(root, current_head, relative):
                 reason = "git_target_modified"
                 return _plan(base_plan, executable, reason, evidence)
-            current_sources.append(current_source)
+            current_sources[target] = current_source
             evidence[f"target_{len(current_sources)}"] = _text_sha256(current_source)
 
-        _validate_reinstall_candidates(detection, current_sources)
+        _validate_reinstall_candidates(
+            detection,
+            run_source=current_sources[detection.run_py],
+            cron_source=current_sources.get(cron_py) if cron_py is not None else None,
+            base_source=current_sources.get(base_py) if base_py is not None else None,
+        )
     except IntegrityRepairRefused as exc:
         reason = _safe_reason(exc)
         return _plan(base_plan, executable, reason, evidence)
@@ -184,6 +218,8 @@ def execute_integrity_repair(
             if cron_py is not None
             else None
         )
+        base_py = _active_base_py(detection)
+        base_source = _read_text(base_py) if base_py is not None else None
         run_patched = apply_patch(
             run_source,
             strategy=detection.hook_strategy or "legacy_gateway_run",
@@ -193,18 +229,25 @@ def execute_integrity_repair(
             if cron_source is not None
             else None
         )
+        base_patched = (
+            apply_base_patch(base_source) if base_source is not None else None
+        )
         _validate_reinstall_candidates(
             detection,
-            [source for source in (run_source, cron_source) if source is not None],
+            run_source=run_source,
+            cron_source=cron_source,
+            base_source=base_source,
         )
 
         run_backup = detection.run_py.with_name(
             f"{detection.run_py.name}{BACKUP_SUFFIX}"
         )
-        changes: list[tuple[Path, str]] = [
-            (detection.run_py, run_patched),
-            (run_backup, run_source),
-        ]
+        changes: list[tuple[Path, str]] = []
+        base_backup: Path | None = None
+        if base_py is not None and base_source is not None and base_patched is not None:
+            base_backup = base_py.with_name(f"{base_py.name}{BACKUP_SUFFIX}")
+            changes.extend(((base_py, base_patched), (base_backup, base_source)))
+        changes.extend(((detection.run_py, run_patched), (run_backup, run_source)))
         cron_backup: Path | None = None
         if cron_py is not None and cron_source is not None and cron_patched is not None:
             cron_backup = cron_py.with_name(
@@ -222,6 +265,9 @@ def execute_integrity_repair(
             cron_source=cron_source,
             cron_patched=cron_patched,
             cron_backup=cron_backup,
+            base_source=base_source,
+            base_patched=base_patched,
+            base_backup=base_backup,
         )
         changes.append(
             (
@@ -240,6 +286,10 @@ def execute_integrity_repair(
                     "integrity evidence changed; rerun diagnosis"
                 )
             if cron_py is not None and _read_text(cron_py) != cron_source:
+                raise IntegrityRepairRefused(
+                    "integrity evidence changed; rerun diagnosis"
+                )
+            if base_py is not None and _read_text(base_py) != base_source:
                 raise IntegrityRepairRefused(
                     "integrity evidence changed; rerun diagnosis"
                 )
@@ -308,12 +358,30 @@ def migrate_integrity_manifest(detection: HermesDetection) -> dict[str, Any]:
             if cron_backup.is_symlink() or _read_text(cron_backup) != cron_source:
                 raise IntegrityRepairRefused("cron backup is not verified")
 
+        base_source = None
+        base_py = _active_base_py(detection)
+        if base_py is not None:
+            if base_py.is_symlink():
+                raise IntegrityRepairRefused("exact Base source must be a regular file")
+            base_current = _read_text(base_py)
+            base_source = remove_base_patch(base_current)
+            if (
+                base_source == base_current
+                or apply_base_patch(base_source) != base_current
+            ):
+                raise IntegrityRepairRefused("exact Base hook is not reversible")
+            base_backup = base_py.with_name(f"{base_py.name}{BACKUP_SUFFIX}")
+            if base_backup.is_symlink() or _read_text(base_backup) != base_source:
+                raise IntegrityRepairRefused("exact Base backup is not verified")
+
         provenance = build_integrity_provenance(
             detection.root,
             run_py=detection.run_py,
             run_source=run_source,
             cron_py=cron_py,
             cron_source=cron_source,
+            base_py=base_py,
+            base_source=base_source,
         )
         manifest["integrity"] = provenance
         _atomic_replace_many(
@@ -331,9 +399,14 @@ def _install_manifest(
     cron_source: str | None,
     cron_patched: str | None,
     cron_backup: Path | None,
+    base_source: str | None,
+    base_patched: str | None,
+    base_backup: Path | None,
 ) -> dict[str, Any]:
     cron_py = _active_cron_py(detection)
+    base_py = _active_base_py(detection)
     manifest: dict[str, Any] = {
+        "manifest_version": CURRENT_INSTALL_MANIFEST_VERSION,
         "run_py": detection.run_py.relative_to(detection.root).as_posix(),
         "patched_sha256": _text_sha256(run_patched),
         "backup": run_backup.relative_to(detection.root).as_posix(),
@@ -353,22 +426,41 @@ def _install_manifest(
                 "cron_backup_sha256": _text_sha256(cron_source),
             }
         )
+    if (
+        base_py is not None
+        and base_source is not None
+        and base_patched is not None
+        and base_backup is not None
+    ):
+        manifest.update(
+            {
+                "base_py": base_py.relative_to(detection.root).as_posix(),
+                "base_patched_sha256": _text_sha256(base_patched),
+                "base_backup": base_backup.relative_to(detection.root).as_posix(),
+                "base_backup_sha256": _text_sha256(base_source),
+            }
+        )
     manifest["integrity"] = build_integrity_provenance(
         detection.root,
         run_py=detection.run_py,
         run_source=run_source,
         cron_py=cron_py,
         cron_source=cron_source,
+        base_py=base_py,
+        base_source=base_source,
     )
     return manifest
 
 
 def _validate_reinstall_candidates(
-    detection: HermesDetection, sources: list[str]
+    detection: HermesDetection,
+    *,
+    run_source: str,
+    cron_source: str | None = None,
+    base_source: str | None = None,
 ) -> None:
-    if not detection.supported or not sources:
+    if not detection.supported or not run_source:
         raise IntegrityRepairRefused("unsupported_anchors")
-    run_source = sources[0]
     try:
         ast.parse(run_source)
         run_patched = apply_patch(
@@ -379,24 +471,33 @@ def _validate_reinstall_candidates(
         if remove_patch(run_patched) != run_source:
             raise ValueError("gateway roundtrip failed")
         if _active_cron_py(detection) is not None:
-            if len(sources) != 2:
+            if cron_source is None:
                 raise ValueError("cron source missing")
-            cron_source = sources[1]
             ast.parse(cron_source)
             cron_patched = apply_cron_patch(cron_source)
             ast.parse(cron_patched)
             if remove_cron_patch(cron_patched) != cron_source:
                 raise ValueError("cron roundtrip failed")
+        if _active_base_py(detection) is not None:
+            if base_source is None:
+                raise ValueError("exact Base source missing")
+            ast.parse(base_source)
+            base_patched = apply_base_patch(base_source)
+            ast.parse(base_patched)
+            if remove_base_patch(base_patched) != base_source:
+                raise ValueError("exact Base roundtrip failed")
     except (SyntaxError, ValueError) as exc:
         raise IntegrityRepairRefused("unsupported_anchors") from exc
 
 
-def _valid_integrity_manifest(value: Any, has_cron: bool) -> bool:
+def _valid_integrity_manifest(value: Any, has_cron: bool, has_base: bool) -> bool:
     if not isinstance(value, dict):
         return False
     required = {"version", "git_head", "run_blob_sha256"}
     if has_cron:
         required.add("cron_blob_sha256")
+    if has_base:
+        required.add("base_blob_sha256")
     if not required.issubset(value):
         return False
     return bool(
@@ -407,6 +508,10 @@ def _valid_integrity_manifest(value: Any, has_cron: bool) -> bool:
         and (
             not has_cron
             or _SHA256_RE.fullmatch(str(value["cron_blob_sha256"]))
+        )
+        and (
+            not has_base
+            or _SHA256_RE.fullmatch(str(value["base_blob_sha256"]))
         )
     )
 
@@ -513,7 +618,13 @@ def _read_manifest(path: Path) -> dict[str, Any] | None:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError):
         return None
-    return value if isinstance(value, dict) else None
+    if not isinstance(value, dict):
+        return None
+    try:
+        validate_install_manifest(value)
+    except ValueError:
+        return None
+    return value
 
 
 def _read_text(path: Path) -> str:
@@ -606,6 +717,17 @@ def _active_cron_py(detection: HermesDetection) -> Path | None:
     if cron_py is None or not getattr(detection, "cron_py_exists", cron_py.is_file()):
         return None
     return cron_py
+
+
+def _active_base_py(detection: HermesDetection) -> Path | None:
+    base_py = detection.base_py
+    if (
+        not detection.base_required
+        or base_py is None
+        or not getattr(detection, "base_py_exists", base_py.is_file())
+    ):
+        return None
+    return base_py
 
 
 def _canonical_hash(value: Any) -> str:

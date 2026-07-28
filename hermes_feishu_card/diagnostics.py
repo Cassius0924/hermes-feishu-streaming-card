@@ -41,6 +41,8 @@ _SENSITIVE_KEYS = {
 }
 _PATH_KEYS = {
     "backup_path",
+    "base_backup_path",
+    "base_py",
     "config_path",
     "cron_backup_path",
     "cron_py",
@@ -56,6 +58,8 @@ _RAW_HASH_KEYS = {
     "current_sha256",
     "cron_backup_sha256",
     "cron_current_sha256",
+    "base_backup_sha256",
+    "base_current_sha256",
     "raw_hash",
     "sha256",
 }
@@ -74,6 +78,7 @@ _CARD_CAPABILITIES = {
     "attachment_delivery",
     "completion_return",
     "cron_delivery",
+    "exact_base_delivery",
     "message_handler",
     "reply_context",
     "run_agent",
@@ -122,12 +127,15 @@ _CARD_METRICS = {
 _CARD_RECOVERY_ACTIONS = {
     "clear_stale_install_state",
     "reapply_current_cron_hook",
+    "reapply_current_base_hook",
     "reapply_current_hook",
     "rebuild_backup",
     "rebuild_cron_backup",
+    "rebuild_base_backup",
     "rebuild_manifest",
     "restore_verified_backup",
     "restore_verified_cron_backup",
+    "restore_verified_base_backup",
 }
 _CARD_FINDING_CODES = {
     "backup_hash_mismatch",
@@ -135,6 +143,22 @@ _CARD_FINDING_CODES = {
     "backup_missing",
     "backup_read_error",
     "backup_source_mismatch",
+    "base_backup_hash_mismatch",
+    "base_backup_invalid",
+    "base_backup_read_error",
+    "base_backup_symlink_refused",
+    "base_current_read_error",
+    "base_evidence_unavailable",
+    "base_install_state_incomplete",
+    "base_manifest_backup_hash_invalid",
+    "base_manifest_current_hash_invalid",
+    "base_manifest_incomplete",
+    "base_manifest_path_mismatch",
+    "base_marker_error",
+    "base_patch_mismatch",
+    "base_source_mismatch",
+    "base_source_missing",
+    "base_symlink_refused",
     "bot_unknown",
     "config_load_failed",
     "cron_backup_hash_mismatch",
@@ -160,6 +184,7 @@ _CARD_FINDING_CODES = {
     "feishu_sdk_incompatible",
     "hermes_check_skipped",
     "hermes_compatibility_partial",
+    "hermes_upgrade_base_source_accepted",
     "hermes_not_checked",
     "hermes_unsupported",
     "install_state_changed",
@@ -259,6 +284,18 @@ def build_diagnostic_report(
         "run_py_exists": detection.run_py_exists,
         "cron_py": str(detection.cron_py) if detection.cron_py is not None else None,
         "cron_py_exists": detection.cron_py_exists,
+        "base_py": str(detection.base_py) if detection.base_py is not None else None,
+        "base_py_exists": detection.base_py_exists,
+        "base_required": detection.base_required,
+        "base_hook_strategy": detection.base_hook_strategy,
+        "exact_delivery_contract": (
+            "ready"
+            if detection.base_required
+            and detection.capabilities.get("exact_base_delivery") is True
+            else "missing_or_unsupported"
+            if detection.base_required
+            else "not_required"
+        ),
         "version_source": detection.version_source,
         "version": detection.version,
         "minimum_supported_version": detection.minimum_version,
@@ -495,6 +532,9 @@ def format_diagnostic_text(report: DiagnosticReport, explain: bool) -> str:
             details.append(f"compatibility {hermes['compatibility']}")
         suffix = f" ({', '.join(details)})" if details else ""
         lines.append(f"- Hermes: {hermes_status}{suffix}")
+        exact_contract = hermes.get("exact_delivery_contract")
+        if exact_contract:
+            lines.append(f"- Exact delivery contract: {exact_contract}")
     else:
         lines.append(f"- Hermes: {hermes_status}")
 
@@ -1160,10 +1200,12 @@ def _card_safe_hermes(value: object) -> dict[str, object]:
     )
     if status:
         result["status"] = status
-    for key in ("root", "run_py", "cron_py", "suggested_root"):
+    for key in ("root", "run_py", "cron_py", "base_py", "suggested_root"):
         _copy_path_hash(result, data, key)
     _copy_bool(result, data, "run_py_exists")
     _copy_bool(result, data, "cron_py_exists")
+    _copy_bool(result, data, "base_py_exists")
+    _copy_bool(result, data, "base_required")
     for key in ("version", "minimum_supported_version"):
         text = str(data.get(key) or "")
         if _SAFE_VERSION_RE.fullmatch(text):
@@ -1178,6 +1220,18 @@ def _card_safe_hermes(value: object) -> dict[str, object]:
     cron_strategy = _safe_enum(data.get("cron_hook_strategy"), {"cron_scheduler"}, "")
     if cron_strategy:
         result["cron_hook_strategy"] = cron_strategy
+    base_strategy = _safe_enum(
+        data.get("base_hook_strategy"), {"exact_base_delivery"}, ""
+    )
+    if base_strategy:
+        result["base_hook_strategy"] = base_strategy
+    exact_contract = _safe_enum(
+        data.get("exact_delivery_contract"),
+        {"ready", "not_required", "missing_or_unsupported"},
+        "",
+    )
+    if exact_contract:
+        result["exact_delivery_contract"] = exact_contract
     compatibility = _safe_enum(
         data.get("compatibility"), {"full", "partial", "unsupported"}, ""
     )

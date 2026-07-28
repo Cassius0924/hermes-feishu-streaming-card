@@ -14,10 +14,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_feishu_card import cli
 from hermes_feishu_card.install.detect import detect_hermes
 from hermes_feishu_card.install import patcher, recovery
 from hermes_feishu_card.install.patcher import (
     CRON_PATCH_END,
+    remove_base_patch,
+    remove_patch,
     apply_cron_patch,
     apply_patch,
 )
@@ -38,6 +41,9 @@ CRON_FIXTURE = (
     / "fixtures"
     / "hermes_cron"
     / "scheduler.py"
+)
+EXACT_BASE_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base.py"
 )
 
 
@@ -850,6 +856,95 @@ def test_plan_recovery_restores_installed_cron_before_clearing_gateway_stale_sta
         "restore_verified_cron_backup",
         "clear_stale_install_state",
     )
+
+
+def test_exact_base_upgrade_requires_opt_in_and_clears_all_owned_state(tmp_path):
+    root = tmp_path / "hermes"
+    shutil.copytree(FIXTURE, root)
+    (root / "VERSION").write_text("v0.19.0\n", encoding="utf-8")
+    base_py = root / "gateway" / "platforms" / "base.py"
+    base_py.parent.mkdir(parents=True)
+    shutil.copy2(EXACT_BASE_FIXTURE, base_py)
+    assert cli.main(["install", "--hermes-dir", str(root), "--yes"]) == 0
+    run_py = root / "gateway" / "run.py"
+    upgraded_run = remove_patch(run_py.read_text(encoding="utf-8")) + "\n# upgrade\n"
+    upgraded_base = (
+        remove_base_patch(base_py.read_text(encoding="utf-8")) + "\n# upgrade\n"
+    )
+    run_py.write_text(upgraded_run, encoding="utf-8")
+    base_py.write_text(upgraded_base, encoding="utf-8")
+    detection = detect_hermes(root)
+
+    refused = plan_recovery(detection)
+    accepted = plan_recovery(detection, accept_hermes_upgrade=True)
+
+    assert refused.state == "stale_unpatched"
+    assert refused.executable is False
+    assert accepted.state == "stale_unpatched"
+    assert accepted.executable is True
+    assert accepted.actions == ("clear_stale_install_state",)
+    assert any(
+        finding.code == "hermes_upgrade_base_source_accepted"
+        for finding in accepted.findings
+    )
+
+    execute_recovery(
+        detection,
+        expected_fingerprint=accepted.fingerprint,
+        accept_hermes_upgrade=True,
+    )
+
+    assert run_py.read_text(encoding="utf-8") == upgraded_run
+    assert base_py.read_text(encoding="utf-8") == upgraded_base
+    assert not run_py.with_name("run.py.hermes_feishu_card.bak").exists()
+    assert not base_py.with_name("base.py.hermes_feishu_card.bak").exists()
+    assert not (root / ".hermes_feishu_card_manifest").exists()
+
+
+def test_recovery_upgrades_legacy_run_only_install_with_required_exact_base(
+    tmp_path,
+):
+    root = tmp_path / "hermes"
+    shutil.copytree(FIXTURE, root)
+    assert cli.main(["install", "--hermes-dir", str(root), "--yes"]) == 0
+    manifest_path = root / ".hermes_feishu_card_manifest"
+    legacy_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert not any(key.startswith("base_") for key in legacy_manifest)
+
+    (root / "VERSION").write_text("v0.19.0\n", encoding="utf-8")
+    base_py = root / "gateway" / "platforms" / "base.py"
+    base_py.parent.mkdir(parents=True)
+    shutil.copy2(EXACT_BASE_FIXTURE, base_py)
+    base_original = base_py.read_text(encoding="utf-8")
+    detection = detect_hermes(root)
+    assert detection.base_required is True
+
+    plan = plan_recovery(detection)
+
+    assert plan.state == "owned_incomplete"
+    assert plan.executable is True
+    assert {
+        "rebuild_base_backup",
+        "reapply_current_base_hook",
+        "rebuild_manifest",
+    } <= set(plan.actions)
+
+    result = execute_recovery(detection, expected_fingerprint=plan.fingerprint)
+
+    assert result.status == "repaired"
+    assert remove_base_patch(base_py.read_text(encoding="utf-8")) == base_original
+    base_backup = base_py.with_name("base.py.hermes_feishu_card.bak")
+    assert base_backup.read_text(encoding="utf-8") == base_original
+    upgraded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert upgraded_manifest["base_py"] == "gateway/platforms/base.py"
+    assert upgraded_manifest["base_backup"] == (
+        "gateway/platforms/base.py.hermes_feishu_card.bak"
+    )
+
+    healthy = plan_recovery(detection)
+    assert healthy.state == "installed"
+    assert healthy.executable is False
+    assert healthy.actions == ()
 
 
 def test_plan_recovery_restores_corrupt_cron_before_clearing_gateway_stale_state(
