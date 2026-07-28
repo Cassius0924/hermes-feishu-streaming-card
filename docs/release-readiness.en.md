@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.0.21`. It fixes Issue #155's answer/tool archive boundary and locks the Issue #147 image/notice combined regression without changing the card UI or configuration. V3.9.1 was released on 2026-07-11; V4.0.20 and earlier releases remain historical release records; real Feishu image acceptance passed on 2026-07-28.
+Current release candidate: `4.1.0`. It adds per-chat native policy, lossless table compaction, authenticated runtime integrity, and explicit sidecar service managers. V3.9.1 was released on 2026-07-11, and V4.0.21 and earlier releases remain historical records. V4.1.0 real Feishu, Linux/Docker, public tag/install, and exact-merge-SHA gates are marked passed only after completion.
 
 ## Ready
 
@@ -144,6 +144,14 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.1.0 Release Gates
+
+- Exact/profile-scoped `bindings.native_chats`, two-stage hook/sidecar enforcement, fail-open direct-card paths, and card-based `/hfc`: **focused matrix and real card → native → card acceptance pending**.
+- Default `table_overflow_mode=compact`, fenced fake-table exclusion, and a terminal native handoff above 28,000 bytes with one complete answer: **real seven-table and oversized-handoff acceptance pending**.
+- `integrity.mode` safe/notify/off, signed `runtime.hello` / `runtime.heartbeat`, strict repair, `sidecar.restart_required`, and no automatic Gateway restart: **upgrade simulation pending**.
+- All four `service.manager` modes, non-escalating `auto`, and ordinary Docker containers: **Linux manager and Docker Compose smoke pending**.
+- Full pytest, `git diff --check`, build/isolated `site-packages`, exact merge SHA, public tagged install, and Release assets: **release workflow pending**.
 
 ## V4.0.21 Release Gates
 

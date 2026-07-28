@@ -32,6 +32,20 @@ Normal card states are intentionally simple:
 
 During `思考中`, the card shows accumulated `thinking.delta` content and real-time tool call counts. When `interaction.requested` arrives, the card enters `等待选择`. The default `auto` mode receives button clicks through the Hermes Feishu adapter's WebSocket-native card-action channel and forwards them to sidecar `/card/actions`, so localhost/private sidecars need no public callback URL. Numbered choices and Hermes' native text interaction path are used only when `text` is configured explicitly. Since V3.8.5, independent commands such as `/new`, `/reset`, and `/model` use the same Feishu/Lark WebSocket-native card-action path, and direct execution results stay in cards too. After `message.completed`, the card enters `已完成`, the final answer replaces thinking content, and users no longer need to see the full thinking trace in the completed state.
 
+## V4.1 Control Protocols And Domain Separation
+
+V4.1 adds two local control planes beside the `/events` data plane. The three signing domains must remain distinct:
+
+| Endpoint | Purpose | Signing domain | Failure behavior |
+|---|---|---|---|
+| `POST /events` | Message lifecycle and card data plane | event domain | Hermes stays on native fail-open until card ownership is confirmed |
+| `POST /delivery/policy` | Per-chat decision before the hook suppresses native output | `hfc-policy-v1` | Timeout, invalid/replayed proof, config error, or unknown profile returns to native delivery |
+| `POST /runtime/events` | `runtime.hello` / `runtime.heartbeat` readiness | `hfc-runtime-v1` | Hermes work continues; sidecar readiness degrades and no source mutation is authorized |
+
+Policy and runtime proofs bind the exact raw body, a short timestamp window, and nonce replay protection. Responses never echo a chat id, transport root, path, source hash, or recovery fingerprint. `runtime.hello` / `runtime.heartbeat` carry only schema-bounded generation/package/sequence facts. Strict repair separately verifies Git, manifest, backup, blobs, anchors, and a fresh pre-mutation fingerprint.
+
+A turn's delivery decision is pinned on its first event. A `bindings.native_chats` change affects only the next new message, and a duplicate terminal event cannot send once through cards and once natively. The sidecar checks policy again before creating `CardSession`, so hook preflight and server enforcement are both required.
+
 ## Content Safety
 
 The sidecar must filter internal thinking boundaries and must not expose `</think>` or similar control tags. Final answers should come from public response content, not raw internal streams.

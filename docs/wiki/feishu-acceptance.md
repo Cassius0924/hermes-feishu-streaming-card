@@ -2,6 +2,16 @@
 
 自动化测试不能完全证明 Feishu/Lark 客户端体验。涉及卡片 UX、topic、系统提示、命令卡片的版本，发布前需要真实飞书 smoke。
 
+## V4.1.0 安全控制验收
+
+- card → native → card：先让普通会话完成一张卡，执行 `chats use-native` 后从下一条新消息观察 Hermes 原生投递，再执行 `chats use-card` 恢复；正在运行的 turn 不能中途变轨，三步均不得重复正文。
+- native 工具与反馈：在 native chat 中完成一轮带工具回答，并分别验证普通命令、system notice、approval/clarify 与 picker 按 Hermes 原生路径可见；`/hfc status` / `/hfc doctor` 仍必须是卡片。
+- 表格：发送包含 7 张真实 Markdown 表格和一段 fenced fake table 的回答；默认 `compact` 只把前 5 张渲染为 table，其余字段列表保留全部行、单元格和后续正文。显式 `truncate` 单独做自动化兼容，不把数据丢失模式作为默认真实验收。
+- 预算 handoff：让最终序列化 card JSON 超过 28,000 byte。运行中只保留小型等待卡；完成后已有卡显示短 handoff，完整答案仅以 Hermes 原生消息出现一次。重复 terminal 不得产生第二份答案。
+- integrity：先验证 `notify` 只报告；在严格 Git provenance fixture 中执行 `integrity migrate-safe`，确认 `sidecar.restart_required: true`、`gateway.restart_required: false`。safe repair 后确认 readiness 显示 `gateway.restart_required: true`，Gateway 未被自动重启；手动重启后新的 `runtime.hello` / `runtime.heartbeat` 恢复 ready。
+- service/Docker：Linux 覆盖 `auto`、`systemd-user`、`systemd-system`、`detached`，确认 `auto` 不调用 sudo/系统总线；Docker Compose 以普通 setup/sidecar/Gateway 容器运行，不使用 privileged 或 systemd。
+- 全程只记录脱敏计数、状态和 release version，不记录真实 chat/message/user id、secret、transport proof、本机路径、回答正文或 recovery fingerprint。真实验收、Linux/Docker smoke 和 public tag/install 未完成前，不得写成已经通过。
+
 ## V4.0.21 内容完整性与媒体/notice 组合验收
 
 - Issue #155：按 `tool -> answer -> completed` 走一轮，完成卡必须保留完整用户可见答案；只有在明确 `answer -> tool` 边界后，前一段答案才能进入时间线。

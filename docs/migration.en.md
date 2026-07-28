@@ -57,6 +57,36 @@ python3 -m hermes_feishu_card.cli status --config config.yaml.example
 
 `status` should show `status: running`, `active_sessions`, and metrics. Without Feishu credentials, advanced starts use a no-op client. With credentials, the sidecar reads them only from local config or environment variables.
 
+## Upgrading To V4.1.0
+
+V4.1.0 preserves cards as the default and does not silently mutate an old configuration. Upgrade the package and rerun setup/install first, then add only the controls you need:
+
+```yaml
+bindings:
+  native_chats: []
+card:
+  table_overflow_mode: compact  # compact | truncate
+integrity:
+  mode: notify  # old configs remain notify until explicit migration
+service:
+  manager: auto  # auto | systemd-user | systemd-system | detached
+```
+
+`bindings.native_chats` uses exact matching. Manage it with `chats use-native`, `chats use-card`, and `chats list`; multi-profile commands require `--profile-id` and write only that profile. `table_overflow_mode: compact` retains table six onward without data loss, while `truncate` is the explicit legacy behavior. A terminal card JSON above 28,000 bytes returns the complete answer to Hermes native delivery.
+
+An old config without `integrity` loads as `notify`. Only an installation with verified Git provenance, backup, manifest, owned blobs, and anchors can migrate explicitly:
+
+```bash
+hermes-feishu-card integrity migrate-safe \
+  --config ~/.hermes/config.yaml \
+  --hermes-dir ~/.hermes/hermes-agent \
+  --yes
+```
+
+Success prints `sidecar.restart_required: true` and `gateway.restart_required: false`. Restart the sidecar before signed `runtime.hello` / `runtime.heartbeat` events are evaluated in safe mode. If strict repair later reinstalls the hook, state changes to `gateway.restart_required: true`, but HFC never restarts Gateway automatically. Incomplete evidence, user edits, symlinks, dirty targets, branch rewinds, and source-stripped roots remain fail closed.
+
+`service.manager: auto` chooses only `systemd-user` or `detached`; it never silently enters `systemd-system` or invokes sudo. `systemd-system` is an explicit Linux transient-unit opt-in. Docker remains an ordinary container process with `detached`. Hermes 0.19.0 / `v2026.7.20` still uses the AST-owned `gateway/run.py` hook; runtime monitoring and strict repair handle upgrade replacement without an import-hook bridge.
+
 ## Upgrading To V3.4.0
 
 V3.4.0+ selects the hook strategy from the Hermes version and `gateway/run.py` code anchors. Hermes `0.13.0+`, `0.14.0` / `v2026.5.16+` uses `gateway_run_013_plus`; older Hermes from `v2026.4.23` through `v2026.4.x` continues to use `legacy_gateway_run`. After upgrading the plugin, reinstall the hook; restarting the sidecar alone is not enough.

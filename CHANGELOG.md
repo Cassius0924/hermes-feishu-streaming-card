@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.1.0 — 2026-07-28
+
+See also: [docs/release-notes-v4.1.0.md](docs/release-notes-v4.1.0.md)
+
+### Added
+- Exact, profile-scoped `bindings.native_chats` policy plus masked `chats use-native`, `chats use-card`, and `chats list` commands. Hook and sidecar enforce the policy independently through domain-separated, replay-resistant authentication.
+- Authenticated `runtime.hello` / `runtime.heartbeat` readiness monitoring and strict, evidence-bound `integrity.mode: safe` repair. Existing configs without the section remain `notify`; HFC never restarts Hermes Gateway automatically.
+- Explicit `service.manager` values `auto`, `systemd-user`, `systemd-system`, and `detached`. `auto` probes only user systemd and never crosses into system privileges.
+
+### Changed
+- `card.table_overflow_mode: compact` preserves table six onward as ordered field lists. `truncate` remains available explicitly, and fenced code no longer counts as tables.
+- The shared card serializer enforces five tables, 200 tagged elements, and a 28,000-byte JSON budget. Terminal overflow hands the complete answer back to Hermes native delivery instead of sending a partial card.
+- Docker Compose remains an ordinary unprivileged container flow and explicitly selects `detached` rather than systemd.
+
+### Compatibility and safety
+- Hermes 0.19.0 / `v2026.7.20` remains compatible with the existing AST-owned `gateway/run.py` hook. Runtime monitoring and strict repair replace broader import-time patching.
+- Credits: @shutdown-awa (#157), @Jasonsun77 (#158), @Redeemer-w (#159), @Cyber-Yichen (#156), and @wholegale39 (#160). The release retains their requirements and environment evidence without adopting implicit privilege escalation or an import-hook monkey patch.
+
 ## V4.0.21 — 2026-07-28
 
 See also: [docs/release-notes-v4.0.21.md](docs/release-notes-v4.0.21.md)

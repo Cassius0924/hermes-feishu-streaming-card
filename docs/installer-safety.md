@@ -52,6 +52,14 @@ python3 -m hermes_feishu_card.cli install --hermes-dir ~/.hermes/hermes-agent --
 
 `status` 和 `start` 会从显式 `--hermes-dir`、选定 env file、配置旁 `.env` 或进程环境读取 `HERMES_DIR`，只读检查 hook 安装状态。若 Hermes 升级替换了源码但旧 backup/manifest 仍可验证，输出 `hook.status: upgrade_repair_required`，并提示上述显式恢复命令及 `hermes gateway start`；`start` 会在启动 sidecar 前拒绝继续，避免“sidecar 正常但 Gateway hook 已丢失”的静默降级。若检测到用户改动、损坏或不受支持的源码，则输出 `manual_review_required`，不提供 `--accept-hermes-upgrade` 捷径。
 
+## V4.1 runtime 完整性
+
+新安装写入 `integrity.mode: safe`；旧配置缺段时保持 `notify`。旧安装只有在 provenance 可验证时才可运行 `integrity migrate-safe --config CONFIG --hermes-dir HERMES_DIR --yes`。成功时输出 `sidecar.restart_required: true` 与 `gateway.restart_required: false`，表示要重启 sidecar 读取新模式，但迁移动作本身不要求重启 Gateway。
+
+重启后，Gateway runtime 以独立签名域发送 `runtime.hello` / `runtime.heartbeat`。这些事件只证明当前 HFC runtime generation 与活性，不携带路径、源码 hash、chat id 或 secret，也不能单独授权写文件。`safe` 仍要求当前 Git HEAD 是已记录 HEAD 的后代、目标 blob 等于当前 HEAD、backup/manifest/anchors/reversible patch 全部一致，并在 mutation 前重新检查 fingerprint。
+
+如果 strict repair 成功重新安装 hook，readiness 会显示 `gateway.restart_required: true`。HFC 不会自动 restart 或 kill Gateway；用户选择合适窗口手动重启，后续匹配的 `runtime.hello` 才清除状态。缺少认证 control secret、source-stripped root、symlink、dirty target、branch rewind、用户编辑、旧 manifest 或变化中的证据都拒绝自动 repair。
+
 ## 备份与 manifest
 
 安装会先保存 `gateway/run.py` 备份，再写入 manifest。manifest 至少记录：

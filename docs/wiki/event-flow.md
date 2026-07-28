@@ -6,12 +6,24 @@
 Hermes Gateway
   -> patched gateway/run.py hook block
   -> hermes_feishu_card.hook_runtime
+  -> signed sidecar /delivery/policy preflight
   -> sidecar /events
+  -> signed sidecar /runtime/events hello/heartbeat
   -> CardSession / reply index / route lookup
   -> Feishu/Lark send or update card
 ```
 
 Hermes 进程内的 hook 只负责提取和转发。sidecar 负责会话状态、卡片渲染、Feishu API、重试、诊断和 metrics。
+
+## V4.1 投递与完整性控制流
+
+新 turn 在任何 sequence、pending delta、session 或原生抑制发生前，通过 `hfc-policy-v1` 查询 per-chat 决策。card decision 在 turn 内固定；native decision 让 original Hermes 路径继续。sidecar 收到 `/events` 后在创建 CardSession、reply alias、动画或 Feishu client state 前再查一次。未知 profile、配置 reload 失败、proof 无效/过期/重放、timeout 或 malformed response 全部走 native fail-open。
+
+normal answer/tool、approval/clarify、cron、system notice、command feedback 与 picker 使用同一决策；`/hfc help/status/doctor/monitor` 和 smoke card 是显式管理面，始终保持卡片。terminal 会清理本轮 policy cache、pending delta 和 native-media suppression；重复 terminal 只复用已记录 disposition，不能泄漏第二条原生答案。
+
+实际 card JSON 由共享 serializer 检查 5 table、200 tagged element 与 28,000 UTF-8 byte。非终态超限用小型 waiting card 继续收集；terminal 超限返回 `applied:false, disposition:native`。有旧卡时只 PATCH 简短 handoff，无卡时不额外发卡，完整原答案交回 Hermes 一次。
+
+Gateway runtime 以独立 `hfc-runtime-v1` 域发送 `runtime.hello` / `runtime.heartbeat`。sidecar readiness 根据本机 monotonic receipt、generation 和 strict integrity 状态计算；heartbeat 只证明 runtime 活性，不授权写源码。safe repair 仍需 Git/manifest/backup/blob/anchor/fingerprint 证据，成功后只设置 `gateway.restart_required`，不自动重启 Gateway。
 
 ## 初始卡片可靠投递
 

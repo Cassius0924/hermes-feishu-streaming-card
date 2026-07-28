@@ -28,6 +28,24 @@ python3 -m pytest tests/unit/test_hook_runtime.py tests/integration/test_hook_ru
 
 这些测试会验证安装后的 Hermes hook 能把 `SidecarEvent` 发送到 mock sidecar，并在发送失败时保持 fail-open。它们只使用 fixture 和 mock sidecar，不访问真实飞书。
 
+## V4.1.0 安全控制回归
+
+```bash
+python3 -m pytest \
+  tests/unit/test_delivery_policy.py \
+  tests/unit/test_text.py \
+  tests/unit/test_render.py \
+  tests/unit/test_runtime_control.py \
+  tests/unit/test_integrity.py \
+  tests/unit/test_process.py \
+  tests/integration/test_hook_runtime_integration.py \
+  tests/integration/test_server.py \
+  tests/integration/test_cli_integrity.py \
+  tests/integration/test_cli_process.py -q
+```
+
+这组测试覆盖 exact/profile-scoped native policy 与签名/重放、fenced-code-safe table compact/truncate、28,000-byte terminal native handoff、`runtime.hello` / `runtime.heartbeat` readiness、strict safe repair、四种 service manager 和 Docker 非 systemd 边界。loopback aiohttp 测试可能需要在允许绑定本机临时端口的环境运行。自动化不能替代真实 card → native → card、七表格、oversized handoff、Hermes upgrade、Linux manager 与普通 Docker Compose 验收。
+
 ## V4.0.21 内容完整性回归
 
 ```bash

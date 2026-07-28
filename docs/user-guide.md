@@ -64,6 +64,29 @@ V3.8.2 起，最终答案保留在主内容区，pre-tool answer 会按“正文
 | 多机器人、多群聊、多 profile 难确认路由 | `bindings.chats`、`group_rules` 安全诊断、profile-aware session key、`/health.routing` 诊断 |
 | sidecar 或 hook 出问题难定位 | `doctor`、runtime import 检查、`/health` metrics、fail-closed installer、restore/uninstall |
 
+## V4.1.0 投递策略、内容保护与运行安全
+
+按会话切换只使用精确匹配：
+
+```yaml
+bindings:
+  native_chats: []
+card:
+  table_overflow_mode: compact  # compact | truncate
+integrity:
+  mode: safe  # safe | notify | off
+service:
+  manager: auto  # auto | systemd-user | systemd-system | detached
+```
+
+`bindings.native_chats` 在多 profile 模式下必须写在对应 `profiles.<id>.bindings` 内，且不会继承顶层列表。用 `chats use-native CHAT_ID --config CONFIG` 与 `chats use-card CHAT_ID --config CONFIG` 修改，用 `chats list --config CONFIG` 查看掩码结果；修改从下一条新消息生效。policy 请求、配置 reload 或 profile 校验失败会 fail-open 到 Hermes 原生消息，`/hfc` 运维面仍保持卡片。
+
+`table_overflow_mode: compact` 默认把第 6 张及后续表格转换为有序字段列表并保留全部数据；`truncate` 是显式旧行为。scanner 不把 fenced code 当表格。实际 card JSON 超过 5 张 table、200 个 tagged element 或 28,000 UTF-8 byte 时，非终态继续收集，终态把完整答案一次性交还 Hermes 原生投递，不发送截断卡。
+
+新安装写 `integrity.mode: safe`，旧配置缺段时按 `notify` 加载。旧安装显式执行 `integrity migrate-safe --config CONFIG --hermes-dir HERMES_DIR --yes` 后会得到 `sidecar.restart_required: true`、`gateway.restart_required: false`，需要重启 sidecar；若后续 strict repair 重新安装 hook，才会显示 `gateway.restart_required: true`，且 HFC 不自动重启 Gateway。认证 `runtime.hello` / `runtime.heartbeat` 用于区分进程存活与真实发卡 readiness。
+
+`service.manager: auto` 只选择可用的 `systemd-user`，否则使用 `detached`，从不隐式进入 `systemd-system` 或调用 sudo。`systemd-system` 仅 Linux 显式 opt-in 且只用 transient unit；Docker 保持普通容器进程与 `detached`。完整排障见 [V4.1 安全控制与排障](wiki/v4.1-safety-controls.md)。
+
 ## V4.0.0 实时双轨卡片
 
 - 运行态 Header title 保留用户自定义标题（默认 `Hermes Agent`），subtitle 根据工具名和 Hermes `progress_callback.preview` 显示动作摘要；完整命令留在 timeline。
@@ -482,7 +505,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.0.21`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.1.0`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -490,7 +513,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.0.21
+export HFC_VERSION=v4.1.0
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -621,7 +644,7 @@ bots:
 bindings:
   fallback_bot: default
   chats:
-    oc_5cc6a25d8815790fa890dd0226005e83: sales
+    oc_example_sales: sales
   group_rules:
     enabled: false
     require_mention: true
@@ -775,6 +798,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
+| [v4.1.0](release-notes-v4.1.0.md) | 2026-07-28 | 精确 per-chat 原生策略、超量表格无损 compact、认证 runtime 完整性与 strict repair、四种显式 service manager |
 | [v4.0.21](release-notes-v4.0.21.md) | 2026-07-28 | Issue #155：仅显式 `answer -> tool` 边界归档答案，避免 post-tool 最终答案进入 timeline；Issue #147 真实飞书验收已观测 completion card + native image、两段答案留在同一卡、无匹配原生重复或 uncertain-delivery warning；不宣称截图或桌面/移动端视觉 QA |
 | [v4.0.20](release-notes-v4.0.20.md) | 2026-07-22 | Issue #153：notice 异步 ACK 使用 `accepted`，真实 PATCH 失败增加脱敏指标和错误码 |
 | [v4.0.19](release-notes-v4.0.19.md) | 2026-07-22 | Hermes venv 安装不再误用 `pip --user`，pip 失败会立即中止并保留真实错误 |

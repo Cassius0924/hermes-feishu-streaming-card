@@ -32,6 +32,20 @@ Hermes 最小 hook 向 sidecar 发送消息生命周期事件。第二阶段 hoo
 
 `思考中` 阶段显示累积的 `thinking.delta` 内容，并在同一张卡片内实时更新工具调用次数。`interaction.requested` 到达后，卡片进入 `等待选择`。默认 `auto` 模式通过 Hermes Feishu adapter 的 WebSocket 原生 card-action channel 接收按钮点击，再转发到 sidecar `/card/actions`，因此 localhost/private sidecar 不需要公网 callback URL；只有显式配置 `text` 时才显示编号选项并交还 Hermes 原生文本交互。V3.8.5 起，`/new`、`/reset`、`/model` 等独立命令也优先走同一条 Feishu/Lark WebSocket 原生 card action 路径，且直通执行结果保持卡片反馈。`message.completed` 后，卡片进入 `已完成`，最终答案替换思考内容；用户不需要在完成态继续看到完整思考轨迹。
 
+## V4.1 控制协议与域分隔
+
+V4.1 在 `/events` 数据面外增加两个本机控制面，三者不得复用签名 domain：
+
+| 端点 | 用途 | 签名域 | 失败行为 |
+|---|---|---|---|
+| `POST /events` | 消息生命周期与卡片数据面 | event domain | 未确认接管时 Hermes 原生 fail-open |
+| `POST /delivery/policy` | 在 hook 抑制原生消息前查询 per-chat 决策 | `hfc-policy-v1` | timeout、invalid/replayed proof、配置错误或未知 profile 都返回原生路径 |
+| `POST /runtime/events` | `runtime.hello` / `runtime.heartbeat` readiness | `hfc-runtime-v1` | Hermes 工作继续；sidecar readiness 降级，不授权源码 mutation |
+
+policy 和 runtime proof 都绑定 exact raw body、短 timestamp window 与 nonce replay protection。响应不回显 chat id、transport root、路径、源码 hash 或 recovery fingerprint。`runtime.hello` / `runtime.heartbeat` 只提供经过 schema 限制的 generation/package/sequence 信息；严格 repair 仍独立验证 Git、manifest、backup、blob、anchor 与 mutation 前 fingerprint。
+
+一个 turn 的 delivery decision 在首次事件时固定。`bindings.native_chats` 的修改只影响下一条新消息；重复 terminal 不能在卡片与原生路径各发送一次。sidecar 在创建 `CardSession` 前再次检查 policy，因此 hook preflight 与 server enforcement 缺一不可。
+
 ## 内容安全
 
 sidecar 必须过滤模型内部思考边界，不得向卡片泄露 `</think>` 标签或类似控制标记。最终答案应来自对外可见的回答内容，而不是原始内部流。

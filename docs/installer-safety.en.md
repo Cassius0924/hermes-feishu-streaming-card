@@ -50,6 +50,14 @@ python3 -m hermes_feishu_card.cli install --hermes-dir ~/.hermes/hermes-agent --
 
 `status` and `start` resolve `HERMES_DIR` from an explicit `--hermes-dir`, the selected env file, the config-adjacent `.env`, or process environment, then check hook state read-only. When a Hermes upgrade replaced the source but the old backup/manifest still verify, they report `hook.status: upgrade_repair_required` and print the explicit recovery command plus `hermes gateway start`; `start` refuses before launching the sidecar, preventing a silent “healthy sidecar, missing Gateway hook” state. User edits, corruption, unsupported source, or incomplete evidence report `manual_review_required` without offering the `--accept-hermes-upgrade` shortcut.
 
+## V4.1 Runtime Integrity
+
+New installs write `integrity.mode: safe`; an old config without the section remains `notify`. An older installation may run `integrity migrate-safe --config CONFIG --hermes-dir HERMES_DIR --yes` only when provenance verifies. Success prints `sidecar.restart_required: true` and `gateway.restart_required: false`: restart the sidecar to load the mode, but the migration itself does not require a Gateway restart.
+
+After restart, the Gateway runtime sends `runtime.hello` / `runtime.heartbeat` in a separate signing domain. These events prove only the current HFC runtime generation and liveness. They carry no paths, source hashes, chat ids, or secrets and cannot authorize a file write by themselves. `safe` still requires the current Git HEAD to descend from the recorded HEAD, target blobs to equal current HEAD, backup/manifest/anchors/reversible patch evidence to agree, and a fresh fingerprint check immediately before mutation.
+
+When strict repair successfully reinstalls the hook, readiness reports `gateway.restart_required: true`. HFC never restarts or kills Gateway automatically. The operator selects a suitable window, and a later matching `runtime.hello` clears the state. A missing authenticated control secret, source-stripped root, symlink, dirty target, branch rewind, user edit, old manifest, or changing evidence refuses automatic repair.
+
 ## Backup And Manifest
 
 Installation saves a backup of `gateway/run.py` before writing the patched file, then writes a manifest. The manifest records at least:

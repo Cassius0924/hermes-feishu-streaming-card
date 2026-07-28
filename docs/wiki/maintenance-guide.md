@@ -23,6 +23,8 @@
 - 运行时包装手动 `/compress`，先创建运行卡，再以 original handler 返回值更新同一卡。
 - 用 task-local command context 承载 all slash command feedback；首次 create、后续 PATCH，失败逐条回原生文本。
 - 处理新版 Hermes 缺少 `message.started` 的首事件场景。
+- 在任何 event/sequence/session 或原生抑制发生前查询 per-chat delivery policy，并对本轮固定决策。
+- 通过既有 startup adapter 和 legacy first-hook fallback 启动认证 runtime hello/heartbeat；不得增加 import hook。
 
 高风险点：
 
@@ -36,6 +38,7 @@
 - 已连接 Lark WebSocket 的 live `EventDispatcherHandler` identity 不得被重建或替换；只可通过 `_ws_thread_loop.call_soon_threadsafe(...)` 更新现有 `p2.card.action.trigger` processor callback，不兼容内部结构必须 fail-open。
 - `_hfc_original_handle_resume_command` 必须保留为唯一恢复执行路径；不要在 HFC 重写 session ownership、continuation 或 `switch_session` 规则。
 - 群聊/topic picker 只有在发起者 `open_id` 可验证时才显示；不可验证时 fail-open。私聊不额外比较操作者。
+- policy cache 必须有界、短 TTL、线程安全且按 profile/chat/endpoint 隔离；认证、timeout、reload 或响应异常全部回到 Hermes 原生路径。terminal 必须清理 turn 决策、pending delta 和 native-media suppression。
 
 ### `hermes_feishu_card/server.py`
 
@@ -45,6 +48,7 @@
 - 根据 `message_id`、`reply_to_message_id` 和 profile/bot 信息路由到卡片。
 - 合并高频 delta，安排 Feishu PATCH。
 - 处理 terminal drain、终态优先更新、metrics 和 `/health`。
+- 在创建 `CardSession`、alias、动画或 Feishu client state 前再次检查 delivery policy，并接收认证 runtime events 维护 readiness。
 
 高风险点：
 
@@ -56,6 +60,7 @@
 - 无凭据的 Noop 模式必须在 `/health` 中标记 `degraded` / `noop_mode`，发送计入 `feishu_noop_attempts` 和 failure；不得生成假 message id 或计入 success。
 - 首轮加载和运行中工具动画必须复用 session 的 `FlushController` 更新同一卡，并保持有界；正文/工具终态到达、更新失败、session reset 或应用清理时必须停止，不能与 terminal drain 竞争或制造独立消息。
 - 群聊 `/hfc status` 只做路由诊断和 binding 提示；@机器人触发、白名单和群消息准入属于 Hermes Gateway。
+- 真实 Card JSON 上限由共享 serializer 最终裁决：5 张 table、200 tagged element、28,000 UTF-8 byte。terminal native handoff 必须幂等，不能发送半截卡后再重复原生答案。
 
 ### `hermes_feishu_card/install/patcher.py`
 
@@ -84,14 +89,15 @@
 
 - 不把 recovery plan、state-dir transport secret、真实 chat id 或安装路径未经脱敏地放进 card、`/health` 或日志。
 - 自动 repair 只适用于 known-safe state；`--no-repair` 必须保持有效，用户编辑不能被覆盖。
+- `integrity.mode=safe` 还必须验证 Git root/ancestry/current blobs、provenance、anchors、可逆 patch 和 mutation 前 fingerprint；runtime heartbeat 本身不构成 mutation 权限。修复只设置 restart required，不能自动重启 Gateway。
 - 调整 planner/executor 时运行 `tests/unit/test_recovery.py`、`tests/unit/test_operations.py`、`tests/integration/test_server.py`；涉及安装器时再加 `tests/integration/test_cli_install.py`。
 
 ### `hermes_feishu_card/process.py` and sidecar lifecycle
 
 职责：
 
-- 在 Linux/systemd user manager 可用时，把 sidecar 放入独立 transient user service，避免与 `hermes-gateway` 共用 cgroup。
-- 在其他平台保留 detached-process fallback。
+- 按 `service.manager` 的 `auto` / `systemd-user` / `systemd-system` / `detached` 明确选择进程所有者。
+- `auto` 仅在 Linux user manager 可用时使用独立 transient user service，其他环境使用 detached。
 - 用 PID、process token 和 manager/unit identity 管理 status、migration 与 stop。
 
 高风险点：
@@ -101,6 +107,7 @@
 - Hermes 升级可能替换 `gateway/run.py` 而保留 HFC backup/manifest；CLI `status` / `start` 必须只读识别 verified `stale_unpatched`，仅对可执行的 `accept_hermes_upgrade` plan 给出显式恢复命令。用户改动、损坏或证据不足必须 fail-closed，不得自动重写 Hermes 或自动重启 Gateway。
 - runner 必须真正读取 `setup` / `start` 显式传入的 `--env-file`。配置优先级保持 YAML < 同目录 `.env` < 显式 env file < process env；禁止为了修复 systemd 环境而隐式读取全局 `~/.hermes/.env`。
 - 升级迁移只能停止 PID/token/health 三者一致的旧进程，未知进程保持 fail-closed。
+- `auto` 不得探测 system bus、调用 sudo/pkexec、写 `/etc` 或静默 fallback 到 system manager；`systemd-system` 只能显式使用 transient unit。
 - 调整 lifecycle 时运行 `tests/unit/test_process.py`、`tests/integration/test_cli_process.py` 和 `tests/unit/test_install_scripts.py`。
 
 ### Hermes Feishu SDK 能力门禁
@@ -119,6 +126,9 @@
 | 群聊路由诊断 / 工具详情 | `python -m pytest tests/unit/test_bots.py tests/unit/test_session.py tests/unit/test_render.py tests/integration/test_server.py -q` | `python -m pytest -q` |
 | patcher / install hook | `python -m pytest tests/unit/test_patcher.py tests/integration/test_cli_install.py -q` | `python -m pytest -q` |
 | renderer / timeline / Markdown | `python -m pytest tests/unit/test_render.py tests/unit/test_session.py -q` | `python -m pytest -q` |
+| delivery policy / native bypass | `python -m pytest tests/unit/test_delivery_policy.py tests/unit/test_hook_runtime.py tests/integration/test_server.py -q` | 真实 card → native → card + `python -m pytest -q` |
+| runtime integrity / strict repair | `python -m pytest tests/unit/test_runtime_control.py tests/unit/test_integrity.py tests/unit/test_integrity_coordinator.py tests/integration/test_cli_integrity.py -q` | upgrade simulation + `python -m pytest -q` |
+| service manager / Docker | `python -m pytest tests/unit/test_process.py tests/integration/test_cli_process.py tests/unit/test_install_scripts.py -q` | Linux + ordinary Docker smoke + `python -m pytest -q` |
 | CLI / doctor / install scripts | `python -m pytest tests/integration/test_cli.py tests/unit/test_install_scripts.py -q` | `python -m pytest -q` |
 | README / release notes / TODO | `python -m pytest tests/unit/test_docs.py -q` | `git diff --check` |
 | version bump | `python -m pytest tests/unit/test_package_metadata.py tests/unit/test_docs.py -q` | `python -m pytest -q` |

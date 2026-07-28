@@ -28,6 +28,24 @@ python3 -m pytest tests/unit/test_hook_runtime.py tests/integration/test_hook_ru
 
 These tests verify that the installed Hermes hook can send `SidecarEvent` data to a mock sidecar and remains fail-open when sending fails. They use fixtures and a mock sidecar only; they do not access real Feishu.
 
+## V4.1.0 Safety-Control Regressions
+
+```bash
+python3 -m pytest \
+  tests/unit/test_delivery_policy.py \
+  tests/unit/test_text.py \
+  tests/unit/test_render.py \
+  tests/unit/test_runtime_control.py \
+  tests/unit/test_integrity.py \
+  tests/unit/test_process.py \
+  tests/integration/test_hook_runtime_integration.py \
+  tests/integration/test_server.py \
+  tests/integration/test_cli_integrity.py \
+  tests/integration/test_cli_process.py -q
+```
+
+This matrix covers exact/profile-scoped native policy with signatures/replay, fenced-code-safe table compact/truncate, the 28,000-byte terminal native handoff, `runtime.hello` / `runtime.heartbeat` readiness, strict safe repair, all four service managers, and the non-systemd Docker boundary. Loopback aiohttp tests may need an environment that allows local ephemeral ports. Automation does not replace real card → native → card, seven-table, oversized-handoff, Hermes-upgrade, Linux-manager, and ordinary Docker Compose acceptance.
+
 ## V4.0.21 content-integrity regressions
 
 ```bash

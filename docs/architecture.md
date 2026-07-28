@@ -8,10 +8,14 @@
 Hermes Gateway
   -> marker-wrapped minimal hook (gateway/run.py)
   -> hermes_feishu_card.hook_runtime
-  -> authenticated/fail-open HTTP POST /events
+     -> signed POST /delivery/policy (before native suppression)
+     -> authenticated/fail-open POST /events
+     -> signed POST /runtime/events (hello/heartbeat)
   -> hermes_feishu_card.server
-  -> session + render + Feishu CardKit send/update
+  -> policy + readiness + session + render + Feishu CardKit send/update
 ```
+
+V4.1 使用域分隔的三条协议：事件数据面、`hfc-policy-v1` per-chat policy、`hfc-runtime-v1` runtime readiness。policy 在 hook 和 sidecar 两侧执行；runtime 事件只证明活性，不授权文件写入。任一控制面失败都不应阻断 Hermes Agent 工作，安装/恢复 mutation 则继续 fail-closed。
 
 Hermes hook 到 sidecar `/events` 的 fail-open 转发链路已经落地：sidecar 不可用或拒绝事件时，hook 不拖垮 Hermes，未被卡片路径确认接管的消息继续遵循 Hermes 原生 fallback。卡片已经接受的路径则抑制重复灰色原生文本。
 
@@ -46,6 +50,8 @@ Hermes hook 到 sidecar `/events` 的 fail-open 转发链路已经落地：sidec
 | 端点 | 默认边界 |
 |---|---|
 | `POST /events` | loopback 本机互信；显式非 loopback 强制事件鉴权 |
+| `POST /delivery/policy` | state-directory transport root、短 timestamp window 与 nonce replay protection；响应不回显 id |
+| `POST /runtime/events` | 独立 runtime domain 的认证 hello/heartbeat；只更新脱敏 readiness |
 | `POST /commands` | state-dir command transport proof |
 | `POST /card/actions` | interaction token 或 operations transport proof |
 | `GET /health` | 无鉴权但严格脱敏；仅供本机探活 |

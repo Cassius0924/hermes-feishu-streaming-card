@@ -57,6 +57,36 @@ python3 -m hermes_feishu_card.cli status --config config.yaml.example
 
 `status` 应显示 `status: running`、`active_sessions` 和 metrics。未配置飞书凭据时会使用 no-op client；配置真实凭据时只从本机配置或环境变量读取。
 
+## 升级到 V4.1.0
+
+V4.1.0 保持旧会话的卡片默认与旧配置的非自动变更边界。建议先升级包并重新运行 setup/install，再按需加入：
+
+```yaml
+bindings:
+  native_chats: []
+card:
+  table_overflow_mode: compact  # compact | truncate
+integrity:
+  mode: notify  # 旧配置保持 notify；显式迁移后再 safe
+service:
+  manager: auto  # auto | systemd-user | systemd-system | detached
+```
+
+`bindings.native_chats` 只精确匹配。用 `chats use-native`、`chats use-card`、`chats list` 管理；多 profile 必须加 `--profile-id` 并写入对应 profile。`table_overflow_mode: compact` 无损转换第 6 张及后续表格，`truncate` 保留显式旧行为；终态 card JSON 超过 28,000 byte 时交还完整 Hermes 原生答案。
+
+旧配置缺少 `integrity` 段时会按 `notify` 加载。只有已验证 Git provenance、backup、manifest、owned blobs 和 anchors 的安装才能显式迁移：
+
+```bash
+hermes-feishu-card integrity migrate-safe \
+  --config ~/.hermes/config.yaml \
+  --hermes-dir ~/.hermes/hermes-agent \
+  --yes
+```
+
+成功后输出 `sidecar.restart_required: true`、`gateway.restart_required: false`；重启 sidecar 后，认证 `runtime.hello` / `runtime.heartbeat` 才开始按 safe 模式评估。若 strict repair 真的重新安装 hook，状态会改为 `gateway.restart_required: true`，但 HFC 不会自动重启 Gateway。证据不足、用户编辑、symlink、dirty target、branch rewind 或 source-stripped root 都保持 fail-closed。
+
+`service.manager: auto` 只选择 `systemd-user` 或 `detached`，不隐式进入 `systemd-system`，不调用 sudo。`systemd-system` 是 Linux transient unit 的显式 opt-in；Docker 继续用普通容器进程和 `detached`。Hermes 0.19.0 / `v2026.7.20` 仍使用 AST-owned `gateway/run.py` hook；升级覆盖通过 runtime 监控和 strict repair 处理，不安装 import-hook bridge。
+
 ## 升级到 V3.4.0
 
 V3.4.0+ 会根据 Hermes 版本和 `gateway/run.py` 代码 anchor 选择 hook strategy。Hermes `0.13.0+`、`0.14.0` / `v2026.5.16+` 使用 `gateway_run_013_plus`，旧版本 Hermes `v2026.4.23` 到 `v2026.4.x` 继续使用 `legacy_gateway_run`。升级插件后必须重新安装 hook，不能只重启 sidecar。

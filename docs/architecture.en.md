@@ -8,10 +8,14 @@ The active mainline uses a sidecar-only architecture. Hermes Agent keeps a minim
 Hermes Gateway
   -> marker-wrapped minimal hook (gateway/run.py)
   -> hermes_feishu_card.hook_runtime
-  -> authenticated/fail-open HTTP POST /events
+     -> signed POST /delivery/policy (before native suppression)
+     -> authenticated/fail-open POST /events
+     -> signed POST /runtime/events (hello/heartbeat)
   -> hermes_feishu_card.server
-  -> session + render + Feishu CardKit send/update
+  -> policy + readiness + session + render + Feishu CardKit send/update
 ```
+
+V4.1 uses three domain-separated protocols: the event data plane, `hfc-policy-v1` per-chat policy, and `hfc-runtime-v1` runtime readiness. Policy is enforced in both hook and sidecar. Runtime events prove liveness only and cannot authorize a file write. A control-plane failure must not stop Hermes Agent work, while install/recovery mutations remain fail closed.
 
 The Hermes hook-to-sidecar `/events` path is fail-open. Sidecar unavailability or event rejection must not bring down Hermes; a message not confirmed as accepted by the card path continues through Hermes' native fallback. Once the card path accepts delivery, the hook suppresses duplicate gray native text.
 
@@ -46,6 +50,8 @@ Event authentication provides source authentication and integrity, not HTTP encr
 | Endpoint | Default boundary |
 |---|---|
 | `POST /events` | loopback local-process trust; explicit non-loopback requires event authentication |
+| `POST /delivery/policy` | state-directory transport root, short timestamp window, and nonce replay protection; responses do not echo ids |
+| `POST /runtime/events` | authenticated hello/heartbeat in a separate runtime domain; updates sanitized readiness only |
 | `POST /commands` | state-directory command transport proof |
 | `POST /card/actions` | interaction token or operations transport proof |
 | `GET /health` | unauthenticated but strictly sanitized; local liveness only |

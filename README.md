@@ -36,6 +36,9 @@ Hermes 飞书流式卡片插件把 Hermes Agent Gateway 的飞书/Lark 回复变
 - **群聊诊断更清楚**：`/hfc status` 会提示群内 chat binding 状态、绑定命令和 slash command 行为边界。
 - **运维卡有明确边界**：`/hfc doctor` 可给出诊断、两步安全修复和重启确认；私聊不比较操作者，群聊只允许发起者确认。运维卡不可用时继续使用 CLI，不改变普通流式卡的 layout 或 footer。
 - **长内容保护**：长 Markdown 表格、fenced code block 按结构边界拆分，降低 raw markdown 和半截围栏问题。
+- **V4.1 按会话原生投递**：精确的 `bindings.native_chats` 可让指定会话回到 Hermes 原生消息；hook 与 sidecar 双重校验，策略失败时 fail-open，不吞消息。
+- **V4.1 无损表格溢出**：默认 `card.table_overflow_mode: compact` 把第 6 张及后续表格转成字段列表；最终卡片仍超出 28,000 byte 时把完整答案一次性交还原生投递，不发送半截内容。
+- **V4.1 升级与服务安全**：认证 `runtime.hello` / `runtime.heartbeat` 区分进程存活与发卡 readiness；strict repair 不自动重启 Gateway，`service.manager: auto` 也不隐式进入 system service 或调用 sudo。
 - **可诊断、可恢复**：`doctor`、`/hfc status`、`/health` metrics、runtime import 检查、Hermes Feishu SDK 能力检查、safe repair/restore/uninstall 覆盖常见故障。若 Hermes adapter 使用 `extra_ua_tags` 而 Gateway venv 仍是旧版 `lark-oapi`，`doctor` 会报告 `feishu_sdk_incompatible`，`setup/install` 会补齐已验证的 `lark-oapi==1.6.8`。
 
 ## 适用场景
@@ -89,8 +92,17 @@ feishu:
   app_secret: ""
 card:
   title: Hermes Agent
+  table_overflow_mode: compact
   footer_fields: [duration, model, input_tokens, output_tokens, context]
+bindings:
+  native_chats: []
+integrity:
+  mode: safe
+service:
+  manager: auto
 ```
+
+`native_chats` 只做精确匹配；多 profile 时放在对应 `profiles.<id>.bindings` 下。现有配置缺少 `integrity` 段时按 `notify` 加载，不会静默启用自动修复。完整配置、迁移和排障见 [V4.1 安全控制与排障](docs/wiki/v4.1-safety-controls.md)。
 
 需要显示 Codex 订阅剩余额度时，把 `subscription_usage` 加入 `footer_fields`。插件仅在显式启用后，通过 Hermes 原生 `fetch_account_usage("openai-codex")` 查询；旧 Hermes、未登录或网络失败时静默隐藏，不影响卡片完成。`card.text_sizes` 可分别设置 `body`、`reasoning`、`tool`、`notice`、`footer`，也可用 `default` / `pc` / `mobile` 做设备映射；卡片物理 width/height 由 Feishu/Lark 客户端控制。
 
@@ -128,7 +140,7 @@ Hermes `v2026.4.23` 起的旧版和 Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x �
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.0.21
+export HFC_VERSION=v4.1.0
 bash install-docker.sh
 ```
 
@@ -169,6 +181,7 @@ bash install-docker.sh
 ![飞书话题内卡片连续更新与思考工具 timeline 展示](docs/assets/feishu-topic-card-showcase-v389.png)
 | 版本 | 重点 |
 |---|---|
+| [v4.1.0](docs/release-notes-v4.1.0.md) | 按会话精确选择原生/卡片投递；第 6 张及后续表格默认无损 compact；认证 runtime 完整性监控与 strict repair；四种显式 sidecar manager，`auto` 不提权 |
 | [v4.0.21](docs/release-notes-v4.0.21.md) | Issue #155：仅显式 `answer -> tool` 边界归档答案，避免 post-tool 最终答案被移入 timeline；Issue #147 真实飞书验收已观测到 completion card + native image、无匹配原生重复或 uncertain-delivery warning，UI 与配置不变 |
 | [v4.0.20](docs/release-notes-v4.0.20.md) | 修复 Issue #153：已有卡片的 notice 异步更新返回 `accepted`，不再误报投递未知；真实 PATCH 失败保留脱敏指标和错误码 |
 | [v4.0.19](docs/release-notes-v4.0.19.md) | 修复 one-line installer 在 Hermes venv 中误用 `pip --user`、并确保 pip 失败时立即停止，避免“显示升级但仍运行旧版本” |
@@ -234,6 +247,7 @@ Hermes Gateway
 - 发布准备：[中文](docs/release-readiness.md) / [English](docs/release-readiness.en.md)
 - 测试说明：[中文](docs/testing.md) / [English](docs/testing.en.md)
 - 项目维护 Wiki：[docs/wiki](docs/wiki/README.md)
+- V4.1 安全控制与排障：[docs/wiki/v4.1-safety-controls.md](docs/wiki/v4.1-safety-controls.md)
 
 ## 贡献者
 
