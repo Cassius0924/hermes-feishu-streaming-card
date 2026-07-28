@@ -71,7 +71,7 @@ from .runtime_control import (
     RuntimeIntegritySupervisor,
     RuntimeProofVerifier,
 )
-from .integrity import RuntimeIntegrityCoordinator
+from .integrity import RuntimeIntegrityCoordinator, sanitize_integrity_snapshot
 
 FEISHU_CLIENT_KEY = web.AppKey("feishu_client", Any)
 SESSIONS_KEY = web.AppKey("sessions", dict)
@@ -455,7 +455,9 @@ async def _health(request: web.Request) -> web.Response:
         "delivery": {"mode": "noop" if request.app[NOOP_MODE_KEY] else "live"},
         "event_auth_required": request.app[EVENT_AUTH_REQUIRED_KEY],
         "readiness": request.app[RUNTIME_INTEGRITY_SUPERVISOR_KEY].snapshot(),
-        "integrity": request.app[RUNTIME_INTEGRITY_COORDINATOR_KEY].snapshot(),
+        "integrity": sanitize_integrity_snapshot(
+            request.app[RUNTIME_INTEGRITY_COORDINATOR_KEY].snapshot()
+        ),
         "active_sessions": len(sessions),
         "process_pid": os.getpid(),
         "metrics": metrics.snapshot(),
@@ -2134,22 +2136,40 @@ def _hfc_monitor_lines(request: web.Request, event: SidecarEvent) -> list[str]:
 
 def _hfc_readiness_lines(request: web.Request) -> list[str]:
     readiness = request.app[RUNTIME_INTEGRITY_SUPERVISOR_KEY].snapshot()
+    integrity = sanitize_integrity_snapshot(
+        request.app[RUNTIME_INTEGRITY_COORDINATOR_KEY].snapshot()
+    )
     lines = [
         f"- readiness: {readiness['status']}",
         f"- readiness_reason: {readiness['reason']}",
         f"- integrity.mode: {readiness['integrity_mode']}",
         "- gateway.restart_required: "
         f"{'true' if readiness['restart_required'] else 'false'}",
+        f"- integrity.status: {integrity['last_status']}",
+        f"- integrity.reason: {integrity['last_reason']}",
+        f"- integrity.repair_attempts: {integrity['repair_attempts']}",
+        f"- integrity.repair_successes: {integrity['repair_successes']}",
+        f"- integrity.repair_refusals: {integrity['repair_refusals']}",
     ]
-    action = {
+    integrity_action = {
+        "repair_available": (
+            "先审核 doctor 证据，再运行 integrity migrate-safe 并重启 sidecar"
+        ),
+        "manual_review_required": "运行 doctor --explain 后人工检查，不要强制修复",
+        "restart_required": "在无活动对话时手动重启 Hermes Gateway 后复查",
+        "repaired": "在无活动对话时手动重启 Hermes Gateway 后复查",
+    }.get(str(integrity["last_status"]))
+    readiness_action = {
         "gateway_restart_required": "重启 Hermes Gateway 后重新检查",
         "runtime_heartbeat_missing": "确认 Hermes Gateway 正在运行，必要时重启",
         "runtime_heartbeat_stale": "检查 Hermes Gateway 状态，必要时重启",
         "control_auth_unavailable": "重新运行 setup 并重启 sidecar 与 Gateway",
         "manual_review_required": "运行 hermes-feishu-card doctor 后人工检查",
     }.get(str(readiness["reason"]))
+    action = integrity_action or readiness_action
     if action:
-        lines.append(f"- next_action: {action}")
+        prefix = "integrity.next_action" if integrity_action else "next_action"
+        lines.append(f"- {prefix}: {action}")
     return lines
 
 

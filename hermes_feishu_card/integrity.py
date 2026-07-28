@@ -9,6 +9,78 @@ from .install.integrity import execute_integrity_repair, plan_integrity_repair
 from .runtime_control import RuntimeIntegritySupervisor
 
 
+_OPERATOR_INTEGRITY_MODES = frozenset({"safe", "notify", "off"})
+_OPERATOR_INTEGRITY_STATUSES = frozenset(
+    {
+        "idle",
+        "disabled",
+        "ready",
+        "manual_review_required",
+        "restart_required",
+        "repair_available",
+        "deduplicated",
+        "repaired",
+    }
+)
+_OPERATOR_INTEGRITY_REASONS = frozenset(
+    {
+        "integrity_disabled",
+        "runtime_ready",
+        "control_auth_unavailable",
+        "gateway_restart_required",
+        "manual_review_required",
+        "integrity_evidence_unavailable",
+        "integrity_migration_required",
+        "recovery_not_required",
+        "recovery_evidence_not_executable",
+        "git_history_not_descendant",
+        "owned_backup_invalid",
+        "owned_backup_mismatch",
+        "git_target_modified",
+        "git_root_invalid",
+        "git_head_invalid",
+        "git_history_unavailable",
+        "git_evidence_unavailable",
+        "git_blob_invalid",
+        "source_not_regular",
+        "source_outside_root",
+        "source_read_failed",
+        "unsupported_anchors",
+        "integrity_evidence_invalid",
+        "verified_git_upgrade",
+        "integrity_repair_refused",
+    }
+)
+
+
+def sanitize_integrity_snapshot(snapshot: Any) -> dict[str, Any]:
+    source = snapshot if isinstance(snapshot, dict) else {}
+    mode = str(source.get("mode") or "")
+    status = str(source.get("last_status") or "")
+    reason = str(source.get("last_reason") or "")
+
+    def bounded_count(name: str) -> int:
+        value = source.get(name)
+        if not isinstance(value, int) or isinstance(value, bool):
+            return 0
+        return min(max(value, 0), 1_000_000_000)
+
+    return {
+        "mode": mode if mode in _OPERATOR_INTEGRITY_MODES else "unknown",
+        "last_status": (
+            status if status in _OPERATOR_INTEGRITY_STATUSES else "unknown"
+        ),
+        "last_reason": (
+            reason
+            if reason in _OPERATOR_INTEGRITY_REASONS
+            else ("none" if not reason else "unknown")
+        ),
+        "repair_attempts": bounded_count("repair_attempts"),
+        "repair_successes": bounded_count("repair_successes"),
+        "repair_refusals": bounded_count("repair_refusals"),
+    }
+
+
 class RuntimeIntegrityCoordinator:
     """Coordinate strict hook recovery without controlling Gateway lifecycle."""
 

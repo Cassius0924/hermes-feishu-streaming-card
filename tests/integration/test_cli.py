@@ -93,6 +93,52 @@ def test_status_reports_runtime_readiness_and_fails_when_degraded(
     assert "gateway.restart_required: true" in output
 
 
+def test_status_reports_sanitized_integrity_repair_action(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda *_args, **_kwargs: {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "status_sidecar",
+        lambda _config: {
+            "running": True,
+            "pid": 123,
+            "manager": "detached",
+            "health": {
+                "status": "healthy",
+                "active_sessions": 0,
+                "metrics": {},
+                "readiness": {
+                    "status": "ready",
+                    "reason": "runtime_ready",
+                    "integrity_mode": "notify",
+                    "restart_required": False,
+                },
+                "integrity": {
+                    "mode": "notify",
+                    "last_status": "repair_available",
+                    "last_reason": "verified_git_upgrade",
+                    "repair_attempts": 0,
+                    "repair_successes": 0,
+                    "repair_refusals": 0,
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(cli_module, "_lifecycle_hook_check", lambda _args: None)
+
+    exit_code = main(["status", "--config", "config.yaml"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "integrity.status: repair_available" in output
+    assert "integrity.reason: verified_git_upgrade" in output
+    assert "integrity.next_action:" in output
+    assert "integrity migrate-safe" in output
+
+
 def test_status_fails_closed_when_process_state_is_untrusted(
     monkeypatch, capsys
 ):

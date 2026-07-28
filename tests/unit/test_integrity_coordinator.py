@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from hermes_feishu_card.integrity import RuntimeIntegrityCoordinator
+from hermes_feishu_card.integrity import (
+    RuntimeIntegrityCoordinator,
+    sanitize_integrity_snapshot,
+)
 
 
 class FakeSupervisor:
@@ -155,3 +158,41 @@ def test_missing_control_auth_never_triggers_source_inspection_or_repair():
         "attempted": False,
     }
     assert calls == []
+
+
+def test_integrity_snapshot_sanitizer_allows_only_bounded_operator_fields():
+    sanitized = sanitize_integrity_snapshot(
+        {
+            "mode": "notify",
+            "last_status": "repair_available",
+            "last_reason": "verified_git_upgrade",
+            "repair_attempts": 2,
+            "repair_successes": 1,
+            "repair_refusals": 3,
+            "private_path": "/private/secret",
+        }
+    )
+
+    assert sanitized == {
+        "mode": "notify",
+        "last_status": "repair_available",
+        "last_reason": "verified_git_upgrade",
+        "repair_attempts": 2,
+        "repair_successes": 1,
+        "repair_refusals": 3,
+    }
+    assert sanitize_integrity_snapshot(
+        {
+            "mode": "unsafe",
+            "last_status": "/private/secret",
+            "last_reason": "token=secret",
+            "repair_attempts": -1,
+        }
+    ) == {
+        "mode": "unknown",
+        "last_status": "unknown",
+        "last_reason": "unknown",
+        "repair_attempts": 0,
+        "repair_successes": 0,
+        "repair_refusals": 0,
+    }

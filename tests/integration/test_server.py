@@ -1687,6 +1687,41 @@ async def test_hfc_monitor_command_reports_safe_metrics(client):
     assert "om_monitor_secret" not in content
 
 
+def test_hfc_readiness_lines_expose_sanitized_integrity_coordinator_action():
+    request = SimpleNamespace(
+        app={
+            sidecar_server.RUNTIME_INTEGRITY_SUPERVISOR_KEY: SimpleNamespace(
+                snapshot=lambda: {
+                    "status": "ready",
+                    "reason": "runtime_ready",
+                    "integrity_mode": "notify",
+                    "restart_required": False,
+                }
+            ),
+            sidecar_server.RUNTIME_INTEGRITY_COORDINATOR_KEY: SimpleNamespace(
+                snapshot=lambda: {
+                    "mode": "notify",
+                    "last_status": "repair_available",
+                    "last_reason": "verified_git_upgrade",
+                    "repair_attempts": 0,
+                    "repair_successes": 0,
+                    "repair_refusals": 1,
+                    "private_path": "/private/secret",
+                }
+            ),
+        }
+    )
+
+    content = "\n".join(sidecar_server._hfc_readiness_lines(request))
+
+    assert "integrity.status: repair_available" in content
+    assert "integrity.reason: verified_git_upgrade" in content
+    assert "integrity.repair_refusals: 1" in content
+    assert "integrity.next_action:" in content
+    assert "integrity migrate-safe" in content
+    assert "/private/secret" not in content
+
+
 async def test_hfc_doctor_sends_group_owned_operations_card(monkeypatch):
     feishu_client = FakeFeishuClient()
     report = operations_report()

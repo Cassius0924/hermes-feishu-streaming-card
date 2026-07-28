@@ -53,6 +53,7 @@ from hermes_feishu_card.install.patcher import (
     remove_cron_patch,
     remove_patch_lenient,
 )
+from hermes_feishu_card.integrity import sanitize_integrity_snapshot
 from hermes_feishu_card.process import start_sidecar, status_sidecar, stop_sidecar
 from hermes_feishu_card.render import render_card
 from hermes_feishu_card.session import CardSession
@@ -2103,6 +2104,9 @@ def _run_status(args: argparse.Namespace) -> int:
                 f"{'true' if restart_required else 'false'}"
             )
             readiness_degraded = readiness_status == "degraded"
+        integrity = status["health"].get("integrity")
+        if isinstance(integrity, dict):
+            _print_status_integrity(integrity)
         print(f"active_sessions: {status['health'].get('active_sessions', 0)}")
         metrics = status["health"].get("metrics", {})
         if isinstance(metrics, dict):
@@ -2137,6 +2141,29 @@ def _run_status(args: argparse.Namespace) -> int:
     hook_check["config"] = args.config
     _print_lifecycle_hook_check(hook_check)
     return 1 if readiness_degraded or bool(hook_check["blocking"]) else 0
+
+
+def _print_status_integrity(snapshot: dict[str, Any]) -> None:
+    integrity = sanitize_integrity_snapshot(snapshot)
+    print(f"integrity.status: {integrity['last_status']}")
+    print(f"integrity.reason: {integrity['last_reason']}")
+    for name in ("repair_attempts", "repair_successes", "repair_refusals"):
+        print(f"integrity.{name}: {integrity[name]}")
+    action = {
+        "repair_available": (
+            "review doctor evidence; run integrity migrate-safe with explicit "
+            "config and Hermes paths; then restart sidecar"
+        ),
+        "manual_review_required": (
+            "run doctor --explain and review evidence; do not force repair"
+        ),
+        "restart_required": (
+            "restart Hermes Gateway manually when idle, then recheck"
+        ),
+        "repaired": "restart Hermes Gateway manually when idle, then recheck",
+    }.get(str(integrity["last_status"]))
+    if action:
+        print(f"integrity.next_action: {action}")
 
 
 def _print_status_routing(health: dict[str, Any]) -> None:
