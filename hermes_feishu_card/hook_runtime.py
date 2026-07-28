@@ -8,6 +8,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from hashlib import sha256
 from ipaddress import ip_address
+import importlib
+import inspect
 import json
 import logging
 import math
@@ -17,7 +19,7 @@ import queue
 import re
 import secrets
 import sys
-from types import SimpleNamespace
+from types import CodeType, SimpleNamespace
 import threading
 import time
 from typing import Any, Callable
@@ -39,6 +41,10 @@ from .operations_transport import (
     read_transport_root_secret,
     sign_command_transport_proof,
 )
+from .native_handoff import (
+    derive_native_handoff_target_hash,
+    derive_native_handoff_uuid_seed,
+)
 from .status import normalize_display_status
 from .runtime_control import reset_runtime_control_for_tests, start_runtime_control
 
@@ -47,8 +53,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_EVENT_URL = "http://127.0.0.1:8765/events"
 DEFAULT_TIMEOUT_SECONDS = 0.8
 TERMINAL_TIMEOUT_SECONDS = 10.0
-NATIVE_HANDOFF_PROTOCOL = "hfc-native-handoff-v1"
+NATIVE_HANDOFF_PROTOCOL = "hfc-native-handoff-v2"
 NATIVE_HANDOFF_MAX_LIFETIME_SECONDS = 3600.0
+NATIVE_HANDOFF_PLAN_PROTOCOL = "hfc-feishu-delivery-plan-v1"
 _NOTICE_UNCERTAIN_WARNING = (
     "⚠️ 一条运行提示的卡片投递结果无法确认，请稍后查看 /hfc status。"
 )
@@ -235,6 +242,10 @@ _HFC_NATIVE_HANDOFF_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
     "hfc_native_handoff_context",
     default=None,
 )
+_HFC_EXACT_COMPLETION_STAGE: ContextVar[dict[str, Any] | None] = ContextVar(
+    "hfc_exact_completion_stage",
+    default=None,
+)
 _HFC_NATIVE_HANDOFF_SEND_TRACKER: ContextVar[dict[str, Any] | None] = ContextVar(
     "hfc_native_handoff_send_tracker",
     default=None,
@@ -248,6 +259,7 @@ _HFC_NATIVE_HANDOFF_ROUTE: ContextVar[str | None] = ContextVar(
     default=None,
 )
 _NATIVE_HANDOFF_ACK_TASKS: set[asyncio.Task[Any]] = set()
+_NATIVE_HANDOFF_PLAN_FINGERPRINTS: dict[tuple[type, int, str, str], str] = {}
 _OPERATION_TRANSPORT_SECRETS: dict[str, tuple[bytes, str, float]] = {}
 _OPERATION_TRANSPORT_SECRETS_LOCK = threading.Lock()
 _OPERATION_TRANSPORT_SECRET_TTL_SECONDS = 600.0
@@ -333,12 +345,14 @@ def reset_runtime_state() -> None:
     _HFC_FEISHU_DELIVERY_CONTEXT.set(None)
     _HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(None)
     _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+    _HFC_EXACT_COMPLETION_STAGE.set(None)
     _HFC_NATIVE_HANDOFF_SEND_TRACKER.set(None)
     _HFC_NATIVE_HANDOFF_CHUNK.set(None)
     _HFC_NATIVE_HANDOFF_ROUTE.set(None)
     for task in list(_NATIVE_HANDOFF_ACK_TASKS):
         task.cancel()
     _NATIVE_HANDOFF_ACK_TASKS.clear()
+    _NATIVE_HANDOFF_PLAN_FINGERPRINTS.clear()
     reset_runtime_control_for_tests()
 
 
@@ -1172,6 +1186,602 @@ async def emit_from_hermes_locals_async(
             return applied
     except Exception:
         return False
+
+
+def can_stage_exact_base_completion(local_vars: dict[str, Any]) -> bool:
+    """Return whether Base will still own one exact final-text decision."""
+    try:
+        source = local_vars.get("source")
+        if _platform_name(local_vars, source) != "feishu":
+            return False
+        response = _completion_answer(local_vars)
+        if not response:
+            return False
+        agent_result = local_vars.get("agent_result")
+        already_sent = bool(
+            local_vars.get("_already_sent")
+            or (
+                isinstance(agent_result, dict)
+                and agent_result.get("already_sent")
+            )
+        )
+        failed = bool(
+            isinstance(agent_result, dict) and agent_result.get("failed")
+        )
+        if already_sent and not failed:
+            return False
+        return _exact_base_delivery_hook_available()
+    except Exception:
+        return False
+
+
+def _exact_base_delivery_hook_available() -> bool:
+    try:
+        from gateway.platforms.base import BasePlatformAdapter
+
+        method = getattr(BasePlatformAdapter, "_process_message_background", None)
+        code = getattr(method, "__code__", None)
+        names = set(getattr(code, "co_names", ()) or ())
+        return {
+            "prepare_exact_base_final_delivery",
+            "finalize_exact_base_no_text",
+        }.issubset(names)
+    except Exception:
+        return False
+
+
+async def stage_message_completed_from_hermes_locals_async(
+    local_vars: dict[str, Any],
+) -> bool:
+    """Freeze one terminal payload until Base exposes exact delivery values.
+
+    No sidecar request or obligation inference happens here. The staged value
+    is task-local and is consumed only by the owned Base hooks after Hermes has
+    finished its native media/file extraction pipeline.
+    """
+    _HFC_EXACT_COMPLETION_STAGE.set(None)
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return False
+        _ensure_runtime_control_started(config)
+        order_identity = _policy_identity(config, local_vars, "message.completed")
+        if order_identity is None:
+            _cleanup_native_policy_state(local_vars)
+            return False
+        event_lock = _policy_async_event_lock(order_identity)
+        async with event_lock:
+            gate = await _policy_gate_async(
+                config,
+                local_vars,
+                "message.completed",
+            )
+            if not gate.card:
+                return False
+            event_locals = _policy_event_locals(local_vars, gate)
+            await _flush_pending_deltas_for_local_vars(event_locals)
+            payload = build_event("message.completed", event_locals)
+            if payload is None:
+                return False
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        _HFC_EXACT_COMPLETION_STAGE.set(
+            {
+                "payload": payload,
+                "event_url": config.event_url,
+                "timeout_seconds": _timeout_for_event(
+                    config,
+                    "message.completed",
+                ),
+                "task_id": id(task) if task is not None else None,
+            }
+        )
+        return True
+    except Exception:
+        _HFC_EXACT_COMPLETION_STAGE.set(None)
+        return False
+
+
+def _exact_completion_stage_for_current_task() -> dict[str, Any] | None:
+    stage = _HFC_EXACT_COMPLETION_STAGE.get()
+    if not isinstance(stage, dict):
+        return None
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    owner = stage.get("task_id")
+    if owner is not None and (task is None or id(task) != owner):
+        _HFC_EXACT_COMPLETION_STAGE.set(None)
+        return None
+    if not isinstance(stage.get("payload"), dict):
+        _HFC_EXACT_COMPLETION_STAGE.set(None)
+        return None
+    return stage
+
+
+class _ExactCardDeliveryAdapterProxy:
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+        self.name = str(getattr(delegate, "name", "feishu") or "feishu")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    async def _send_with_retry(self, *_args: Any, **_kwargs: Any) -> Any:
+        return _send_result(True)
+
+
+def _exact_base_attachments(local_vars: dict[str, Any]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    attachments: list[dict[str, str]] = []
+    for field in ("images", "local_files", "media_files"):
+        values = local_vars.get(field)
+        if values is None:
+            continue
+        candidates = values if isinstance(values, (list, tuple, set)) else [values]
+        for candidate in candidates:
+            attachment = _coerce_attachment(candidate)
+            if attachment is None or attachment["name"] in seen:
+                continue
+            seen.add(attachment["name"])
+            attachments.append(attachment)
+    return attachments
+
+
+def _exact_base_has_attachments(local_vars: dict[str, Any]) -> bool:
+    """Treat any Base attachment local as outside the exact text contract."""
+    for field in ("images", "local_files", "media_files"):
+        try:
+            if bool(local_vars.get(field)):
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def _exact_stage_allows_ack(stage: dict[str, Any]) -> bool:
+    payload = stage.get("payload")
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return False
+    profile_id = str(data.get("profile_id") or "")
+    profile_source = str(data.get("profile_source") or "")
+    return profile_id == "default" and not profile_source.startswith("sanitized_")
+
+
+def _native_handoff_content_hash(content: Any) -> str:
+    return sha256(
+        b"hfc-native-content-v1\0" + str(content or "").encode("utf-8")
+    ).hexdigest()
+
+
+def _semantic_code_value(value: Any) -> Any:
+    """Return location-independent Python code semantics for hashing."""
+    if isinstance(value, CodeType):
+        return {
+            "argcount": value.co_argcount,
+            "posonlyargcount": value.co_posonlyargcount,
+            "kwonlyargcount": value.co_kwonlyargcount,
+            "nlocals": value.co_nlocals,
+            "flags": value.co_flags,
+            "code": value.co_code.hex(),
+            "consts": [_semantic_code_value(item) for item in value.co_consts],
+            "names": list(value.co_names),
+            "varnames": list(value.co_varnames),
+            "freevars": list(value.co_freevars),
+            "cellvars": list(value.co_cellvars),
+        }
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("non-finite code constant")
+        return {"float": repr(value)}
+    if isinstance(value, bytes):
+        return {"bytes": value.hex()}
+    if isinstance(value, tuple):
+        return {"tuple": [_semantic_code_value(item) for item in value]}
+    if isinstance(value, list):
+        return {"list": [_semantic_code_value(item) for item in value]}
+    if isinstance(value, (set, frozenset)):
+        values = [_semantic_code_value(item) for item in value]
+        return {
+            "set": sorted(
+                values,
+                key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
+            )
+        }
+    if isinstance(value, dict):
+        items = [
+            (_semantic_code_value(key), _semantic_code_value(item))
+            for key, item in value.items()
+        ]
+        return {
+            "dict": sorted(
+                items,
+                key=lambda pair: json.dumps(
+                    pair[0], sort_keys=True, separators=(",", ":")
+                ),
+            )
+        }
+    raise ValueError("unsupported code constant")
+
+
+def _callable_delivery_semantics(value: Any) -> Any | None:
+    """Return loaded callable bytecode semantics, never source-file text."""
+    if isinstance(value, (staticmethod, classmethod)):
+        value = value.__func__
+    if not callable(value):
+        return None
+    try:
+        code = getattr(value, "__code__")
+        if not isinstance(code, CodeType):
+            return None
+        return _semantic_code_value(code)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _module_delivery_semantics(module: Any) -> dict[str, Any] | None:
+    """Hash the already-loaded adapter module's functions and plan constants."""
+    module_name = str(getattr(module, "__name__", "") or "")
+    if not module_name:
+        return None
+    functions: dict[str, Any] = {}
+    patterns: dict[str, Any] = {}
+    constants: dict[str, Any] = {}
+    for name, value in sorted(vars(module).items()):
+        if inspect.isfunction(value) and value.__module__ == module_name:
+            semantics = _callable_delivery_semantics(value)
+            if semantics is None:
+                return None
+            functions[name] = semantics
+            continue
+        if isinstance(value, re.Pattern):
+            patterns[name] = {
+                "pattern": _semantic_code_value(value.pattern),
+                "flags": value.flags,
+            }
+            continue
+        if not name.lstrip("_").isupper():
+            continue
+        try:
+            constants[name] = _semantic_code_value(value)
+        except ValueError:
+            # Classes, modules, fixtures, and other runtime objects are not
+            # delivery-plan constants and must not make the digest unstable.
+            continue
+    if not functions:
+        return None
+    return {
+        "module": module_name,
+        "functions": functions,
+        "patterns": patterns,
+        "constants": constants,
+    }
+
+
+def _native_handoff_runtime_wrappers_ready(adapter: Any) -> bool:
+    """Require the complete stable-UUID and ledger ACK wrapper chain."""
+    adapter_type = type(adapter)
+    required_methods = (
+        ("send", _hfc_send_with_native_command_result_card, "_hfc_original_send"),
+        (
+            "_feishu_send_with_retry",
+            _hfc_feishu_send_with_native_handoff_tracking,
+            "_hfc_original_feishu_send_with_retry",
+        ),
+        (
+            "_send_raw_message",
+            _hfc_send_raw_message_with_native_handoff_route,
+            "_hfc_original_send_raw_message",
+        ),
+        (
+            "_build_reply_message_body",
+            _hfc_build_reply_message_body_with_native_uuid,
+            "_hfc_original_build_reply_message_body",
+        ),
+        (
+            "_build_create_message_body",
+            _hfc_build_create_message_body_with_native_uuid,
+            "_hfc_original_build_create_message_body",
+        ),
+    )
+    for method_name, wrapper, original_name in required_methods:
+        if getattr(adapter_type, method_name, None) is not wrapper:
+            return False
+        if not callable(getattr(adapter_type, original_name, None)):
+            return False
+    ledger = sys.modules.get("gateway.delivery_ledger")
+    return bool(
+        ledger is not None
+        and getattr(ledger, "mark_delivered", None)
+        is _hfc_mark_delivery_ledger_delivered_then_ack
+        and getattr(ledger, "mark_failed", None)
+        is _hfc_mark_delivery_ledger_failed_then_clear
+        and callable(getattr(ledger, "_hfc_original_mark_delivered", None))
+        and callable(getattr(ledger, "_hfc_original_mark_failed", None))
+    )
+
+
+def _native_handoff_plan_fingerprint(adapter: Any) -> str:
+    """Fingerprint the exact Feishu chunk, route, and UUID delivery contract.
+
+    A missing source component disables ACK-capable handoff. This deliberately
+    favors Hermes' ordinary fail-open delivery over reusing a descriptor across
+    an adapter upgrade whose chunking or endpoint plan cannot be proven equal.
+    """
+    adapter_type = type(adapter)
+    try:
+        max_length = int(getattr(adapter, "MAX_MESSAGE_LENGTH"))
+    except (TypeError, ValueError, AttributeError):
+        return ""
+    if max_length <= 0:
+        return ""
+    adapter_module = sys.modules.get(adapter_type.__module__)
+    helpers_module = sys.modules.get("gateway.platforms.helpers")
+    if helpers_module is None:
+        try:
+            helpers_module = importlib.import_module("gateway.platforms.helpers")
+        except Exception:
+            helpers_module = None
+    if adapter_module is None or helpers_module is None:
+        return ""
+    adapter_semantics = _module_delivery_semantics(adapter_module)
+    strip_markdown_semantics = _callable_delivery_semantics(
+        getattr(helpers_module, "strip_markdown", None)
+    )
+    if adapter_semantics is None or strip_markdown_semantics is None:
+        return ""
+    callables = (
+        getattr(adapter_type, "_hfc_original_send", None),
+        getattr(adapter_type, "format_message", None),
+        getattr(adapter_type, "truncate_message", None),
+        getattr(adapter_type, "_build_outbound_payload", None),
+        getattr(adapter_type, "_hfc_original_feishu_send_with_retry", None),
+        getattr(adapter_type, "_hfc_original_send_raw_message", None),
+        getattr(adapter_type, "_hfc_original_build_reply_message_body", None),
+        getattr(adapter_type, "_hfc_original_build_create_message_body", None),
+        _hfc_send_with_native_command_result_card,
+        _hfc_feishu_send_with_native_handoff_tracking,
+        _hfc_send_raw_message_with_native_handoff_route,
+        _hfc_build_reply_message_body_with_native_uuid,
+        _hfc_build_create_message_body_with_native_uuid,
+        _native_handoff_uuid,
+    )
+    callable_semantics = [_callable_delivery_semantics(value) for value in callables]
+    if any(value is None for value in callable_semantics):
+        return ""
+    semantic_material = json.dumps(
+        {
+            "adapter": adapter_semantics,
+            "strip_markdown": strip_markdown_semantics,
+            "critical_callables": callable_semantics,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    semantic_digest = sha256(semantic_material).hexdigest()
+    cache_key = (adapter_type, max_length, __version__, semantic_digest)
+    cached = _NATIVE_HANDOFF_PLAN_FINGERPRINTS.get(cache_key)
+    if cached:
+        return cached
+    material = json.dumps(
+        {
+            "protocol": NATIVE_HANDOFF_PLAN_PROTOCOL,
+            "package_version": __version__,
+            "adapter_module": adapter_type.__module__,
+            "adapter_qualname": adapter_type.__qualname__,
+            "max_message_length": max_length,
+            "semantic_digest": semantic_digest,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    fingerprint = sha256(material).hexdigest()
+    if len(_NATIVE_HANDOFF_PLAN_FINGERPRINTS) >= 128:
+        _NATIVE_HANDOFF_PLAN_FINGERPRINTS.pop(
+            next(iter(_NATIVE_HANDOFF_PLAN_FINGERPRINTS)),
+            None,
+        )
+    _NATIVE_HANDOFF_PLAN_FINGERPRINTS[cache_key] = fingerprint
+    return fingerprint
+
+
+def _exact_native_route(metadata: Any) -> str:
+    thread_id = _metadata_thread_id(metadata if isinstance(metadata, dict) else None)
+    return "thread-create" if thread_id else "create"
+
+
+def _exact_terminal_payload(
+    stage: dict[str, Any],
+    local_vars: dict[str, Any],
+    *,
+    ack_capable: bool,
+) -> dict[str, Any]:
+    payload = copy.deepcopy(stage["payload"])
+    data = payload.setdefault("data", {})
+    content = str(
+        local_vars.get("content", local_vars.get("text_content", "")) or ""
+    )
+    exact_thread_id = _metadata_thread_id(
+        local_vars.get("metadata") if isinstance(local_vars.get("metadata"), dict) else None
+    )
+    if exact_thread_id:
+        payload["thread_id"] = exact_thread_id
+    else:
+        payload.pop("thread_id", None)
+    attachments = _exact_base_attachments(local_vars)
+    has_base_attachments = _exact_base_has_attachments(local_vars)
+    data["answer"] = content
+    data["attachments"] = attachments
+    data["native_delivery"] = "required" if has_base_attachments else "allowed"
+    prior_handoff = data.get("native_handoff")
+    generation = (
+        str(prior_handoff.get("generation") or "")
+        if isinstance(prior_handoff, dict)
+        else ""
+    )
+    handoff: dict[str, Any] = {"generation": generation}
+    if ack_capable:
+        obligation_id = str(local_vars.get("obligation_id") or "").strip()
+        plan_fingerprint = str(local_vars.get("plan_fingerprint") or "")
+        obligation_key = _native_handoff_obligation_key(obligation_id)
+        content_hash = _native_handoff_content_hash(content)
+        route = _exact_native_route(local_vars.get("metadata"))
+        target_hash = derive_native_handoff_target_hash(
+            profile_id=str(data.get("profile_id") or ""),
+            chat_id=str(payload.get("chat_id") or ""),
+            thread_id=exact_thread_id,
+            route=route,
+        )
+        handoff.update(
+            {
+                "capabilities": [
+                    "native-ack-v2",
+                    "stable-feishu-uuid-v2",
+                    "exact-base-delivery-v1",
+                ],
+                "obligation_key": obligation_key,
+                "content_hash": content_hash,
+                "plan_fingerprint": plan_fingerprint,
+                "route": route,
+                "target_hash": target_hash,
+                "provisional_uuid_seed": derive_native_handoff_uuid_seed(
+                    obligation_key=obligation_key,
+                    content_hash=content_hash,
+                    plan_fingerprint=plan_fingerprint,
+                    route=route,
+                    target_hash=target_hash,
+                ),
+            }
+        )
+    data["native_handoff"] = handoff
+    return payload
+
+
+async def _recover_exact_terminal_native_handoff(
+    payload: dict[str, Any],
+    *,
+    event_url: str,
+    timeout: float,
+) -> bool:
+    binding = _native_handoff_binding_from_payload(payload)
+    if binding is None:
+        return False
+    recovery_payload = _native_handoff_recovery_payload(binding)
+    recovery_url = _summary_base_url(event_url) + "/native-handoff/recover"
+    status, descriptor = await _lookup_native_handoff_descriptor(
+        recovery_url,
+        recovery_payload,
+        timeout,
+    )
+    if status == "found" and descriptor is not None:
+        _install_native_handoff_context(binding, descriptor)
+        return True
+    if status == "unknown":
+        _install_provisional_native_handoff(
+            binding,
+            recovery_url=recovery_url,
+            recovery_timeout=timeout,
+            recovery_payload=recovery_payload,
+            recovery=False,
+        )
+        return True
+    return False
+
+
+async def prepare_exact_base_final_delivery(
+    local_vars: dict[str, Any],
+) -> tuple[Any, str, Any, Any]:
+    """Commit exact Base terminal state after Hermes ledger is attempting."""
+    adapter = local_vars.get("delivery_adapter")
+    content = str(local_vars.get("content") or "")
+    reply_to = local_vars.get("reply_to")
+    metadata = local_vars.get("metadata")
+    fallback = (adapter, content, reply_to, metadata)
+    stage = _exact_completion_stage_for_current_task()
+    if stage is None or adapter is None or not content:
+        return fallback
+    try:
+        obligation_id = str(local_vars.get("obligation_id") or "").strip()
+        plan_fingerprint = _native_handoff_plan_fingerprint(adapter)
+        ack_capable = bool(
+            obligation_id
+            and _is_lower_hex(plan_fingerprint, 64)
+            and _native_handoff_runtime_wrappers_ready(adapter)
+            and not _exact_base_has_attachments(local_vars)
+            and _exact_stage_allows_ack(stage)
+        )
+        payload = _exact_terminal_payload(
+            stage,
+            {
+                **local_vars,
+                "plan_fingerprint": plan_fingerprint,
+            },
+            ack_capable=ack_capable,
+        )
+        event_url = str(stage["event_url"])
+        timeout = float(stage["timeout_seconds"])
+        try:
+            result = await _post_json_ordered_response(
+                event_url,
+                payload,
+                timeout,
+            )
+        except Exception:
+            if ack_capable:
+                await _recover_exact_terminal_native_handoff(
+                    payload,
+                    event_url=event_url,
+                    timeout=timeout,
+                )
+            return fallback
+        applied = _event_was_applied(result, strict=True)
+        if ack_capable and not applied:
+            registered = _register_native_handoff_descriptor(payload, result)
+            if not registered:
+                await _recover_exact_terminal_native_handoff(
+                    payload,
+                    event_url=event_url,
+                    timeout=timeout,
+                )
+        if applied:
+            return (
+                _ExactCardDeliveryAdapterProxy(adapter),
+                content,
+                reply_to,
+                metadata,
+            )
+        return fallback
+    except Exception:
+        _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+        return fallback
+    finally:
+        _HFC_EXACT_COMPLETION_STAGE.set(None)
+
+
+async def finalize_exact_base_no_text(local_vars: dict[str, Any]) -> None:
+    """Finalize a staged terminal whose Base path has no standalone text."""
+    stage = _exact_completion_stage_for_current_task()
+    if stage is None:
+        return
+    try:
+        payload = _exact_terminal_payload(stage, local_vars, ack_capable=False)
+        await _post_json_ordered_response(
+            str(stage["event_url"]),
+            payload,
+            float(stage["timeout_seconds"]),
+        )
+    except Exception:
+        pass
+    finally:
+        _HFC_EXACT_COMPLETION_STAGE.set(None)
 
 
 def _event_was_applied(result: Any, *, strict: bool = True) -> bool:
@@ -3480,47 +4090,135 @@ def _validated_native_handoff_descriptor(value: Any) -> dict[str, Any] | None:
     }
 
 
-def _register_native_handoff_descriptor(payload: Any, result: Any) -> bool:
-    """Register a server-issued handoff only in the current task context."""
-    _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
-    if not isinstance(payload, dict) or not isinstance(result, dict):
-        return False
-    if result.get("ok") is False or result.get("applied") is not False:
-        return False
-    if str(result.get("disposition") or "") != "native":
-        return False
-    descriptor = _validated_native_handoff_descriptor(result.get("native_handoff"))
+def _native_handoff_binding_from_payload(payload: Any) -> dict[str, str] | None:
+    if not isinstance(payload, dict):
+        return None
     data = payload.get("data")
-    if descriptor is None or not isinstance(data, dict):
-        return False
+    if not isinstance(data, dict):
+        return None
     chat_id = str(payload.get("chat_id") or "").strip()
-    answer = _card_visible_answer(str(data.get("answer") or ""))
+    answer = str(data.get("answer") or "")
     if not chat_id or not answer:
-        return False
+        return None
+    profile_id = str(data.get("profile_id") or "")
+    profile_source = str(data.get("profile_source") or "")
+    if profile_id != "default" or profile_source.startswith("sanitized_"):
+        return None
     metadata = data.get("native_handoff")
-    obligation_key = ""
-    if isinstance(metadata, dict):
-        candidate = str(metadata.get("obligation_key") or "")
-        if _is_lower_hex(candidate, 64):
-            obligation_key = candidate
+    if not isinstance(metadata, dict):
+        return None
+    capabilities = set(metadata.get("capabilities") or ())
+    if not {
+        "native-ack-v2",
+        "stable-feishu-uuid-v2",
+        "exact-base-delivery-v1",
+    }.issubset(capabilities):
+        return None
+    obligation_key = str(metadata.get("obligation_key") or "")
+    content_hash = str(metadata.get("content_hash") or "")
+    plan_fingerprint = str(metadata.get("plan_fingerprint") or "")
+    route = str(metadata.get("route") or "")
+    target_hash = str(metadata.get("target_hash") or "")
+    provisional_uuid_seed = str(metadata.get("provisional_uuid_seed") or "")
+    expected_route = "thread-create" if str(payload.get("thread_id") or "").strip() else "create"
+    try:
+        expected_target_hash = derive_native_handoff_target_hash(
+            profile_id=profile_id,
+            chat_id=chat_id,
+            thread_id=str(payload.get("thread_id") or "").strip(),
+            route=route,
+        )
+        expected_uuid_seed = derive_native_handoff_uuid_seed(
+            obligation_key=obligation_key,
+            content_hash=content_hash,
+            plan_fingerprint=plan_fingerprint,
+            route=route,
+            target_hash=target_hash,
+        )
+    except ValueError:
+        return None
+    if (
+        not _is_lower_hex(obligation_key, 64)
+        or not _is_lower_hex(content_hash, 64)
+        or not _is_lower_hex(plan_fingerprint, 64)
+        or not _is_lower_hex(target_hash, 64)
+        or content_hash != _native_handoff_content_hash(answer)
+        or route != expected_route
+        or target_hash != expected_target_hash
+        or provisional_uuid_seed != expected_uuid_seed
+    ):
+        return None
+    return {
+        "chat_id": chat_id,
+        "thread_id": str(payload.get("thread_id") or "").strip(),
+        "content_hash": content_hash,
+        "match_content_hash": content_hash,
+        "obligation_key": obligation_key,
+        "plan_fingerprint": plan_fingerprint,
+        "route": route,
+        "target_hash": target_hash,
+        "uuid_seed": expected_uuid_seed,
+    }
+
+
+def _install_native_handoff_context(
+    binding: dict[str, str],
+    descriptor: dict[str, Any],
+    *,
+    recovery: bool = False,
+    send_content: str | None = None,
+    provisional: bool = False,
+    recovery_url: str = "",
+    recovery_timeout: float = 0.0,
+    recovery_payload: dict[str, Any] | None = None,
+) -> Any:
     try:
         task = asyncio.current_task()
     except RuntimeError:
         task = None
-    _HFC_NATIVE_HANDOFF_CONTEXT.set(
-        {
-            "descriptor": descriptor,
-            "chat_id": chat_id,
-            "thread_id": str(payload.get("thread_id") or "").strip(),
-            "content_hash": sha256(answer.encode("utf-8")).hexdigest(),
-            "obligation_key": obligation_key,
-            "task_id": id(task) if task is not None else None,
-        }
-    )
+    context: dict[str, Any] = {
+        "descriptor": descriptor,
+        **binding,
+        "task_id": id(task) if task is not None else None,
+    }
+    if recovery:
+        context["recovery"] = True
+    if send_content is not None:
+        context["send_content"] = send_content
+    if provisional:
+        context["provisional"] = True
+        context["provisional_expires_at"] = (
+            time.time() + NATIVE_HANDOFF_MAX_LIFETIME_SECONDS
+        )
+        context["recovery_url"] = recovery_url
+        context["recovery_timeout"] = recovery_timeout
+        context["recovery_payload"] = copy.deepcopy(recovery_payload)
+    return _HFC_NATIVE_HANDOFF_CONTEXT.set(context)
+
+
+def _register_native_handoff_descriptor(payload: Any, result: Any) -> bool:
+    """Register a server-issued handoff only in the current task context."""
+    _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+    if not isinstance(result, dict):
+        return False
+    if result.get("ok") is not True or result.get("applied") is not False:
+        return False
+    if str(result.get("disposition") or "") != "native":
+        return False
+    descriptor = _validated_native_handoff_descriptor(result.get("native_handoff"))
+    binding = _native_handoff_binding_from_payload(payload)
+    if (
+        descriptor is None
+        or binding is None
+        or descriptor.get("uuid_seed") != binding.get("uuid_seed")
+    ):
+        return False
+    _install_native_handoff_context(binding, descriptor)
     return True
 
 
 def _native_handoff_for_send(
+    adapter: Any,
     chat_id: Any,
     content: Any,
     metadata: Any,
@@ -3529,7 +4227,21 @@ def _native_handoff_for_send(
     if not isinstance(context, dict):
         return None
     descriptor = context.get("descriptor")
-    if _validated_native_handoff_descriptor(descriptor) is None:
+    provisional = context.get("provisional") is True
+    provisional_seed = (
+        str(descriptor.get("uuid_seed") or "")
+        if isinstance(descriptor, dict)
+        else ""
+    )
+    provisional_expires_at = _finite_float(context.get("provisional_expires_at"))
+    descriptor_valid = _validated_native_handoff_descriptor(descriptor) is not None
+    provisional_valid = bool(
+        provisional
+        and _is_lower_hex(provisional_seed, 32)
+        and provisional_expires_at is not None
+        and provisional_expires_at > time.time()
+    )
+    if not descriptor_valid and not provisional_valid:
         _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
         return None
     try:
@@ -3540,14 +4252,28 @@ def _native_handoff_for_send(
     if owner is not None and (task is None or id(task) != owner):
         _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
         return None
-    visible_content = _card_visible_answer(str(content or ""))
     expected_thread = str(context.get("thread_id") or "")
     actual_thread = _metadata_thread_id(metadata if isinstance(metadata, dict) else None)
+    expected_route = str(context.get("route") or "")
+    actual_route = "thread-create" if actual_thread else "create"
+    try:
+        actual_target_hash = derive_native_handoff_target_hash(
+            profile_id="default",
+            chat_id=str(chat_id or "").strip(),
+            thread_id=actual_thread,
+            route=actual_route,
+        )
+    except ValueError:
+        actual_target_hash = ""
     matches = (
         str(chat_id or "").strip() == context.get("chat_id")
-        and sha256(visible_content.encode("utf-8")).hexdigest()
-        == context.get("content_hash")
-        and (not expected_thread or actual_thread == expected_thread)
+        and _native_handoff_content_hash(content)
+        == context.get("match_content_hash")
+        and _native_handoff_plan_fingerprint(adapter)
+        == context.get("plan_fingerprint")
+        and expected_route == actual_route
+        and actual_thread == expected_thread
+        and actual_target_hash == context.get("target_hash")
     )
     if not matches:
         # A different send in the same task is a lifecycle fence: an old
@@ -3577,6 +4303,131 @@ def _native_handoff_obligation_key(obligation_id: Any) -> str:
     return sha256(
         b"hfc-native-obligation-v1\0" + value.encode("utf-8")
     ).hexdigest()
+
+
+def _native_handoff_recovery_payload(
+    binding: dict[str, str],
+) -> dict[str, str]:
+    return {
+        "protocol": "hfc-native-handoff-recovery-v2",
+        "obligation_key": binding["obligation_key"],
+        "content_hash": binding["content_hash"],
+        "plan_fingerprint": binding["plan_fingerprint"],
+        "route": binding["route"],
+        "target_hash": binding["target_hash"],
+    }
+
+
+async def _lookup_native_handoff_descriptor(
+    url: str,
+    payload: dict[str, Any],
+    timeout: float,
+) -> tuple[str, dict[str, Any] | None]:
+    """Return found, absent, or unknown without mistaking transport loss."""
+    try:
+        result = await _post_json_response(url, payload, timeout)
+    except Exception:
+        return "unknown", None
+    if not isinstance(result, dict):
+        return "unknown", None
+    if result.get("ok") is not True:
+        return "absent", None
+    if result.get("found") is False:
+        return "absent", None
+    if result.get("found") is not True:
+        return "unknown", None
+    descriptor = _validated_native_handoff_descriptor(result.get("native_handoff"))
+    try:
+        expected_seed = derive_native_handoff_uuid_seed(
+            obligation_key=str(payload.get("obligation_key") or ""),
+            content_hash=str(payload.get("content_hash") or ""),
+            plan_fingerprint=str(payload.get("plan_fingerprint") or ""),
+            route=str(payload.get("route") or ""),
+            target_hash=str(payload.get("target_hash") or ""),
+        )
+    except ValueError:
+        return "unknown", None
+    if descriptor is None or descriptor.get("uuid_seed") != expected_seed:
+        return "unknown", None
+    return "found", descriptor
+
+
+def _install_provisional_native_handoff(
+    binding: dict[str, str],
+    *,
+    recovery_url: str,
+    recovery_timeout: float,
+    recovery_payload: dict[str, Any],
+    recovery: bool,
+    match_content: str | None = None,
+) -> Any:
+    provisional_binding = dict(binding)
+    if match_content is not None:
+        provisional_binding["match_content_hash"] = _native_handoff_content_hash(
+            match_content
+        )
+    return _install_native_handoff_context(
+        provisional_binding,
+        {"uuid_seed": binding["uuid_seed"]},
+        recovery=recovery,
+        provisional=True,
+        recovery_url=recovery_url,
+        recovery_timeout=recovery_timeout,
+        recovery_payload=recovery_payload,
+    )
+
+
+def _ledger_obligation_inside_provisional_window(obligation_id: str) -> bool:
+    ledger = sys.modules.get("gateway.delivery_ledger")
+    debug_rows = getattr(ledger, "debug_rows", None) if ledger else None
+    if not callable(debug_rows):
+        return False
+    try:
+        decoded = json.loads(debug_rows(limit=500))
+    except Exception:
+        return False
+    if not isinstance(decoded, list):
+        return False
+    matches = [
+        row
+        for row in decoded
+        if isinstance(row, dict) and row.get("id") == obligation_id
+    ]
+    if len(matches) != 1:
+        return False
+    created_at = _finite_float(matches[0].get("created_at"))
+    if created_at is None:
+        return False
+    age = time.time() - created_at
+    return 0.0 <= age <= NATIVE_HANDOFF_MAX_LIFETIME_SECONDS
+
+
+async def _recover_and_ack_provisional_native_handoff(
+    context: dict[str, Any],
+) -> bool:
+    url = str(context.get("recovery_url") or "")
+    timeout = _finite_float(context.get("recovery_timeout"))
+    payload = context.get("recovery_payload")
+    if not url or timeout is None or timeout <= 0 or not isinstance(payload, dict):
+        return False
+    status, descriptor = await _lookup_native_handoff_descriptor(
+        url,
+        payload,
+        timeout,
+    )
+    if status != "found" or descriptor is None:
+        return False
+    return await _ack_native_handoff(descriptor)
+
+
+def _schedule_provisional_native_handoff_recovery(context: dict[str, Any]) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(_recover_and_ack_provisional_native_handoff(dict(context)))
+    _NATIVE_HANDOFF_ACK_TASKS.add(task)
+    task.add_done_callback(_NATIVE_HANDOFF_ACK_TASKS.discard)
 
 
 def _schedule_native_handoff_ack(descriptor: dict[str, Any]) -> None:
@@ -3610,6 +4461,8 @@ def _hfc_mark_delivery_ledger_delivered_then_ack(
     descriptor = _validated_native_handoff_descriptor(context.get("descriptor"))
     if descriptor is None:
         _HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+        if context.get("provisional") is True:
+            _schedule_provisional_native_handoff_recovery(context)
         return result
     # Clear before spawning the ACK task so no later same-task send can reuse
     # the descriptor after the ledger has become authoritative.
@@ -3673,10 +4526,12 @@ def _install_delivery_ledger_mark_delivered_wrapper() -> bool:
 
 async def prepare_native_handoff_recovery(
     *,
+    adapter: Any,
     obligation_id: Any,
     chat_id: Any,
     content: Any,
     thread_id: Any = "",
+    original_content: Any = None,
 ) -> Any:
     """Re-establish one task-scoped handoff for a ledger redelivery.
 
@@ -3688,53 +4543,86 @@ async def prepare_native_handoff_recovery(
     bounded_chat_id = str(chat_id or "").strip()
     bounded_content = str(content or "")
     bounded_thread_id = str(thread_id or "").strip()
+    exact_original_content = (
+        original_content
+        if isinstance(original_content, str) and original_content
+        else None
+    )
+    plan_fingerprint = _native_handoff_plan_fingerprint(adapter)
+    route = "thread-create" if bounded_thread_id else "create"
     if (
         not raw_obligation_id
         or len(raw_obligation_id) > 512
         or not bounded_chat_id
         or len(bounded_chat_id) > 512
         or not bounded_content
+        or exact_original_content is None
+        or not _is_lower_hex(plan_fingerprint, 64)
+        or not _native_handoff_runtime_wrappers_ready(adapter)
         or any(ord(character) < 32 for character in raw_obligation_id)
     ):
         return None
-    obligation_key = _native_handoff_obligation_key(raw_obligation_id)
-    request_payload = {
-        "protocol": "hfc-native-handoff-recovery-v1",
-        "obligation_key": obligation_key,
-    }
     try:
+        obligation_key = _native_handoff_obligation_key(raw_obligation_id)
+        target_hash = derive_native_handoff_target_hash(
+            profile_id="default",
+            chat_id=bounded_chat_id,
+            thread_id=bounded_thread_id,
+            route=route,
+        )
+        content_hash = _native_handoff_content_hash(exact_original_content)
+        uuid_seed = derive_native_handoff_uuid_seed(
+            obligation_key=obligation_key,
+            content_hash=content_hash,
+            plan_fingerprint=plan_fingerprint,
+            route=route,
+            target_hash=target_hash,
+        )
+        binding = {
+            "chat_id": bounded_chat_id,
+            "thread_id": bounded_thread_id,
+            "content_hash": content_hash,
+            "match_content_hash": _native_handoff_content_hash(bounded_content),
+            "obligation_key": obligation_key,
+            "plan_fingerprint": plan_fingerprint,
+            "route": route,
+            "target_hash": target_hash,
+            "uuid_seed": uuid_seed,
+        }
+        request_payload = _native_handoff_recovery_payload(binding)
         config = load_runtime_config()
-        result = await _post_json_response(
-            _summary_base_url(config.event_url) + "/native-handoff/recover",
+        recovery_url = _summary_base_url(config.event_url) + "/native-handoff/recover"
+        status, descriptor = await _lookup_native_handoff_descriptor(
+            recovery_url,
             request_payload,
             config.timeout_seconds,
         )
-    except Exception:
+    except (KeyError, TypeError, ValueError):
         return None
-    if not isinstance(result, dict) or result.get("ok") is not True:
-        return None
-    if result.get("found") is not True:
-        return None
-    descriptor = _validated_native_handoff_descriptor(result.get("native_handoff"))
-    if descriptor is None:
-        return None
-    try:
-        task = asyncio.current_task()
-    except RuntimeError:
-        task = None
-    return _HFC_NATIVE_HANDOFF_CONTEXT.set(
-        {
-            "descriptor": descriptor,
-            "chat_id": bounded_chat_id,
-            "thread_id": bounded_thread_id,
-            "content_hash": sha256(
-                _card_visible_answer(bounded_content).encode("utf-8")
-            ).hexdigest(),
-            "obligation_key": obligation_key,
-            "task_id": id(task) if task is not None else None,
-            "recovery": True,
-        }
-    )
+    if status == "found" and descriptor is not None:
+        # A confirmed descriptor refers to the exact original ledger row, so
+        # chunk boundaries and UUID ordinals may safely omit RECOVERED_MARKER.
+        return _install_native_handoff_context(
+            binding,
+            descriptor,
+            recovery=True,
+            send_content=exact_original_content,
+        )
+    if status == "unknown" and _ledger_obligation_inside_provisional_window(
+        raw_obligation_id
+    ):
+        # Transport ambiguity inside Hermes' one-hour ledger window may use
+        # the deterministic seed, but it keeps the visible marker until a
+        # full sidecar descriptor is independently recovered.
+        return _install_provisional_native_handoff(
+            binding,
+            recovery_url=recovery_url,
+            recovery_timeout=config.timeout_seconds,
+            recovery_payload=request_payload,
+            recovery=True,
+            match_content=bounded_content,
+        )
+    return None
 
 
 def finish_native_handoff_recovery(scope: Any) -> None:
@@ -3845,7 +4733,10 @@ async def _hfc_send_raw_message_with_native_handoff_route(self: Any, **kwargs: A
         return await original(self, **kwargs)
     metadata = kwargs.get("metadata")
     thread_id = _metadata_thread_id(metadata if isinstance(metadata, dict) else None)
-    route = "thread" if thread_id else ("reply" if kwargs.get("reply_to") else "create")
+    if thread_id:
+        route = "thread-reply" if kwargs.get("reply_to") else "thread-create"
+    else:
+        route = "reply" if kwargs.get("reply_to") else "create"
     token = _HFC_NATIVE_HANDOFF_ROUTE.set(route)
     try:
         return await original(self, **kwargs)
@@ -3885,7 +4776,8 @@ def _hfc_build_reply_message_body_with_native_uuid(
         uuid_value = _native_handoff_uuid(
             str(descriptor.get("uuid_seed") or ""),
             int(chunk.get("ordinal", 0)),
-            _HFC_NATIVE_HANDOFF_ROUTE.get() or ("thread" if reply_in_thread else "reply"),
+            _HFC_NATIVE_HANDOFF_ROUTE.get()
+            or ("thread-reply" if reply_in_thread else "reply"),
             str(chunk.get("format") or msg_type or "text"),
         )
     if not callable(original):
@@ -3969,9 +4861,14 @@ async def _hfc_send_with_native_command_result_card(
     metadata: dict[str, Any] | None = None,
 ) -> Any:
     original = getattr(type(self), "_hfc_original_send", None)
-    handoff_context = _native_handoff_for_send(chat_id, content, metadata)
+    handoff_context = _native_handoff_for_send(self, chat_id, content, metadata)
     if handoff_context is not None and callable(original):
         descriptor = handoff_context["descriptor"]
+        delivery_content = content
+        if handoff_context.get("recovery") is True:
+            exact_original_content = handoff_context.get("send_content")
+            if isinstance(exact_original_content, str) and exact_original_content:
+                delivery_content = exact_original_content
         tracker = {
             "descriptor": descriptor,
             "next_ordinal": 0,
@@ -3979,14 +4876,22 @@ async def _hfc_send_with_native_command_result_card(
             "required": {},
             "failures": {},
         }
+        effective_metadata = dict(metadata or {})
+        for reply_key in ("reply_to_message_id", "message_id", "reply_to"):
+            effective_metadata.pop(reply_key, None)
+        expected_thread = str(handoff_context.get("thread_id") or "")
+        if expected_thread:
+            effective_metadata["thread_id"] = expected_thread
+        else:
+            effective_metadata.pop("thread_id", None)
         token = _HFC_NATIVE_HANDOFF_SEND_TRACKER.set(tracker)
         try:
             result = await original(
                 self,
                 chat_id,
-                content,
-                reply_to=reply_to,
-                metadata=metadata,
+                delivery_content,
+                reply_to=None,
+                metadata=effective_metadata or None,
             )
         except Exception:
             # An exception escapes the adapter's normal SendResult contract;
@@ -6567,9 +7472,9 @@ def build_cron_event(local_vars: dict[str, Any]) -> dict[str, Any] | None:
     attachments = _extract_attachments(attachment_source, local_vars)
     created_at = time.time()
     job_id = str(job.get("id") or "").strip()
-    message_id = "cron_" + sha256(f"{job_id}:{created_at}".encode("utf-8")).hexdigest()[
-        :16
-    ]
+    message_id = "cron_" + sha256(
+        f"{job_id}:{created_at}".encode("utf-8")
+    ).hexdigest()[:16]
     return {
         "schema_version": "1",
         "event": "message.completed",
@@ -6977,20 +7882,11 @@ def _native_handoff_event_metadata(
     if event_name not in {"message.started", "message.completed", "message.failed"}:
         return None
     generation = _native_handoff_generation(local_vars)
-    metadata: dict[str, Any] = {
-        "generation": generation,
-        "capabilities": [
-            "native-ack-v1",
-            "stable-feishu-uuid-v1",
-        ],
-    }
-    if event_name == "message.completed":
-        obligation_id = _native_handoff_obligation_id(local_vars)
-        if obligation_id:
-            metadata["obligation_key"] = sha256(
-                b"hfc-native-obligation-v1\0" + obligation_id.encode("utf-8")
-            ).hexdigest()
-    return metadata
+    # The ordinary completion hook runs before Base resolves exact text,
+    # obligation, route, and chunk plan. Advertising ACK here would let a raw
+    # answer create an authoritative descriptor. Exact Base finalization adds
+    # the capabilities and all matching fences later, in one terminal POST.
+    return {"generation": generation}
 
 
 def _native_handoff_generation(local_vars: dict[str, Any]) -> str:
@@ -7013,22 +7909,14 @@ def _native_handoff_generation(local_vars: dict[str, Any]) -> str:
 
 
 def _native_handoff_obligation_id(local_vars: dict[str, Any]) -> str:
-    explicit = str(local_vars.get("_hfc_delivery_obligation_id") or "").strip()
-    if explicit:
-        return explicit
-    session_key = str(local_vars.get("session_key") or "").strip()
-    event = local_vars.get("event")
-    inbound_message_id = str(getattr(event, "message_id", "") or "").strip()
-    answer = _completion_answer(local_vars)
-    if not session_key or not inbound_message_id or not answer:
-        return ""
-    try:
-        from gateway.delivery_ledger import compute_obligation_id
+    """Return only an obligation captured from Hermes' exact ledger path.
 
-        computed = compute_obligation_id(session_key, inbound_message_id, answer)
-    except Exception:
-        return ""
-    return str(computed or "").strip()
+    The completion hook runs before ``BasePlatformAdapter`` finishes media and
+    file extraction. Recomputing that pipeline here would drift across Hermes
+    upgrades, so raw answers are never used to infer a recovery identity.
+    """
+    explicit = str(local_vars.get("_hfc_delivery_obligation_id") or "").strip()
+    return explicit
 
 
 def _is_lower_hex(value: str, length: int) -> bool:

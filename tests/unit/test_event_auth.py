@@ -90,7 +90,7 @@ def test_event_and_policy_proofs_are_domain_separated():
 
 def test_native_handoff_ack_proof_is_body_bound_replay_safe_and_domain_separated():
     secret = b"a" * 32
-    body = b'{"protocol":"hfc-native-handoff-v1"}'
+    body = b'{"protocol":"hfc-native-handoff-v2"}'
     headers = sign_native_handoff_ack_request(
         secret,
         body,
@@ -111,7 +111,7 @@ def test_native_handoff_ack_proof_is_body_bound_replay_safe_and_domain_separated
 
 def test_native_handoff_recovery_proof_is_separate_from_ack_domain():
     secret = b"r" * 32
-    body = b'{"protocol":"hfc-native-handoff-recovery-v1"}'
+    body = b'{"protocol":"hfc-native-handoff-recovery-v2"}'
     headers = sign_native_handoff_recovery_request(
         secret,
         body,

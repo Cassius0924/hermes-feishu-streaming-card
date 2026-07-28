@@ -51,6 +51,8 @@ from .native_handoff import (
     NativeHandoffRecord,
     NativeHandoffStore,
     NativeHandoffStoreError,
+    derive_native_handoff_target_hash,
+    derive_native_handoff_uuid_seed,
     handoff_identity_key,
 )
 from .operations import (
@@ -1975,7 +1977,7 @@ async def _native_handoff_ack(request: web.Request) -> web.Response:
         )
     try:
         descriptor = json.loads(body.decode("utf-8"))
-        _record, changed = request.app[NATIVE_HANDOFF_STORE_KEY].acknowledge(
+        record, changed = request.app[NATIVE_HANDOFF_STORE_KEY].acknowledge(
             descriptor
         )
     except (UnicodeError, ValueError, NativeHandoffStoreError, OSError):
@@ -1983,7 +1985,22 @@ async def _native_handoff_ack(request: web.Request) -> web.Response:
             {"ok": False, "error": "invalid native handoff ack"},
             status=400,
         )
+    _sync_acknowledged_native_handoff(request.app, record)
     return web.json_response({"ok": True, "acknowledged": changed})
+
+
+def _sync_acknowledged_native_handoff(
+    app: web.Application,
+    record: NativeHandoffRecord,
+) -> None:
+    for session in app[SESSIONS_KEY].values():
+        cached = session.terminal_handoff_record
+        if (
+            cached is not None
+            and cached.handoff_id == record.handoff_id
+            and cached.uuid_seed == record.uuid_seed
+        ):
+            session.terminal_handoff_record = record
 
 
 async def _native_handoff_recover(request: web.Request) -> web.Response:
@@ -2006,20 +2023,43 @@ async def _native_handoff_recover(request: web.Request) -> web.Response:
         if not isinstance(payload, dict) or set(payload) != {
             "protocol",
             "obligation_key",
+            "content_hash",
+            "plan_fingerprint",
+            "route",
+            "target_hash",
         }:
             raise ValueError("invalid recovery lookup")
-        if payload.get("protocol") != "hfc-native-handoff-recovery-v1":
+        if payload.get("protocol") != "hfc-native-handoff-recovery-v2":
             raise ValueError("invalid recovery lookup")
-        obligation_key = str(payload.get("obligation_key") or "")
-        record = request.app[NATIVE_HANDOFF_STORE_KEY].get_by_obligation(
-            obligation_key
+        obligation_key = payload.get("obligation_key")
+        content_hash = payload.get("content_hash")
+        plan_fingerprint = payload.get("plan_fingerprint")
+        route = payload.get("route")
+        target_hash = payload.get("target_hash")
+        if any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in (
+                obligation_key,
+                content_hash,
+                plan_fingerprint,
+                target_hash,
+            )
+        ) or route not in {"create", "thread-create"}:
+            raise ValueError("invalid recovery lookup")
+        record = request.app[NATIVE_HANDOFF_STORE_KEY].get_by_exact_binding(
+            obligation_key=obligation_key,
+            content_hash=content_hash,
+            plan_fingerprint=plan_fingerprint,
+            route=route,
+            target_hash=target_hash,
         )
     except (UnicodeError, ValueError, NativeHandoffStoreError, OSError):
         return web.json_response(
             {"ok": False, "error": "invalid native handoff recovery"},
             status=400,
         )
-    # get_by_obligation normalizes expiry against the store's own clock.
+    # Exact lookup normalizes expiry against the store's own clock.
     descriptor = record.descriptor() if record is not None else None
     if descriptor is None:
         return web.json_response({"ok": True, "found": False})
@@ -2234,6 +2274,8 @@ def _hfc_monitor_lines(request: web.Request, event: SidecarEvent) -> list[str]:
         "events_applied",
         "events_ignored",
         "events_rejected",
+        "native_handoff_fence_restores",
+        "native_handoff_fence_restore_refusals",
         "runtime_control_events_received",
         "runtime_control_events_accepted",
         "runtime_control_auth_rejections",
@@ -2481,17 +2523,122 @@ def _native_handoff_metadata(event: SidecarEvent) -> dict[str, Any]:
         and re.fullmatch(r"[0-9a-f]{64}", obligation_key) is not None
     ):
         normalized["obligation_key"] = obligation_key
+    for field in ("content_hash", "plan_fingerprint", "target_hash"):
+        field_value = value.get(field)
+        if (
+            isinstance(field_value, str)
+            and re.fullmatch(r"[0-9a-f]{64}", field_value) is not None
+        ):
+            normalized[field] = field_value
+    provisional_uuid_seed = value.get("provisional_uuid_seed")
+    if (
+        isinstance(provisional_uuid_seed, str)
+        and re.fullmatch(r"[0-9a-f]{32}", provisional_uuid_seed) is not None
+    ):
+        normalized["provisional_uuid_seed"] = provisional_uuid_seed
+    route = value.get("route")
+    if route in {"create", "thread-create"}:
+        normalized["route"] = route
     return normalized
 
 
 def _native_handoff_ack_capable(
     app: web.Application,
     metadata: dict[str, Any],
+    event: SidecarEvent,
 ) -> bool:
     capabilities = set(metadata.get("capabilities") or ())
-    return (
+    complete = (
         NATIVE_HANDOFF_ACK_AUTH_VERIFIER_KEY in app
-        and {"native-ack-v1", "stable-feishu-uuid-v1"}.issubset(capabilities)
+        and {
+            "native-ack-v2",
+            "stable-feishu-uuid-v2",
+            "exact-base-delivery-v1",
+        }.issubset(capabilities)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", str(metadata.get("obligation_key") or "")
+        )
+        is not None
+        and re.fullmatch(
+            r"[0-9a-f]{64}", str(metadata.get("content_hash") or "")
+        )
+        is not None
+        and re.fullmatch(
+            r"[0-9a-f]{64}", str(metadata.get("plan_fingerprint") or "")
+        )
+        is not None
+        and re.fullmatch(
+            r"[0-9a-f]{64}", str(metadata.get("target_hash") or "")
+        )
+        is not None
+        and metadata.get("route") in {"create", "thread-create"}
+    )
+    if not complete:
+        return False
+    data = event.data if isinstance(event.data, dict) else {}
+    profile_id = str(data.get("profile_id") or "").strip()
+    profile_source = str(data.get("profile_source") or "")
+    if profile_id != "default" or profile_source.startswith("sanitized_"):
+        return False
+    route = str(metadata.get("route") or "")
+    try:
+        expected_target = derive_native_handoff_target_hash(
+            profile_id=profile_id,
+            chat_id=event.chat_id,
+            thread_id=event.thread_id,
+            route=route,
+        )
+        expected_seed = derive_native_handoff_uuid_seed(
+            obligation_key=str(metadata.get("obligation_key") or ""),
+            content_hash=str(metadata.get("content_hash") or ""),
+            plan_fingerprint=str(metadata.get("plan_fingerprint") or ""),
+            route=route,
+            target_hash=str(metadata.get("target_hash") or ""),
+        )
+    except ValueError:
+        return False
+    return (
+        metadata.get("target_hash") == expected_target
+        and metadata.get("provisional_uuid_seed") == expected_seed
+    )
+
+
+def _native_terminal_matches_cached_handoff(
+    event: SidecarEvent,
+    metadata: dict[str, Any],
+    session: CardSession,
+    record: NativeHandoffRecord,
+) -> bool:
+    return (
+        str(metadata.get("generation") or "") == record.generation
+        and str(metadata.get("obligation_key") or "") == record.obligation_key
+        and str(metadata.get("content_hash") or "") == record.content_hash
+        and str(metadata.get("plan_fingerprint") or "")
+        == record.plan_fingerprint
+        and str(metadata.get("route") or "") == record.route
+        and str(metadata.get("target_hash") or "") == record.target_hash
+        and event.created_at == record.event_created_at
+    )
+
+
+def _native_terminal_matches_durable_handoff(
+    event: SidecarEvent,
+    metadata: dict[str, Any],
+    record: NativeHandoffRecord,
+) -> bool:
+    return (
+        bool(record.obligation_key)
+        and bool(record.content_hash)
+        and bool(record.plan_fingerprint)
+        and bool(record.route)
+        and str(metadata.get("generation") or "") == record.generation
+        and str(metadata.get("obligation_key") or "") == record.obligation_key
+        and str(metadata.get("content_hash") or "") == record.content_hash
+        and str(metadata.get("plan_fingerprint") or "")
+        == record.plan_fingerprint
+        and str(metadata.get("route") or "") == record.route
+        and str(metadata.get("target_hash") or "") == record.target_hash
+        and event.created_at == record.event_created_at
     )
 
 
@@ -2536,6 +2683,11 @@ def _begin_native_handoff(
     generation: str = "",
     ack_capable: bool = False,
     obligation_key: str = "",
+    content_hash: str = "",
+    plan_fingerprint: str = "",
+    route: str = "",
+    target_hash: str = "",
+    provisional_uuid_seed: str = "",
 ) -> tuple[NativeHandoffRecord | None, bool]:
     try:
         store = app[NATIVE_HANDOFF_STORE_KEY]
@@ -2546,6 +2698,11 @@ def _begin_native_handoff(
                 generation=generation,
                 ack_capable=ack_capable,
                 obligation_key=obligation_key,
+                content_hash=content_hash,
+                plan_fingerprint=plan_fingerprint,
+                route=route,
+                target_hash=target_hash,
+                provisional_uuid_seed=provisional_uuid_seed,
             )
         return store.begin(
             identity_key,
@@ -2555,6 +2712,11 @@ def _begin_native_handoff(
             generation=generation,
             ack_capable=ack_capable,
             obligation_key=obligation_key,
+            content_hash=content_hash,
+            plan_fingerprint=plan_fingerprint,
+            route=route,
+            target_hash=target_hash,
+            provisional_uuid_seed=provisional_uuid_seed,
         )
     except (NativeHandoffStoreError, OSError, ValueError):
         logger.warning("native handoff state could not be persisted safely")
@@ -2851,15 +3013,60 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
     # policy has since changed. Suppress it before considering a new policy
     # decision, but do not mutate handoff state for a genuinely native turn.
     if event_is_terminal and not starts_new_lifecycle:
+        has_native_terminal_session = bool(
+            session is not None
+            and session.status in {"completed", "failed"}
+            and session.terminal_disposition == "native"
+        )
         try:
             prior_handoff = _get_native_handoff(request.app, handoff_identity)
         except (NativeHandoffStoreError, OSError, ValueError):
             logger.warning("native handoff state could not be read safely")
+            if has_native_terminal_session:
+                metrics.native_handoff_fence_restore_refusals += 1
             metrics.events_rejected += 1
             return web.json_response(
                 {"ok": False, "error": "native handoff state unavailable"},
                 status=503,
             ), None
+        cached_handoff = (
+            session.terminal_handoff_record
+            if has_native_terminal_session and session is not None
+            else None
+        )
+        if cached_handoff is not None and cached_handoff.delivery_state in {
+            "pending",
+            "acked",
+        }:
+            if not _native_terminal_matches_cached_handoff(
+                incoming_event,
+                handoff_metadata,
+                session,
+                cached_handoff,
+            ):
+                metrics.native_handoff_fence_restore_refusals += 1
+                metrics.events_rejected += 1
+                return web.json_response(
+                    {"ok": False, "error": "native handoff state unavailable"},
+                    status=503,
+                ), None
+            try:
+                prior_handoff, restored = request.app[
+                    NATIVE_HANDOFF_STORE_KEY
+                ].restore_delivery_fence_if_missing(
+                    handoff_identity,
+                    cached_handoff,
+                )
+            except (NativeHandoffStoreError, OSError, ValueError):
+                metrics.native_handoff_fence_restore_refusals += 1
+                metrics.events_rejected += 1
+                return web.json_response(
+                    {"ok": False, "error": "native handoff state unavailable"},
+                    status=503,
+                ), None
+            session.terminal_handoff_record = prior_handoff
+            if restored:
+                metrics.native_handoff_fence_restores += 1
         if prior_handoff is not None:
             if handoff_generation and prior_handoff.generation != handoff_generation:
                 if incoming_event.created_at > prior_handoff.event_created_at:
@@ -2890,6 +3097,33 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                         {"ok": True, "applied": True}
                     ), None
             if prior_handoff is not None:
+                incoming_exact = _native_handoff_ack_capable(
+                    request.app,
+                    handoff_metadata,
+                    incoming_event,
+                )
+                durable_exact = bool(
+                    prior_handoff.obligation_key
+                    and prior_handoff.content_hash
+                    and prior_handoff.plan_fingerprint
+                    and prior_handoff.route
+                    and prior_handoff.target_hash
+                )
+                if (incoming_exact or durable_exact) and (
+                    not incoming_exact
+                    or not durable_exact
+                    or not _native_terminal_matches_durable_handoff(
+                        incoming_event,
+                        handoff_metadata,
+                        prior_handoff,
+                    )
+                ):
+                    metrics.native_handoff_fence_restore_refusals += 1
+                    metrics.events_rejected += 1
+                    return web.json_response(
+                        {"ok": False, "error": "native handoff state unavailable"},
+                        status=503,
+                    ), None
                 try:
                     prior_handoff = request.app[
                         NATIVE_HANDOFF_STORE_KEY
@@ -2911,6 +3145,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 )
                 descriptor = prior_handoff.descriptor()
                 if descriptor is not None:
+                    metrics.events_ignored += 1
                     response_payload = {
                         "ok": True,
                         "applied": False,
@@ -2934,52 +3169,16 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                     ),
                 }
                 return web.json_response(response_payload), post_lock_task
-        if (
-            prior_handoff is None
-            and session is not None
-            and session.status in {"completed", "failed"}
-            and session.terminal_disposition == "native"
-        ):
-            # The in-memory session proves this terminal previously crossed
-            # the native handoff boundary, but its durable dedupe fence has
-            # disappeared. Never report applied=True from memory alone: that
-            # would suppress the only remaining copy of the native answer.
-            # Recreate a bounded descriptor when the store is writable; if it
-            # is corrupt or unsafe the 503 above preserves hook fail-open.
-            recreated, _ = _begin_native_handoff(
-                request.app,
-                handoff_identity,
-                feishu_message_id=feishu_message_ids.get(session_key),
-                bot_id=message_bot_ids.get(session_key),
-                event_created_at=incoming_event.created_at,
-                generation=handoff_generation,
-                ack_capable=_native_handoff_ack_capable(
-                    request.app, handoff_metadata
-                ),
-                obligation_key=str(handoff_metadata.get("obligation_key") or ""),
-            )
-            if recreated is None:
-                metrics.events_rejected += 1
-                return web.json_response(
-                    {"ok": False, "error": "native handoff state unavailable"},
-                    status=503,
-                ), None
-            request.app[DIAGNOSTICS_KEY]["last_terminal_event"] = {
-                "message_id_hash": _diagnostic_id_hash(incoming_event.message_id),
-                "event": incoming_event.event,
-                "sequence": incoming_event.sequence,
-                "applied": False,
-                "disposition": "native_state_recreated",
-            }
-            return _native_disposition_response(recreated), (
-                _schedule_pending_native_handoff_repair(
-                    request.app,
-                    handoff_identity,
-                    recreated,
-                    feishu_message_id=feishu_message_ids.get(session_key),
-                    bot_id=message_bot_ids.get(session_key),
-                )
-            )
+        if has_native_terminal_session:
+            # A legacy, expired, uncertain, mismatched, or otherwise
+            # non-restorable in-memory record is not authority to invent a new
+            # UUID. Fail open so Hermes retains the only remaining answer path.
+            metrics.native_handoff_fence_restore_refusals += 1
+            metrics.events_rejected += 1
+            return web.json_response(
+                {"ok": False, "error": "native handoff state unavailable"},
+                status=503,
+            ), None
 
     if session is None or reopens_completed_session:
         metrics.policy_event_checks += 1
@@ -3208,10 +3407,23 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                         event_created_at=incoming_event.created_at,
                         generation=handoff_generation,
                         ack_capable=_native_handoff_ack_capable(
-                            request.app, handoff_metadata
+                            request.app, handoff_metadata, incoming_event
                         ),
                         obligation_key=str(
                             handoff_metadata.get("obligation_key") or ""
+                        ),
+                        content_hash=str(
+                            handoff_metadata.get("content_hash") or ""
+                        ),
+                        plan_fingerprint=str(
+                            handoff_metadata.get("plan_fingerprint") or ""
+                        ),
+                        route=str(handoff_metadata.get("route") or ""),
+                        target_hash=str(
+                            handoff_metadata.get("target_hash") or ""
+                        ),
+                        provisional_uuid_seed=str(
+                            handoff_metadata.get("provisional_uuid_seed") or ""
                         ),
                     )
                     if handoff_record is None:
@@ -3226,6 +3438,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                             {"ok": False, "error": "native handoff state unavailable"},
                             status=503,
                         ), None
+                    session.terminal_handoff_record = handoff_record
                     if not handoff_created:
                         duplicate_response = _native_disposition_response(
                             handoff_record,
@@ -3233,6 +3446,8 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                         )
                         if handoff_record.descriptor() is None:
                             metrics.events_applied += 1
+                        else:
+                            metrics.events_ignored += 1
                         return duplicate_response, None
                     _record_card_render_decision(metrics, render_result)
                     session.terminal_disposition = "native"
@@ -3362,9 +3577,18 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 event_created_at=incoming_event.created_at,
                 generation=handoff_generation,
                 ack_capable=_native_handoff_ack_capable(
-                    request.app, handoff_metadata
+                    request.app, handoff_metadata, incoming_event
                 ),
                 obligation_key=str(handoff_metadata.get("obligation_key") or ""),
+                content_hash=str(handoff_metadata.get("content_hash") or ""),
+                plan_fingerprint=str(
+                    handoff_metadata.get("plan_fingerprint") or ""
+                ),
+                route=str(handoff_metadata.get("route") or ""),
+                target_hash=str(handoff_metadata.get("target_hash") or ""),
+                provisional_uuid_seed=str(
+                    handoff_metadata.get("provisional_uuid_seed") or ""
+                ),
             )
             if handoff_record is None:
                 if terminal_session_snapshot is not None:
@@ -3374,6 +3598,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                     {"ok": False, "error": "native handoff state unavailable"},
                     status=503,
                 ), None
+            session.terminal_handoff_record = handoff_record
             if not handoff_created:
                 duplicate_response = _native_disposition_response(
                     handoff_record,
@@ -3381,6 +3606,8 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 )
                 if handoff_record.descriptor() is None:
                     metrics.events_applied += 1
+                else:
+                    metrics.events_ignored += 1
                 return duplicate_response, _schedule_pending_native_handoff_repair(
                     request.app,
                     handoff_identity,

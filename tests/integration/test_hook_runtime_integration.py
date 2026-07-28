@@ -321,11 +321,7 @@ async def test_installed_hook_forwards_streaming_tool_and_completion_events(
             "attachments": [],
             "native_delivery": "allowed",
         }
-        assert set(native_handoff) == {"capabilities", "generation"}
-        assert native_handoff["capabilities"] == [
-            "native-ack-v1",
-            "stable-feishu-uuid-v1",
-        ]
+        assert set(native_handoff) == {"generation"}
         assert len(native_handoff["generation"]) == 32
         assert all(char in "0123456789abcdef" for char in native_handoff["generation"])
     finally:

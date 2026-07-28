@@ -16,7 +16,7 @@ Hermes Gateway
   -> policy + readiness + session + render + Feishu CardKit send/update
 ```
 
-V4.1 domain-separates the event data plane from four control actions: `hfc-policy-v1` per-chat policy, `hfc-runtime-v1` runtime readiness, `hfc-native-handoff-recovery-v2` pending-descriptor recovery, and `hfc-native-handoff-ack-v1` post-delivery confirmation. Policy is enforced in both hook and sidecar. Runtime events prove liveness only and cannot authorize a file write. Recovery submits only one-way obligation, exact-content, and delivery-plan hashes plus a canonical-route enum, never answer text. ACK can run only after the Hermes ledger durably marks `delivered`. A control-plane failure must not stop Hermes Agent work, while install/recovery mutations remain fail closed.
+V4.1 domain-separates the event data plane from four control actions: `hfc-policy-v1` per-chat policy, `hfc-runtime-v1` runtime readiness, `hfc-native-handoff-recovery-v2` pending-descriptor recovery, and `hfc-native-handoff-ack-v1` post-delivery confirmation. Policy is enforced in both hook and sidecar. Runtime events prove liveness only and cannot authorize a file write. Recovery submits only one-way obligation, exact-content, delivery-plan, and target-scope hashes plus a canonical-route enum, never answer text or raw routing identifiers. ACK can run only after the Hermes ledger durably marks `delivered`. A control-plane failure must not stop Hermes Agent work, while install/recovery mutations remain fail closed.
 
 The Hermes hook-to-sidecar `/events` path is fail-open. Sidecar unavailability or event rejection must not bring down Hermes; a message not confirmed as accepted by the card path continues through Hermes' native fallback. Once the card path accepts delivery, the hook suppresses duplicate gray native text.
 
@@ -55,7 +55,7 @@ Event authentication provides source authentication and integrity, not HTTP encr
 | `POST /events` | loopback local-process trust; explicit non-loopback requires event authentication |
 | `POST /delivery/policy` | state-directory transport root, short timestamp window, and nonce replay protection; responses do not echo ids |
 | `POST /runtime/events` | authenticated hello/heartbeat in a separate runtime domain; updates sanitized readiness only |
-| `POST /native-handoff/recover` | separate recovery domain; exactly matches obligation/content/plan hashes and a `create`/`thread-create` route within the one-hour window, without answer text |
+| `POST /native-handoff/recover` | separate recovery domain; exactly matches obligation/content/plan/target hashes and a `create`/`thread-create` route within the one-hour window, without answer text or raw routing identifiers |
 | `POST /native-handoff/ack` | separate ACK domain; confirms a handoff only after the Hermes ledger durably records `delivered` |
 | `POST /commands` | state-directory command transport proof |
 | `POST /card/actions` | interaction token or operations transport proof |

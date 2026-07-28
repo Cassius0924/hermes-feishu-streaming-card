@@ -16,7 +16,7 @@ Hermes Gateway
   -> policy + readiness + session + render + Feishu CardKit send/update
 ```
 
-V4.1 使用域分隔的事件数据面与四条控制动作：`hfc-policy-v1` per-chat policy、`hfc-runtime-v1` runtime readiness、`hfc-native-handoff-recovery-v2` pending descriptor 恢复，以及 `hfc-native-handoff-ack-v1` delivered 后确认。policy 在 hook 和 sidecar 两侧执行；runtime 事件只证明活性，不授权文件写入；handoff recovery 只提交 obligation、exact content、delivery plan 与 canonical route 的单向 hash/枚举，不提交正文，ACK 只能发生在 Hermes ledger 已持久化 `delivered` 之后。任一控制面失败都不应阻断 Hermes Agent 工作，安装/恢复 mutation 则继续 fail-closed。
+V4.1 使用域分隔的事件数据面与四条控制动作：`hfc-policy-v1` per-chat policy、`hfc-runtime-v1` runtime readiness、`hfc-native-handoff-recovery-v2` pending descriptor 恢复，以及 `hfc-native-handoff-ack-v1` delivered 后确认。policy 在 hook 和 sidecar 两侧执行；runtime 事件只证明活性，不授权文件写入；handoff recovery 只提交 obligation、exact content、delivery plan、canonical route 与目标作用域的单向 hash/枚举，不提交正文或原始路由标识，ACK 只能发生在 Hermes ledger 已持久化 `delivered` 之后。任一控制面失败都不应阻断 Hermes Agent 工作，安装/恢复 mutation 则继续 fail-closed。
 
 Hermes hook 到 sidecar `/events` 的 fail-open 转发链路已经落地：sidecar 不可用或拒绝事件时，hook 不拖垮 Hermes，未被卡片路径确认接管的消息继续遵循 Hermes 原生 fallback。卡片已经接受的路径则抑制重复灰色原生文本。
 
@@ -55,7 +55,7 @@ Windows non-loopback 在无法验证 state directory 的 ACL 私有性时 fail-c
 | `POST /events` | loopback 本机互信；显式非 loopback 强制事件鉴权 |
 | `POST /delivery/policy` | state-directory transport root、短 timestamp window 与 nonce replay protection；响应不回显 id |
 | `POST /runtime/events` | 独立 runtime domain 的认证 hello/heartbeat；只更新脱敏 readiness |
-| `POST /native-handoff/recover` | 独立 recovery domain；用 obligation/content/plan hash 与 `create`/`thread-create` route 精确匹配一小时窗口内的 pending descriptor，不发送正文 |
+| `POST /native-handoff/recover` | 独立 recovery domain；用 obligation/content/plan/target hash 与 `create`/`thread-create` route 精确匹配一小时窗口内的 pending descriptor，不发送正文或原始路由标识 |
 | `POST /native-handoff/ack` | 独立 ACK domain；仅在 Hermes ledger 已持久化 `delivered` 后确认 handoff |
 | `POST /commands` | state-dir command transport proof |
 | `POST /card/actions` | interaction token 或 operations transport proof |

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from dataclasses import replace
 
 import pytest
 
@@ -35,6 +36,64 @@ def _obligation(index: int = 1) -> str:
     return f"{index:064x}"
 
 
+def _content_hash(index: int = 1) -> str:
+    return f"{index + 100:064x}"
+
+
+def _plan_fingerprint(index: int = 1) -> str:
+    return f"{index + 200:064x}"
+
+
+def _target_hash(index: int = 1, *, route: str = "create") -> str:
+    return native_handoff_module.derive_native_handoff_target_hash(
+        profile_id="default",
+        chat_id=f"oc_private_{index}",
+        thread_id="thread-private" if route == "thread-create" else "",
+        route=route,
+    )
+
+
+def _exact_binding(index: int = 1, *, route: str = "create") -> dict[str, str]:
+    return {
+        "content_hash": _content_hash(index),
+        "plan_fingerprint": _plan_fingerprint(index),
+        "route": route,
+        "target_hash": _target_hash(index, route=route),
+    }
+
+
+def _provisional_uuid_seed(index: int = 1, *, route: str = "create") -> str:
+    return native_handoff_module.derive_native_handoff_uuid_seed(
+        obligation_key=_obligation(index),
+        content_hash=_content_hash(index),
+        plan_fingerprint=_plan_fingerprint(index),
+        route=route,
+        target_hash=_target_hash(index, route=route),
+    )
+
+
+def test_exact_binding_derives_stable_uuid_seed_and_fences_all_inputs():
+    expected = _provisional_uuid_seed()
+
+    assert len(expected) == 32
+    assert _provisional_uuid_seed() == expected
+    assert _provisional_uuid_seed(2) != expected
+    assert _provisional_uuid_seed(route="thread-create") != expected
+    assert native_handoff_module.derive_native_handoff_uuid_seed(
+        obligation_key=_obligation(),
+        content_hash=_content_hash(),
+        plan_fingerprint=_plan_fingerprint(),
+        route="create",
+        target_hash=_target_hash(2),
+    ) != expected
+    assert native_handoff_module.derive_native_handoff_target_hash(
+        profile_id="work",
+        chat_id="oc_private_1",
+        thread_id="",
+        route="create",
+    ) != _target_hash()
+
+
 def test_handoff_identity_is_stable_hash_and_does_not_contain_raw_ids():
     first = _identity()
     second = _identity()
@@ -59,6 +118,7 @@ def test_ack_capable_handoff_separates_card_notice_from_native_delivery(tmp_path
         generation=_generation(),
         ack_capable=True,
         obligation_key=_obligation(),
+        **_exact_binding(),
     )
 
     assert created is True
@@ -68,9 +128,9 @@ def test_ack_capable_handoff_separates_card_notice_from_native_delivery(tmp_path
     assert pending.bot_hash
     descriptor = pending.descriptor(now=100.0)
     assert descriptor == store.get(identity).descriptor(now=100.0)
-    assert descriptor["protocol"] == "hfc-native-handoff-v1"
+    assert descriptor["protocol"] == "hfc-native-handoff-v2"
     assert descriptor["id"] == pending.handoff_id
-    assert descriptor["uuid_seed"] == pending.uuid_seed
+    assert descriptor["uuid_seed"] == pending.uuid_seed == _provisional_uuid_seed()
     assert descriptor["expires_at"] == 3700.0
 
     card_committed = store.mark_card_committed(identity, expected_record=pending)
@@ -88,6 +148,87 @@ def test_ack_capable_handoff_separates_card_notice_from_native_delivery(tmp_path
     serialized = (tmp_path / "state" / "native-handoffs.json").read_text()
     assert "fake-card-message-private" not in serialized
     assert "fake-bot-private" not in serialized
+    payload = json.loads(serialized)
+    assert payload["version"] == 4
+    persisted = payload["records"][identity]
+    assert persisted["content_hash"] == _content_hash()
+    assert persisted["plan_fingerprint"] == _plan_fingerprint()
+    assert persisted["route"] == "create"
+    assert persisted["target_hash"] == _target_hash()
+
+
+def test_ack_capable_begin_requires_complete_exact_delivery_binding(tmp_path):
+    store = NativeHandoffStore(tmp_path / "state", now=lambda: 100.0)
+
+    with pytest.raises(ValueError, match="binding is required"):
+        store.begin_no_card(
+            _identity(),
+            event_created_at=90.0,
+            generation=_generation(),
+            ack_capable=True,
+            obligation_key=_obligation(),
+        )
+    with pytest.raises(ValueError, match="binding is incomplete"):
+        store.begin_no_card(
+            _identity(),
+            event_created_at=90.0,
+            generation=_generation(),
+            ack_capable=True,
+            obligation_key=_obligation(),
+            content_hash=_content_hash(),
+        )
+    with pytest.raises(ValueError, match="route is invalid"):
+        store.begin_no_card(
+            _identity(),
+            event_created_at=90.0,
+            generation=_generation(),
+            ack_capable=True,
+            obligation_key=_obligation(),
+            **_exact_binding(route="reply"),
+        )
+
+    with pytest.raises(ValueError, match="UUID seed"):
+        store.begin_no_card(
+            _identity(),
+            event_created_at=90.0,
+            generation=_generation(),
+            ack_capable=True,
+            obligation_key=_obligation(),
+            provisional_uuid_seed="f" * 32,
+            **_exact_binding(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("obligation_key", _obligation(2)),
+        ("content_hash", _content_hash(2)),
+        ("plan_fingerprint", _plan_fingerprint(2)),
+        ("route", "thread-create"),
+        ("target_hash", _target_hash(2)),
+    ],
+)
+def test_same_generation_exact_begin_refuses_delivery_binding_drift(
+    tmp_path,
+    field,
+    replacement,
+):
+    store = NativeHandoffStore(tmp_path / "state", now=lambda: 100.0)
+    identity = _identity()
+    initial = {
+        "event_created_at": 90.0,
+        "generation": _generation(),
+        "ack_capable": True,
+        "obligation_key": _obligation(),
+        **_exact_binding(),
+    }
+    store.begin_no_card(identity, **initial)
+    changed = dict(initial)
+    changed[field] = replacement
+
+    with pytest.raises(ValueError, match="delivery fence conflicts"):
+        store.begin_no_card(identity, **changed)
 
 
 def test_native_ack_can_race_before_independent_card_notice_commit(tmp_path):
@@ -101,6 +242,7 @@ def test_native_ack_can_race_before_independent_card_notice_commit(tmp_path):
         generation=_generation(),
         ack_capable=True,
         obligation_key=_obligation(),
+        **_exact_binding(),
     )
 
     acknowledged, changed = store.acknowledge(pending.descriptor(now=100.0))
@@ -122,6 +264,7 @@ def test_unacked_handoff_expires_to_uncertain_without_rotating_descriptor(tmp_pa
         generation=_generation(),
         ack_capable=True,
         obligation_key=_obligation(),
+        **_exact_binding(),
     )
     descriptor = pending.descriptor(now=100.0)
 
@@ -139,6 +282,164 @@ def test_unacked_handoff_expires_to_uncertain_without_rotating_descriptor(tmp_pa
     assert status["delivery_states"]["uncertain"] == 1
     assert status["manual_review_required"] is True
     assert status["next_action"] == "review_native_delivery_before_manual_retry"
+
+
+def test_recovery_lookup_expires_pending_record_before_returning_it(tmp_path):
+    now = [100.0]
+    store = NativeHandoffStore(tmp_path / "state", now=lambda: now[0])
+    identity = _identity()
+    pending, _ = store.begin_no_card(
+        identity,
+        event_created_at=90.0,
+        generation=_generation(),
+        ack_capable=True,
+        obligation_key=_obligation(),
+        **_exact_binding(),
+    )
+    assert store.get_by_exact_binding(
+        obligation_key=_obligation(),
+        **_exact_binding(),
+    ) == pending
+
+    now[0] = pending.expires_at + 1
+    uncertain = store.get_by_exact_binding(
+        obligation_key=_obligation(),
+        **_exact_binding(),
+    )
+
+    assert uncertain is not None
+    assert uncertain.delivery_state == "uncertain"
+    assert uncertain.descriptor(now=now[0]) is None
+    assert store.get(identity).delivery_state == "uncertain"
+
+
+def test_exact_recovery_lookup_fails_closed_on_multiple_candidates(tmp_path):
+    store = NativeHandoffStore(tmp_path / "state", now=lambda: 100.0)
+    for index in (1, 2):
+        store.begin_no_card(
+            _identity(index),
+            event_created_at=90.0 + index,
+            generation=_generation(index),
+            ack_capable=True,
+            obligation_key=_obligation(),
+            **_exact_binding(),
+        )
+
+    assert store.get_by_exact_binding(
+        obligation_key=_obligation(),
+        **_exact_binding(),
+    ) is None
+
+
+def test_restore_delivery_fence_preserves_exact_pending_descriptor(tmp_path):
+    now = [100.0]
+    store = NativeHandoffStore(tmp_path / "state", now=lambda: now[0])
+    identity = _identity()
+    pending, _ = store.begin_no_card(
+        identity,
+        event_created_at=90.0,
+        generation=_generation(),
+        ack_capable=True,
+        obligation_key=_obligation(),
+        **_exact_binding(),
+    )
+    descriptor = pending.descriptor(now=now[0])
+
+    store.path.unlink()
+    restored, changed = store.restore_delivery_fence_if_missing(
+        identity,
+        pending,
+    )
+
+    assert changed is True
+    assert restored == pending
+    assert restored.descriptor(now=now[0]) == descriptor
+
+
+def test_restore_delivery_fence_rejects_expired_or_unacknowledged_legacy_state(
+    tmp_path,
+):
+    now = [100.0]
+    store = NativeHandoffStore(tmp_path / "state", now=lambda: now[0])
+    identity = _identity()
+    pending, _ = store.begin_no_card(
+        identity,
+        event_created_at=90.0,
+        generation=_generation(),
+        ack_capable=True,
+        obligation_key=_obligation(),
+        **_exact_binding(),
+    )
+    store.path.unlink()
+    now[0] = pending.expires_at + 1
+
+    with pytest.raises(ValueError, match="expired"):
+        store.restore_delivery_fence_if_missing(identity, pending)
+
+    legacy, _ = store.begin_no_card(
+        identity,
+        event_created_at=now[0],
+        ack_capable=False,
+    )
+    store.path.unlink()
+    with pytest.raises(ValueError, match="not restorable"):
+        store.restore_delivery_fence_if_missing(identity, legacy)
+
+
+def test_restore_delivery_fence_preserves_ack_and_never_rolls_it_back(tmp_path):
+    store = NativeHandoffStore(tmp_path / "state", now=lambda: 100.0)
+    identity = _identity()
+    pending, _ = store.begin_no_card(
+        identity,
+        event_created_at=90.0,
+        generation=_generation(),
+        ack_capable=True,
+        obligation_key=_obligation(),
+        **_exact_binding(),
+    )
+    acked, _ = store.acknowledge(pending.descriptor(now=100.0))
+
+    current, changed = store.restore_delivery_fence_if_missing(identity, pending)
+    assert changed is False
+    assert current == acked
+
+    store.path.unlink()
+    restored, changed = store.restore_delivery_fence_if_missing(identity, acked)
+    assert changed is True
+    assert restored == acked
+
+
+def test_restore_delivery_fence_rejects_identity_conflicts_and_ack_rollback(
+    tmp_path,
+):
+    store = NativeHandoffStore(tmp_path / "state", now=lambda: 100.0)
+    identity = _identity()
+    pending, _ = store.begin_no_card(
+        identity,
+        event_created_at=90.0,
+        generation=_generation(),
+        ack_capable=True,
+        obligation_key=_obligation(),
+        **_exact_binding(),
+    )
+
+    with pytest.raises(ValueError, match="conflicts"):
+        store.restore_delivery_fence_if_missing(
+            identity,
+            replace(pending, uuid_seed="f" * 32),
+        )
+    with pytest.raises(ValueError, match="conflicts"):
+        store.restore_delivery_fence_if_missing(
+            identity,
+            replace(pending, plan_fingerprint="f" * 64),
+        )
+    with pytest.raises(ValueError, match="identity mismatch"):
+        store.restore_delivery_fence_if_missing(_identity(2), pending)
+    with pytest.raises(ValueError, match="roll back ACK"):
+        store.restore_delivery_fence_if_missing(
+            identity,
+            replace(pending, delivery_state="acked"),
+        )
 
 
 def test_generation_fence_prevents_old_tombstone_from_swallowing_new_turn(tmp_path):
@@ -167,6 +468,7 @@ def test_generation_fence_prevents_old_tombstone_from_swallowing_new_turn(tmp_pa
         generation=_generation(2),
         ack_capable=True,
         obligation_key=_obligation(2),
+        **_exact_binding(2),
     )
     assert created is True
     assert fresh.delivery_state == "pending"
@@ -189,6 +491,7 @@ def test_completed_first_new_generation_can_replace_old_terminal_record(tmp_path
         generation=_generation(2),
         ack_capable=True,
         obligation_key=_obligation(2),
+        **_exact_binding(2),
     )
 
     assert created is True
@@ -284,6 +587,68 @@ def test_store_reads_early_v1_record_without_event_timestamp(tmp_path):
     assert record.event_created_at == 10.0
 
 
+def test_store_reads_v2_ack_record_as_legacy_without_exact_binding(tmp_path):
+    root = tmp_path / "state"
+    identity = _identity()
+    writer = NativeHandoffStore(root, now=lambda: 100.0)
+    writer.begin_no_card(
+        identity,
+        event_created_at=90.0,
+        generation=_generation(),
+        ack_capable=True,
+        obligation_key=_obligation(),
+        **_exact_binding(),
+    )
+    path = root / "native-handoffs.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["version"] = 2
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+
+    record = NativeHandoffStore(root, now=lambda: 101.0).get(identity)
+
+    assert record.delivery_state == "pending"
+    assert record.content_hash == ""
+    assert record.plan_fingerprint == ""
+    assert record.route == ""
+    with pytest.raises(ValueError, match="binding is required"):
+        NativeHandoffStore(root, now=lambda: 101.0).restore_delivery_fence_if_missing(
+            identity,
+            record,
+        )
+    with pytest.raises(ValueError, match="delivery fence conflicts"):
+        NativeHandoffStore(root, now=lambda: 101.0).begin_no_card(
+            identity,
+            event_created_at=90.0,
+            generation=_generation(),
+            ack_capable=True,
+            obligation_key=_obligation(),
+            **_exact_binding(),
+        )
+
+
+def test_store_rejects_partial_exact_binding_in_v3_state(tmp_path):
+    root = tmp_path / "state"
+    identity = _identity()
+    writer = NativeHandoffStore(root, now=lambda: 100.0)
+    writer.begin_no_card(
+        identity,
+        event_created_at=90.0,
+        generation=_generation(),
+        ack_capable=True,
+        obligation_key=_obligation(),
+        **_exact_binding(),
+    )
+    path = root / "native-handoffs.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["records"][identity]["plan_fingerprint"] = ""
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+
+    with pytest.raises(NativeHandoffStoreError, match="invalid"):
+        NativeHandoffStore(root, now=lambda: 101.0).get(identity)
+
+
 def test_store_is_bounded_and_evicts_committed_before_pending(tmp_path):
     clock = iter((1.0, 2.0, 3.0, 4.0, 5.0))
     store = NativeHandoffStore(
@@ -329,6 +694,7 @@ def test_stale_lifecycle_and_expired_pending_do_not_block_new_handoff(tmp_path):
         generation=_generation(2),
         ack_capable=True,
         obligation_key=_obligation(2),
+        **_exact_binding(2),
     )
 
     now[0] = 3801.0
@@ -338,6 +704,7 @@ def test_stale_lifecycle_and_expired_pending_do_not_block_new_handoff(tmp_path):
         generation=_generation(3),
         ack_capable=True,
         obligation_key=_obligation(3),
+        **_exact_binding(3),
     )
 
     assert created is True
@@ -361,6 +728,7 @@ def test_fresh_pending_records_are_never_silently_evicted(tmp_path):
             generation=_generation(index),
             ack_capable=True,
             obligation_key=_obligation(index),
+            **_exact_binding(index),
         )
 
     with pytest.raises(NativeHandoffStoreError, match="cannot be bounded"):
@@ -370,6 +738,7 @@ def test_fresh_pending_records_are_never_silently_evicted(tmp_path):
             generation=_generation(3),
             ack_capable=True,
             obligation_key=_obligation(3),
+            **_exact_binding(3),
         )
 
     reloaded = NativeHandoffStore(
@@ -401,6 +770,7 @@ def test_acked_handoff_fence_survives_retry_window_then_becomes_evictable(
             generation=_generation(1),
             ack_capable=True,
             obligation_key=_obligation(1),
+            **_exact_binding(1),
         )
     else:
         record, _ = store.begin(
@@ -411,6 +781,7 @@ def test_acked_handoff_fence_survives_retry_window_then_becomes_evictable(
             generation=_generation(1),
             ack_capable=True,
             obligation_key=_obligation(1),
+            **_exact_binding(1),
         )
         if notice_state == "committed":
             record = store.mark_card_committed(identity, expected_record=record)
@@ -423,6 +794,7 @@ def test_acked_handoff_fence_survives_retry_window_then_becomes_evictable(
             generation=_generation(2),
             ack_capable=True,
             obligation_key=_obligation(2),
+            **_exact_binding(2),
         )
     assert store.get(identity).delivery_state == "acked"
 
@@ -433,6 +805,7 @@ def test_acked_handoff_fence_survives_retry_window_then_becomes_evictable(
         generation=_generation(2),
         ack_capable=True,
         obligation_key=_obligation(2),
+        **_exact_binding(2),
     )
 
     assert created is True

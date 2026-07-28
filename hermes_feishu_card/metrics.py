@@ -21,6 +21,8 @@ class SidecarMetrics:
     policy_invalid_requests: int = 0
     policy_event_checks: int = 0
     native_bypass_events: int = 0
+    native_handoff_fence_restores: int = 0
+    native_handoff_fence_restore_refusals: int = 0
     feishu_send_attempts: int = 0
     feishu_noop_attempts: int = 0
     feishu_send_successes: int = 0

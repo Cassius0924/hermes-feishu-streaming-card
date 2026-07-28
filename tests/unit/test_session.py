@@ -31,6 +31,7 @@ def test_terminal_native_disposition_defaults_empty_and_can_be_persisted():
 
     assert session.terminal_disposition == ""
     assert session.terminal_limit_reason == ""
+    assert session.terminal_handoff_record is None
 
     session.terminal_disposition = "native"
     session.terminal_limit_reason = "json_bytes"

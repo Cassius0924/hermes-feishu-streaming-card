@@ -2384,6 +2384,11 @@ def test_v410_release_docs_define_ack_multibot_and_compose_boundaries():
 
     assert "不承诺永久 exactly-once" in notes
     assert "does not promise forever exactly-once" in notes_en
+    assert "obligation/content/plan/route/target" in notes
+    assert "obligation/content/plan/route/target" in notes_en
+    assert "schema v4" in notes
+    assert "schema v4" in notes_en
+    assert "target_hash" in controls
 
     for text in (notes, notes_en, guide, guide_en, controls):
         assert "#162" in text

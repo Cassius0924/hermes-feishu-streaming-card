@@ -41,12 +41,12 @@ V4.1 在 `/events` 数据面外增加相互隔离的本机控制面，各动作�
 | `POST /events` | 消息生命周期与卡片数据面 | event domain | 未确认接管时 Hermes 原生 fail-open |
 | `POST /delivery/policy` | 在 hook 抑制原生消息前查询 per-chat 决策 | `hfc-policy-v1` | timeout、invalid/replayed proof、配置错误或未知 profile 都返回原生路径 |
 | `POST /runtime/events` | `runtime.hello` / `runtime.heartbeat` readiness | `hfc-runtime-v1` | Hermes 工作继续；sidecar readiness 降级，不授权源码 mutation |
-| `POST /native-handoff/recover` | 用 obligation/content/plan hash 与 canonical route 精确查询 pending native descriptor | `hfc-native-handoff-recovery-v2` | 任一 fence 不匹配都返回未找到；Hermes 保留 recovered marker 与随机 UUID fail-open |
+| `POST /native-handoff/recover` | 用 obligation/content/plan/target hash 与 canonical route 精确查询 pending native descriptor | `hfc-native-handoff-recovery-v2` | 任一 fence 不匹配都返回未找到；Hermes 保留 recovered marker 与随机 UUID fail-open |
 | `POST /native-handoff/ack` | 全部分片成功且 ledger 已 `delivered` 后确认 native final | `hfc-native-handoff-ack-v1` | ACK 失败不回滚已 delivered ledger；sidecar pending 最终转 uncertain |
 
 policy、runtime、native recovery 与 native ACK proof 都绑定 exact raw body、短 timestamp window 与 nonce replay protection。recovery body 只携带 64 位 obligation/content/plan digest 和 `create` / `thread-create` 枚举，不携带答案正文或 reply anchor；响应不回显 chat id、transport root、路径、源码 hash 或 recovery fingerprint。`runtime.hello` / `runtime.heartbeat` 只提供经过 schema 限制的 generation/package/sequence 信息；严格 repair 仍独立验证 Git、manifest、backup、blob、anchor 与 mutation 前 fingerprint。
 
-exact native handoff 还要求 Gateway 与 sidecar 同时声明 `native-ack-v2`、`stable-feishu-uuid-v2`、`exact-base-delivery-v1`，descriptor protocol 必须是 `hfc-native-handoff-v2`。terminal POST 响应丢失或损坏时，Gateway 立即用相同 obligation/content/plan/route 发起 recovery-v2 查询；若查询也不可用，则保持普通 native fail-open，不把不确定结果冒充成 exact 成功。该契约只覆盖默认 profile、无附件/媒体的 Hermes 0.19 Base 普通文本 final-answer；secondary profile 不广告 exact ACK。
+exact native handoff 还要求 Gateway 与 sidecar 同时声明 `native-ack-v2`、`stable-feishu-uuid-v2`、`exact-base-delivery-v1`，descriptor protocol 必须是 `hfc-native-handoff-v2`。terminal POST 响应丢失或损坏时，Gateway 立即用相同 obligation/content/plan/route/target 五项 binding 发起 recovery-v2 查询；若查询也不可用，本轮可使用同五项派生的 provisional UUID seed，随后只在取回完整 descriptor 后 ACK。若最初请求没有到达 sidecar，后续仍保持带可见 marker 的普通 native fail-open，不把不确定结果冒充成 exact 成功。该契约只覆盖默认 profile、无附件/媒体的 Hermes 0.19 Base 普通文本 final-answer；secondary profile 不广告 exact ACK。
 
 一个 turn 的 delivery decision 在首次事件时固定。`bindings.native_chats` 的修改只影响下一条新消息；重复 terminal 不能在卡片与原生路径各发送一次。sidecar 在创建 `CardSession` 前再次检查 policy，因此 hook preflight 与 server enforcement 缺一不可。
 

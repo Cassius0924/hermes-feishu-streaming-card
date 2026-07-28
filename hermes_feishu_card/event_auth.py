@@ -117,7 +117,7 @@ def sign_native_handoff_recovery_request(
     return _sign_domain_request(
         secret,
         body,
-        domain="hfc-native-handoff-recovery-v1",
+        domain="hfc-native-handoff-recovery-v2",
         timestamp_header=NATIVE_HANDOFF_RECOVERY_TIMESTAMP_HEADER,
         nonce_header=NATIVE_HANDOFF_RECOVERY_NONCE_HEADER,
         signature_header=NATIVE_HANDOFF_RECOVERY_SIGNATURE_HEADER,
@@ -209,7 +209,7 @@ class NativeHandoffRecoveryProofVerifier:
     ):
         self._verifier = _DomainProofVerifier(
             secret,
-            domain="hfc-native-handoff-recovery-v1",
+            domain="hfc-native-handoff-recovery-v2",
             timestamp_header=NATIVE_HANDOFF_RECOVERY_TIMESTAMP_HEADER,
             nonce_header=NATIVE_HANDOFF_RECOVERY_NONCE_HEADER,
             signature_header=NATIVE_HANDOFF_RECOVERY_SIGNATURE_HEADER,
