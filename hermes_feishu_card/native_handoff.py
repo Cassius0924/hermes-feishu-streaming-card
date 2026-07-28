@@ -93,6 +93,10 @@ class NativeHandoffStore:
         ):
             raise ValueError("max_file_bytes must be at least 1024")
         expanded_root = Path(root).expanduser()
+        if ".." in expanded_root.parts:
+            raise ValueError(
+                "handoff state root must not traverse toward a filesystem root"
+            )
         self.root = (
             expanded_root
             if expanded_root.is_absolute()
