@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from hermes_feishu_card import integrity as integrity_module
 from hermes_feishu_card.integrity import (
     RuntimeIntegrityCoordinator,
     build_runtime_integrity_fence_binding,
@@ -55,6 +56,43 @@ def test_fence_binding_is_domain_separated_and_contains_no_target_path(tmp_path)
     assert first.target_identity == second.target_identity
     assert first.plan_fingerprint != second.plan_fingerprint
     assert str(hermes_root) not in repr(first)
+
+
+def test_fence_binding_does_not_require_path_stat_keyword_arguments(
+    monkeypatch,
+    tmp_path,
+):
+    """Python 3.9 Path.stat() does not accept follow_symlinks."""
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir()
+    evidence = hermes_root.lstat()
+
+    class Python39ResolvedPath:
+        def expanduser(self):
+            return self
+
+        def resolve(self, *, strict=False):
+            assert strict is True
+            return self
+
+        def stat(self):
+            return evidence
+
+        def lstat(self):
+            return evidence
+
+        def __str__(self):
+            return str(hermes_root)
+
+    monkeypatch.setattr(
+        integrity_module,
+        "Path",
+        lambda _root: Python39ResolvedPath(),
+    )
+
+    binding = build_runtime_integrity_fence_binding(hermes_root, "a" * 64)
+
+    assert len(binding.target_identity) == 64
 
 
 def test_coordinator_binds_new_fence_to_target_and_exact_plan(tmp_path):

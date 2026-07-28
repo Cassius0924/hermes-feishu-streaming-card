@@ -77,8 +77,8 @@ def build_runtime_integrity_fence_binding(
         raise ValueError("integrity plan fingerprint is invalid")
     try:
         resolved = Path(hermes_root).expanduser().resolve(strict=True)
-        before = resolved.stat(follow_symlinks=False)
-        after = resolved.stat(follow_symlinks=False)
+        before = resolved.lstat()
+        after = resolved.lstat()
     except (OSError, RuntimeError) as exc:
         raise ValueError("Hermes target identity is unavailable") from exc
     if (
