@@ -602,6 +602,11 @@ def test_docs_describe_secure_event_transport_and_current_feishu_state():
         assert "local-process trust" in doc
         assert "allow_non_loopback" in doc
         assert "event authentication" in doc
+        assert "Windows non-loopback" in doc
+        assert "ACL privacy" in doc
+    for doc in (readme, guide, architecture):
+        assert "Windows non-loopback" in doc
+        assert "ACL 私有性" in doc
     assert "allow_non_loopback: false" in config
     assert "不要把 sidecar 未鉴权暴露" in config
     assert "Do not expose an unauthenticated sidecar" in config

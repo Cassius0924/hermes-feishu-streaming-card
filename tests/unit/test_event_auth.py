@@ -88,3 +88,48 @@ def test_policy_proof_refuses_missing_or_invalid_private_root(secret):
         sign_policy_request(secret, b"{}")
     with pytest.raises(ValueError, match="transport root is invalid"):
         PolicyProofVerifier(secret)
+
+
+def test_default_event_nonce_capacity_handles_expected_parallel_streams():
+    secret = b"e" * 32
+    body = b'{}'
+    verifier = EventProofVerifier(secret, now=lambda: 100.0)
+
+    for index in range(4097):
+        verifier.verify(
+            sign_event_request(
+                secret,
+                body,
+                timestamp=100,
+                nonce=f"event-nonce-{index:08d}",
+            ),
+            body,
+        )
+
+
+def test_event_nonce_capacity_remains_fail_closed_when_explicitly_full():
+    secret = b"e" * 32
+    body = b"{}"
+    verifier = EventProofVerifier(secret, now=lambda: 100.0, max_nonces=2)
+
+    for index in range(2):
+        verifier.verify(
+            sign_event_request(
+                secret,
+                body,
+                timestamp=100,
+                nonce=f"small-event-nonce-{index:04d}",
+            ),
+            body,
+        )
+
+    with pytest.raises(EventAuthenticationError, match="overloaded"):
+        verifier.verify(
+            sign_event_request(
+                secret,
+                body,
+                timestamp=100,
+                nonce="small-event-nonce-0002",
+            ),
+            body,
+        )

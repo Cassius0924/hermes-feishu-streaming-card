@@ -4247,7 +4247,10 @@ def _is_client_factory(feishu_client: Any) -> bool:
 
 
 def _safe_update_error_message(bot_id: str | None, exc: Exception) -> str:
-    parts = [f"bot_id={bot_id or ''}", exc.__class__.__name__]
+    parts = [
+        f"bot_hash={_diagnostic_id_hash(bot_id or 'default', domain='bot')}",
+        exc.__class__.__name__,
+    ]
     status_code = getattr(exc, "status_code", None)
     if (
         isinstance(status_code, int)
@@ -4426,10 +4429,11 @@ def _health_key_should_hash(key: str) -> bool:
     return any(part in key for part in ("chat_id", "open_id", "message_id"))
 
 
-def _diagnostic_id_hash(value: Any) -> str:
+def _diagnostic_id_hash(value: Any, *, domain: str = "identifier") -> str:
     if not isinstance(value, str) or not value:
         return ""
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    encoded = f"hfc-diagnostic-{domain}-v1\0{value}".encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:12]
 
 
 def _full_diagnostic_hash(value: str) -> str:

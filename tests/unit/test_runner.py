@@ -187,6 +187,9 @@ def test_main_enforces_event_auth_for_explicit_non_loopback_listener(monkeypatch
     monkeypatch.setattr(runner, "load_config", lambda path: config)
     monkeypatch.setattr(runner, "ensure_transport_root_secret", lambda: root_secret)
     monkeypatch.setattr(
+        runner, "transport_root_privacy_verified", lambda: True, raising=False
+    )
+    monkeypatch.setattr(
         runner,
         "create_app",
         lambda _client, **kwargs: captured.update(kwargs) or object(),
@@ -202,6 +205,53 @@ def test_main_enforces_event_auth_for_explicit_non_loopback_listener(monkeypatch
     assert captured["event_auth_required"] is True
     assert captured["operations_transport_root_secret"] == root_secret
     assert captured["run_app"]["host"] == "0.0.0.0"
+
+
+def test_main_rejects_non_loopback_when_windows_acl_privacy_is_unverified(monkeypatch):
+    config = {
+        "server": {
+            "host": "0.0.0.0",
+            "port": 8765,
+            "allow_non_loopback": True,
+        },
+        "feishu": {},
+        "card": {},
+    }
+    monkeypatch.setattr(runner, "load_config", lambda path: config)
+    monkeypatch.setattr(runner, "ensure_transport_root_secret", lambda: b"r" * 32)
+    monkeypatch.setattr(
+        runner, "transport_root_privacy_verified", lambda: False, raising=False
+    )
+    monkeypatch.setattr(
+        runner.web,
+        "run_app",
+        lambda *_args, **_kwargs: pytest.fail("unverified listener must not start"),
+    )
+
+    with pytest.raises(RuntimeError, match="private state directory"):
+        main(["--config", "config.yaml"])
+
+
+def test_main_warns_when_loopback_transport_acl_privacy_is_unverified(
+    monkeypatch, caplog
+):
+    config = {
+        "server": {"host": "127.0.0.1", "port": 8765},
+        "feishu": {},
+        "card": {},
+    }
+    monkeypatch.setattr(runner, "load_config", lambda path: config)
+    monkeypatch.setattr(runner, "ensure_transport_root_secret", lambda: b"r" * 32)
+    monkeypatch.setattr(
+        runner, "transport_root_privacy_verified", lambda: False, raising=False
+    )
+    monkeypatch.setattr(runner, "create_app", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(runner.web, "run_app", lambda *_args, **_kwargs: None)
+
+    assert main(["--config", "config.yaml"]) == 0
+
+    assert "ACL privacy is unverified" in caplog.text
+    assert "loopback local-process trust only" in caplog.text
 
 
 def test_main_keeps_loopback_listener_backward_compatible(monkeypatch):

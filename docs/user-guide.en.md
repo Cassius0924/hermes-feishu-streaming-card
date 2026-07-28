@@ -835,3 +835,5 @@ Thanks to these contributors for improving the project:
 ## Security
 
 Default loopback uses local-process trust; do not expose an unauthenticated sidecar to the network. Non-loopback requires explicit `server.allow_non_loopback: true` and state-directory HMAC event authentication. Event authentication does not encrypt traffic, so public deployment still requires TLS/mTLS or a controlled reverse proxy. Do not commit App Secret, tenant token, or real chat_id. Production credentials belong in local config or environment variables.
+
+Windows non-loopback startup is rejected when state-directory ACL privacy cannot be verified. Windows loopback remains available under local-process trust without claiming that ACL privacy has been verified.

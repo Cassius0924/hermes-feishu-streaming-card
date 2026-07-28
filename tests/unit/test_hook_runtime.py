@@ -73,6 +73,22 @@ def test_load_runtime_config_custom_url_and_timeout(monkeypatch):
     assert config.timeout_seconds == 0.25
 
 
+def test_sync_policy_gate_cleans_native_state_when_identity_is_missing():
+    hook_runtime._HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(
+        hook_runtime._NativeMediaTextSuppression("oc_stale", "stale answer")
+    )
+
+    result = hook_runtime._policy_gate_sync(
+        hook_runtime.load_runtime_config(),
+        {"platform": "telegram", "message_id": "om_missing"},
+        "message.started",
+    )
+
+    assert result.card is False
+    assert result.identity is None
+    assert hook_runtime._HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.get() is None
+
+
 @pytest.mark.parametrize("value", ["1", "49", "5001", "abc"])
 def test_load_runtime_config_invalid_timeout_falls_back(monkeypatch, value):
     monkeypatch.setenv("HERMES_FEISHU_CARD_TIMEOUT_MS", value)

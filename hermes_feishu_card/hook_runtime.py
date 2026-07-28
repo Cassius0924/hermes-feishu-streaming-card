@@ -396,6 +396,7 @@ def _policy_gate_sync(
 ) -> _PolicyGateResult:
     identity = _policy_identity(config, local_vars, event_name)
     if identity is None:
+        _cleanup_native_policy_state(local_vars)
         return _PolicyGateResult(False, None)
     disposition = _pinned_policy_disposition(identity)
     if disposition is None:

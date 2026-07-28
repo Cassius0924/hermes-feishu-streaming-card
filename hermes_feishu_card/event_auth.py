@@ -20,7 +20,8 @@ POLICY_SIGNATURE_HEADER = "X-HFC-Policy-Signature"
 _ROOT_SECRET_BYTES = 32
 _PROOF_MAX_AGE_SECONDS = 30
 _POLICY_PROOF_MAX_AGE_SECONDS = 5
-_MAX_NONCES = 512
+_EVENT_MAX_NONCES = 16_384
+_POLICY_MAX_NONCES = 512
 
 
 class EventAuthenticationError(ValueError):
@@ -77,7 +78,7 @@ class EventProofVerifier:
         secret: bytes,
         *,
         now: Callable[[], float] = time.time,
-        max_nonces: int = _MAX_NONCES,
+        max_nonces: int = _EVENT_MAX_NONCES,
     ):
         self._verifier = _DomainProofVerifier(
             secret,
@@ -101,7 +102,7 @@ class PolicyProofVerifier:
         secret: bytes,
         *,
         now: Callable[[], float] = time.time,
-        max_nonces: int = _MAX_NONCES,
+        max_nonces: int = _POLICY_MAX_NONCES,
     ):
         self._verifier = _DomainProofVerifier(
             secret,

@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 from pathlib import Path
+import re
 import secrets
 import threading
 import time
@@ -2736,7 +2737,10 @@ async def test_operations_patch_failure_is_recorded_on_the_completed_card():
 
     assert updated is False
     assert operation.result["delivery_error"] == "card update unavailable"
-    assert app[DIAGNOSTICS_KEY]["last_update_error"] == "bot_id= RuntimeError"
+    assert re.fullmatch(
+        r"bot_hash=[0-9a-f]{12} RuntimeError",
+        app[DIAGNOSTICS_KEY]["last_update_error"],
+    )
     assert feishu_client.updated == []
 
 
@@ -8065,7 +8069,9 @@ async def test_routed_update_failure_reports_safe_bot_id():
     assert started.status == 200
     assert updated.status == 200
     # Lock optimization: non-terminal update failures no longer return 502
-    assert health_body["diagnostics"]["last_update_error"] == "bot_id=sales RuntimeError"
+    last_update_error = health_body["diagnostics"]["last_update_error"]
+    assert re.fullmatch(r"bot_hash=[0-9a-f]{12} RuntimeError", last_update_error)
+    assert "sales" not in last_update_error
     assert "secret" not in health_body["diagnostics"]["last_update_error"].lower()
     assert "token" not in health_body["diagnostics"]["last_update_error"].lower()
 
@@ -8106,12 +8112,21 @@ async def test_routed_update_failure_redacts_sensitive_exception_text():
     last_update_error = health_body["diagnostics"]["last_update_error"]
     assert updated.status == 200
     # Lock optimization: non-terminal update failures no longer return 502
-    assert "bot_id=sales" in last_update_error
+    assert re.search(r"bot_hash=[0-9a-f]{12}", last_update_error)
+    assert "sales" not in last_update_error
     assert "RuntimeError" in last_update_error
     assert "tenant-token-secret" not in last_update_error
     assert "super-secret" not in last_update_error
     assert "Authorization" not in last_update_error
     assert "Bearer" not in last_update_error
+
+
+def test_diagnostic_hash_is_fixed_width_and_domain_separated():
+    bot_hash = sidecar_server._diagnostic_id_hash("sales", domain="bot")
+
+    assert re.fullmatch(r"[0-9a-f]{12}", bot_hash)
+    assert bot_hash == sidecar_server._diagnostic_id_hash("sales", domain="bot")
+    assert bot_hash != sidecar_server._diagnostic_id_hash("sales", domain="chat")
 
 
 async def test_session_key_uses_profile_id():

@@ -272,6 +272,8 @@ This is a sidecar-only design: the Hermes hook stays fail-open, while Feishu del
 ## Security
 Default `127.0.0.1` uses local-process trust; do not expose an unauthenticated sidecar to the network. Non-loopback starts only with explicit `server.allow_non_loopback: true` and requires state-directory HMAC event authentication, which does not replace TLS. Do not commit App Secret, tenant token, real chat_id, or unredacted screenshots. Production credentials belong in local config or environment variables.
 
+Windows non-loopback startup is rejected when state-directory ACL privacy cannot be verified. Windows loopback remains available under local-process trust without claiming that ACL privacy has been verified.
+
 ## License
 
 MIT License. See [LICENSE](LICENSE).

@@ -271,6 +271,9 @@ Hermes Gateway
 
 ## 安全说明
 默认 `127.0.0.1` 采用本机进程互信；不要把 sidecar 未鉴权暴露到网络。非 loopback 只有显式设置 `server.allow_non_loopback: true` 才能启动，并强制使用私有 state directory 的 HMAC 事件鉴权；它不替代 TLS。不要把 App Secret、tenant token、真实 chat_id、未脱敏截图提交到仓库，生产凭据应保存在本机配置或环境变量中。
+
+Windows non-loopback 在无法验证 state directory 的 ACL 私有性时会拒绝启动；Windows loopback 仍可使用本机进程互信，但不会宣称 ACL 私有性已经验证。
+
 ## License
 
 MIT License，详见 [LICENSE](LICENSE)。

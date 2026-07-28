@@ -174,6 +174,10 @@ def resolve_operations_hermes_root(
     """Resolve the local Hermes source root without adding user configuration."""
     if explicit:
         return Path(explicit).expanduser()
+    for name in ("HERMES_DIR", "HFC_HERMES_DIR", "HERMES_AGENT_ROOT"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return Path(value).expanduser()
     if env_file is not None:
         dotenv = _read_dotenv(Path(env_file).expanduser())
         value = dotenv.get("HERMES_DIR", "").strip()
@@ -182,10 +186,6 @@ def resolve_operations_hermes_root(
     if config_path is not None:
         dotenv = _read_dotenv(Path(config_path).expanduser().parent / ".env")
         value = dotenv.get("HERMES_DIR", "").strip()
-        if value:
-            return Path(value).expanduser()
-    for name in ("HERMES_DIR", "HFC_HERMES_DIR", "HERMES_AGENT_ROOT"):
-        value = os.environ.get(name, "").strip()
         if value:
             return Path(value).expanduser()
     current = Path.cwd()

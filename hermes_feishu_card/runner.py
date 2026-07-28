@@ -15,7 +15,10 @@ from .delivery_policy import ReloadingDeliveryPolicyProvider
 from .event_auth import is_loopback_host
 from .feishu_client import FeishuAPIError, FeishuClient, FeishuClientConfig
 from .server import create_app
-from .operations_transport import ensure_transport_root_secret
+from .operations_transport import (
+    ensure_transport_root_secret,
+    transport_root_privacy_verified,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -219,6 +222,17 @@ def main(argv: list[str] | None = None) -> int:
     if event_auth_required and operations_transport_root_secret is None:
         raise RuntimeError(
             "non-loopback sidecar binding requires event authentication"
+        )
+    transport_privacy_verified = transport_root_privacy_verified()
+    if event_auth_required and not transport_privacy_verified:
+        raise RuntimeError(
+            "non-loopback sidecar binding requires a private state directory "
+            "with verified access controls"
+        )
+    if not event_auth_required and not transport_privacy_verified:
+        logger.warning(
+            "State-directory ACL privacy is unverified on this platform; "
+            "continuing with loopback local-process trust only."
         )
     noop_mode = not _has_any_feishu_credentials(config)
     delivery_policy = ReloadingDeliveryPolicyProvider(

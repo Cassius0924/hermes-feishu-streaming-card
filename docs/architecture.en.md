@@ -45,6 +45,8 @@ The default `server.host: 127.0.0.1` uses **local-process trust**. For upgrade c
 
 A non-loopback listener is rejected by default. Binding is allowed only with explicit `server.allow_non_loopback: true`, and the sidecar then requires a domain-separated HMAC event authentication proof over the raw request body, timestamp, and nonce. Missing, incorrect, expired, or replayed proofs are rejected before event parsing or card delivery. The root secret never enters YAML, environment files, cards, logs, or health output.
 
+Windows non-loopback startup fails closed when state-directory ACL privacy cannot be verified. Windows loopback continues under local-process trust without claiming that ACL privacy has been verified.
+
 Event authentication provides source authentication and integrity, not HTTP encryption. Non-loopback mode is only for trusted containers or private networks that share the private state directory. Do not expose the sidecar directly to the public internet; public deployment requires an additional TLS/mTLS or controlled reverse-proxy boundary.
 
 | Endpoint | Default boundary |

@@ -190,7 +190,9 @@ def test_operations_hermes_root_uses_process_hint_without_user_config(
     assert resolve_operations_hermes_root() == hinted
 
 
-def test_operations_hermes_root_prefers_explicit_then_config_env_file(monkeypatch, tmp_path):
+def test_operations_hermes_root_prefers_explicit_then_process_environment(
+    monkeypatch, tmp_path
+):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("server: {}\n", encoding="utf-8")
     dotenv_root = tmp_path / "from-dotenv"
@@ -199,14 +201,14 @@ def test_operations_hermes_root_prefers_explicit_then_config_env_file(monkeypatc
     (tmp_path / ".env").write_text(f"HERMES_DIR={dotenv_root}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_DIR", str(process_root))
 
-    assert resolve_operations_hermes_root(config_path=config_path) == dotenv_root
+    assert resolve_operations_hermes_root(config_path=config_path) == process_root
     assert (
         resolve_operations_hermes_root(explicit_root, config_path=config_path)
         == explicit_root
     )
 
 
-def test_operations_hermes_root_prefers_selected_env_file_over_config_and_process(
+def test_operations_hermes_root_prefers_process_environment_over_selected_env_file(
     monkeypatch, tmp_path
 ):
     config_path = tmp_path / "config.yaml"
@@ -215,6 +217,20 @@ def test_operations_hermes_root_prefers_selected_env_file_over_config_and_proces
     (tmp_path / ".env").write_text("HERMES_DIR=config-root\n", encoding="utf-8")
     selected_env.write_text("HERMES_DIR=selected-root\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_DIR", "process-root")
+
+    assert resolve_operations_hermes_root(
+        config_path=config_path, env_file=selected_env
+    ) == Path("process-root")
+
+
+def test_operations_hermes_root_uses_selected_env_before_config_env(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    selected_env = tmp_path / "selected.env"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("HERMES_DIR=config-root\n", encoding="utf-8")
+    selected_env.write_text("HERMES_DIR=selected-root\n", encoding="utf-8")
+    for name in ("HERMES_DIR", "HFC_HERMES_DIR", "HERMES_AGENT_ROOT"):
+        monkeypatch.delenv(name, raising=False)
 
     assert resolve_operations_hermes_root(
         config_path=config_path, env_file=selected_env

@@ -67,6 +67,24 @@ def read_transport_root_secret(directory: str | Path | None = None) -> bytes | N
     return _read_secret_bytes(root, path)
 
 
+def transport_root_privacy_verified(directory: str | Path | None = None) -> bool:
+    """Return true only when this runtime can prove private directory access."""
+    if _is_windows():
+        # POSIX mode bits do not prove Windows ACL privacy. Until a stable ACL
+        # verifier exists, this directory cannot back non-loopback trust.
+        return False
+    root = Path(directory).expanduser() if directory is not None else state_dir()
+    root_stat = _path_lstat(root)
+    if root_stat is None or not stat.S_ISDIR(root_stat.st_mode):
+        return False
+    getuid = getattr(os, "getuid", None)
+    return bool(
+        callable(getuid)
+        and root_stat.st_uid == getuid()
+        and stat.S_IMODE(root_stat.st_mode) == 0o700
+    )
+
+
 def _read_secret_bytes(root: Path, path: Path) -> bytes | None:
     if not _valid_transport_root(root):
         return None

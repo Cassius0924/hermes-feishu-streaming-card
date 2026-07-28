@@ -431,6 +431,7 @@ V3.6.0 面向真实线上使用后的排障和维护场景：当 Hermes 升级�
 
 - 默认 `server.host: 127.0.0.1` 属于本机进程互信；不要把 sidecar 未鉴权暴露到网络。
 - 非 loopback 必须显式设置 `server.allow_non_loopback: true`，并强制使用私有 state directory 的 HMAC 事件鉴权；事件鉴权不提供加密，公网仍需 TLS/mTLS 或受控反向代理。
+- Windows non-loopback 在无法验证 state directory 的 ACL 私有性时拒绝启动；Windows loopback 继续使用本机进程互信，但不宣称 ACL 私有性已验证。
 - `--config` 指向的配置文件同目录存在 `.env` 时，会自动读取 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`HERMES_FEISHU_CARD_HOST`、`HERMES_FEISHU_CARD_PORT`；`setup` / `start --env-file ...` 选中的 env file 也会进入同一配置加载链。
 - 优先级固定为 YAML < 配置同目录 `.env` < 显式选中的 env file < 真实进程环境变量；不会隐式读取全局 `~/.hermes/.env`。
 - 多 Profile 模式下继续要求每个 profile 显式配置 Feishu 凭据，顶层环境变量不会覆盖 profile 凭据。

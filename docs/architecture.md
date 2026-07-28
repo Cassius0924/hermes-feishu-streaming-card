@@ -45,6 +45,8 @@ Hermes hook 到 sidecar `/events` 的 fail-open 转发链路已经落地：sidec
 
 非 loopback listener 默认拒绝启动。只有显式设置 `server.allow_non_loopback: true` 才允许绑定，并且 sidecar 会强制校验基于私有 transport root、请求原始 body、时间戳和 nonce 的 HMAC 事件鉴权 proof；缺失、错误、过期或重放 proof 都在事件解析和发卡前拒绝。root secret 使用独立事件域分隔，不写进 YAML、env、卡片、日志或健康检查。
 
+Windows non-loopback 在无法验证 state directory 的 ACL 私有性时 fail-closed；Windows loopback 继续使用本机进程互信，但不宣称 ACL 私有性已验证。
+
 事件鉴权只证明请求来源和完整性，不为 HTTP 内容加密。非 loopback 只适合共享同一私有 state directory 的受信容器/私有网络；不要把 sidecar 直接暴露到公网。公网部署需要额外的 TLS/mTLS 或受控反向代理边界。
 
 | 端点 | 默认边界 |

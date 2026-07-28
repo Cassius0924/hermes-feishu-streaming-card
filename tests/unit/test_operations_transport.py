@@ -4,6 +4,7 @@ import os
 
 import pytest
 
+from hermes_feishu_card import operations_transport
 from hermes_feishu_card.event_auth import (
     EventAuthenticationError,
     EventProofVerifier,
@@ -70,6 +71,22 @@ def test_windows_transport_uses_regular_secret_without_posix_mode_checks(monkeyp
     (state_dir / "operations.transport.key").chmod(0o644)
 
     assert read_transport_root_secret(state_dir) == secret
+    privacy_check = getattr(
+        operations_transport, "transport_root_privacy_verified", None
+    )
+    assert privacy_check is not None
+    assert privacy_check(state_dir) is False
+
+
+def test_posix_private_transport_root_has_verified_privacy(tmp_path):
+    state_dir = tmp_path / "state"
+    ensure_transport_root_secret(state_dir)
+
+    privacy_check = getattr(
+        operations_transport, "transport_root_privacy_verified", None
+    )
+    assert privacy_check is not None
+    assert privacy_check(state_dir) is True
 
 
 @pytest.mark.parametrize("windows", [False, True])
