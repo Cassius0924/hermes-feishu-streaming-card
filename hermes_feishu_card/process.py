@@ -91,6 +91,8 @@ def start_sidecar(
         record_file_exists = record_path.exists() or record_path.is_symlink()
     except OSError:
         return "failed: pidfile state could not be inspected; start refused"
+    if record is not None and not _record_identity_valid(record):
+        return "failed: invalid pidfile exists; start refused"
     if health is not None:
         if record is None or not _record_identity_valid(record):
             return (
@@ -107,9 +109,18 @@ def start_sidecar(
     elif record is None and record_file_exists:
         return "failed: invalid pidfile exists; start refused"
     elif record is not None:
-        if _record_manager(record) != "detached" or pid_is_running(record["pid"]):
+        record_manager = _record_manager(record)
+        if (
+            record_manager in {"systemd-user", "systemd-system"}
+            and _explicit_systemd_manager(config) == record_manager
+        ):
+            if not _stop_owned_record(record):
+                return "failed: owned systemd sidecar could not be stopped for recovery"
+            clear_pid()
+        elif record_manager != "detached" or pid_is_running(record["pid"]):
             return "failed: owned sidecar health is unavailable; start refused"
-        clear_pid()
+        else:
+            clear_pid()
 
     token = secrets.token_hex(16)
     command = _sidecar_command(config_path, env_file=env_file, token=token)
@@ -196,6 +207,12 @@ def stop_sidecar(config: dict[str, dict[str, Any]]) -> str:
         return f"failed: {state_error}"
     record = read_pid_record()
     if record is None:
+        try:
+            record_file_exists = pid_path().exists() or pid_path().is_symlink()
+        except OSError:
+            return "failed: pidfile state could not be inspected; stop refused"
+        if record_file_exists:
+            return "failed: invalid pidfile exists; stop refused"
         if fetch_health(config) is not None:
             return "failed: running sidecar has no pidfile"
         return "not running"
@@ -206,7 +223,10 @@ def stop_sidecar(config: dict[str, dict[str, Any]]) -> str:
     manager = _record_manager(record)
     health = fetch_health(config)
     if manager in {"systemd-user", "systemd-system"}:
-        if health is None or not _record_matches_health(record, health):
+        if health is None:
+            if _explicit_systemd_manager(config) != manager:
+                return "failed: pidfile identity mismatch"
+        elif not _record_matches_health(record, health):
             return "failed: pidfile identity mismatch"
         unit = str(record["unit"])
         if not _stop_systemd_sidecar(manager, unit):
@@ -259,15 +279,33 @@ def read_pid_record() -> dict[str, Any] | None:
     path = pid_path()
     if path.is_symlink():
         return None
+    descriptor: int | None = None
     try:
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor = os.open(str(path), flags)
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return None
+        if _supports_posix_state_permissions():
+            getuid = getattr(os, "getuid", None)
+            if callable(getuid) and metadata.st_uid != getuid():
+                return None
+            if stat.S_IMODE(metadata.st_mode) != 0o600:
+                return None
+        handle = os.fdopen(descriptor, "r", encoding="utf-8")
+        descriptor = None
+        with handle:
             text = handle.read(4097)
     except (OSError, UnicodeError):
         return None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
     if len(text) > 4096:
         return None
     text = text.strip()
@@ -384,10 +422,17 @@ def _state_dir_security_error(
     allow_missing: bool,
     require_private_mode: bool,
 ) -> str:
-    candidate = state_dir().expanduser()
+    configured = state_dir().expanduser()
+    if ".." in configured.parts:
+        return "state directory path must not contain parent traversal"
+    candidate = configured
     if not candidate.is_absolute():
-        candidate = Path.cwd() / candidate
-    if candidate == Path(candidate.anchor):
+        candidate = (Path.cwd() / candidate).absolute()
+    try:
+        canonical = candidate.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return "state directory could not be inspected"
+    if candidate == Path(candidate.anchor) or canonical == Path(canonical.anchor):
         return "state directory must not be filesystem root"
     parts = candidate.parts
     current = Path(parts[0])
@@ -543,8 +588,7 @@ def _systemd_system_available() -> bool:
 def _select_service_manager(
     config: dict[str, dict[str, Any]],
 ) -> tuple[str, str]:
-    service = config.get("service", {})
-    requested = service.get("manager", "auto") if isinstance(service, dict) else "auto"
+    requested = _configured_service_manager(config)
     if requested not in SERVICE_MANAGER_VALUES:
         return "", "failed: invalid service.manager"
     if requested == "auto":
@@ -566,6 +610,16 @@ def _select_service_manager(
         "failed: service.manager=systemd-system is unavailable; "
         "it requires Linux with systemd-run and systemctl",
     )
+
+
+def _configured_service_manager(config: dict[str, dict[str, Any]]) -> Any:
+    service = config.get("service", {})
+    return service.get("manager", "auto") if isinstance(service, dict) else "auto"
+
+
+def _explicit_systemd_manager(config: dict[str, dict[str, Any]]) -> str:
+    requested = _configured_service_manager(config)
+    return requested if requested in {"systemd-user", "systemd-system"} else ""
 
 
 def _start_systemd_user_sidecar(command: list[str]) -> bool:

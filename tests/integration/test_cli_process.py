@@ -137,6 +137,7 @@ def test_stop_rejects_pidfile_without_matching_health_token(tmp_path):
             json.dumps({"pid": sleeper.pid, "token": "not-sidecar"}) + "\n",
             encoding="utf-8",
         )
+        pidfile_path(tmp_path).chmod(0o600)
 
         result = run_cli("stop", "--config", str(config), env=env)
 
