@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import secrets
-import signal
 import shutil
 import stat
 import subprocess
@@ -21,6 +20,9 @@ import urllib.request
 DEFAULT_STATE_DIR = Path.home() / ".hermes_feishu_card"
 PIDFILE_NAME = "sidecar.pid"
 LOGFILE_NAME = "sidecar.log"
+CONTROL_SHUTDOWN_PATH = "/control/shutdown"
+CONTROL_TOKEN_HEADER = "X-HFC-Process-Token"
+DETACHED_PIDFILE_HANDSHAKE_SECONDS = 5.0
 SYSTEMD_UNIT_NAME = "hermes-feishu-card-sidecar.service"
 SERVICE_MANAGER_VALUES = frozenset(
     {"auto", "systemd-user", "systemd-system", "detached"}
@@ -77,10 +79,17 @@ def start_sidecar(
     config: dict[str, dict[str, Any]],
     *,
     env_file: str | Path | None = None,
+    hermes_dir: str | Path | None = None,
+    python_executable: str | Path | None = None,
+    expected_package_version: str | None = None,
+    expected_python_identity: str | None = None,
 ) -> str:
     selected_manager, manager_error = _select_service_manager(config)
     if manager_error:
         return manager_error
+    migration = migrate_legacy_pidfile_permissions()
+    if migration.startswith("failed:"):
+        return "failed: invalid pidfile exists; start refused"
     state_error = _prepare_private_state_dir()
     if state_error:
         return state_error
@@ -101,9 +110,33 @@ def start_sidecar(
             )
         if not _record_matches_health(record, health):
             return "failed: running sidecar identity mismatch; migration refused"
-        if _record_manager(record) == selected_manager:
+        if (
+            _record_manager(record) == selected_manager
+            and _health_matches_expected_identity(
+                health,
+                expected_package_version=expected_package_version,
+                expected_python_identity=expected_python_identity,
+            )
+        ):
             return "already running"
-        if not _stop_owned_record(record):
+        current_health = fetch_health(config)
+        if current_health is None or not _record_matches_health(
+            record, current_health
+        ):
+            return "failed: running sidecar changed before stop"
+        if (
+            _record_manager(record) == selected_manager
+            and _health_matches_expected_identity(
+                current_health,
+                expected_package_version=expected_package_version,
+                expected_python_identity=expected_python_identity,
+            )
+        ):
+            return "already running"
+        stop_result = _stop_owned_record(record, config)
+        if stop_result != "stopped":
+            if stop_result == "timeout":
+                return "failed: authenticated sidecar shutdown timed out"
             return "failed: owned sidecar could not be stopped for manager migration"
         clear_pid()
     elif record is None and record_file_exists:
@@ -114,7 +147,7 @@ def start_sidecar(
             record_manager in {"systemd-user", "systemd-system"}
             and _explicit_systemd_manager(config) == record_manager
         ):
-            if not _stop_owned_record(record):
+            if _stop_owned_record(record, config) != "stopped":
                 return "failed: owned systemd sidecar could not be stopped for recovery"
             clear_pid()
         elif record_manager != "detached" or pid_is_running(record["pid"]):
@@ -123,7 +156,14 @@ def start_sidecar(
             clear_pid()
 
     token = secrets.token_hex(16)
-    command = _sidecar_command(config_path, env_file=env_file, token=token)
+    command = _sidecar_command(
+        config_path,
+        env_file=env_file,
+        token=token,
+        hermes_dir=hermes_dir,
+        managed_pidfile=selected_manager == "detached",
+        python_executable=python_executable,
+    )
 
     if selected_manager in {"systemd-user", "systemd-system"}:
         unit = _expected_unit(selected_manager)
@@ -144,6 +184,11 @@ def start_sidecar(
             if (
                 health is not None
                 and _health_matches_token(health, token)
+                and _health_matches_expected_identity(
+                    health,
+                    expected_package_version=expected_package_version,
+                    expected_python_identity=expected_python_identity,
+                )
             ):
                 try:
                     write_pid_record(
@@ -168,6 +213,7 @@ def start_sidecar(
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            cwd=_private_state_working_directory(),
         )
     finally:
         log_handle.close()
@@ -175,30 +221,46 @@ def start_sidecar(
     try:
         write_pid_record(process.pid, token)
     except (OSError, ValueError) as exc:
-        stop_pid(process.pid)
+        _wait_for_child_exit(
+            process,
+            timeout=DETACHED_PIDFILE_HANDSHAKE_SECONDS + 1.0,
+        )
         return f"failed: pidfile could not be written: {exc.__class__.__name__}"
 
+    detached_record = {
+        "pid": process.pid,
+        "token": token,
+        "manager": "detached",
+    }
+    health = None
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         if process.poll() is not None:
             clear_pid()
             return f"failed: process exited with {process.returncode}"
         health = fetch_health(config)
-        detached_record = {
-            "pid": process.pid,
-            "token": token,
-            "manager": "detached",
-        }
-        if health is not None and _record_matches_health(detached_record, health):
+        if (
+            health is not None
+            and _record_matches_health(detached_record, health)
+            and _health_matches_expected_identity(
+                health,
+                expected_package_version=expected_package_version,
+                expected_python_identity=expected_python_identity,
+            )
+        ):
             return "started"
         time.sleep(0.1)
 
-    stop_pid(process.pid)
-    clear_pid()
+    if health is not None and _record_matches_health(detached_record, health):
+        if _stop_owned_record(detached_record, config) == "stopped":
+            clear_pid()
     return "failed: health check timed out"
 
 
 def stop_sidecar(config: dict[str, dict[str, Any]]) -> str:
+    migration = migrate_legacy_pidfile_permissions()
+    if migration.startswith("failed:"):
+        return "failed: invalid pidfile exists; stop refused"
     state_error = _state_dir_security_error(
         allow_missing=True,
         require_private_mode=True,
@@ -214,7 +276,7 @@ def stop_sidecar(config: dict[str, dict[str, Any]]) -> str:
         if record_file_exists:
             return "failed: invalid pidfile exists; stop refused"
         if fetch_health(config) is not None:
-            return "failed: running sidecar has no pidfile"
+            return "failed: running sidecar has no pidfile; stop refused"
         return "not running"
 
     if not _record_identity_valid(record):
@@ -228,6 +290,8 @@ def stop_sidecar(config: dict[str, dict[str, Any]]) -> str:
                 return "failed: pidfile identity mismatch"
         elif not _record_matches_health(record, health):
             return "failed: pidfile identity mismatch"
+        elif not _record_matches_health(record, fetch_health(config) or {}):
+            return "failed: pidfile identity changed before stop"
         unit = str(record["unit"])
         if not _stop_systemd_sidecar(manager, unit):
             label = "user" if manager == "systemd-user" else "system"
@@ -242,15 +306,20 @@ def stop_sidecar(config: dict[str, dict[str, Any]]) -> str:
     if not _record_matches_health(record, health):
         return "failed: pidfile identity mismatch"
 
-    if pid_is_running(pid):
-        stop_pid(pid)
+    if not _record_matches_health(record, fetch_health(config) or {}):
+        return "failed: pidfile identity changed before stop"
+    stop_result = _stop_owned_record(record, config)
+    if stop_result == "timeout":
+        return "failed: authenticated sidecar shutdown timed out"
+    if stop_result != "stopped":
+        return "failed: authenticated sidecar shutdown refused"
     clear_pid()
     return "stopped"
 
 
 def fetch_health(config: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
     server = config["server"]
-    host = str(server["host"])
+    host = local_control_host(str(server["host"]))
     url_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
     url = f"http://{url_host}:{server['port']}/health"
     try:
@@ -261,6 +330,135 @@ def fetch_health(config: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
     if isinstance(payload, dict) and payload.get("status") in {"healthy", "degraded"}:
         return payload
     return None
+
+
+def local_control_host(configured_host: str) -> str:
+    """Return the loopback endpoint paired with the configured listener."""
+    normalized = configured_host.strip().lower().strip("[]")
+    if normalized in {"", "0.0.0.0"}:
+        return "127.0.0.1"
+    if normalized == "::":
+        return "::1"
+    if normalized == "localhost" or normalized.startswith("127."):
+        return normalized
+    if normalized == "::1":
+        return normalized
+    return "::1" if ":" in normalized else "127.0.0.1"
+
+
+def migrate_legacy_pidfile_permissions() -> str:
+    """Tighten a known official 0644 pidfile without replacing its inode."""
+    if os.name == "nt" or not callable(getattr(os, "getuid", None)):
+        return "not needed"
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        return "failed: secure legacy pidfile migration is unavailable"
+    root = state_dir().expanduser()
+    state_error = _state_dir_security_error(
+        allow_missing=False,
+        require_private_mode=False,
+    )
+    if state_error:
+        return "not needed"
+
+    root_descriptor = -1
+    record_descriptor = -1
+    try:
+        root_descriptor = os.open(
+            str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+        opened_root = os.fstat(root_descriptor)
+        current_root = os.lstat(root)
+        getuid = os.getuid
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or opened_root.st_uid != getuid()
+            or opened_root.st_dev != current_root.st_dev
+            or opened_root.st_ino != current_root.st_ino
+        ):
+            return "failed: legacy pidfile state is not safely owned"
+        try:
+            record_descriptor = os.open(
+                PIDFILE_NAME,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=root_descriptor,
+            )
+        except FileNotFoundError:
+            return "not needed"
+        opened = os.fstat(record_descriptor)
+        if stat.S_IMODE(opened_root.st_mode) != 0o700:
+            return "failed: legacy pidfile state directory must already be private"
+        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != getuid():
+            return "failed: legacy pidfile could not be verified"
+        mode = stat.S_IMODE(opened.st_mode)
+        if mode == 0o600:
+            return "not needed"
+        if mode != 0o644:
+            return "failed: legacy pidfile could not be verified"
+        raw = os.read(record_descriptor, 4097)
+        if len(raw) > 4096 or not _known_legacy_record(raw):
+            return "failed: legacy pidfile could not be verified"
+        before_change = os.fstat(record_descriptor)
+        if not _same_pidfile_snapshot(opened, before_change):
+            return "failed: legacy pidfile changed during verification"
+        os.fchmod(record_descriptor, 0o600)
+        os.fsync(record_descriptor)
+        after_change = os.fstat(record_descriptor)
+        final_root = os.fstat(root_descriptor)
+        if (
+            after_change.st_dev != opened.st_dev
+            or after_change.st_ino != opened.st_ino
+            or after_change.st_uid != opened.st_uid
+            or stat.S_IMODE(after_change.st_mode) != 0o600
+            or final_root.st_dev != opened_root.st_dev
+            or final_root.st_ino != opened_root.st_ino
+        ):
+            return "failed: legacy pidfile changed during migration"
+        return "migrated"
+    except OSError:
+        return "failed: legacy pidfile could not be migrated safely"
+    finally:
+        if record_descriptor >= 0:
+            os.close(record_descriptor)
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+
+
+def _known_legacy_record(raw: bytes) -> bool:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    keys = set(payload)
+    manager = payload.get("manager", "detached")
+    if manager == "detached":
+        if keys not in ({"pid", "token"}, {"pid", "token", "manager"}):
+            return False
+    elif manager in {"systemd-user", "systemd-system"}:
+        if keys != {"pid", "token", "manager", "unit"}:
+            return False
+    else:
+        return False
+    normalized = {
+        "pid": payload.get("pid"),
+        "token": payload.get("token"),
+        "manager": manager,
+    }
+    if "unit" in payload:
+        normalized["unit"] = payload.get("unit")
+    return _record_identity_valid(normalized)
+
+
+def _same_pidfile_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
+    return bool(
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_uid == right.st_uid
+        and left.st_mode == right.st_mode
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+    )
 
 
 def _open_health_url(url: str, timeout: float):
@@ -373,10 +571,19 @@ def _sidecar_command(
     *,
     env_file: str | Path | None,
     token: str,
+    hermes_dir: str | Path | None = None,
+    managed_pidfile: bool = False,
+    python_executable: str | Path | None = None,
 ) -> list[str]:
     resolved_config = Path(config_path).expanduser().resolve(strict=False)
+    selected_python = (
+        str(Path(python_executable).expanduser())
+        if python_executable is not None
+        else sys.executable
+    )
     command = [
-        sys.executable,
+        selected_python,
+        "-I",
         "-m",
         "hermes_feishu_card.runner",
         "--config",
@@ -385,8 +592,40 @@ def _sidecar_command(
     if env_file is not None:
         resolved_env = Path(env_file).expanduser().resolve(strict=False)
         command.extend(("--env-file", str(resolved_env)))
+    if hermes_dir is not None:
+        resolved_hermes_dir = Path(hermes_dir).expanduser().resolve(strict=False)
+        command.extend(("--hermes-dir", str(resolved_hermes_dir)))
+    if managed_pidfile:
+        command.append("--managed-pidfile")
     command.extend(("--token", token))
     return command
+
+
+def wait_for_managed_pidfile(
+    pid: int,
+    token: str,
+    *,
+    timeout: float = DETACHED_PIDFILE_HANDSHAKE_SECONDS,
+) -> bool:
+    """Wait until the launcher has persisted this exact detached identity."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or not token:
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        record = read_pid_record()
+        if record == {"pid": pid, "token": token, "manager": "detached"}:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _wait_for_child_exit(process: Any, *, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return True
+        time.sleep(0.05)
+    return process.poll() is not None
 
 
 def _prepare_private_state_dir() -> str:
@@ -521,14 +760,72 @@ def _health_matches_token(health: dict[str, Any], token: str) -> bool:
     )
 
 
-def _stop_owned_record(record: dict[str, Any]) -> bool:
+def _health_matches_expected_identity(
+    health: dict[str, Any],
+    *,
+    expected_package_version: str | None,
+    expected_python_identity: str | None,
+) -> bool:
+    if (
+        expected_package_version is not None
+        and health.get("package_version") != expected_package_version
+    ):
+        return False
+    if (
+        expected_python_identity is not None
+        and health.get("python_identity") != expected_python_identity
+    ):
+        return False
+    return True
+
+
+def _stop_owned_record(
+    record: dict[str, Any],
+    config: dict[str, dict[str, Any]],
+) -> str:
     manager = _record_manager(record)
     if manager == "detached":
-        # The caller has already matched PID + token against live health.
-        # stop_pid() is itself tolerant of a process exiting between checks.
-        stop_pid(record["pid"])
-        return True
-    return _stop_systemd_sidecar(manager, str(record["unit"]))
+        if not _request_authenticated_shutdown(config, str(record["token"])):
+            return "request-refused"
+        return "stopped" if _wait_for_health_disappearance(config) else "timeout"
+    return (
+        "stopped"
+        if _stop_systemd_sidecar(manager, str(record["unit"]))
+        else "manager-failed"
+    )
+
+
+def _request_authenticated_shutdown(
+    config: dict[str, dict[str, Any]], token: str
+) -> bool:
+    server = config["server"]
+    control_host = local_control_host(str(server["host"]))
+    url_host = f"[{control_host}]" if ":" in control_host else control_host
+    request = urllib.request.Request(
+        f"http://{url_host}:{server['port']}{CONTROL_SHUTDOWN_PATH}",
+        data=b"",
+        headers={CONTROL_TOKEN_HEADER: token},
+        method="POST",
+    )
+    try:
+        with _NO_PROXY_OPENER.open(request, timeout=0.8) as response:
+            if getattr(response, "status", None) != 202:
+                return False
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
+    return payload == {"ok": True, "status": "stopping"}
+
+
+def _wait_for_health_disappearance(
+    config: dict[str, dict[str, Any]], *, timeout: float = 5.0
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if fetch_health(config) is None:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _stop_systemd_sidecar(manager: str, unit: str) -> bool:
@@ -632,6 +929,7 @@ def _start_systemd_user_sidecar(command: list[str]) -> bool:
                 f"--unit={SYSTEMD_UNIT_NAME}",
                 "--collect",
                 _systemd_state_environment_arg(),
+                _systemd_working_directory_arg(),
                 "--property=Type=exec",
                 "--property=Restart=on-failure",
                 "--property=RestartSec=2s",
@@ -663,6 +961,7 @@ def _start_systemd_system_sidecar(command: list[str], unit: str) -> bool:
                 f"--unit={unit}",
                 "--collect",
                 _systemd_state_environment_arg(),
+                _systemd_working_directory_arg(),
                 f"--uid={os.getuid()}",
                 f"--gid={os.getgid()}",
                 "--property=Type=exec",
@@ -687,6 +986,15 @@ def _start_systemd_system_sidecar(command: list[str], unit: str) -> bool:
 
 def _systemd_state_environment_arg() -> str:
     return f"--setenv=HERMES_FEISHU_CARD_STATE_DIR={state_dir().expanduser()}"
+
+
+def _private_state_working_directory() -> str:
+    return str(state_dir().expanduser().resolve(strict=False))
+
+
+def _systemd_working_directory_arg() -> str:
+    working_directory = _private_state_working_directory().replace("%", "%%")
+    return f"--property=WorkingDirectory={working_directory}"
 
 
 def _stop_systemd_user_sidecar(unit: str) -> bool:
@@ -738,24 +1046,8 @@ def pid_is_running(pid: int) -> bool:
 
 
 def stop_pid(pid: int) -> None:
-    if sys.platform == "win32":
-        _stop_pid_windows(pid)
-        return
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(pid, sig)
-        except ProcessLookupError:
-            return
-        except OSError:
-            try:
-                os.kill(pid, sig)
-            except ProcessLookupError:
-                return
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            if not pid_is_running(pid):
-                return
-            time.sleep(0.05)
+    del pid
+    raise RuntimeError("numeric PID termination is disabled")
 
 
 def _pid_is_running_windows(pid: int) -> bool:
@@ -773,21 +1065,8 @@ def _pid_is_running_windows(pid: int) -> bool:
 
 
 def _stop_pid_windows(pid: int) -> None:
-    try:
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            check=False,
-        )
-    except (FileNotFoundError, OSError, subprocess.SubprocessError):
-        return
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        if not pid_is_running(pid):
-            return
-        time.sleep(0.05)
+    del pid
+    raise RuntimeError("numeric PID termination is disabled")
 
 
 def pid_path() -> Path:

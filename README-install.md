@@ -141,6 +141,24 @@ safe mode, run `hermes-feishu-card integrity migrate-safe --config CONFIG
 `gateway.restart_required: false`; a later strict repair may require an
 operator-chosen Gateway restart, but HFC never performs it automatically.
 
+V4.1.1 makes the upgrade path identity-aware. `setup/install` probes the
+detected Hermes runtime venv with isolated Python, requires the package to come
+from that venv's `site-packages`, and compares package/Python identity from
+sidecar `/health` before a managed restart. The verified canonical Hermes root
+is passed directly to the runner, so a conflicting selected environment cannot
+retarget monitoring. A detached child verifies its exact PID/token manager
+record before reading config or listening; failed parent registration makes the
+child exit itself. Detached V4.1.1 sidecars stop by a loopback process-token
+request and never by signalling a numeric PID/PGID. A specifically configured
+non-loopback listener receives a same-family loopback management listener for
+local health and shutdown; wildcard listeners are not duplicated. Stop
+pre-V4.1.1 or pidfile-less sidecars manually before rerunning setup. Waiting for
+the first authenticated heartbeat does not create a fence when the verified
+disk plan is already installed. Use `integrity acknowledge-review` only for a
+twice-verified installed plan, stopped sidecar, absent pidfile, matching
+target-bound fence, and unchanged CAS snapshot; then manually restart sidecar
+and Hermes Gateway.
+
 Hermes compatibility evidence is reported at two different levels:
 
 | Hermes release | Automated strategy detection | Real-source validation |
@@ -234,7 +252,7 @@ a privileged container, or mount host system-service directories.
 ```
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.1.0
+export HFC_VERSION=v4.1.1
 bash install-docker.sh
 ```
 
@@ -250,6 +268,10 @@ sanitized health metrics. A passing automated gate is required before release,
 but it does not replace acceptance on a real Docker deployment or in real
 Feishu. Real Docker and real Feishu scenarios remain pending acceptance until
 their respective release evidence is recorded.
+
+V4.1.1 must repeat this gate with the Hermes-venv package/Python identity and
+upgrade-restart branches. That result remains pending until the release
+candidate workflow completes.
 
 ## One-Line Install
 

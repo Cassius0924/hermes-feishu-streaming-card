@@ -57,6 +57,31 @@ python3 -m hermes_feishu_card.cli status --config config.yaml.example
 
 `status` should show `status: running`, `active_sessions`, and metrics. Without Feishu credentials, advanced starts use a no-op client. With credentials, the sidecar reads them only from local config or environment variables.
 
+## Upgrading From V4.1.0 To V4.1.1
+
+V4.1.1 fixes the boundary where disk state is current but a running sidecar still uses an old interpreter/package, as well as an incorrect fence while waiting for the first heartbeat. Continue to use official setup/install and never edit Hermes source manually:
+
+```bash
+hermes-feishu-card doctor --config CONFIG --hermes-dir HERMES_DIR --explain
+hermes-feishu-card stop --config CONFIG
+hermes-feishu-card setup --config CONFIG --hermes-dir HERMES_DIR --yes
+```
+
+Setup installs and rechecks V4.1.1 through the detected Hermes runtime venv and uses the package version and Python identity from `/health` to decide whether an old sidecar must restart. A running old sidecar without a pidfile is never silently adopted or killed. Stop that service manually and rerun setup; do not substitute a guessed PID or broad `pkill`.
+
+Only when `doctor --explain` confirms an `installed` on-disk plan, sidecar health is unreachable, no pidfile exists in the state directory, and `manual_review_required` remains may you run:
+
+```bash
+hermes-feishu-card integrity acknowledge-review \
+  --config CONFIG \
+  --hermes-dir HERMES_DIR \
+  --yes
+```
+
+An empty `pre_repair_runtime_hash` means runtime identity cannot prove a process transition, so operator acknowledgement may clear that otherwise unresolvable fence. A non-empty hash clears only the manual-review bit; the Gateway restart fence remains until a different runtime id sends a generation/package-matching `runtime.hello`. Then manually restart sidecar and Hermes Gateway and confirm ready through `doctor` / `/health`. Dirty targets, unknown manifests/backups, non-private state/fence files, or a remaining pidfile must be resolved first; `acknowledge-review` is not a force-clear command.
+
+A legacy `0644` pidfile can be tightened in place to `0600` only inside a current-user-owned private `0700` state directory with a strictly matching shape and identity. Every other case fails closed.
+
 ## Upgrading To V4.1.0
 
 V4.1.0 preserves cards as the default and does not silently mutate an old configuration. Upgrade the package and rerun setup/install first, then add only the controls you need:

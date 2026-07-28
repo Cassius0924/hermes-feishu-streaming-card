@@ -66,6 +66,8 @@ Since V3.8.2, the final answer stays in the primary content area while pre-tool 
 
 ## V4.1.0 Delivery Policy, Content Protection, and Runtime Safety
 
+V4.1.1 fixes upgrade recovery without changing the delivery experience below: waiting for the first heartbeat writes no persistent fence; `integrity acknowledge-review` is constrained by two plan checks, a stopped sidecar, no pidfile, target binding, and a CAS snapshot; setup rechecks the Hermes venv with isolated Python and uses `/health` package/Python identity for restart decisions. Detached processes stop through token-authenticated self-shutdown rather than forced numeric PID/PGID signals. See [V4.1 safety controls and troubleshooting](wiki/v4.1-safety-controls.md) for the complete order.
+
 Per-chat switching uses exact matching only:
 
 ```yaml
@@ -479,14 +481,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.1.0`.
+The Compose example defaults `HFC_VERSION` to `v4.1.1`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.1.0
+export HFC_VERSION=v4.1.1
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -729,6 +731,7 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.1.1](release-notes-v4.1.1.en.md) | 2026-07-28 | Upgrade-recovery hotfix: heartbeat waiting without a fence, constrained review acknowledgement, fail-closed legacy pidfile/process handling, and Hermes-venv/running-identity alignment during setup |
 | [v4.1.0](release-notes-v4.1.0.en.md) | 2026-07-28 | Exact per-chat native policy, lossless compact rendering for excess tables, authenticated runtime integrity with strict repair, and four explicit service managers |
 | [v4.0.21](release-notes-v4.0.21.en.md) | 2026-07-28 | Issue #155 archives only at an explicit `answer -> tool` boundary so post-tool final answers stay visible; Issue #147 real Feishu acceptance observed a completion card plus native image and two answer segments in one card with no matching native duplicate or uncertain-delivery warning; it does not claim screenshot or desktop/mobile visual QA |
 | [v4.0.20](release-notes-v4.0.20.en.md) | 2026-07-22 | Issue #153: queued notice ACKs use `accepted`, with redacted metrics and codes for real PATCH failures |

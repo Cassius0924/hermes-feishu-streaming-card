@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import hmac
@@ -30,8 +31,10 @@ _PROOF_MAX_AGE_SECONDS = 5
 _MAX_NONCES = 512
 _RUNTIME_EVENTS = frozenset({"runtime.hello", "runtime.heartbeat"})
 _RUNTIME_INTEGRITY_FENCE_STATE_NAME = "runtime-integrity-fence.json"
-_RUNTIME_INTEGRITY_FENCE_MAX_BYTES = 2048
+_RUNTIME_INTEGRITY_FENCE_LOCK_NAME = ".runtime-integrity-fence.lock"
+_RUNTIME_INTEGRITY_FENCE_MAX_BYTES = 4096
 _RUNTIME_ID_HASH_DOMAIN = b"hfc-runtime-id-v1\0"
+_RUNTIME_FENCE_SNAPSHOT_DOMAIN = b"hfc-runtime-integrity-fence-snapshot-v1\0"
 _RUNTIME_EVENT_FIELDS = frozenset(
     {
         "schema_version",
@@ -57,10 +60,61 @@ class _RuntimeIntegrityFenceStateError(ValueError):
 
 
 @dataclass(frozen=True)
+class RuntimeIntegrityFenceBinding:
+    """Opaque hashes binding a persisted fence to one Hermes target and plan."""
+
+    target_identity: str
+    plan_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.target_identity, str)
+            or not isinstance(self.plan_fingerprint, str)
+            or _SHA256_RE.fullmatch(self.target_identity) is None
+            or _SHA256_RE.fullmatch(self.plan_fingerprint) is None
+        ):
+            raise ValueError("runtime integrity fence binding is invalid")
+
+
+@dataclass(frozen=True)
 class _RuntimeIntegrityFenceState:
     restart_required: bool = False
     manual_review_required: bool = False
     pre_repair_runtime_hash: str = ""
+    binding: RuntimeIntegrityFenceBinding | None = None
+    legacy_unbound: bool = False
+
+
+@dataclass(frozen=True)
+class RuntimeIntegrityReviewSnapshot:
+    state_token: str
+    state_present: bool
+    manual_review_required: bool
+    restart_required: bool
+    binding: RuntimeIntegrityFenceBinding | None
+    legacy_unbound_empty_restart: bool
+
+
+def _review_snapshot(
+    state: _RuntimeIntegrityFenceState,
+    raw: bytes | None,
+) -> RuntimeIntegrityReviewSnapshot:
+    token_material = b"<absent>" if raw is None else raw
+    return RuntimeIntegrityReviewSnapshot(
+        state_token=hashlib.sha256(
+            _RUNTIME_FENCE_SNAPSHOT_DOMAIN + token_material
+        ).hexdigest(),
+        state_present=raw is not None,
+        manual_review_required=state.manual_review_required,
+        restart_required=state.restart_required,
+        binding=state.binding,
+        legacy_unbound_empty_restart=bool(
+            state.legacy_unbound
+            and state.restart_required
+            and state.manual_review_required
+            and not state.pre_repair_runtime_hash
+        ),
+    )
 
 
 class _RuntimeIntegrityFenceStore:
@@ -68,10 +122,25 @@ class _RuntimeIntegrityFenceStore:
         self.root = Path(directory).expanduser()
         self.path = self.root / _RUNTIME_INTEGRITY_FENCE_STATE_NAME
 
+    @contextmanager
+    def locked(self):
+        with _exclusive_private_fence_lock(self.root):
+            yield
+
     def load(self) -> _RuntimeIntegrityFenceState:
+        with self.locked():
+            state, _raw = self._load_unlocked()
+            return state
+
+    def load_snapshot(self) -> RuntimeIntegrityReviewSnapshot:
+        with self.locked():
+            state, raw = self._load_unlocked()
+            return _review_snapshot(state, raw)
+
+    def _load_unlocked(self) -> tuple[_RuntimeIntegrityFenceState, bytes | None]:
         _prepare_private_fence_root(self.root)
         if _fence_lstat(self.path) is None:
-            return _RuntimeIntegrityFenceState()
+            return _RuntimeIntegrityFenceState(), None
         raw = _read_private_fence_file(self.root, self.path)
         try:
             payload = json.loads(raw)
@@ -79,12 +148,23 @@ class _RuntimeIntegrityFenceStore:
             raise _RuntimeIntegrityFenceStateError(
                 "runtime integrity fence state is invalid"
             ) from exc
-        if not isinstance(payload, dict) or set(payload) != {
+        if not isinstance(payload, dict):
+            raise _RuntimeIntegrityFenceStateError(
+                "runtime integrity fence state is invalid"
+            )
+        schema_version = payload.get("schema_version")
+        common_fields = {
             "schema_version",
             "restart_required",
             "manual_review_required",
             "pre_repair_runtime_hash",
-        }:
+        }
+        expected_fields = (
+            common_fields
+            if schema_version == "1"
+            else common_fields | {"target_identity", "plan_fingerprint"}
+        )
+        if schema_version not in {"1", "2"} or set(payload) != expected_fields:
             raise _RuntimeIntegrityFenceStateError(
                 "runtime integrity fence state is invalid"
             )
@@ -92,8 +172,7 @@ class _RuntimeIntegrityFenceStore:
         manual_review_required = payload.get("manual_review_required")
         runtime_hash = payload.get("pre_repair_runtime_hash")
         if (
-            payload.get("schema_version") != "1"
-            or not isinstance(restart_required, bool)
+            not isinstance(restart_required, bool)
             or not isinstance(manual_review_required, bool)
             or not isinstance(runtime_hash, str)
             or (runtime_hash and _SHA256_RE.fullmatch(runtime_hash) is None)
@@ -102,15 +181,34 @@ class _RuntimeIntegrityFenceStore:
             raise _RuntimeIntegrityFenceStateError(
                 "runtime integrity fence state is invalid"
             )
+        binding = None
+        if schema_version == "2":
+            try:
+                binding = RuntimeIntegrityFenceBinding(
+                    target_identity=payload.get("target_identity"),
+                    plan_fingerprint=payload.get("plan_fingerprint"),
+                )
+            except (TypeError, ValueError) as exc:
+                raise _RuntimeIntegrityFenceStateError(
+                    "runtime integrity fence state is invalid"
+                ) from exc
         return _RuntimeIntegrityFenceState(
             restart_required=restart_required,
             manual_review_required=manual_review_required,
             pre_repair_runtime_hash=runtime_hash,
-        )
+            binding=binding,
+            legacy_unbound=schema_version == "1",
+        ), raw
 
     def write(self, state: _RuntimeIntegrityFenceState) -> None:
+        with self.locked():
+            self._write_unlocked(state)
+
+    def _write_unlocked(self, state: _RuntimeIntegrityFenceState) -> None:
         if (
             not isinstance(state, _RuntimeIntegrityFenceState)
+            or state.binding is None
+            or state.legacy_unbound
             or (
                 state.pre_repair_runtime_hash
                 and _SHA256_RE.fullmatch(state.pre_repair_runtime_hash) is None
@@ -124,10 +222,12 @@ class _RuntimeIntegrityFenceStore:
         payload = (
             json.dumps(
                 {
-                    "schema_version": "1",
+                    "schema_version": "2",
                     "restart_required": state.restart_required,
                     "manual_review_required": state.manual_review_required,
                     "pre_repair_runtime_hash": state.pre_repair_runtime_hash,
+                    "target_identity": state.binding.target_identity,
+                    "plan_fingerprint": state.binding.plan_fingerprint,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -135,6 +235,99 @@ class _RuntimeIntegrityFenceStore:
             + "\n"
         ).encode("utf-8")
         _atomic_write_private_fence(self.root, self.path, payload)
+
+    def acknowledge(
+        self,
+        *,
+        expected_state_token: str,
+        expected_binding: RuntimeIntegrityFenceBinding,
+        allow_legacy_unbound_empty_restart: bool,
+    ) -> bool:
+        with self.locked():
+            state, raw = self._load_unlocked()
+            snapshot = _review_snapshot(state, raw)
+            if not hmac.compare_digest(snapshot.state_token, expected_state_token):
+                raise _RuntimeIntegrityFenceStateError(
+                    "runtime integrity fence changed before acknowledgement"
+                )
+            if state.binding is None:
+                if not state.manual_review_required and raw is None:
+                    return False
+                if not (
+                    allow_legacy_unbound_empty_restart
+                    and snapshot.legacy_unbound_empty_restart
+                ):
+                    raise _RuntimeIntegrityFenceStateError(
+                        "runtime integrity fence is not bound"
+                    )
+                output_binding = expected_binding
+            else:
+                if state.binding != expected_binding:
+                    raise _RuntimeIntegrityFenceStateError(
+                        "runtime integrity fence binding changed"
+                    )
+                output_binding = state.binding
+            if not state.manual_review_required:
+                return False
+            unresolved_restart = bool(
+                state.restart_required and not state.pre_repair_runtime_hash
+            )
+            self._write_unlocked(
+                _RuntimeIntegrityFenceState(
+                    restart_required=(
+                        False if unresolved_restart else state.restart_required
+                    ),
+                    manual_review_required=False,
+                    pre_repair_runtime_hash=(
+                        "" if unresolved_restart else state.pre_repair_runtime_hash
+                    ),
+                    binding=output_binding,
+                )
+            )
+            return True
+
+
+def inspect_runtime_integrity_review(
+    state_directory: str | Path,
+) -> RuntimeIntegrityReviewSnapshot:
+    """Return an opaque review snapshot suitable for later CAS acknowledgement."""
+    store = _RuntimeIntegrityFenceStore(state_directory)
+    try:
+        return store.load_snapshot()
+    except (OSError, _RuntimeIntegrityFenceStateError) as exc:
+        raise RuntimeControlValidationError(
+            "runtime integrity review could not be inspected safely"
+        ) from exc
+
+
+def acknowledge_runtime_integrity_review(
+    state_directory: str | Path,
+    *,
+    expected_state_token: str,
+    expected_binding: RuntimeIntegrityFenceBinding,
+    allow_legacy_unbound_empty_restart: bool = False,
+) -> bool:
+    """CAS-clear a bound review fence, with one explicit V4.1.0 migration."""
+    if (
+        not isinstance(expected_state_token, str)
+        or _SHA256_RE.fullmatch(expected_state_token) is None
+        or not isinstance(expected_binding, RuntimeIntegrityFenceBinding)
+        or not isinstance(allow_legacy_unbound_empty_restart, bool)
+    ):
+        raise RuntimeControlValidationError(
+            "runtime integrity review could not be acknowledged safely"
+        )
+    store = _RuntimeIntegrityFenceStore(state_directory)
+    try:
+        return store.acknowledge(
+            expected_state_token=expected_state_token,
+            expected_binding=expected_binding,
+            allow_legacy_unbound_empty_restart=allow_legacy_unbound_empty_restart,
+        )
+    except (OSError, _RuntimeIntegrityFenceStateError) as exc:
+        raise RuntimeControlValidationError(
+            "runtime integrity review could not be acknowledged safely"
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -419,6 +612,8 @@ class RuntimeIntegritySupervisor:
         self._restart_required = False
         self._manual_review_required = False
         self._pre_repair_runtime_hash = ""
+        self._fence_binding: RuntimeIntegrityFenceBinding | None = None
+        self._legacy_unbound_fence = False
         self._fence_store = (
             _RuntimeIntegrityFenceStore(state_directory)
             if state_directory is not None
@@ -433,6 +628,11 @@ class RuntimeIntegritySupervisor:
                 self._restart_required = fence.restart_required
                 self._manual_review_required = fence.manual_review_required
                 self._pre_repair_runtime_hash = fence.pre_repair_runtime_hash
+                self._fence_binding = fence.binding
+                self._legacy_unbound_fence = bool(
+                    fence.legacy_unbound
+                    and (fence.restart_required or fence.manual_review_required)
+                )
         self._control_auth_unavailable = False
         self._lock = threading.Lock()
 
@@ -470,19 +670,56 @@ class RuntimeIntegritySupervisor:
                     self._pre_repair_runtime_hash = previous_hash
         return True
 
-    def mark_restart_required(self) -> None:
+    def mark_restart_required(
+        self,
+        *,
+        binding: RuntimeIntegrityFenceBinding | None = None,
+    ) -> None:
         with self._lock:
+            binding_ready = self._adopt_fence_binding_locked(binding)
             if not self._restart_required:
                 self._pre_repair_runtime_hash = _runtime_id_hash(self._runtime_id)
                 if not self._pre_repair_runtime_hash:
                     self._manual_review_required = True
             self._restart_required = True
+            if not binding_ready:
+                self._manual_review_required = True
+                return
             self._persist_fence_locked()
 
-    def mark_manual_review_required(self) -> None:
+    def mark_manual_review_required(
+        self,
+        *,
+        binding: RuntimeIntegrityFenceBinding | None = None,
+    ) -> None:
         with self._lock:
+            if not self._adopt_fence_binding_locked(binding):
+                self._manual_review_required = True
+                return
             self._manual_review_required = True
             self._persist_fence_locked()
+
+    def _adopt_fence_binding_locked(
+        self,
+        binding: RuntimeIntegrityFenceBinding | None,
+    ) -> bool:
+        if binding is not None and not isinstance(
+            binding, RuntimeIntegrityFenceBinding
+        ):
+            return False
+        if self._legacy_unbound_fence:
+            return False
+        if self._fence_binding is None:
+            if binding is None:
+                return self._fence_store is None
+            self._fence_binding = binding
+            return True
+        if binding is None or binding == self._fence_binding:
+            return True
+        if self._restart_required or self._manual_review_required:
+            return False
+        self._fence_binding = binding
+        return True
 
     def mark_control_auth_unavailable(self) -> None:
         with self._lock:
@@ -491,12 +728,16 @@ class RuntimeIntegritySupervisor:
     def _persist_fence_locked(self) -> bool:
         if self._fence_store is None:
             return True
+        if self._fence_binding is None or self._legacy_unbound_fence:
+            self._manual_review_required = True
+            return False
         try:
             self._fence_store.write(
                 _RuntimeIntegrityFenceState(
                     restart_required=self._restart_required,
                     manual_review_required=self._manual_review_required,
                     pre_repair_runtime_hash=self._pre_repair_runtime_hash,
+                    binding=self._fence_binding,
                 )
             )
         except (OSError, _RuntimeIntegrityFenceStateError):
@@ -660,6 +901,89 @@ def _runtime_id_hash(runtime_id: str) -> str:
 
 def _runtime_signing_input(timestamp: int, nonce: str, body_hash: str) -> bytes:
     return f"hfc-runtime-v1\0{timestamp}\0{nonce}\0{body_hash}".encode("utf-8")
+
+
+@contextmanager
+def _exclusive_private_fence_lock(root: Path):
+    """Serialize all cooperating fence readers/writers across processes."""
+    _prepare_private_fence_root(root)
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
+        import msvcrt
+
+        lock_path = root / _RUNTIME_INTEGRITY_FENCE_LOCK_NAME
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.chmod(lock_path, 0o600)
+            _validate_private_fence_file(lock_path)
+            if os.fstat(descriptor).st_size < 1:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        finally:
+            os.close(descriptor)
+        return
+
+    import fcntl
+
+    root_descriptor = _open_private_fence_root(root)
+    descriptor = -1
+    try:
+        opened_root = os.fstat(root_descriptor)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(
+            _RUNTIME_INTEGRITY_FENCE_LOCK_NAME,
+            flags,
+            0o600,
+            dir_fd=root_descriptor,
+        )
+        os.fchmod(descriptor, 0o600)
+        opened = os.fstat(descriptor)
+        current = _fence_stat_at(
+            root_descriptor, _RUNTIME_INTEGRITY_FENCE_LOCK_NAME
+        )
+        if (
+            current is None
+            or not _same_fence_identity(opened, current)
+            or not _fence_root_matches_descriptor(root, opened_root)
+        ):
+            raise _RuntimeIntegrityFenceStateError(
+                "runtime integrity fence lock changed while opening"
+            )
+        _validate_private_fence_stat(opened)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            current = _fence_stat_at(
+                root_descriptor, _RUNTIME_INTEGRITY_FENCE_LOCK_NAME
+            )
+            if (
+                current is None
+                or not _same_fence_identity(opened, current)
+                or not _fence_root_matches_descriptor(root, opened_root)
+            ):
+                raise _RuntimeIntegrityFenceStateError(
+                    "runtime integrity fence lock changed while waiting"
+                )
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except _RuntimeIntegrityFenceStateError:
+        raise
+    except OSError as exc:
+        raise _RuntimeIntegrityFenceStateError(
+            "runtime integrity fence lock is unavailable"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(root_descriptor)
 
 
 def _prepare_private_fence_root(root: Path) -> None:

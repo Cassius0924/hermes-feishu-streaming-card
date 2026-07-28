@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import warnings
 
 import pytest
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from hermes_feishu_card import hook_runtime
 from hermes_feishu_card import flush as flush_module
@@ -1236,6 +1236,123 @@ def test_create_app_does_not_require_a_current_event_loop():
 
     assert app[sidecar_server.OPERATIONS_DIAGNOSTIC_SEMAPHORE_KEY]["value"] is None
     assert app[sidecar_server.OPERATIONS_PUBLISH_LOCKS_GUARD_KEY]["value"] is None
+
+
+async def test_health_reports_package_and_domain_separated_python_identity_without_path():
+    executable = "/private/example/hermes/.venv/bin/python"
+    identity = sidecar_server.python_executable_identity(executable)
+    app = create_app(
+        FakeFeishuClient(),
+        package_version="4.1.1",
+        python_identity=identity,
+    )
+    request = make_mocked_request("GET", "/health", app=app)
+    response = await sidecar_server._health(request)
+    body = json.loads(response.body)
+
+    assert response.status == 200
+    assert body["package_version"] == "4.1.1"
+    assert body["python_identity"] == identity
+    assert identity.startswith("python-sha256:")
+    assert len(identity.removeprefix("python-sha256:")) == 64
+    assert executable not in json.dumps(body)
+    assert identity != hashlib.sha256(executable.encode("utf-8")).hexdigest()
+
+
+async def test_shutdown_control_requires_matching_process_token_and_never_echoes_it(
+    monkeypatch,
+):
+    process_token = "private-process-token"
+    shutdown_requests: list[bool] = []
+    app = create_app(
+        FakeFeishuClient(),
+        process_token=process_token,
+        shutdown_callback=lambda: shutdown_requests.append(True),
+    )
+
+    def request(headers=None):
+        mocked = make_mocked_request(
+            "POST", "/control/shutdown", headers=headers, app=app
+        )
+        mocked._transport_peername = ("127.0.0.1", 43210)
+        return mocked
+
+    missing = await sidecar_server._control_shutdown(request())
+    assert missing.status == 403
+    assert process_token not in missing.text
+    assert shutdown_requests == []
+
+    wrong = await sidecar_server._control_shutdown(
+        request({"X-HFC-Process-Token": "wrong-token"})
+    )
+    assert wrong.status == 403
+    assert process_token not in wrong.text
+    assert "wrong-token" not in wrong.text
+    assert shutdown_requests == []
+
+    async def successful_write_eof(self, data=b""):
+        return None
+
+    monkeypatch.setattr(sidecar_server.web.Response, "write_eof", successful_write_eof)
+    accepted = await sidecar_server._control_shutdown(
+        request({"X-HFC-Process-Token": process_token})
+    )
+    assert accepted.status == 202
+    assert json.loads(accepted.body) == {"ok": True, "status": "stopping"}
+    assert shutdown_requests == []
+
+    await accepted.write_eof()
+
+    assert shutdown_requests == [True]
+
+
+async def test_shutdown_control_rejects_non_loopback_peer_even_with_token():
+    app = create_app(
+        FakeFeishuClient(),
+        process_token="private-process-token",
+        shutdown_callback=lambda: pytest.fail("remote peer scheduled shutdown"),
+    )
+    request = make_mocked_request(
+        "POST",
+        "/control/shutdown",
+        headers={"X-HFC-Process-Token": "private-process-token"},
+        app=app,
+    )
+    request._transport_peername = ("203.0.113.10", 43210)
+
+    response = await sidecar_server._control_shutdown(request)
+
+    assert response.status == 403
+    assert "private-process-token" not in response.text
+
+
+async def test_shutdown_control_does_not_stop_when_response_could_not_be_sent(
+    monkeypatch,
+):
+    shutdown_requests: list[bool] = []
+    app = create_app(
+        FakeFeishuClient(),
+        process_token="private-process-token",
+        shutdown_callback=lambda: shutdown_requests.append(True),
+    )
+    request = make_mocked_request(
+        "POST",
+        "/control/shutdown",
+        headers={"X-HFC-Process-Token": "private-process-token"},
+        app=app,
+    )
+    request._transport_peername = ("127.0.0.1", 43210)
+
+    async def failed_write_eof(self, data=b""):
+        raise ConnectionResetError("client disconnected")
+
+    monkeypatch.setattr(sidecar_server.web.Response, "write_eof", failed_write_eof)
+    response = await sidecar_server._control_shutdown(request)
+
+    with pytest.raises(ConnectionResetError, match="client disconnected"):
+        await response.write_eof()
+
+    assert shutdown_requests == []
 
 
 async def test_health_reports_healthy_status_and_active_sessions(client):

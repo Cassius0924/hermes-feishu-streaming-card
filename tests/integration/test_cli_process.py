@@ -237,6 +237,72 @@ def test_start_status_and_stop_manage_sidecar_process(tmp_path):
         time.sleep(0.1)
 
 
+def test_start_safely_migrates_verified_v40_pidfile_in_private_state_dir(tmp_path):
+    port = free_port()
+    config = write_config(tmp_path, port)
+    env = process_env(tmp_path)
+    start = run_cli("start", "--config", str(config), env=env)
+    try:
+        assert start.returncode == 0, start.stderr
+        record_path = pidfile_path(tmp_path)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record_path.write_text(
+            json.dumps({"pid": record["pid"], "token": record["token"]}) + "\n",
+            encoding="utf-8",
+        )
+        record_path.chmod(0o644)
+        record_path.parent.chmod(0o700)
+        legacy_stat = record_path.stat()
+
+        adopted = run_cli("start", "--config", str(config), env=env)
+
+        assert adopted.returncode == 0, adopted.stderr
+        assert "start: already running" in adopted.stdout
+        migrated = json.loads(record_path.read_text(encoding="utf-8"))
+        assert migrated == {
+            "pid": record["pid"],
+            "token": record["token"],
+        }
+        migrated_stat = record_path.stat()
+        assert (migrated_stat.st_dev, migrated_stat.st_ino) == (
+            legacy_stat.st_dev,
+            legacy_stat.st_ino,
+        )
+        assert migrated_stat.st_mode & 0o777 == 0o600
+        assert record_path.parent.stat().st_mode & 0o777 == 0o700
+    finally:
+        run_cli("stop", "--config", str(config), env=env)
+        time.sleep(0.1)
+
+
+def test_stop_refuses_pidless_v40_sidecar_without_adoption_or_automatic_kill(tmp_path):
+    port = free_port()
+    config = write_config(tmp_path, port)
+    env = process_env(tmp_path)
+    start = run_cli("start", "--config", str(config), env=env)
+    original_pidfile = None
+    try:
+        assert start.returncode == 0, start.stderr
+        original_pidfile = pidfile_path(tmp_path).read_bytes()
+        pidfile_path(tmp_path).unlink()
+
+        refused = run_cli("stop", "--config", str(config), env=env)
+
+        assert refused.returncode != 0
+        assert "running sidecar has no pidfile; stop refused" in refused.stderr
+        assert read_health(port)["process_pid"] > 0
+
+        help_result = run_cli("stop", "--help", env=env)
+        assert help_result.returncode == 0
+        assert "--adopt-legacy" not in help_result.stdout
+    finally:
+        if original_pidfile is not None:
+            pidfile_path(tmp_path).write_bytes(original_pidfile)
+            pidfile_path(tmp_path).chmod(0o600)
+        run_cli("stop", "--config", str(config), env=env)
+        time.sleep(0.1)
+
+
 def test_start_loads_credentials_from_selected_env_file(tmp_path):
     port = free_port()
     config = write_config(tmp_path, port)
