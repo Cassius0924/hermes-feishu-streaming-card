@@ -4,6 +4,8 @@ import stat
 import subprocess
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_feishu_card import process
 
 
@@ -92,6 +94,20 @@ def test_pid_record_accepts_only_expected_systemd_unit_identity(
         encoding="utf-8",
     )
     assert process.read_pid_record() is None
+
+
+def test_pid_record_io_refuses_symlink_without_touching_target(monkeypatch, tmp_path):
+    record_path = tmp_path / "sidecar.pid"
+    target = tmp_path / "target.txt"
+    target.write_text("keep-me\n", encoding="utf-8")
+    record_path.symlink_to(target)
+    monkeypatch.setattr(process, "pid_path", lambda: record_path)
+
+    assert process.read_pid_record() is None
+    with pytest.raises(ValueError, match="symbolic link"):
+        process.write_pid_record(4321, "sidecar-token")
+
+    assert target.read_text(encoding="utf-8") == "keep-me\n"
 
 
 def test_systemd_system_unit_is_stable_and_state_scoped(monkeypatch, tmp_path):
@@ -234,6 +250,33 @@ def test_start_sidecar_tightens_existing_state_directory_mode(
 
     assert result == "failed: health check timed out"
     assert stat.S_IMODE(private_state.stat().st_mode) == 0o700
+
+
+def test_start_sidecar_refuses_symlink_state_directory_without_chmod_target(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "target"
+    target.mkdir(mode=0o755)
+    target.chmod(0o755)
+    linked_state = tmp_path / "linked-state"
+    linked_state.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(process, "_systemd_user_available", lambda: False)
+    monkeypatch.setattr(process, "state_dir", lambda: linked_state)
+    monkeypatch.setattr(
+        process,
+        "fetch_health",
+        lambda _config: (_ for _ in ()).throw(
+            AssertionError("invalid state must be refused before health probing")
+        ),
+    )
+
+    result = process.start_sidecar(
+        tmp_path / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+
+    assert result == "failed: state directory must not be a symbolic link"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
 
 
 def test_sidecar_command_uses_absolute_config_and_env_paths(monkeypatch, tmp_path):
@@ -736,6 +779,7 @@ def test_start_sidecar_refuses_unverified_manager_migration(monkeypatch, tmp_pat
 
     monkeypatch.setattr(process, "fetch_health", lambda _config: old_health)
     monkeypatch.setattr(process, "_systemd_user_available", lambda: True)
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
     monkeypatch.setattr(
         process,
         "read_pid_record",
@@ -759,6 +803,59 @@ def test_start_sidecar_refuses_unverified_manager_migration(monkeypatch, tmp_pat
     assert result == "failed: running sidecar identity mismatch; migration refused"
     assert stopped == []
     assert launched == []
+
+
+def test_start_sidecar_refuses_live_pid_record_when_health_is_unavailable(
+    monkeypatch, tmp_path
+):
+    launched = []
+    monkeypatch.setattr(process, "fetch_health", lambda _config: None)
+    monkeypatch.setattr(process, "_systemd_user_available", lambda: False)
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        process,
+        "read_pid_record",
+        lambda: {"pid": 1234, "token": "owned", "manager": "detached"},
+    )
+    monkeypatch.setattr(process, "pid_is_running", lambda _pid: True)
+    monkeypatch.setattr(
+        process.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: launched.append(True),
+    )
+
+    result = process.start_sidecar(
+        tmp_path / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+
+    assert result == "failed: owned sidecar health is unavailable; start refused"
+    assert launched == []
+
+
+def test_start_sidecar_refuses_invalid_existing_pidfile_without_overwriting(
+    monkeypatch, tmp_path
+):
+    pid_file = tmp_path / process.PIDFILE_NAME
+    pid_file.write_text('{"manager":"forged"}\n', encoding="utf-8")
+    launched = []
+    monkeypatch.setattr(process, "fetch_health", lambda _config: None)
+    monkeypatch.setattr(process, "_systemd_user_available", lambda: False)
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        process.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: launched.append(True),
+    )
+
+    result = process.start_sidecar(
+        tmp_path / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+
+    assert result == "failed: invalid pidfile exists; start refused"
+    assert launched == []
+    assert pid_file.read_text(encoding="utf-8") == '{"manager":"forged"}\n'
 
 
 def test_stop_sidecar_uses_systemd_unit_after_service_restart(monkeypatch):

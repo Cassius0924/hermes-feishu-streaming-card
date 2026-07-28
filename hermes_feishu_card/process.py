@@ -9,6 +9,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 import urllib.error
@@ -65,9 +66,17 @@ def start_sidecar(
     selected_manager, manager_error = _select_service_manager(config)
     if manager_error:
         return manager_error
+    state_error = _prepare_private_state_dir()
+    if state_error:
+        return state_error
     health = fetch_health(config)
+    record = read_pid_record()
+    record_path = pid_path()
+    try:
+        record_file_exists = record_path.exists() or record_path.is_symlink()
+    except OSError:
+        return "failed: pidfile state could not be inspected; start refused"
     if health is not None:
-        record = read_pid_record()
         if record is None or not _record_identity_valid(record):
             return (
                 "failed: running sidecar has no verified pidfile; "
@@ -80,10 +89,13 @@ def start_sidecar(
         if not _stop_owned_record(record):
             return "failed: owned sidecar could not be stopped for manager migration"
         clear_pid()
+    elif record is None and record_file_exists:
+        return "failed: invalid pidfile exists; start refused"
+    elif record is not None:
+        if _record_manager(record) != "detached" or pid_is_running(record["pid"]):
+            return "failed: owned sidecar health is unavailable; start refused"
+        clear_pid()
 
-    private_state_dir = state_dir()
-    private_state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    private_state_dir.chmod(0o700)
     token = secrets.token_hex(16)
     command = _sidecar_command(config_path, env_file=env_file, token=token)
 
@@ -136,7 +148,7 @@ def start_sidecar(
 
     try:
         write_pid_record(process.pid, token)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         stop_pid(process.pid)
         return f"failed: pidfile could not be written: {exc.__class__.__name__}"
 
@@ -223,10 +235,21 @@ def read_pid() -> int | None:
 
 
 def read_pid_record() -> dict[str, Any] | None:
-    try:
-        text = pid_path().read_text(encoding="utf-8").strip()
-    except OSError:
+    path = pid_path()
+    if path.is_symlink():
         return None
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(str(path), flags)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            text = handle.read(4097)
+    except (OSError, UnicodeError):
+        return None
+    if len(text) > 4096:
+        return None
+    text = text.strip()
     try:
         record = json.loads(text)
     except ValueError:
@@ -259,7 +282,29 @@ def write_pid_record(
         payload["unit"] = unit
     if not _record_identity_valid(payload):
         raise ValueError("invalid pidfile manager identity")
-    pid_path().write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    path = pid_path()
+    if path.is_symlink():
+        raise ValueError("pidfile must not be a symbolic link")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        try:
+            os.fchmod(descriptor, 0o600)
+            handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        except Exception:
+            os.close(descriptor)
+            raise
+        with handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.is_symlink():
+            raise ValueError("pidfile must not be a symbolic link")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _sidecar_command(
@@ -281,6 +326,20 @@ def _sidecar_command(
         command.extend(("--env-file", str(resolved_env)))
     command.extend(("--token", token))
     return command
+
+
+def _prepare_private_state_dir() -> str:
+    private_state_dir = state_dir()
+    try:
+        if private_state_dir.is_symlink():
+            return "failed: state directory must not be a symbolic link"
+        private_state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if private_state_dir.is_symlink() or not private_state_dir.is_dir():
+            return "failed: state directory is not a private directory"
+        private_state_dir.chmod(0o700)
+    except OSError:
+        return "failed: state directory could not be prepared"
+    return ""
 
 
 def _record_manager(record: dict[str, Any]) -> str:
