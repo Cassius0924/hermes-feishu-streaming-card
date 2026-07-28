@@ -1645,7 +1645,8 @@ async def test_hfc_status_group_unbound_shows_binding_hint_and_slash_guidance():
     card = factory.clients["default"].sent[0][1]
     content = str(card)
     assert "当前群未绑定" in content
-    assert "bots bind-chat oc_group default" in content
+    assert "oc_group" not in content
+    assert "bots bind-chat CHAT_ID default" in content
     assert "群内 slash command" in content
     assert "Hermes @/白名单" in content
     assert "所有非空文本反馈使用独立命令卡片" in content

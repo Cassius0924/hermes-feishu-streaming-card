@@ -2209,7 +2209,7 @@ def _run_smoke_feishu_card(args: argparse.Namespace) -> int:
         return 1
 
     print("smoke ok")
-    print(f"message_id: {message_id}")
+    print(f"message_id: {_masked_message_id(message_id)}")
     return 0
 
 
@@ -2287,6 +2287,11 @@ def _masked_chat_id(chat_id: str) -> str:
     return f"chat#{digest}"
 
 
+def _masked_message_id(message_id: str) -> str:
+    digest = hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:10]
+    return f"message#{digest}"
+
+
 def _run_bots(args: argparse.Namespace) -> int:
     try:
         if args.bot_command == "list":
@@ -2323,7 +2328,7 @@ def _run_bots(args: argparse.Namespace) -> int:
             chats = _ensure_mapping_path(data, "bindings", "chats")
             chats[args.chat_id] = args.bot_id
             _write_local_yaml(args.config, data)
-            print(f"bound: {args.chat_id} -> {args.bot_id}")
+            print(f"bound: {_masked_chat_id(args.chat_id)} -> {args.bot_id}")
             return 0
 
         if args.bot_command == "unbind-chat":
@@ -2331,7 +2336,7 @@ def _run_bots(args: argparse.Namespace) -> int:
             chats = _ensure_mapping_path(data, "bindings", "chats")
             chats.pop(args.chat_id, None)
             _write_local_yaml(args.config, data)
-            print(f"unbound: {args.chat_id}")
+            print(f"unbound: {_masked_chat_id(args.chat_id)}")
             return 0
 
         if args.bot_command == "test":
@@ -2341,7 +2346,7 @@ def _run_bots(args: argparse.Namespace) -> int:
                 _smoke_feishu_card_with_bot(config, args.bot_id, args.chat_id)
             )
             print("bot smoke ok")
-            print(f"message_id: {message_id}")
+            print(f"message_id: {_masked_message_id(message_id)}")
             return 0
     except Exception as exc:
         print(f"error: {_sanitize_error(exc, locals().get('config'))}", file=sys.stderr)

@@ -1295,6 +1295,8 @@ bindings:
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "bound" in captured.out.lower()
+    assert "oc-chat-1" not in captured.out + captured.err
+    assert "chat#" in captured.out
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert config["bindings"]["chats"]["oc-chat-1"] == "sales"
 
@@ -1321,6 +1323,8 @@ bindings:
     assert first_exit_code == 0
     assert second_exit_code == 0
     assert "unbound" in captured.out.lower()
+    assert "oc-chat-1" not in captured.out + captured.err
+    assert "chat#" in captured.out
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert config["bindings"]["chats"] == {}
 
@@ -1391,7 +1395,8 @@ bots:
     captured = capsys.readouterr()
     assert exit_code == 0
     assert calls[0][1:] == ("sales", "oc-chat-1")
-    assert "om-message-1" in captured.out
+    assert "om-message-1" not in captured.out + captured.err
+    assert "message#" in captured.out
     assert "sales-secret" not in captured.out
 
 
@@ -1431,7 +1436,8 @@ profiles:
     assert exit_code == 0
     assert calls[0][0]["feishu"]["app_id"] == "cli-work-app"
     assert calls[0][1] == "oc-chat-1"
-    assert "om-profile-smoke" in captured.out
+    assert "om-profile-smoke" not in captured.out + captured.err
+    assert "message#" in captured.out
     assert "work-secret" not in captured.out
 
 
@@ -1477,7 +1483,8 @@ profiles:
     assert exit_code == 0
     assert calls[0][0]["bots"]["items"]["sales"]["app_id"] == "cli-work-sales"
     assert calls[0][1:] == ("sales", "oc-chat-1")
-    assert "om-profile-bot-smoke" in captured.out
+    assert "om-profile-bot-smoke" not in captured.out + captured.err
+    assert "message#" in captured.out
     assert "work-sales-secret" not in captured.out
 
 

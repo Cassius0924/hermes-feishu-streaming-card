@@ -2219,7 +2219,8 @@ def _hfc_group_context_lines(event: SidecarEvent, route: RouteResult) -> list[st
         lines.extend(
             [
                 "- 当前群未绑定到指定 Bot，正在使用 fallback/default 路由。",
-                f"- 建议绑定: `hermes-feishu-card bots bind-chat {event.chat_id} {bot_id} --config config.yaml`",
+                f"- 建议绑定: `hermes-feishu-card bots bind-chat CHAT_ID {bot_id} --config config.yaml`",
+                "- 将 `CHAT_ID` 替换为本地配置中的真实群 ID；卡片不会回显原始 ID。",
             ]
         )
     return lines
