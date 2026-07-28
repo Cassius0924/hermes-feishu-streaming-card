@@ -129,7 +129,8 @@ def test_status_reports_stopped_when_sidecar_is_not_running(tmp_path):
 def test_stop_rejects_pidfile_without_matching_health_token(tmp_path):
     config = write_config(tmp_path, free_port())
     env = process_env(tmp_path)
-    pidfile_path(tmp_path).parent.mkdir()
+    pidfile_path(tmp_path).parent.mkdir(mode=0o700)
+    pidfile_path(tmp_path).parent.chmod(0o700)
     sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         pidfile_path(tmp_path).write_text(
