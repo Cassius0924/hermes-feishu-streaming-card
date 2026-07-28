@@ -2204,6 +2204,39 @@ def test_v4021_release_docs_record_content_integrity_and_real_feishu_acceptance(
     ) is None
 
 
+def test_v4021_docs_record_final_local_release_gate():
+    changelog = read_doc("CHANGELOG.md")
+    notes = read_doc("docs/release-notes-v4.0.21.md")
+    notes_en = read_doc("docs/release-notes-v4.0.21.en.md")
+    readiness = read_doc("docs/release-readiness.md")
+    readiness_en = read_doc("docs/release-readiness.en.md")
+    todo = read_doc("TODO.md")
+
+    gate_markers = (
+        "1525 passed, 4 skipped in 53.44s",
+        "uv build",
+        "hermes_feishu_streaming_card-4.0.21.tar.gz",
+        "hermes_feishu_streaming_card-4.0.21-py3-none-any.whl",
+        "Python 3.12",
+        "site-packages",
+        "4.0.21",
+        "hermes-feishu-card = hermes_feishu_card.cli:main",
+        "--help exit 0",
+    )
+    for text in (notes, notes_en, readiness, readiness_en):
+        for marker in gate_markers:
+            assert marker in text
+
+    assert "1525 passed, 4 skipped in 53.44s" in changelog
+    assert "uv build" in changelog
+    assert "hermes_feishu_streaming_card-4.0.21-py3-none-any.whl" in changelog
+    assert "最终本地发布门禁已通过" in todo
+    assert "公开 tagged installer 与 Release assets 的 post-tag 验证仍待完成" in todo
+    for text in (changelog, notes, notes_en, readiness, readiness_en, todo):
+        assert "/private/tmp" not in text
+        assert "/Users/" not in text
+
+
 def test_feishu_cli_playbook_is_linked_and_keeps_cli_optional():
     wiki = read_doc("docs/wiki/README.md")
     playbook = read_doc("docs/wiki/feishu-cli-playbook.md")

@@ -20,6 +20,8 @@ See also: [docs/release-notes-v4.0.21.md](docs/release-notes-v4.0.21.md)
 - Task 1 focused ordering coverage passed `74 passed`; Task 2 image/notice combination coverage passed `277 passed` without requiring a production runtime change.
 - Real Feishu acceptance on 2026-07-28 confirmed the image and answer-ordering paths with zero matching native duplicates or uncertain-delivery warnings; this is not a screenshot or desktop/mobile visual-QA claim.
 - The candidate runtime was observed in Hermes venv `site-packages` as `4.0.21`. Public tagged-installer and Release-asset verification remain pending post-tag.
+- Final local release gate passed: full pytest reported `1525 passed, 4 skipped in 53.44s`; `uv build` produced `hermes_feishu_streaming_card-4.0.21.tar.gz` and `hermes_feishu_streaming_card-4.0.21-py3-none-any.whl`.
+- A clean Python 3.12 venv installed the wheel with imports resolving from `site-packages`; package and distribution versions were both `4.0.21`, `hermes-feishu-card = hermes_feishu_card.cli:main` was present, and CLI `--help` exit 0.
 
 ## V4.0.20 — 2026-07-22
 

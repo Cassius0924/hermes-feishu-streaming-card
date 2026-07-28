@@ -22,6 +22,8 @@ V4.0.21 is a content-integrity hotfix for Issue #155 and locks the combined imag
 - Real Feishu acceptance on 2026-07-28 observed one marker-bearing, non-running interactive completion card and one native image for an image turn, with no uncertain-delivery warning. A normal tool turn retained two answer segments in one card, with a bot native marker duplicate count of zero.
 - Final sidecar metrics were `events_received/events_applied=23/23`, 1 send success and 16 update successes; event rejected, auth rejection, send/update failures, notice uncertain warnings, and notice update failures were all zero. Gateway logs confirmed the Feishu WebSocket connection.
 - The candidate runtime in Hermes venv site-packages was 4.0.21. This does not claim screenshot or desktop/mobile visual QA, nor a real fault-injection result.
+- Final local release gate: full pytest reported `1525 passed, 4 skipped in 53.44s`. `uv build` produced `hermes_feishu_streaming_card-4.0.21.tar.gz` and `hermes_feishu_streaming_card-4.0.21-py3-none-any.whl`.
+- A clean Python 3.12 venv installed from the wheel with imports in `site-packages`; package and distribution versions were both `4.0.21`, `hermes-feishu-card = hermes_feishu_card.cli:main` was present, and CLI --help exit 0.
 - The public tagged installer and Release assets remain pending post-tag verification.
 - These notes include no real chat/message/user identifiers, credentials, tokens, or local paths.
 

@@ -22,6 +22,8 @@ V4.0.21 是针对 Issue #155 的内容完整性热修，并为 Issue #147 固化
 - 2026-07-28 真实飞书验收：图片回合观测到 1 条带标记、非“生成中”的 interactive completion card 与 1 条 native image，且没有 uncertain-delivery warning。正常工具回合的两段答案保留在同一张卡，bot 原生标记重复为 0。
 - sidecar 最终 metrics 为 `events_received/events_applied=23/23`、1 次发送成功、16 次更新成功；event rejected、auth rejection、send/update failures、notice uncertain warnings 与 notice update failures 均为 0。Gateway 日志确认 Feishu WebSocket 已连接。
 - Hermes venv site-packages 中的候选 runtime 为 4.0.21。本验收不宣称截图或桌面/移动端视觉 QA，也不扩大为真实故障注入结论。
+- 最终本地发布门禁：完整 pytest 为 `1525 passed, 4 skipped in 53.44s`。`uv build` 成功生成 `hermes_feishu_streaming_card-4.0.21.tar.gz` 与 `hermes_feishu_streaming_card-4.0.21-py3-none-any.whl`。
+- 干净 Python 3.12 venv 从 wheel 安装后，import 位于 `site-packages`；package version 与 distribution version 均为 `4.0.21`，存在 `hermes-feishu-card = hermes_feishu_card.cli:main`，CLI --help exit 0。
 - 公开 tagged installer 与 Release assets 仍待 post-tag 验证。
 - 本说明不包含真实 chat/message/user 标识符、凭据、token 或本机路径。
 
