@@ -930,6 +930,7 @@ def _runtime_integrity(value: object) -> dict[str, object]:
             "runtime_ready",
             "gateway_restart_required",
             "manual_review_required",
+            "control_auth_unavailable",
             "integrity_evidence_unavailable",
             "integrity_repair_refused",
             "integrity_migration_required",

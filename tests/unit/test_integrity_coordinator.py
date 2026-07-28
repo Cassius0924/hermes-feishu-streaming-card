@@ -135,3 +135,23 @@ def test_ready_runtime_and_off_mode_do_not_inspect_or_mutate_source():
         assert coordinator.check_once()["status"] in {"ready", "disabled"}
 
     assert calls == []
+
+
+def test_missing_control_auth_never_triggers_source_inspection_or_repair():
+    calls = []
+    coordinator = RuntimeIntegrityCoordinator(
+        mode="safe",
+        hermes_root="/sanitized-in-test",
+        supervisor=FakeSupervisor(reason="control_auth_unavailable"),
+        detector=lambda _root: calls.append("detect"),
+        executor=lambda *_args, **_kwargs: calls.append("execute"),
+    )
+
+    result = coordinator.check_once()
+
+    assert result == {
+        "status": "manual_review_required",
+        "reason": "control_auth_unavailable",
+        "attempted": False,
+    }
+    assert calls == []
