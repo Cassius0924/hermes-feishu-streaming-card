@@ -785,12 +785,20 @@ def _build_doctor_report(
     recovery_plan = plan_recovery(detection)
     profile_id = str(getattr(args, "_profile_id", "") or "")
     route = _diagnostic_route(config, profile_id)
-    health: dict[str, object] = {
+    try:
+        sidecar_status = status_sidecar(config)
+    except (OSError, RuntimeError, ValueError):
+        sidecar_status = {}
+    live_health = sidecar_status.get("health")
+    health: dict[str, object] = (
+        dict(live_health) if isinstance(live_health, dict) else {}
+    )
+    health.update({
         "streaming": streaming,
         "runtime_import": runtime_import,
         "feishu_sdk": feishu_sdk,
         "install_state": install_state,
-    }
+    })
     if route is not None:
         health["routing"] = {"last_route": route}
     return build_diagnostic_report(

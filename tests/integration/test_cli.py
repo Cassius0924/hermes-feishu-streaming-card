@@ -620,6 +620,51 @@ def test_module_doctor_explain_reports_summary_and_next_steps(tmp_path):
     assert "Next steps" in result.stdout
 
 
+def test_doctor_explain_reports_live_runtime_readiness(
+    tmp_path, monkeypatch, capsys
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("server:\n  port: 9014\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cli_module,
+        "status_sidecar",
+        lambda _config: {
+            "running": True,
+            "health": {
+                "status": "healthy",
+                "active_sessions": 0,
+                "readiness": {
+                    "status": "degraded",
+                    "reason": "gateway_restart_required",
+                    "integrity_mode": "safe",
+                    "restart_required": True,
+                },
+                "integrity": {
+                    "mode": "safe",
+                    "last_status": "restart_required",
+                    "last_reason": "gateway_restart_required",
+                },
+            },
+        },
+    )
+
+    exit_code = main(
+        [
+            "doctor",
+            "--config",
+            str(config_path),
+            "--hermes-dir",
+            str(FIXTURE),
+            "--explain",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Card runtime readiness: degraded - gateway_restart_required" in output
+    assert "The Hermes card runtime is not ready" in output
+
+
 @pytest.mark.parametrize(
     ("profile_id", "expected_bot_id"),
     [("default", "main-bot"), ("child", "child-bot")],
