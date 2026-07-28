@@ -308,7 +308,9 @@ async def test_installed_hook_forwards_streaming_tool_and_completion_events(
             "profile_source": "fallback_default",
             "text": "answer fixture delta",
         }
-        assert received[4]["data"] == {
+        completed_data = dict(received[4]["data"])
+        native_handoff = completed_data.pop("native_handoff")
+        assert completed_data == {
             "profile_id": "default",
             "profile_source": "fallback_default",
             "answer": "fixture answer",
@@ -319,6 +321,13 @@ async def test_installed_hook_forwards_streaming_tool_and_completion_events(
             "attachments": [],
             "native_delivery": "allowed",
         }
+        assert set(native_handoff) == {"capabilities", "generation"}
+        assert native_handoff["capabilities"] == [
+            "native-ack-v1",
+            "stable-feishu-uuid-v1",
+        ]
+        assert len(native_handoff["generation"]) == 32
+        assert all(char in "0123456789abcdef" for char in native_handoff["generation"])
     finally:
         await client.close()
 

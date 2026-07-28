@@ -31,6 +31,8 @@ COMMAND_CARD_STARTUP_PATCH_BEGIN = (
     "# HERMES_FEISHU_CARD_COMMAND_CARD_STARTUP_PATCH_BEGIN"
 )
 COMMAND_CARD_STARTUP_PATCH_END = "# HERMES_FEISHU_CARD_COMMAND_CARD_STARTUP_PATCH_END"
+NATIVE_REDELIVERY_PATCH_BEGIN = "# HERMES_FEISHU_CARD_NATIVE_REDELIVERY_PATCH_BEGIN"
+NATIVE_REDELIVERY_PATCH_END = "# HERMES_FEISHU_CARD_NATIVE_REDELIVERY_PATCH_END"
 PLATFORM_NOTICE_PATCH_BEGIN = "# HERMES_FEISHU_CARD_PLATFORM_NOTICE_PATCH_BEGIN"
 PLATFORM_NOTICE_PATCH_END = "# HERMES_FEISHU_CARD_PLATFORM_NOTICE_PATCH_END"
 HFC_COMMAND_PATCH_BEGIN = "# HERMES_FEISHU_CARD_HFC_COMMAND_PATCH_BEGIN"
@@ -52,6 +54,7 @@ def apply_patch(content: str, strategy: str = "legacy_gateway_run") -> str:
     if strategy == "gateway_run_013_plus":
         content = _apply_cron_patch(content)
         content = _apply_command_card_startup_patch(content)
+        content = _apply_native_redelivery_patch(content)
         content = _apply_command_card_adapter_patch(content)
         content = _apply_hfc_command_patch(content)
         content = _apply_platform_notice_patch(content)
@@ -334,28 +337,61 @@ def _apply_command_card_startup_patch(content: str) -> str:
         "command card startup patch markers",
     )
     if owned_block is not None:
-        lines = content.splitlines(keepends=True)
-        begin_index, end_index = owned_block
-        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
-        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
-        expected = _render_command_card_startup_hook_block(indent, newline)
-        if lines[begin_index : end_index + 1] == expected:
-            return content
-        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+        stripped = _remove_simple_owned_patch(
+            content,
+            COMMAND_CARD_STARTUP_PATCH_BEGIN,
+            COMMAND_CARD_STARTUP_PATCH_END,
+            _render_command_card_startup_hook_block,
+            "command card startup patch markers",
+        )
+        if stripped != content:
+            return _apply_command_card_startup_patch(stripped)
 
     tree = _parse_content(content)
     func = _find_gateway_runner_method(tree, "start")
     if func is None:
         return content
-    drain = _find_recovered_watcher_drain(func)
-    if drain is None or drain.lineno is None:
+    anchor = _find_redelivery_startup_call(func) or _find_recovered_watcher_drain(func)
+    if anchor is None or anchor.lineno is None:
         return content
 
     lines = content.splitlines(keepends=True)
-    insert_at = drain.lineno - 1
+    insert_at = anchor.lineno - 1
     indent = _line_indent(lines, insert_at)
     newline = _line_ending(lines[insert_at]) or _detect_newline(content)
     hook = _render_command_card_startup_hook_block(indent, newline)
+    return "".join(lines[:insert_at] + hook + lines[insert_at:])
+
+
+def _apply_native_redelivery_patch(content: str) -> str:
+    owned_block = _find_simple_marker_block(
+        content,
+        NATIVE_REDELIVERY_PATCH_BEGIN,
+        NATIVE_REDELIVERY_PATCH_END,
+        "native redelivery patch markers",
+    )
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+        expected = _render_native_redelivery_hook_block(indent, newline)
+        if lines[begin_index : end_index + 1] == expected:
+            return content
+        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+
+    tree = _parse_content(content)
+    func = _find_gateway_runner_method(tree, "_redeliver_pending_obligations")
+    if func is None:
+        return content
+    send = _find_redelivery_adapter_send(func)
+    if send is None or send.lineno is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    insert_at = send.lineno - 1
+    indent = _line_indent(lines, insert_at)
+    newline = _line_ending(lines[insert_at]) or _detect_newline(content)
+    hook = _render_native_redelivery_hook_block(indent, newline)
     return "".join(lines[:insert_at] + hook + lines[insert_at:])
 
 
@@ -437,6 +473,13 @@ def remove_patch(content: str) -> str:
         COMMAND_CARD_STARTUP_PATCH_END,
         _render_command_card_startup_hook_block,
         "command card startup patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        NATIVE_REDELIVERY_PATCH_BEGIN,
+        NATIVE_REDELIVERY_PATCH_END,
+        _render_native_redelivery_hook_block,
+        "native redelivery patch markers",
     )
     content = _remove_simple_owned_patch(
         content,
@@ -565,6 +608,7 @@ def remove_patch_lenient(content: str) -> str:
         (APPROVAL_PATCH_BEGIN, APPROVAL_PATCH_END),
         (STATUS_PATCH_BEGIN, STATUS_PATCH_END),
         (COMMAND_CARD_STARTUP_PATCH_BEGIN, COMMAND_CARD_STARTUP_PATCH_END),
+        (NATIVE_REDELIVERY_PATCH_BEGIN, NATIVE_REDELIVERY_PATCH_END),
         (COMMAND_CARD_PATCH_BEGIN, COMMAND_CARD_PATCH_END),
         (HFC_COMMAND_PATCH_BEGIN, HFC_COMMAND_PATCH_END),
         (PLATFORM_NOTICE_PATCH_BEGIN, PLATFORM_NOTICE_PATCH_END),
@@ -1316,6 +1360,43 @@ def _find_gateway_runner_method(tree, name: str):
             if isinstance(child, ast.AsyncFunctionDef) and child.name == name:
                 return child
     return None
+
+
+def _find_redelivery_startup_call(func):
+    for node in func.body:
+        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Await):
+            continue
+        call = node.value.value
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_redeliver_pending_obligations"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "self"
+        ):
+            return node
+    return None
+
+
+def _find_redelivery_adapter_send(func):
+    matches = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Await):
+            continue
+        call = node.value.value
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "send"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "adapter"
+            and any(
+                isinstance(target, ast.Name) and target.id == "result"
+                for target in node.targets
+            )
+        ):
+            matches.append(node)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _find_recovered_watcher_drain(func):
@@ -2097,6 +2178,26 @@ def _render_command_card_startup_hook_block(indent: str, newline: str):
         f"{inner_indent}_hfc_install_command_cards(self){newline}",
         *_render_hook_exception_handler(indent, newline),
         f"{indent}{COMMAND_CARD_STARTUP_PATCH_END}{newline}",
+    ]
+
+
+def _render_native_redelivery_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    return [
+        f"{indent}{NATIVE_REDELIVERY_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import prepare_native_handoff_recovery as _hfc_prepare_native_handoff_recovery{newline}"
+        ),
+        f"{inner_indent}await _hfc_prepare_native_handoff_recovery({newline}",
+        f"{inner_indent}    obligation_id=row.get(\"obligation_id\"),{newline}",
+        f"{inner_indent}    chat_id=row.get(\"chat_id\"),{newline}",
+        f"{inner_indent}    content=content,{newline}",
+        f"{inner_indent}    thread_id=row.get(\"thread_id\") or \"\",{newline}",
+        f"{inner_indent}){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{NATIVE_REDELIVERY_PATCH_END}{newline}",
     ]
 
 

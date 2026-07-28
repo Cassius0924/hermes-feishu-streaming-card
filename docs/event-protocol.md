@@ -34,15 +34,17 @@ Hermes 最小 hook 向 sidecar 发送消息生命周期事件。第二阶段 hoo
 
 ## V4.1 控制协议与域分隔
 
-V4.1 在 `/events` 数据面外增加两个本机控制面，三者不得复用签名 domain：
+V4.1 在 `/events` 数据面外增加相互隔离的本机控制面，各动作不得复用签名 domain：
 
 | 端点 | 用途 | 签名域 | 失败行为 |
 |---|---|---|---|
 | `POST /events` | 消息生命周期与卡片数据面 | event domain | 未确认接管时 Hermes 原生 fail-open |
 | `POST /delivery/policy` | 在 hook 抑制原生消息前查询 per-chat 决策 | `hfc-policy-v1` | timeout、invalid/replayed proof、配置错误或未知 profile 都返回原生路径 |
 | `POST /runtime/events` | `runtime.hello` / `runtime.heartbeat` readiness | `hfc-runtime-v1` | Hermes 工作继续；sidecar readiness 降级，不授权源码 mutation |
+| `POST /native-handoff/recover` | 用 Hermes ledger obligation hash 查询 pending native descriptor | `hfc-native-handoff-recovery-v1` | 查询失败时不 ACK、不盲目重发；保留 ledger recoverable 状态 |
+| `POST /native-handoff/ack` | 全部分片成功且 ledger 已 `delivered` 后确认 native final | `hfc-native-handoff-ack-v1` | ACK 失败不回滚已 delivered ledger；sidecar pending 最终转 uncertain |
 
-policy 和 runtime proof 都绑定 exact raw body、短 timestamp window 与 nonce replay protection。响应不回显 chat id、transport root、路径、源码 hash 或 recovery fingerprint。`runtime.hello` / `runtime.heartbeat` 只提供经过 schema 限制的 generation/package/sequence 信息；严格 repair 仍独立验证 Git、manifest、backup、blob、anchor 与 mutation 前 fingerprint。
+policy、runtime、native recovery 与 native ACK proof 都绑定 exact raw body、短 timestamp window 与 nonce replay protection。响应不回显 chat id、transport root、路径、源码 hash 或 recovery fingerprint。`runtime.hello` / `runtime.heartbeat` 只提供经过 schema 限制的 generation/package/sequence 信息；严格 repair 仍独立验证 Git、manifest、backup、blob、anchor 与 mutation 前 fingerprint。
 
 一个 turn 的 delivery decision 在首次事件时固定。`bindings.native_chats` 的修改只影响下一条新消息；重复 terminal 不能在卡片与原生路径各发送一次。sidecar 在创建 `CardSession` 前再次检查 policy，因此 hook preflight 与 server enforcement 缺一不可。
 

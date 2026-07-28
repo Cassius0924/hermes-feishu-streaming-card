@@ -5,9 +5,15 @@ import pytest
 from hermes_feishu_card.event_auth import (
     EventAuthenticationError,
     EventProofVerifier,
+    NativeHandoffAckAuthenticationError,
+    NativeHandoffAckProofVerifier,
+    NativeHandoffRecoveryAuthenticationError,
+    NativeHandoffRecoveryProofVerifier,
     PolicyAuthenticationError,
     PolicyProofVerifier,
     sign_event_request,
+    sign_native_handoff_ack_request,
+    sign_native_handoff_recovery_request,
     sign_policy_request,
 )
 
@@ -77,6 +83,81 @@ def test_event_and_policy_proofs_are_domain_separated():
                 "X-HFC-Event-Timestamp": policy_headers["X-HFC-Policy-Timestamp"],
                 "X-HFC-Event-Nonce": policy_headers["X-HFC-Policy-Nonce"],
                 "X-HFC-Event-Signature": policy_headers["X-HFC-Policy-Signature"],
+            },
+            body,
+        )
+
+
+def test_native_handoff_ack_proof_is_body_bound_replay_safe_and_domain_separated():
+    secret = b"a" * 32
+    body = b'{"protocol":"hfc-native-handoff-v1"}'
+    headers = sign_native_handoff_ack_request(
+        secret,
+        body,
+        timestamp=100,
+        nonce="native-ack-nonce-0001",
+    )
+    verifier = NativeHandoffAckProofVerifier(secret, now=lambda: 100.0)
+
+    verifier.verify(headers, body)
+    with pytest.raises(NativeHandoffAckAuthenticationError, match="replayed"):
+        verifier.verify(headers, body)
+    with pytest.raises(NativeHandoffAckAuthenticationError, match="invalid"):
+        NativeHandoffAckProofVerifier(secret, now=lambda: 100.0).verify(
+            headers,
+            body + b" ",
+        )
+
+
+def test_native_handoff_recovery_proof_is_separate_from_ack_domain():
+    secret = b"r" * 32
+    body = b'{"protocol":"hfc-native-handoff-recovery-v1"}'
+    headers = sign_native_handoff_recovery_request(
+        secret,
+        body,
+        timestamp=100,
+        nonce="native-recovery-nonce-0001",
+    )
+    verifier = NativeHandoffRecoveryProofVerifier(secret, now=lambda: 100.0)
+
+    verifier.verify(headers, body)
+    with pytest.raises(NativeHandoffRecoveryAuthenticationError, match="replayed"):
+        verifier.verify(headers, body)
+
+    ack_headers = sign_native_handoff_ack_request(
+        secret,
+        body,
+        timestamp=100,
+        nonce="native-recovery-nonce-0002",
+    )
+    with pytest.raises(NativeHandoffRecoveryAuthenticationError, match="invalid"):
+        NativeHandoffRecoveryProofVerifier(secret, now=lambda: 100.0).verify(
+            {
+                "X-HFC-Native-Recovery-Timestamp": ack_headers[
+                    "X-HFC-Native-Ack-Timestamp"
+                ],
+                "X-HFC-Native-Recovery-Nonce": ack_headers[
+                    "X-HFC-Native-Ack-Nonce"
+                ],
+                "X-HFC-Native-Recovery-Signature": ack_headers[
+                    "X-HFC-Native-Ack-Signature"
+                ],
+            },
+            body,
+        )
+
+    event_headers = sign_event_request(
+        secret,
+        body,
+        timestamp=100,
+        nonce="native-ack-nonce-0002",
+    )
+    with pytest.raises(NativeHandoffAckAuthenticationError, match="invalid"):
+        NativeHandoffAckProofVerifier(secret, now=lambda: 100.0).verify(
+            {
+                "X-HFC-Native-Ack-Timestamp": event_headers["X-HFC-Event-Timestamp"],
+                "X-HFC-Native-Ack-Nonce": event_headers["X-HFC-Event-Nonce"],
+                "X-HFC-Native-Ack-Signature": event_headers["X-HFC-Event-Signature"],
             },
             body,
         )

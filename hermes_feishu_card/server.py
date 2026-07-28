@@ -32,6 +32,10 @@ from .events import EventValidationError, SidecarEvent
 from .event_auth import (
     EventAuthenticationError,
     EventProofVerifier,
+    NativeHandoffAckAuthenticationError,
+    NativeHandoffAckProofVerifier,
+    NativeHandoffRecoveryAuthenticationError,
+    NativeHandoffRecoveryProofVerifier,
     PolicyAuthenticationError,
     PolicyProofVerifier,
 )
@@ -112,6 +116,12 @@ RUNTIME_INTEGRITY_COORDINATOR_KEY = web.AppKey(
 RUNTIME_INTEGRITY_TASK_KEY = web.AppKey("runtime_integrity_task", asyncio.Task)
 DELIVERY_POLICY_KEY = web.AppKey("delivery_policy", Any)
 POLICY_AUTH_VERIFIER_KEY = web.AppKey("policy_auth_verifier", PolicyProofVerifier)
+NATIVE_HANDOFF_ACK_AUTH_VERIFIER_KEY = web.AppKey(
+    "native_handoff_ack_auth_verifier", NativeHandoffAckProofVerifier
+)
+NATIVE_HANDOFF_RECOVERY_AUTH_VERIFIER_KEY = web.AppKey(
+    "native_handoff_recovery_auth_verifier", NativeHandoffRecoveryProofVerifier
+)
 MESSAGE_LOCKS_KEY = web.AppKey("message_locks", dict)
 MESSAGE_LOCK_USERS_KEY = web.AppKey("message_lock_users", dict)
 FOOTER_FIELDS_KEY = web.AppKey("footer_fields", Any)
@@ -287,6 +297,12 @@ def create_app(
         app[POLICY_AUTH_VERIFIER_KEY] = PolicyProofVerifier(
             operations_transport_root_secret
         )
+        app[NATIVE_HANDOFF_ACK_AUTH_VERIFIER_KEY] = NativeHandoffAckProofVerifier(
+            operations_transport_root_secret
+        )
+        app[NATIVE_HANDOFF_RECOVERY_AUTH_VERIFIER_KEY] = (
+            NativeHandoffRecoveryProofVerifier(operations_transport_root_secret)
+        )
     app[MESSAGE_LOCKS_KEY] = {}
     app[MESSAGE_LOCK_USERS_KEY] = {}
     app[FLUSH_CONTROLLERS_KEY] = {}
@@ -357,6 +373,8 @@ def create_app(
     app.router.add_post("/commands", _commands)
     app.router.add_post("/runtime/events", _runtime_events)
     app.router.add_post("/delivery/policy", _delivery_policy)
+    app.router.add_post("/native-handoff/ack", _native_handoff_ack)
+    app.router.add_post("/native-handoff/recover", _native_handoff_recover)
     app.router.add_post("/events", _events)
     app.on_startup.append(_start_runtime_cleanup)
     app.on_startup.append(_start_runtime_integrity_monitor)
@@ -520,6 +538,7 @@ async def _health(request: web.Request) -> web.Response:
         "routing": _sanitize_health_diagnostics(request.app[ROUTING_DIAGNOSTICS_KEY]),
         "profile_diagnostics": _sanitize_health_diagnostics(request.app[PROFILE_DIAGNOSTICS_KEY]),
         "delivery_policy": _safe_delivery_policy_diagnostics(request.app),
+        "native_handoffs": _safe_native_handoff_diagnostics(request.app),
     }
     process_token = request.app[PROCESS_TOKEN_KEY]
     if process_token:
@@ -555,6 +574,14 @@ def _safe_delivery_policy_diagnostics(app: web.Application) -> dict[str, Any]:
         return {"status": "unavailable"}
     if not isinstance(diagnostics, dict):
         return {"status": "unavailable"}
+    return _sanitize_health_diagnostics(diagnostics)
+
+
+def _safe_native_handoff_diagnostics(app: web.Application) -> dict[str, Any]:
+    try:
+        diagnostics = app[NATIVE_HANDOFF_STORE_KEY].safe_status()
+    except Exception:
+        return {"status": "unavailable", "manual_review_required": True}
     return _sanitize_health_diagnostics(diagnostics)
 
 
@@ -1931,6 +1958,76 @@ def _has_control_characters(value: str) -> bool:
     return any(ord(character) < 32 or ord(character) == 127 for character in value)
 
 
+async def _native_handoff_ack(request: web.Request) -> web.Response:
+    verifier = request.app.get(NATIVE_HANDOFF_ACK_AUTH_VERIFIER_KEY)
+    if verifier is None:
+        return web.json_response(
+            {"ok": False, "error": "native handoff authentication unavailable"},
+            status=503,
+        )
+    body = await request.read()
+    try:
+        verifier.verify(request.headers, body)
+    except NativeHandoffAckAuthenticationError:
+        return web.json_response(
+            {"ok": False, "error": "native handoff authentication failed"},
+            status=401,
+        )
+    try:
+        descriptor = json.loads(body.decode("utf-8"))
+        _record, changed = request.app[NATIVE_HANDOFF_STORE_KEY].acknowledge(
+            descriptor
+        )
+    except (UnicodeError, ValueError, NativeHandoffStoreError, OSError):
+        return web.json_response(
+            {"ok": False, "error": "invalid native handoff ack"},
+            status=400,
+        )
+    return web.json_response({"ok": True, "acknowledged": changed})
+
+
+async def _native_handoff_recover(request: web.Request) -> web.Response:
+    verifier = request.app.get(NATIVE_HANDOFF_RECOVERY_AUTH_VERIFIER_KEY)
+    if verifier is None:
+        return web.json_response(
+            {"ok": False, "error": "native handoff authentication unavailable"},
+            status=503,
+        )
+    body = await request.read()
+    try:
+        verifier.verify(request.headers, body)
+    except NativeHandoffRecoveryAuthenticationError:
+        return web.json_response(
+            {"ok": False, "error": "native handoff authentication failed"},
+            status=401,
+        )
+    try:
+        payload = json.loads(body.decode("utf-8"))
+        if not isinstance(payload, dict) or set(payload) != {
+            "protocol",
+            "obligation_key",
+        }:
+            raise ValueError("invalid recovery lookup")
+        if payload.get("protocol") != "hfc-native-handoff-recovery-v1":
+            raise ValueError("invalid recovery lookup")
+        obligation_key = str(payload.get("obligation_key") or "")
+        record = request.app[NATIVE_HANDOFF_STORE_KEY].get_by_obligation(
+            obligation_key
+        )
+    except (UnicodeError, ValueError, NativeHandoffStoreError, OSError):
+        return web.json_response(
+            {"ok": False, "error": "invalid native handoff recovery"},
+            status=400,
+        )
+    # get_by_obligation normalizes expiry against the store's own clock.
+    descriptor = record.descriptor() if record is not None else None
+    if descriptor is None:
+        return web.json_response({"ok": True, "found": False})
+    return web.json_response(
+        {"ok": True, "found": True, "native_handoff": descriptor}
+    )
+
+
 def _policy_decision(
     app: web.Application,
     chat_id: str,
@@ -2317,6 +2414,43 @@ def _native_handoff_identity(event: SidecarEvent) -> str:
     )
 
 
+def _native_handoff_metadata(event: SidecarEvent) -> dict[str, Any]:
+    data = event.data if isinstance(event.data, dict) else {}
+    value = data.get("native_handoff")
+    if not isinstance(value, dict):
+        return {}
+    generation = value.get("generation")
+    if (
+        not isinstance(generation, str)
+        or re.fullmatch(r"[0-9a-f]{32,64}", generation) is None
+    ):
+        return {}
+    normalized: dict[str, Any] = {"generation": generation}
+    capabilities = value.get("capabilities")
+    if isinstance(capabilities, list) and all(
+        isinstance(item, str) and len(item) <= 64 for item in capabilities
+    ):
+        normalized["capabilities"] = tuple(capabilities)
+    obligation_key = value.get("obligation_key")
+    if (
+        isinstance(obligation_key, str)
+        and re.fullmatch(r"[0-9a-f]{64}", obligation_key) is not None
+    ):
+        normalized["obligation_key"] = obligation_key
+    return normalized
+
+
+def _native_handoff_ack_capable(
+    app: web.Application,
+    metadata: dict[str, Any],
+) -> bool:
+    capabilities = set(metadata.get("capabilities") or ())
+    return (
+        NATIVE_HANDOFF_ACK_AUTH_VERIFIER_KEY in app
+        and {"native-ack-v1", "stable-feishu-uuid-v1"}.issubset(capabilities)
+    )
+
+
 def _event_starts_new_lifecycle(event: SidecarEvent) -> bool:
     if event.event == "message.started":
         return True
@@ -2359,6 +2493,9 @@ def _begin_native_handoff(
     feishu_message_id: str | None,
     bot_id: str | None,
     event_created_at: float,
+    generation: str = "",
+    ack_capable: bool = False,
+    obligation_key: str = "",
 ) -> tuple[NativeHandoffRecord | None, bool]:
     try:
         store = app[NATIVE_HANDOFF_STORE_KEY]
@@ -2366,12 +2503,18 @@ def _begin_native_handoff(
             return store.begin_no_card(
                 identity_key,
                 event_created_at=event_created_at,
+                generation=generation,
+                ack_capable=ack_capable,
+                obligation_key=obligation_key,
             )
         return store.begin(
             identity_key,
             feishu_message_id=feishu_message_id,
             bot_id=bot_id or "",
             event_created_at=event_created_at,
+            generation=generation,
+            ack_capable=ack_capable,
+            obligation_key=obligation_key,
         )
     except (NativeHandoffStoreError, OSError, ValueError):
         logger.warning("native handoff state could not be persisted safely")
@@ -2398,8 +2541,11 @@ def _schedule_pending_native_handoff_repair(
     app: web.Application,
     identity_key: str,
     record: NativeHandoffRecord,
+    *,
+    feishu_message_id: str | None = None,
+    bot_id: str | None = None,
 ) -> asyncio.Task[bool] | None:
-    if record.state != "pending" or not record.feishu_message_id:
+    if record.card_state != "pending" or not feishu_message_id:
         return None
     current_repairs: Dict[str, asyncio.Task[bool]] = app[
         NATIVE_HANDOFF_CURRENT_REPAIRS_KEY
@@ -2412,16 +2558,16 @@ def _schedule_pending_native_handoff_repair(
         card = render_terminal_limit_handoff_card(app[CARD_TITLE_KEY])
         updated = await _update_card_for_app(
             app,
-            record.feishu_message_id,
+            feishu_message_id,
             card,
-            record.bot_id or None,
+            bot_id,
         )
         if not updated:
             updated = await _retry_terminal_update(
                 app,
-                record.feishu_message_id,
+                feishu_message_id,
                 card,
-                record.bot_id or None,
+                bot_id,
             )
         if updated:
             _commit_native_handoff(app, identity_key, record)
@@ -2624,6 +2770,8 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
         event = _event_for_session(incoming_event, session)
     event_is_terminal = _event_is_terminal(event)
     handoff_identity = _native_handoff_identity(incoming_event)
+    handoff_metadata = _native_handoff_metadata(incoming_event)
+    handoff_generation = str(handoff_metadata.get("generation") or "")
     starts_new_lifecycle = _event_starts_new_lifecycle(incoming_event)
     reopens_completed_session = bool(
         session is not None
@@ -2637,14 +2785,47 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
         )
     )
 
+    # A signed new-hook lifecycle token is a durable turn fence.  Record it
+    # before the per-chat policy bypass so a native started event cannot leave
+    # an older card handoff tombstone authoritative for the next completion.
+    lifecycle_fence_recorded = False
+    if starts_new_lifecycle and handoff_generation:
+        try:
+            fence_result = request.app[NATIVE_HANDOFF_STORE_KEY].record_lifecycle_fence(
+                handoff_identity,
+                generation=handoff_generation,
+                event_created_at=incoming_event.created_at,
+            )
+        except (NativeHandoffStoreError, OSError, ValueError):
+            metrics.events_rejected += 1
+            return web.json_response(
+                {"ok": False, "error": "native handoff state unavailable"},
+                status=503,
+            ), None
+        if fence_result == "stale":
+            metrics.events_ignored += 1
+            return web.json_response({"ok": True, "applied": False}), None
+        lifecycle_fence_recorded = fence_result in {"advanced", "same"}
+
     # A duplicate terminal handoff belongs to the prior card turn even when
     # policy has since changed. Suppress it before considering a new policy
     # decision, but do not mutate handoff state for a genuinely native turn.
     if event_is_terminal and not starts_new_lifecycle:
         prior_handoff = _get_native_handoff(request.app, handoff_identity)
         if prior_handoff is not None:
-            if prior_handoff.state == "lifecycle":
-                if incoming_event.created_at >= prior_handoff.event_created_at:
+            if handoff_generation and prior_handoff.generation != handoff_generation:
+                if incoming_event.created_at > prior_handoff.event_created_at:
+                    prior_handoff = None
+                else:
+                    metrics.events_applied += 1
+                    return web.json_response(
+                        {"ok": True, "applied": True}
+                    ), None
+            if prior_handoff is not None and prior_handoff.state == "lifecycle":
+                if (
+                    handoff_generation
+                    and prior_handoff.generation == handoff_generation
+                ) or incoming_event.created_at >= prior_handoff.event_created_at:
                     prior_handoff = None
                 else:
                     metrics.events_applied += 1
@@ -2661,24 +2842,50 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                         {"ok": True, "applied": True}
                     ), None
             if prior_handoff is not None:
+                try:
+                    prior_handoff = request.app[
+                        NATIVE_HANDOFF_STORE_KEY
+                    ].expire_pending(handoff_identity)
+                except (NativeHandoffStoreError, OSError, ValueError):
+                    prior_handoff = None
+                if prior_handoff is None:
+                    metrics.events_rejected += 1
+                    return web.json_response(
+                        {"ok": False, "error": "native handoff state unavailable"},
+                        status=503,
+                    ), None
                 post_lock_task = _schedule_pending_native_handoff_repair(
                     request.app,
                     handoff_identity,
                     prior_handoff,
+                    feishu_message_id=feishu_message_ids.get(session_key),
+                    bot_id=message_bot_ids.get(session_key),
                 )
-                metrics.events_applied += 1
+                descriptor = prior_handoff.descriptor()
+                if descriptor is not None:
+                    response_payload = {
+                        "ok": True,
+                        "applied": False,
+                        "disposition": "native",
+                        "native_handoff": descriptor,
+                    }
+                else:
+                    metrics.events_applied += 1
+                    response_payload = {"ok": True, "applied": True}
                 request.app[DIAGNOSTICS_KEY]["last_terminal_event"] = {
                     "message_id_hash": _diagnostic_id_hash(
                         incoming_event.message_id
                     ),
                     "event": incoming_event.event,
                     "sequence": incoming_event.sequence,
-                    "applied": True,
-                    "disposition": "native_deduplicated",
+                    "applied": descriptor is None,
+                    "disposition": (
+                        "native_pending_ack"
+                        if descriptor is not None
+                        else "native_deduplicated"
+                    ),
                 }
-                return web.json_response(
-                    {"ok": True, "applied": True}
-                ), post_lock_task
+                return web.json_response(response_payload), post_lock_task
 
     if session is None or reopens_completed_session:
         metrics.policy_event_checks += 1
@@ -2699,7 +2906,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 }
             ), None
 
-    if starts_new_lifecycle:
+    if starts_new_lifecycle and not lifecycle_fence_recorded:
         lifecycle_state = _prepare_native_handoff_lifecycle(
             request.app,
             handoff_identity,
@@ -2905,6 +3112,13 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                         feishu_message_id=None,
                         bot_id=None,
                         event_created_at=incoming_event.created_at,
+                        generation=handoff_generation,
+                        ack_capable=_native_handoff_ack_capable(
+                            request.app, handoff_metadata
+                        ),
+                        obligation_key=str(
+                            handoff_metadata.get("obligation_key") or ""
+                        ),
                     )
                     if handoff_record is None:
                         _cleanup_failed_session_state(
@@ -2919,14 +3133,13 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                             status=503,
                         ), None
                     if not handoff_created:
-                        metrics.events_applied += 1
-                        return web.json_response(
-                            {"ok": True, "applied": True}
-                        ), _schedule_pending_native_handoff_repair(
-                            request.app,
-                            handoff_identity,
+                        duplicate_response = _native_disposition_response(
                             handoff_record,
+                            duplicate=True,
                         )
+                        if handoff_record.descriptor() is None:
+                            metrics.events_applied += 1
+                        return duplicate_response, None
                     _record_card_render_decision(metrics, render_result)
                     session.terminal_disposition = "native"
                     session.terminal_limit_reason = render_result.limit_reason
@@ -2942,7 +3155,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                         "session_status": session.status,
                         "answer_chars": len(session.answer_text),
                     }
-                    return _native_disposition_response(), None
+                    return _native_disposition_response(handoff_record), None
                 _record_card_render_decision(metrics, render_result)
                 delivery = await _send_card(
                     request,
@@ -3043,6 +3256,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
     if terminal_already_handled:
         applied = True
     render_result: CardRenderResult | None = None
+    handoff_record: NativeHandoffRecord | None = None
     if applied and not terminal_already_handled:
         render_result = _render_session_card_result_for_app(request.app, session)
         if event_is_terminal and render_result.disposition == "native":
@@ -3052,6 +3266,11 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 feishu_message_id=feishu_message_id,
                 bot_id=message_bot_ids.get(session_key),
                 event_created_at=incoming_event.created_at,
+                generation=handoff_generation,
+                ack_capable=_native_handoff_ack_capable(
+                    request.app, handoff_metadata
+                ),
+                obligation_key=str(handoff_metadata.get("obligation_key") or ""),
             )
             if handoff_record is None:
                 if terminal_session_snapshot is not None:
@@ -3062,13 +3281,18 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                     status=503,
                 ), None
             if not handoff_created:
-                metrics.events_applied += 1
-                return web.json_response(
-                    {"ok": True, "applied": True}
-                ), _schedule_pending_native_handoff_repair(
+                duplicate_response = _native_disposition_response(
+                    handoff_record,
+                    duplicate=True,
+                )
+                if handoff_record.descriptor() is None:
+                    metrics.events_applied += 1
+                return duplicate_response, _schedule_pending_native_handoff_repair(
                     request.app,
                     handoff_identity,
                     handoff_record,
+                    feishu_message_id=feishu_message_id,
+                    bot_id=message_bot_ids.get(session_key),
                 )
             _record_card_render_decision(metrics, render_result)
             session.terminal_disposition = "native"
@@ -3197,6 +3421,11 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
     }
     if native_disposition:
         response_payload["disposition"] = "native"
+        descriptor = (
+            handoff_record.descriptor() if handoff_record is not None else None
+        )
+        if descriptor is not None:
+            response_payload["native_handoff"] = descriptor
     if (
         applied
         and not native_disposition
@@ -3671,10 +3900,22 @@ def _record_card_render_decision(
             metrics.card_limit_tables += 1
 
 
-def _native_disposition_response() -> web.Response:
-    return web.json_response(
-        {"ok": True, "applied": False, "disposition": "native"}
-    )
+def _native_disposition_response(
+    record: NativeHandoffRecord | None = None,
+    *,
+    duplicate: bool = False,
+) -> web.Response:
+    descriptor = record.descriptor() if record is not None else None
+    if duplicate and descriptor is None:
+        return web.json_response({"ok": True, "applied": True})
+    payload: dict[str, Any] = {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    if descriptor is not None:
+        payload["native_handoff"] = descriptor
+    return web.json_response(payload)
 
 
 def _footer_fields_for_session(

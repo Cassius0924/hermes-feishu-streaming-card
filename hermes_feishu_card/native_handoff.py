@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import tempfile
 import threading
@@ -29,9 +30,18 @@ NATIVE_HANDOFF_STATE_NAME = "native-handoffs.json"
 NATIVE_HANDOFF_LOCK_NAME = "native-handoffs.lock"
 DEFAULT_MAX_RECORDS = 512
 DEFAULT_MAX_FILE_BYTES = 256 * 1024
+NATIVE_HANDOFF_PROTOCOL = "hfc-native-handoff-v1"
+NATIVE_HANDOFF_TTL_SECONDS = 60 * 60
+LIFECYCLE_FENCE_TTL_SECONDS = 60 * 60
 _IDENTITY_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
-_VALID_STATES = frozenset({"pending", "committed", "no_card", "lifecycle"})
-_ACTIVE_STATES = frozenset({"pending", "lifecycle"})
+_GENERATION_RE = re.compile(r"^[0-9a-f]{32,64}$")
+_HANDOFF_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_UUID_SEED_RE = re.compile(r"^[0-9a-f]{32}$")
+_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_VALID_CARD_STATES = frozenset({"none", "pending", "committed"})
+_VALID_DELIVERY_STATES = frozenset(
+    {"lifecycle", "legacy_consumed", "pending", "acked", "uncertain"}
+)
 _MAX_FEISHU_MESSAGE_ID_CHARS = 512
 _MAX_BOT_ID_CHARS = 256
 _PROCESS_LOCKS_GUARD = threading.Lock()
@@ -44,12 +54,56 @@ class NativeHandoffStoreError(OSError):
 
 @dataclass(frozen=True)
 class NativeHandoffRecord:
-    state: str
-    feishu_message_id: str
-    bot_id: str
+    card_state: str
+    delivery_state: str
+    card_message_hash: str
+    bot_hash: str
+    generation: str
+    handoff_id: str
+    uuid_seed: str
+    obligation_key: str
     created_at: float
     updated_at: float
     event_created_at: float
+    expires_at: float
+
+    @property
+    def state(self) -> str:
+        """Compatibility view for pre-ACK callers.
+
+        Native delivery is deliberately not inferred from the card-notice
+        PATCH state.  New code must inspect ``card_state`` and
+        ``delivery_state`` independently.
+        """
+
+        if self.delivery_state == "lifecycle":
+            return "lifecycle"
+        if self.delivery_state == "pending" or self.card_state == "pending":
+            return "pending"
+        if self.card_state == "committed":
+            return "committed"
+        return "no_card"
+
+    @property
+    def feishu_message_id(self) -> str:
+        # Raw platform identifiers are intentionally never persisted.
+        return ""
+
+    @property
+    def bot_id(self) -> str:
+        return ""
+
+    def descriptor(self, *, now: float | None = None) -> dict[str, Any] | None:
+        if self.delivery_state != "pending":
+            return None
+        if now is not None and _finite_timestamp(now) > self.expires_at:
+            return None
+        return {
+            "protocol": NATIVE_HANDOFF_PROTOCOL,
+            "id": self.handoff_id,
+            "uuid_seed": self.uuid_seed,
+            "expires_at": self.expires_at,
+        }
 
 
 def handoff_identity_key(
@@ -124,6 +178,9 @@ class NativeHandoffStore:
         feishu_message_id: str,
         bot_id: str,
         event_created_at: float,
+        generation: str = "",
+        ack_capable: bool = False,
+        obligation_key: str = "",
     ) -> tuple[NativeHandoffRecord, bool]:
         _validate_identity_key(identity_key)
         message_id = _bounded_identifier(
@@ -140,25 +197,39 @@ class NativeHandoffStore:
         )
         return self._begin(
             identity_key,
-            state="pending",
-            feishu_message_id=message_id,
-            bot_id=bounded_bot_id,
+            card_state="pending",
+            card_message_hash=_routing_hash("card-message", message_id),
+            bot_hash=(
+                _routing_hash("bot", bounded_bot_id) if bounded_bot_id else ""
+            ),
             event_created_at=_finite_timestamp(event_created_at),
+            generation=_validated_generation(generation, required=ack_capable),
+            ack_capable=bool(ack_capable),
+            obligation_key=_validated_obligation_key(obligation_key),
         )
 
     def begin_no_card(
-        self, identity_key: str, *, event_created_at: float
+        self,
+        identity_key: str,
+        *,
+        event_created_at: float,
+        generation: str = "",
+        ack_capable: bool = False,
+        obligation_key: str = "",
     ) -> tuple[NativeHandoffRecord, bool]:
         _validate_identity_key(identity_key)
         return self._begin(
             identity_key,
-            state="no_card",
-            feishu_message_id="",
-            bot_id="",
+            card_state="none",
+            card_message_hash="",
+            bot_hash="",
             event_created_at=_finite_timestamp(event_created_at),
+            generation=_validated_generation(generation, required=ack_capable),
+            ack_capable=bool(ack_capable),
+            obligation_key=_validated_obligation_key(obligation_key),
         )
 
-    def mark_committed(
+    def mark_card_committed(
         self,
         identity_key: str,
         *,
@@ -171,22 +242,152 @@ class NativeHandoffStore:
                 current = records.get(identity_key)
                 if current is None:
                     return None
-                if expected_record is not None and current != expected_record:
+                if expected_record is not None and (
+                    current.handoff_id != expected_record.handoff_id
+                    or current.generation != expected_record.generation
+                    or current.created_at != expected_record.created_at
+                    or current.event_created_at != expected_record.event_created_at
+                ):
                     # A newer lifecycle may have reused the same stable key
                     # while an older asynchronous PATCH was still in flight.
-                    # Never let that stale completion commit the new record.
+                    # Delivery ACK is an independent axis and may legitimately
+                    # race ahead of this card-notice PATCH.
                     return current
-                if current.state in {"committed", "no_card", "lifecycle"}:
+                if current.card_state in {"committed", "none"}:
                     return current
                 updated = replace(
                     current,
-                    state="committed",
+                    card_state="committed",
                     updated_at=self._timestamp(),
                 )
                 pending = dict(records)
                 pending[identity_key] = updated
                 self._write_records(pending, protected_key=identity_key)
                 return updated
+
+    # Backward-compatible spelling used by the existing server integration.
+    mark_committed = mark_card_committed
+
+    def acknowledge(
+        self,
+        descriptor: dict[str, Any],
+    ) -> tuple[NativeHandoffRecord, bool]:
+        normalized = _validated_descriptor(descriptor)
+        with self._lock:
+            with self._persistent_lock():
+                records = self._load_records()
+                match = next(
+                    (
+                        (key, record)
+                        for key, record in records.items()
+                        if record.handoff_id == normalized["id"]
+                    ),
+                    None,
+                )
+                if match is None:
+                    raise ValueError("native handoff not found")
+                identity_key, current = match
+                if not _descriptor_matches(current, normalized):
+                    raise ValueError("native handoff descriptor mismatch")
+                if current.delivery_state == "acked":
+                    return current, False
+                if current.delivery_state != "pending":
+                    raise ValueError("native handoff is not pending")
+                if self._timestamp() > current.expires_at:
+                    raise ValueError("native handoff is not pending")
+                updated = replace(
+                    current,
+                    delivery_state="acked",
+                    updated_at=self._timestamp(),
+                )
+                pending = dict(records)
+                pending[identity_key] = updated
+                self._write_records(pending, protected_key=identity_key)
+                return updated, True
+
+    def expire_pending(self, identity_key: str) -> NativeHandoffRecord | None:
+        _validate_identity_key(identity_key)
+        with self._lock:
+            with self._persistent_lock():
+                records = self._load_records()
+                current = records.get(identity_key)
+                if (
+                    current is None
+                    or current.delivery_state != "pending"
+                    or self._timestamp() <= current.expires_at
+                ):
+                    return current
+                updated = replace(
+                    current,
+                    delivery_state="uncertain",
+                    updated_at=self._timestamp(),
+                )
+                pending = dict(records)
+                pending[identity_key] = updated
+                self._write_records(pending, protected_key=identity_key)
+                return updated
+
+    def get_by_obligation(self, obligation_key: str) -> NativeHandoffRecord | None:
+        key = _validated_obligation_key(obligation_key, required=True)
+        with self._lock:
+            with self._persistent_lock():
+                for record in self._load_records().values():
+                    if record.obligation_key == key:
+                        return record
+        return None
+
+    def safe_status(self) -> dict[str, Any]:
+        """Return bounded aggregate diagnostics without identifiers."""
+        with self._lock:
+            with self._persistent_lock():
+                records = self._load_records()
+        counts = {state: 0 for state in sorted(_VALID_DELIVERY_STATES)}
+        for record in records.values():
+            counts[record.delivery_state] += 1
+        return {
+            "records": len(records),
+            "delivery_states": counts,
+            "manual_review_required": counts["uncertain"] > 0,
+        }
+
+    def record_lifecycle_fence(
+        self,
+        identity_key: str,
+        *,
+        generation: str,
+        event_created_at: float,
+    ) -> str:
+        _validate_identity_key(identity_key)
+        bounded_generation = _validated_generation(generation, required=True)
+        lifecycle_at = _finite_timestamp(event_created_at)
+        with self._lock:
+            with self._persistent_lock():
+                records = self._load_records()
+                current = records.get(identity_key)
+                if current is not None:
+                    if current.generation == bounded_generation:
+                        return "same"
+                    if lifecycle_at <= current.event_created_at:
+                        return "stale"
+                timestamp = self._timestamp()
+                fence = NativeHandoffRecord(
+                    card_state="none",
+                    delivery_state="lifecycle",
+                    card_message_hash="",
+                    bot_hash="",
+                    generation=bounded_generation,
+                    handoff_id=_handoff_id(identity_key, bounded_generation),
+                    uuid_seed="",
+                    obligation_key="",
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                    event_created_at=lifecycle_at,
+                    expires_at=timestamp,
+                )
+                pending = dict(records)
+                pending[identity_key] = fence
+                self._write_records(pending, protected_key=identity_key)
+                return "advanced"
 
     def clear(self, identity_key: str) -> bool:
         _validate_identity_key(identity_key)
@@ -215,12 +416,18 @@ class NativeHandoffStore:
                     return "stale"
                 timestamp = self._timestamp()
                 lifecycle_floor = NativeHandoffRecord(
-                    state="lifecycle",
-                    feishu_message_id="",
-                    bot_id="",
+                    card_state="none",
+                    delivery_state="lifecycle",
+                    card_message_hash="",
+                    bot_hash="",
+                    generation="",
+                    handoff_id=_handoff_id(identity_key, ""),
+                    uuid_seed="",
+                    obligation_key="",
                     created_at=timestamp,
                     updated_at=timestamp,
                     event_created_at=lifecycle_at,
+                    expires_at=timestamp,
                 )
                 pending = dict(records)
                 pending[identity_key] = lifecycle_floor
@@ -231,29 +438,46 @@ class NativeHandoffStore:
         self,
         identity_key: str,
         *,
-        state: str,
-        feishu_message_id: str,
-        bot_id: str,
+        card_state: str,
+        card_message_hash: str,
+        bot_hash: str,
         event_created_at: float,
+        generation: str,
+        ack_capable: bool,
+        obligation_key: str,
     ) -> tuple[NativeHandoffRecord, bool]:
         with self._lock:
             with self._persistent_lock():
                 records = self._load_records()
                 current = records.get(identity_key)
                 if current is not None:
-                    if (
-                        current.state != "lifecycle"
-                        or event_created_at < current.event_created_at
-                    ):
+                    same_generation = current.generation == generation
+                    if same_generation and current.delivery_state != "lifecycle":
+                        return current, False
+                    if current.delivery_state == "lifecycle" and same_generation:
+                        if event_created_at < current.event_created_at:
+                            return current, False
+                    elif event_created_at <= current.event_created_at:
                         return current, False
                 timestamp = self._timestamp()
+                delivery_state = "pending" if ack_capable else "legacy_consumed"
                 record = NativeHandoffRecord(
-                    state=state,
-                    feishu_message_id=feishu_message_id,
-                    bot_id=bot_id,
+                    card_state=card_state,
+                    delivery_state=delivery_state,
+                    card_message_hash=card_message_hash,
+                    bot_hash=bot_hash,
+                    generation=generation,
+                    handoff_id=_handoff_id(identity_key, generation),
+                    uuid_seed=secrets.token_hex(16) if ack_capable else "",
+                    obligation_key=obligation_key,
                     created_at=timestamp,
                     updated_at=timestamp,
                     event_created_at=event_created_at,
+                    expires_at=(
+                        timestamp + NATIVE_HANDOFF_TTL_SECONDS
+                        if ack_capable
+                        else timestamp
+                    ),
                 )
                 pending = dict(records)
                 pending[identity_key] = record
@@ -291,7 +515,12 @@ class NativeHandoffStore:
         if _lstat(self.path) is None:
             return {}
         raw = _read_private_file(self.root, self.path, self.max_file_bytes)
-        return _decode_records(raw, self.max_records)
+        records = self._normalize_records(_decode_records(raw))
+        # Bound every read as well as every write. Fresh active handoffs are
+        # never silently discarded; if they alone exceed the configured
+        # bound, surface an explicit operational error.
+        self._evict_to_count(records, protected_key="")
+        return records
 
     def _write_records(
         self,
@@ -299,7 +528,7 @@ class NativeHandoffStore:
         *,
         protected_key: str = "",
     ) -> None:
-        pending = dict(records)
+        pending = self._normalize_records(records)
         _validate_existing_private_file(self.root, self.path)
         self._evict_to_count(pending, protected_key=protected_key)
         payload = self._serialized_payload(pending)
@@ -311,23 +540,50 @@ class NativeHandoffStore:
             raise NativeHandoffStoreError("handoff state exceeds bounded file size")
         _atomic_write_private(self.root, self.path, payload)
 
+    def _normalize_records(
+        self,
+        records: dict[str, NativeHandoffRecord],
+    ) -> dict[str, NativeHandoffRecord]:
+        if not any(
+            record.delivery_state == "pending" for record in records.values()
+        ):
+            return dict(records)
+        now = self._timestamp()
+        normalized: dict[str, NativeHandoffRecord] = {}
+        for key, record in records.items():
+            if record.delivery_state == "pending" and now > record.expires_at:
+                record = replace(
+                    record,
+                    delivery_state="uncertain",
+                    updated_at=now,
+                )
+            normalized[key] = record
+        return normalized
+
     def _serialized_payload(
         self, values: dict[str, NativeHandoffRecord]
     ) -> bytes:
         records = {
             key: {
                 "state": record.state,
-                "feishu_message_id": record.feishu_message_id,
-                "bot_id": record.bot_id,
+                "card_state": record.card_state,
+                "delivery_state": record.delivery_state,
+                "card_message_hash": record.card_message_hash,
+                "bot_hash": record.bot_hash,
+                "generation": record.generation,
+                "handoff_id": record.handoff_id,
+                "uuid_seed": record.uuid_seed,
+                "obligation_key": record.obligation_key,
                 "created_at": record.created_at,
                 "updated_at": record.updated_at,
                 "event_created_at": record.event_created_at,
+                "expires_at": record.expires_at,
             }
             for key, record in sorted(values.items())
         }
         return (
             json.dumps(
-                {"version": 1, "records": records},
+                {"version": 2, "records": records},
                 ensure_ascii=False,
                 separators=(",", ":"),
                 sort_keys=True,
@@ -351,10 +607,20 @@ class NativeHandoffStore:
         *,
         protected_key: str,
     ) -> bool:
+        now = self._timestamp()
         candidates = [
             (key, record)
             for key, record in records.items()
-            if key != protected_key and record.state not in _ACTIVE_STATES
+            if key != protected_key
+            and record.delivery_state != "pending"
+            and (
+                record.delivery_state != "lifecycle"
+                or now - record.updated_at >= LIFECYCLE_FENCE_TTL_SECONDS
+            )
+            and (
+                record.card_state != "pending"
+                or record.delivery_state == "uncertain"
+            )
         ]
         if not candidates:
             return False
@@ -369,13 +635,14 @@ class NativeHandoffStore:
         return True
 
 
-def _decode_records(raw: bytes, max_records: int) -> dict[str, NativeHandoffRecord]:
+def _decode_records(raw: bytes) -> dict[str, NativeHandoffRecord]:
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeError, ValueError) as exc:
         raise NativeHandoffStoreError("handoff state is invalid") from exc
-    if not isinstance(payload, dict) or payload.get("version") != 1:
+    if not isinstance(payload, dict) or payload.get("version") not in {1, 2}:
         raise NativeHandoffStoreError("handoff state is invalid")
+    version = payload["version"]
     values = payload.get("records")
     if not isinstance(values, dict):
         raise NativeHandoffStoreError("handoff state is invalid")
@@ -383,71 +650,199 @@ def _decode_records(raw: bytes, max_records: int) -> dict[str, NativeHandoffReco
     for key, value in values.items():
         try:
             _validate_identity_key(key)
-            decoded[key] = _decode_record(value)
+            decoded[key] = _decode_record(key, value, version=version)
         except (TypeError, ValueError, OverflowError) as exc:
             raise NativeHandoffStoreError("handoff state is invalid") from exc
-    if len(decoded) > max_records:
-        active_count = sum(
-            record.state in _ACTIVE_STATES for record in decoded.values()
-        )
-        if active_count > max_records:
-            raise NativeHandoffStoreError(
-                "handoff state has too many active records"
-            )
-        ordered = sorted(
-            decoded.items(),
-            key=lambda item: (
-                item[1].state in _ACTIVE_STATES,
-                item[1].updated_at,
-                item[0],
-            ),
-            reverse=True,
-        )
-        decoded = dict(ordered[:max_records])
     return decoded
 
 
-def _decode_record(value: Any) -> NativeHandoffRecord:
+def _decode_record(
+    identity_key: str,
+    value: Any,
+    *,
+    version: int,
+) -> NativeHandoffRecord:
     if not isinstance(value, dict):
         raise ValueError("record must be an object")
-    state = value.get("state")
-    if state not in _VALID_STATES:
-        raise ValueError("invalid record state")
-    message_id = _bounded_identifier(
-        value.get("feishu_message_id"),
-        name="feishu_message_id",
-        max_chars=_MAX_FEISHU_MESSAGE_ID_CHARS,
-        required=state in {"pending", "committed"},
-    )
-    bot_id = _bounded_identifier(
-        value.get("bot_id"),
-        name="bot_id",
-        max_chars=_MAX_BOT_ID_CHARS,
-        required=False,
-    )
-    if state in {"no_card", "lifecycle"} and (message_id or bot_id):
-        raise ValueError("record must not contain delivery identifiers")
     created_at = _finite_timestamp(value.get("created_at"))
     updated_at = _finite_timestamp(value.get("updated_at"))
-    # Early development builds wrote version-1 records before this field was
-    # added.  The private file is migrated in place on the next mutation; using
-    # the durable write timestamp is the safest lifecycle-ordering fallback.
     event_created_at = _finite_timestamp(value.get("event_created_at", created_at))
     if updated_at < created_at:
         raise ValueError("record timestamps are invalid")
+    if version == 1:
+        state = value.get("state")
+        if state not in {"pending", "committed", "no_card", "lifecycle"}:
+            raise ValueError("invalid record state")
+        message_id = _bounded_identifier(
+            value.get("feishu_message_id"),
+            name="feishu_message_id",
+            max_chars=_MAX_FEISHU_MESSAGE_ID_CHARS,
+            required=state in {"pending", "committed"},
+        )
+        bot_id = _bounded_identifier(
+            value.get("bot_id"),
+            name="bot_id",
+            max_chars=_MAX_BOT_ID_CHARS,
+            required=False,
+        )
+        if state in {"no_card", "lifecycle"} and (message_id or bot_id):
+            raise ValueError("record must not contain delivery identifiers")
+        card_state = {
+            "pending": "pending",
+            "committed": "committed",
+            "no_card": "none",
+            "lifecycle": "none",
+        }[state]
+        return NativeHandoffRecord(
+            card_state=card_state,
+            delivery_state=(
+                "lifecycle" if state == "lifecycle" else "legacy_consumed"
+            ),
+            card_message_hash=(
+                _routing_hash("card-message", message_id) if message_id else ""
+            ),
+            bot_hash=_routing_hash("bot", bot_id) if bot_id else "",
+            generation="",
+            handoff_id=_handoff_id(identity_key, ""),
+            uuid_seed="",
+            obligation_key="",
+            created_at=created_at,
+            updated_at=updated_at,
+            event_created_at=event_created_at,
+            expires_at=updated_at,
+        )
+
+    card_state = value.get("card_state")
+    delivery_state = value.get("delivery_state")
+    if (
+        card_state not in _VALID_CARD_STATES
+        or delivery_state not in _VALID_DELIVERY_STATES
+    ):
+        raise ValueError("invalid record state")
+    generation = _validated_generation(
+        value.get("generation", ""),
+        required=delivery_state == "pending",
+    )
+    handoff_id = _validated_hash(value.get("handoff_id"), "handoff_id")
+    uuid_seed = str(value.get("uuid_seed") or "")
+    if delivery_state == "pending":
+        if _UUID_SEED_RE.fullmatch(uuid_seed) is None:
+            raise ValueError("invalid uuid seed")
+    elif uuid_seed and _UUID_SEED_RE.fullmatch(uuid_seed) is None:
+        raise ValueError("invalid uuid seed")
+    card_message_hash = _validated_optional_hash(
+        value.get("card_message_hash", ""), "card_message_hash"
+    )
+    bot_hash = _validated_optional_hash(value.get("bot_hash", ""), "bot_hash")
+    obligation_key = _validated_obligation_key(value.get("obligation_key", ""))
+    expires_at = _finite_timestamp(value.get("expires_at", updated_at))
+    if card_state == "none" and (card_message_hash or bot_hash):
+        raise ValueError("card-free record contains routing hashes")
     return NativeHandoffRecord(
-        state=state,
-        feishu_message_id=message_id,
-        bot_id=bot_id,
+        card_state=card_state,
+        delivery_state=delivery_state,
+        card_message_hash=card_message_hash,
+        bot_hash=bot_hash,
+        generation=generation,
+        handoff_id=handoff_id,
+        uuid_seed=uuid_seed,
+        obligation_key=obligation_key,
         created_at=created_at,
         updated_at=updated_at,
         event_created_at=event_created_at,
+        expires_at=expires_at,
     )
 
 
 def _validate_identity_key(value: Any) -> None:
     if not isinstance(value, str) or _IDENTITY_KEY_RE.fullmatch(value) is None:
         raise ValueError("identity key must be a SHA-256 digest")
+
+
+def _validated_generation(value: Any, *, required: bool) -> str:
+    if not isinstance(value, str):
+        raise ValueError("generation must be a string")
+    normalized = value.strip().lower()
+    if not normalized:
+        if required:
+            raise ValueError("generation is required")
+        return ""
+    if _GENERATION_RE.fullmatch(normalized) is None:
+        raise ValueError("generation is invalid")
+    return normalized
+
+
+def _validated_obligation_key(value: Any, *, required: bool = False) -> str:
+    if not isinstance(value, str):
+        raise ValueError("obligation key must be a string")
+    normalized = value.strip().lower()
+    if not normalized:
+        if required:
+            raise ValueError("obligation key is required")
+        return ""
+    if _HASH_RE.fullmatch(normalized) is None:
+        raise ValueError("obligation key is invalid")
+    return normalized
+
+
+def _validated_hash(value: Any, name: str) -> str:
+    if not isinstance(value, str) or _HASH_RE.fullmatch(value) is None:
+        raise ValueError(f"{name} is invalid")
+    return value
+
+
+def _validated_optional_hash(value: Any, name: str) -> str:
+    if value == "":
+        return ""
+    return _validated_hash(value, name)
+
+
+def _routing_hash(domain: str, value: str) -> str:
+    return hashlib.sha256(
+        f"hfc-native-handoff-{domain}-v1\0{value}".encode("utf-8")
+    ).hexdigest()
+
+
+def _handoff_id(identity_key: str, generation: str) -> str:
+    return hashlib.sha256(
+        f"hfc-native-handoff-id-v1\0{identity_key}\0{generation}".encode("ascii")
+    ).hexdigest()
+
+
+def _validated_descriptor(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "protocol",
+        "id",
+        "uuid_seed",
+        "expires_at",
+    }:
+        raise ValueError("native handoff descriptor is invalid")
+    if value.get("protocol") != NATIVE_HANDOFF_PROTOCOL:
+        raise ValueError("native handoff descriptor is invalid")
+    handoff_id = value.get("id")
+    uuid_seed = value.get("uuid_seed")
+    if not isinstance(handoff_id, str) or _HANDOFF_ID_RE.fullmatch(handoff_id) is None:
+        raise ValueError("native handoff descriptor is invalid")
+    if not isinstance(uuid_seed, str) or _UUID_SEED_RE.fullmatch(uuid_seed) is None:
+        raise ValueError("native handoff descriptor is invalid")
+    return {
+        "protocol": NATIVE_HANDOFF_PROTOCOL,
+        "id": handoff_id,
+        "uuid_seed": uuid_seed,
+        "expires_at": _finite_timestamp(value.get("expires_at")),
+    }
+
+
+def _descriptor_matches(
+    record: NativeHandoffRecord,
+    descriptor: dict[str, Any],
+) -> bool:
+    return (
+        descriptor["protocol"] == NATIVE_HANDOFF_PROTOCOL
+        and descriptor["id"] == record.handoff_id
+        and descriptor["uuid_seed"] == record.uuid_seed
+        and descriptor["expires_at"] == record.expires_at
+    )
 
 
 def _bounded_identifier(

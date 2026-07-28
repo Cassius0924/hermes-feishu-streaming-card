@@ -313,6 +313,50 @@ def test_apply_patch_installs_command_card_adapter_before_recovered_watchers():
     assert patcher.remove_patch(patched) == content
 
 
+def test_v019_startup_installs_uuid_wrapper_before_delivery_ledger_redelivery():
+    content = (
+        "class GatewayRunner:\n"
+        "    async def start(self):\n"
+        "        await self._redeliver_pending_obligations()\n"
+        "        try:\n"
+        "            from tools.process_registry import process_registry\n"
+        "            watchers = process_registry.pending_watchers\n"
+        "            for watcher in watchers:\n"
+        "                self._run_process_watcher(watcher)\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "\n"
+        "    async def _redeliver_pending_obligations(self):\n"
+        "        for row in claimed:\n"
+        "            adapter = self.adapters[row['platform']]\n"
+        "            content = row['content']\n"
+        "            result = await adapter.send(\n"
+        "                chat_id=row['chat_id'],\n"
+        "                content=content,\n"
+        "                metadata=None,\n"
+        "            )\n"
+        "\n"
+        "    async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):\n"
+        "        response = 'ok'\n"
+        "        _response_time = 1\n"
+        "        agent_result = {}\n"
+        "        return response\n"
+    )
+
+    patched = patcher.apply_patch(content, strategy="gateway_run_013_plus")
+
+    ast.parse(patched)
+    assert patched.index(patcher.COMMAND_CARD_STARTUP_PATCH_BEGIN) < patched.index(
+        "await self._redeliver_pending_obligations()"
+    )
+    assert patched.index(patcher.NATIVE_REDELIVERY_PATCH_BEGIN) < patched.index(
+        "result = await adapter.send("
+    )
+    assert "obligation_id=row.get(\"obligation_id\")" in patched
+    assert patcher.apply_patch(patched, strategy="gateway_run_013_plus") == patched
+    assert patcher.remove_patch(patched) == content
+
+
 @pytest.mark.parametrize(
     "runner_name, watcher_call",
     [

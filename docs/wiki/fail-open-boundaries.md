@@ -17,7 +17,7 @@
 | patch anchors、manifest、backup 或恢复所有权不可验证 | 必须失败 | installer/repair 拒绝覆盖，增加 `recovery_refusals`；只有已知安全状态才允许自动修复。 |
 | runtime heartbeat 缺失、generation 不匹配或 strict repair 完成 | 主流程可继续、mutation 必须失败或等待 | readiness 降级或显示 restart required；heartbeat 不授权写源码，HFC 不自动重启 Gateway。 |
 | `service.manager=auto` 没有 user systemd | 可继续 | 使用 owned `detached`；不得进入 system manager 或触发提权。显式 manager 不可用时则拒绝启动。 |
-| Card JSON 超过 28,000 byte | 可继续但不得截断 | 非终态继续收集；terminal 交还完整 Hermes 原生答案，handoff 与重复 terminal 保持幂等。 |
+| Card JSON 超过 28,000 byte | 可继续但不得截断 | 非终态继续收集；terminal 交还完整 Hermes 原生答案。delivery record 不保存正文或原始路由 id；notice 仅当前进程内 best-effort，native final 由稳定 UUID、Hermes ledger 与 delivered 后签名 ACK 保持幂等。 |
 | Hermes 版本 metadata 缺失但 gateway anchors 完整可验证 | 可继续 | source-stripped 安装可使用 anchors 选择策略；metadata 可读但结构和 anchors 均不可验证时仍拒绝。 |
 | 用户可验证修改与 HFC markers/manifest 不一致 | 必须失败 | 不覆盖用户内容；先人工确认修改来源，再选择 restore、重新安装或手工合并。 |
 

@@ -20,7 +20,12 @@ from hermes_feishu_card.bots import RouteResult
 from hermes_feishu_card.card_limits import inspect_card_limits
 from hermes_feishu_card.events import SidecarEvent
 from hermes_feishu_card.delivery_policy import ChatDeliveryPolicy
-from hermes_feishu_card.event_auth import sign_event_request, sign_policy_request
+from hermes_feishu_card.event_auth import (
+    sign_event_request,
+    sign_native_handoff_ack_request,
+    sign_native_handoff_recovery_request,
+    sign_policy_request,
+)
 from hermes_feishu_card.feishu_client import FeishuAPIError
 from hermes_feishu_card.diagnostics import DiagnosticFinding, DiagnosticReport
 from hermes_feishu_card.flush import FlushController
@@ -4596,6 +4601,383 @@ async def test_nonterminal_oversize_updates_existing_card_with_waiting_handoff(c
     assert metrics["card_limit_json_bytes"] == 1
 
 
+async def test_ack_capable_terminal_repeats_descriptor_until_signed_ack(tmp_path):
+    state_root = tmp_path / "handoff-state"
+    app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=NativeHandoffStore(state_root, now=lambda: 100.0),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    generation = "1" * 32
+    obligation_key = "2" * 64
+    handoff_meta = {
+        "generation": generation,
+        "capabilities": ["native-ack-v1", "stable-feishu-uuid-v1"],
+        "obligation_key": obligation_key,
+    }
+    try:
+        started = event_payload(
+            "message.started",
+            0,
+            {"native_handoff": {"generation": generation}},
+        )
+        assert (await (await test_client.post("/events", json=started)).json())["applied"] is True
+        completed_payload = event_payload(
+            "message.completed",
+            1,
+            {
+                "answer": "ACK-NATIVE-" + ("密" * 40_000),
+                "native_handoff": handoff_meta,
+            },
+        )
+        first = await (await test_client.post("/events", json=completed_payload)).json()
+        repeated = await (await test_client.post("/events", json=completed_payload)).json()
+
+        assert first["applied"] is False
+        assert first["disposition"] == "native"
+        assert first["native_handoff"] == repeated["native_handoff"]
+        assert repeated["applied"] is False
+        descriptor = first["native_handoff"]
+        assert descriptor["protocol"] == "hfc-native-handoff-v1"
+        assert descriptor["expires_at"] == 3700.0
+
+        ack_body = json.dumps(descriptor, separators=(",", ":")).encode("utf-8")
+        ack_headers = sign_native_handoff_ack_request(
+            TRANSPORT_ROOT_SECRET,
+            ack_body,
+            timestamp=int(sidecar_server.time.time()),
+            nonce="native-ack-server-0001",
+        )
+        ack = await test_client.post(
+            "/native-handoff/ack",
+            data=ack_body,
+            headers=ack_headers,
+        )
+        assert ack.status == 200
+        assert await ack.json() == {"ok": True, "acknowledged": True}
+
+        ack_retry_body = json.dumps(descriptor, separators=(",", ":")).encode("utf-8")
+        ack_retry = await test_client.post(
+            "/native-handoff/ack",
+            data=ack_retry_body,
+            headers=sign_native_handoff_ack_request(
+                TRANSPORT_ROOT_SECRET,
+                ack_retry_body,
+                timestamp=int(sidecar_server.time.time()),
+                nonce="native-ack-server-0002",
+            ),
+        )
+        assert await ack_retry.json() == {"ok": True, "acknowledged": False}
+
+        after_ack = await (
+            await test_client.post("/events", json=completed_payload)
+        ).json()
+        assert after_ack == {"ok": True, "applied": True}
+    finally:
+        await test_client.close()
+
+
+async def test_native_descriptor_returns_before_slow_notice_and_survives_notice_cancel(
+    tmp_path,
+):
+    state_root = tmp_path / "handoff-state"
+    feishu = FakeFeishuClient()
+    feishu.update_delay = 0.5
+    store = NativeHandoffStore(state_root)
+    app = create_app(feishu, native_handoff_store=store)
+    first_client = TestClient(TestServer(app))
+    await first_client.start_server()
+    generation = "7" * 32
+    obligation_key = "8" * 64
+    try:
+        await first_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": generation}},
+                message_id="message-slow-native-notice",
+            ),
+        )
+        started_at = asyncio.get_running_loop().time()
+        response = await first_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                1,
+                {
+                    "answer": "SLOW-NATIVE-" + ("密" * 40_000),
+                    "native_handoff": {
+                        "generation": generation,
+                        "capabilities": [
+                            "native-ack-v1",
+                            "stable-feishu-uuid-v1",
+                        ],
+                        "obligation_key": obligation_key,
+                    },
+                },
+                message_id="message-slow-native-notice",
+            ),
+        )
+        elapsed = asyncio.get_running_loop().time() - started_at
+        payload = await response.json()
+
+        assert response.status == 200
+        assert elapsed < 0.2
+        assert elapsed < feishu.update_delay
+        assert payload["applied"] is False
+        assert payload["disposition"] == "native"
+        descriptor = payload["native_handoff"]
+        assert feishu.updated == []
+    finally:
+        # Simulate process loss while the decorative notice PATCH is still
+        # in flight. Shutdown cancels that in-memory task only.
+        await first_client.close()
+
+    second_app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=NativeHandoffStore(state_root),
+    )
+    second_client = TestClient(TestServer(second_app))
+    await second_client.start_server()
+    body = json.dumps(
+        {
+            "protocol": "hfc-native-handoff-recovery-v1",
+            "obligation_key": obligation_key,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    try:
+        recovered = await second_client.post(
+            "/native-handoff/recover",
+            data=body,
+            headers=sign_native_handoff_recovery_request(
+                TRANSPORT_ROOT_SECRET,
+                body,
+                timestamp=int(sidecar_server.time.time()),
+                nonce="native-recovery-slow-notice-0001",
+            ),
+        )
+        recovered_payload = await recovered.json()
+    finally:
+        await second_client.close()
+
+    assert recovered_payload == {
+        "ok": True,
+        "found": True,
+        "native_handoff": descriptor,
+    }
+    serialized = (state_root / "native-handoffs.json").read_text()
+    assert "feishu-message-1" not in serialized
+    assert "SLOW-NATIVE" not in serialized
+
+
+async def test_native_handoff_ack_endpoint_rejects_replay_and_schema_extension(tmp_path):
+    app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    body = b'{"protocol":"hfc-native-handoff-v1","id":"' + b"a" * 64 + b'","uuid_seed":"' + b"b" * 32 + b'","expires_at":100,"extra":true}'
+    headers = sign_native_handoff_ack_request(
+        TRANSPORT_ROOT_SECRET,
+        body,
+        timestamp=int(sidecar_server.time.time()),
+        nonce="native-ack-server-0003",
+    )
+    try:
+        invalid = await test_client.post(
+            "/native-handoff/ack", data=body, headers=headers
+        )
+        invalid_body = await invalid.json()
+        replay = await test_client.post(
+            "/native-handoff/ack", data=body, headers=headers
+        )
+        replay_body = await replay.json()
+    finally:
+        await test_client.close()
+
+    assert invalid.status == 400
+    assert invalid_body == {"ok": False, "error": "invalid native handoff ack"}
+    assert replay.status == 401
+    assert replay_body == {"ok": False, "error": "native handoff authentication failed"}
+
+
+async def test_signed_recovery_lookup_returns_only_pending_descriptor(tmp_path):
+    store = NativeHandoffStore(tmp_path / "handoff-state")
+    obligation_key = "d" * 64
+    record, _ = store.begin_no_card(
+        handoff_identity_key(
+            profile_id="default",
+            chat_id="oc_private_recovery",
+            conversation_id="conversation_private_recovery",
+            message_id="message_private_recovery",
+        ),
+        event_created_at=time.time(),
+        generation="e" * 32,
+        ack_capable=True,
+        obligation_key=obligation_key,
+    )
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    body = json.dumps(
+        {
+            "protocol": "hfc-native-handoff-recovery-v1",
+            "obligation_key": obligation_key,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    headers = sign_native_handoff_recovery_request(
+        TRANSPORT_ROOT_SECRET,
+        body,
+        timestamp=int(sidecar_server.time.time()),
+        nonce="native-recovery-server-0001",
+    )
+    try:
+        response = await test_client.post(
+            "/native-handoff/recover",
+            data=body,
+            headers=headers,
+        )
+        payload = await response.json()
+        replay = await test_client.post(
+            "/native-handoff/recover",
+            data=body,
+            headers=headers,
+        )
+        replay_payload = await replay.json()
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    assert payload == {
+        "ok": True,
+        "found": True,
+        "native_handoff": record.descriptor(),
+    }
+    serialized = json.dumps(payload)
+    assert "private" not in serialized
+    assert replay.status == 401
+    assert replay_payload == {
+        "ok": False,
+        "error": "native handoff authentication failed",
+    }
+
+
+async def test_native_started_generation_fence_prevents_prior_tombstone_swallow(tmp_path):
+    raw_chat_id = "oc_native_generation_fence"
+    message_id = "message-reused-generation"
+    identity = handoff_identity_key(
+        profile_id="",
+        chat_id=raw_chat_id,
+        conversation_id="conversation-1",
+        message_id=message_id,
+    )
+    store = NativeHandoffStore(tmp_path / "handoff-state", now=lambda: 300.0)
+    store.begin_no_card(
+        identity,
+        event_created_at=100.0,
+        generation="1" * 32,
+        ack_capable=False,
+    )
+    app = create_app(
+        FakeFeishuClient(),
+        delivery_policy=ChatDeliveryPolicy(native_chats=(raw_chat_id,)),
+        native_handoff_store=store,
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        started = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": "2" * 32}},
+                chat_id=raw_chat_id,
+                message_id=message_id,
+                created_at=200.0,
+            ),
+        )
+        started_body = await started.json()
+        completed = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                1,
+                {
+                    "answer": "new native answer",
+                    "native_handoff": {"generation": "2" * 32},
+                },
+                chat_id=raw_chat_id,
+                message_id=message_id,
+                created_at=201.0,
+            ),
+        )
+        completed_body = await completed.json()
+    finally:
+        await test_client.close()
+
+    assert started_body == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    assert completed_body == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    assert store.get(identity).generation == "2" * 32
+
+
+async def test_completed_first_new_generation_rechecks_card_policy(tmp_path):
+    message_id = "message-completed-first-reuse"
+    identity = handoff_identity_key(
+        profile_id="",
+        chat_id="oc_abc",
+        conversation_id="conversation-1",
+        message_id=message_id,
+    )
+    store = NativeHandoffStore(tmp_path / "handoff-state", now=lambda: 300.0)
+    store.begin_no_card(
+        identity,
+        event_created_at=100.0,
+        generation="1" * 32,
+        ack_capable=False,
+    )
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    payload = event_payload(
+        "message.completed",
+        0,
+        {
+            "answer": "NEW-COMPLETED-FIRST-" + ("密" * 40_000),
+            "native_handoff": {
+                "generation": "2" * 32,
+                "capabilities": ["native-ack-v1", "stable-feishu-uuid-v1"],
+                "obligation_key": "3" * 64,
+            },
+        },
+        message_id=message_id,
+        created_at=201.0,
+    )
+    try:
+        response = await test_client.post("/events", json=payload)
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    assert body["applied"] is False
+    assert body["disposition"] == "native"
+    assert body["native_handoff"]["protocol"] == "hfc-native-handoff-v1"
+    assert store.get(identity).generation == "2" * 32
+
+
 async def test_existing_card_terminal_oversize_hands_off_once_and_duplicate_is_applied(client):
     test_client, feishu_client = client
     sensitive = "SENSITIVE-TERMINAL-" + ("密" * 40_000)
@@ -4712,7 +5094,7 @@ async def test_terminal_only_handoff_survives_restart_and_duplicate_is_applied(
         await second_client.close()
 
 
-async def test_pending_handoff_retries_after_restart_and_commits(
+async def test_pending_card_notice_does_not_persist_raw_restart_repair_locator(
     tmp_path,
     monkeypatch,
 ):
@@ -4773,13 +5155,16 @@ async def test_pending_handoff_retries_after_restart_and_commits(
     try:
         duplicate = await second_client.post("/events", json=payload)
         assert await duplicate.json() == {"ok": True, "applied": True}
-        await wait_for_condition(lambda: len(repaired_feishu.updated) == 1)
         assert repaired_feishu.sent == []
-        message_id, handoff_card = repaired_feishu.updated[0]
-        assert message_id == "feishu-message-1"
-        assert "完整内容已切换为 Hermes 原生消息发送" in str(handoff_card)
-        assert "SENSITIVE-REPAIR" not in str(handoff_card)
-        await wait_for_condition(lambda: second_store.get(identity).state == "committed")
+        assert repaired_feishu.updated == []
+        # The durable store intentionally has no raw Feishu locator. The
+        # decorative terminal notice is a best-effort task in the original
+        # process; native-final crash recovery belongs to Hermes' delivery
+        # ledger and its opaque obligation-key lookup.
+        serialized = (state_root / "native-handoffs.json").read_text()
+        assert "feishu-message-1" not in serialized
+        assert "SENSITIVE-REPAIR" not in serialized
+        assert second_store.get(identity).card_state == "pending"
     finally:
         await second_client.close()
 

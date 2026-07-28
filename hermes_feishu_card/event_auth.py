@@ -16,12 +16,19 @@ EVENT_SIGNATURE_HEADER = "X-HFC-Event-Signature"
 POLICY_TIMESTAMP_HEADER = "X-HFC-Policy-Timestamp"
 POLICY_NONCE_HEADER = "X-HFC-Policy-Nonce"
 POLICY_SIGNATURE_HEADER = "X-HFC-Policy-Signature"
+NATIVE_HANDOFF_ACK_TIMESTAMP_HEADER = "X-HFC-Native-Ack-Timestamp"
+NATIVE_HANDOFF_ACK_NONCE_HEADER = "X-HFC-Native-Ack-Nonce"
+NATIVE_HANDOFF_ACK_SIGNATURE_HEADER = "X-HFC-Native-Ack-Signature"
+NATIVE_HANDOFF_RECOVERY_TIMESTAMP_HEADER = "X-HFC-Native-Recovery-Timestamp"
+NATIVE_HANDOFF_RECOVERY_NONCE_HEADER = "X-HFC-Native-Recovery-Nonce"
+NATIVE_HANDOFF_RECOVERY_SIGNATURE_HEADER = "X-HFC-Native-Recovery-Signature"
 
 _ROOT_SECRET_BYTES = 32
 _PROOF_MAX_AGE_SECONDS = 30
 _POLICY_PROOF_MAX_AGE_SECONDS = 5
 _EVENT_MAX_NONCES = 16_384
 _POLICY_MAX_NONCES = 512
+_NATIVE_HANDOFF_CONTROL_MAX_NONCES = 512
 
 
 class EventAuthenticationError(ValueError):
@@ -29,6 +36,14 @@ class EventAuthenticationError(ValueError):
 
 
 class PolicyAuthenticationError(ValueError):
+    pass
+
+
+class NativeHandoffAckAuthenticationError(ValueError):
+    pass
+
+
+class NativeHandoffRecoveryAuthenticationError(ValueError):
     pass
 
 
@@ -72,6 +87,46 @@ def sign_policy_request(
     )
 
 
+def sign_native_handoff_ack_request(
+    secret: bytes,
+    body: bytes,
+    *,
+    timestamp: int | None = None,
+    nonce: str | None = None,
+) -> dict[str, str]:
+    return _sign_domain_request(
+        secret,
+        body,
+        domain="hfc-native-handoff-ack-v1",
+        timestamp_header=NATIVE_HANDOFF_ACK_TIMESTAMP_HEADER,
+        nonce_header=NATIVE_HANDOFF_ACK_NONCE_HEADER,
+        signature_header=NATIVE_HANDOFF_ACK_SIGNATURE_HEADER,
+        timestamp=timestamp,
+        nonce=nonce,
+        label="native handoff ack",
+    )
+
+
+def sign_native_handoff_recovery_request(
+    secret: bytes,
+    body: bytes,
+    *,
+    timestamp: int | None = None,
+    nonce: str | None = None,
+) -> dict[str, str]:
+    return _sign_domain_request(
+        secret,
+        body,
+        domain="hfc-native-handoff-recovery-v1",
+        timestamp_header=NATIVE_HANDOFF_RECOVERY_TIMESTAMP_HEADER,
+        nonce_header=NATIVE_HANDOFF_RECOVERY_NONCE_HEADER,
+        signature_header=NATIVE_HANDOFF_RECOVERY_SIGNATURE_HEADER,
+        timestamp=timestamp,
+        nonce=nonce,
+        label="native handoff recovery",
+    )
+
+
 class EventProofVerifier:
     def __init__(
         self,
@@ -112,6 +167,54 @@ class PolicyProofVerifier:
             signature_header=POLICY_SIGNATURE_HEADER,
             max_age_seconds=_POLICY_PROOF_MAX_AGE_SECONDS,
             error_type=PolicyAuthenticationError,
+            now=now,
+            max_nonces=max_nonces,
+        )
+
+    def verify(self, headers: Mapping[str, str], body: bytes) -> None:
+        self._verifier.verify(headers, body)
+
+
+class NativeHandoffAckProofVerifier:
+    def __init__(
+        self,
+        secret: bytes,
+        *,
+        now: Callable[[], float] = time.time,
+        max_nonces: int = _NATIVE_HANDOFF_CONTROL_MAX_NONCES,
+    ):
+        self._verifier = _DomainProofVerifier(
+            secret,
+            domain="hfc-native-handoff-ack-v1",
+            timestamp_header=NATIVE_HANDOFF_ACK_TIMESTAMP_HEADER,
+            nonce_header=NATIVE_HANDOFF_ACK_NONCE_HEADER,
+            signature_header=NATIVE_HANDOFF_ACK_SIGNATURE_HEADER,
+            max_age_seconds=_PROOF_MAX_AGE_SECONDS,
+            error_type=NativeHandoffAckAuthenticationError,
+            now=now,
+            max_nonces=max_nonces,
+        )
+
+    def verify(self, headers: Mapping[str, str], body: bytes) -> None:
+        self._verifier.verify(headers, body)
+
+
+class NativeHandoffRecoveryProofVerifier:
+    def __init__(
+        self,
+        secret: bytes,
+        *,
+        now: Callable[[], float] = time.time,
+        max_nonces: int = _NATIVE_HANDOFF_CONTROL_MAX_NONCES,
+    ):
+        self._verifier = _DomainProofVerifier(
+            secret,
+            domain="hfc-native-handoff-recovery-v1",
+            timestamp_header=NATIVE_HANDOFF_RECOVERY_TIMESTAMP_HEADER,
+            nonce_header=NATIVE_HANDOFF_RECOVERY_NONCE_HEADER,
+            signature_header=NATIVE_HANDOFF_RECOVERY_SIGNATURE_HEADER,
+            max_age_seconds=_PROOF_MAX_AGE_SECONDS,
+            error_type=NativeHandoffRecoveryAuthenticationError,
             now=now,
             max_nonces=max_nonces,
         )
