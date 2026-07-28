@@ -26,6 +26,7 @@ from urllib import parse
 from urllib import request
 
 from . import __version__
+from .card_limits import serialize_card_for_delivery
 from .event_auth import sign_event_request, sign_policy_request
 from .operations import sign_transport_proof
 from .operations_transport import (
@@ -2381,7 +2382,7 @@ async def _hfc_try_resume_picker(
         )
         return bool(getattr(result, "success", False))
     except Exception as exc:
-        _hfc_warn(f"resume picker failed open: {exc.__class__.__name__}: {exc}")
+        _hfc_warn(f"resume picker failed open: {_hfc_exception_summary(exc)}")
         return False
 
 
@@ -2612,17 +2613,50 @@ def _hfc_update_response_success(response: Any) -> bool:
 
 
 def _hfc_update_response_error(response: Any) -> str:
+    return _hfc_response_summary(response)
+
+
+def _hfc_log_reference(kind: str, value: Any) -> str:
+    normalized_kind = re.sub(r"[^a-z0-9_-]", "", str(kind or "id").lower()) or "id"
+    normalized_value = str(value or "").strip()
+    if not normalized_value:
+        return f"{normalized_kind}#missing"
+    digest = sha256(
+        f"hfc-log:{normalized_kind}:{normalized_value}".encode("utf-8")
+    ).hexdigest()[:10]
+    return f"{normalized_kind}#{digest}"
+
+
+def _hfc_exception_summary(exc: BaseException) -> str:
+    details: list[str] = []
+    for name in ("status_code", "api_code", "code", "outcome", "retryable"):
+        try:
+            value = getattr(exc, name, None)
+        except Exception:
+            value = None
+        if value is not None and isinstance(value, (str, int, float, bool)):
+            details.append(f"{name}={value!r}")
+    suffix = f" ({', '.join(details)})" if details else ""
+    return f"{exc.__class__.__name__}{suffix}"
+
+
+def _hfc_response_summary(response: Any) -> str:
     try:
         code = getattr(response, "code", None)
-        msg = getattr(response, "msg", None)
-        if code or msg:
-            return f"code={code!r} msg={msg!r}"
+        status_code = getattr(response, "status_code", None)
+        parts = []
+        if code is not None:
+            parts.append(f"code={code!r}")
+        if status_code is not None:
+            parts.append(f"status_code={status_code!r}")
+        if parts:
+            return " ".join(parts)
     except Exception:
         pass
     raw_response = getattr(response, "raw_response", None)
     if raw_response is not None and raw_response is not response:
-        return _hfc_update_response_error(raw_response)
-    return repr(response)
+        return _hfc_response_summary(raw_response)
+    return f"type={response.__class__.__name__}"
 
 
 def _hfc_warn(message: str) -> None:
@@ -3340,12 +3374,15 @@ async def _hfc_send_native_command_result_card(
             response = await adapter._feishu_send_with_retry(
                 chat_id=chat_id,
                 msg_type="interactive",
-                payload=json.dumps(card, ensure_ascii=False),
+                payload=serialize_card_for_delivery(card),
                 reply_to=effective_reply_to,
                 metadata=effective_metadata or None,
             )
         except Exception as exc:
-            _hfc_warn(f"send command result card failed: {exc.__class__.__name__}: {exc}")
+            _hfc_warn(
+                "send command result card failed: "
+                f"{_hfc_exception_summary(exc)}"
+            )
             return _send_result(False, error=str(exc))
 
         finalizer = getattr(adapter, "_finalize_send_result", None)
@@ -3362,7 +3399,10 @@ async def _hfc_send_native_command_result_card(
                 pass
         success, message_id = _hfc_feishu_send_success(response)
         if not success:
-            _hfc_warn(f"send command result card failed: response={response!r}")
+            _hfc_warn(
+                "send command result card failed: "
+                f"response={_hfc_response_summary(response)}"
+            )
             return _send_result(False, error="send command result card failed")
         context["card_message_id"] = message_id
         return _send_result(True, message_id=message_id)
@@ -3484,7 +3524,7 @@ def handle_platform_notice_from_hermes(runner: Any, source: Any, content: str) -
     except Exception as exc:
         _hfc_warn(
             "platform notice hook failed: "
-            f"{exc.__class__.__name__}: {exc}"
+            f"{_hfc_exception_summary(exc)}"
         )
         return False
 
@@ -3539,15 +3579,13 @@ def _hfc_schedule_platform_notice_card(
                 metadata=None,
             )
             if not getattr(notice_result, "success", False):
-                error = getattr(notice_result, "error", None) or "unknown"
                 _hfc_warn(
-                    "system notice card delivery failed; native notice suppressed: "
-                    f"{error}"
+                    "system notice card delivery failed; native notice suppressed"
                 )
         except Exception as exc:
             _hfc_warn(
                 "system notice card delivery failed; native notice suppressed: "
-                f"{exc.__class__.__name__}: {exc}"
+                f"{_hfc_exception_summary(exc)}"
             )
         finally:
             if token is not None:
@@ -3675,19 +3713,25 @@ async def _hfc_send_native_slash_confirm(
         response = await self._feishu_send_with_retry(
             chat_id=chat_id,
             msg_type="interactive",
-            payload=json.dumps(card, ensure_ascii=False),
+            payload=serialize_card_for_delivery(card),
             reply_to=_metadata_reply_to(metadata) or None,
             metadata=metadata,
         )
     except Exception as exc:
-        _hfc_warn(f"send_slash_confirm failed: {exc.__class__.__name__}: {exc}")
+        _hfc_warn(f"send_slash_confirm failed: {_hfc_exception_summary(exc)}")
         return _send_result(False, error=str(exc))
 
     success, message_id = _hfc_feishu_send_success(response)
     if not success:
-        _hfc_warn(f"send_slash_confirm failed: response={response!r}")
+        _hfc_warn(
+            f"send_slash_confirm failed: response={_hfc_response_summary(response)}"
+        )
         return _send_result(False, error="send_slash_confirm failed")
-    _hfc_info(f"send_slash_confirm stored confirm_id={confirm_id!r} message_id={message_id!r}")
+    _hfc_info(
+        "send_slash_confirm stored "
+        f"{_hfc_log_reference('confirm', confirm_id)} "
+        f"{_hfc_log_reference('message', message_id)}"
+    )
     state = getattr(self, "_hfc_slash_confirm_state", None)
     if not isinstance(state, dict):
         state = {}
@@ -3754,7 +3798,7 @@ async def _hfc_send_native_model_picker(
         response = await self._feishu_send_with_retry(
             chat_id=chat_id,
             msg_type="interactive",
-            payload=json.dumps(card, ensure_ascii=False),
+            payload=serialize_card_for_delivery(card),
             reply_to=_metadata_reply_to(metadata) or None,
             metadata=metadata,
         )
@@ -3764,7 +3808,11 @@ async def _hfc_send_native_model_picker(
     success, message_id = _hfc_feishu_send_success(response)
     if not success:
         return _send_result(False, error="send_model_picker failed")
-    _hfc_info(f"send_model_picker stored picker_id={picker_id!r} message_id={message_id!r}")
+    _hfc_info(
+        "send_model_picker stored "
+        f"{_hfc_log_reference('picker', picker_id)} "
+        f"{_hfc_log_reference('message', message_id)}"
+    )
     state = getattr(self, "_hfc_model_picker_state", None)
     if not isinstance(state, dict):
         state = {}
@@ -3862,7 +3910,7 @@ async def _hfc_send_native_resume_picker(
         response = await self._feishu_send_with_retry(
             chat_id=chat_id,
             msg_type="interactive",
-            payload=json.dumps(card, ensure_ascii=False),
+            payload=serialize_card_for_delivery(card),
             reply_to=_metadata_reply_to(metadata) or None,
             metadata=metadata,
         )
@@ -3896,7 +3944,9 @@ async def _hfc_send_native_resume_picker(
         "expires_at": time.time() + 300,
     }
     _hfc_info(
-        f"send_resume_picker stored picker_id={picker_id!r} message_id={message_id!r}"
+        "send_resume_picker stored "
+        f"{_hfc_log_reference('picker', picker_id)} "
+        f"{_hfc_log_reference('message', message_id)}"
     )
     return _send_result(True, message_id=message_id)
 
@@ -4350,11 +4400,17 @@ def _hfc_handle_interaction_select_action(
         url = f"{base_url}/card/actions"
         result = _post_json_sync_response(url, sidecar_payload, 5.0)
     except Exception as exc:
-        _hfc_warn(f"interaction.select forward failed: {exc.__class__.__name__}: {exc}")
+        _hfc_warn(
+            "interaction.select forward failed: "
+            f"{_hfc_exception_summary(exc)}"
+        )
         return _hfc_empty_feishu_callback_response(adapter)
 
     if isinstance(result, dict) and isinstance(result.get("card"), dict):
-        _hfc_info(f"interaction.select resolved: interaction_id={interaction_id!r}")
+        _hfc_info(
+            "interaction.select resolved: "
+            f"{_hfc_log_reference('interaction', interaction_id)}"
+        )
         return _hfc_raw_feishu_callback_response(adapter, result["card"])
     _hfc_info("interaction.select forwarded but no card returned")
     return _hfc_empty_feishu_callback_response(adapter)
@@ -4445,7 +4501,10 @@ def _hfc_schedule_native_command_card_update(
     try:
         submitted = bool(submit(loop, coro))
     except Exception as exc:
-        _hfc_warn(f"native command card update schedule failed: {exc.__class__.__name__}: {exc}")
+        _hfc_warn(
+            "native command card update schedule failed: "
+            f"{_hfc_exception_summary(exc)}"
+        )
     finally:
         if not submitted:
             try:
@@ -4467,7 +4526,10 @@ def _hfc_handle_native_slash_action(
         _hfc_info("inline slash_confirm ignored: unresolved")
         return _hfc_empty_feishu_callback_response(adapter)
     card, message_id = resolved
-    _hfc_info(f"inline slash_confirm resolved: message_id={message_id!r}")
+    _hfc_info(
+        "inline slash_confirm resolved: "
+        f"{_hfc_log_reference('message', message_id)}"
+    )
     return _hfc_raw_feishu_callback_response(adapter, card)
 
 
@@ -4646,13 +4708,16 @@ def _hfc_switch_model_background_task(adapter: Any, data: Any, action_value: dic
             await adapter._feishu_send_with_retry(
                 chat_id=chat_id,
                 msg_type="interactive",
-                payload=json.dumps(card, ensure_ascii=False),
+                payload=serialize_card_for_delivery(card),
                 reply_to=message_id or None,
                 metadata=metadata,
             )
             _hfc_info("background model switch: result card sent")
         except Exception as exc:
-            _hfc_warn(f"background model switch: direct send failed: {exc.__class__.__name__}: {exc}")
+            _hfc_warn(
+                "background model switch: direct send failed: "
+                f"{_hfc_exception_summary(exc)}"
+            )
             # Fallback: reuse the well-tested native command result card sender
             # (it passes metadata correctly and handles reply threading).
             try:
@@ -4666,7 +4731,10 @@ def _hfc_switch_model_background_task(adapter: Any, data: Any, action_value: dic
                 )
                 _hfc_info("background model switch: result card sent (fallback)")
             except Exception as exc2:
-                _hfc_warn(f"background model switch: fallback send failed: {exc2.__class__.__name__}: {exc2}")
+                _hfc_warn(
+                    "background model switch: fallback send failed: "
+                    f"{_hfc_exception_summary(exc2)}"
+                )
 
     loop = getattr(adapter, "_loop", None)
     submit = getattr(adapter, "_submit_on_loop", None)
@@ -4679,7 +4747,10 @@ def _hfc_switch_model_background_task(adapter: Any, data: Any, action_value: dic
                 _hfc_warn("background model switch schedule failed")
             return
         except Exception as exc:
-            _hfc_warn(f"background model switch schedule failed: {exc.__class__.__name__}: {exc}")
+            _hfc_warn(
+                "background model switch schedule failed: "
+                f"{_hfc_exception_summary(exc)}"
+            )
         finally:
             if not submitted:
                 coroutine.close()
@@ -4819,7 +4890,7 @@ def _hfc_resume_picker_background_task(
             await adapter._feishu_send_with_retry(
                 chat_id=chat_id,
                 msg_type="interactive",
-                payload=json.dumps(card, ensure_ascii=False),
+                payload=serialize_card_for_delivery(card),
                 reply_to=message_id or None,
                 metadata=_hfc_action_metadata(data),
             )
@@ -4827,7 +4898,7 @@ def _hfc_resume_picker_background_task(
         except Exception as exc:
             _hfc_warn(
                 "background resume: fallback send failed: "
-                f"{exc.__class__.__name__}: {exc}"
+                f"{_hfc_exception_summary(exc)}"
             )
 
     loop = prepared["loop"]
@@ -4843,7 +4914,8 @@ def _hfc_resume_picker_background_task(
             _hfc_warn("background resume schedule failed")
     except Exception as exc:
         _hfc_warn(
-            f"background resume schedule failed: {exc.__class__.__name__}: {exc}"
+            "background resume schedule failed: "
+            f"{_hfc_exception_summary(exc)}"
         )
     finally:
         if not submitted:
@@ -4907,7 +4979,7 @@ async def _hfc_update_native_command_card(adapter: Any, message_id: str, card: d
         if not callable(run_blocking):
             _hfc_warn("native command card update skipped: Feishu run helper unavailable")
             return False
-        content = json.dumps(card, ensure_ascii=False)
+        content = serialize_card_for_delivery(card)
         message_api = client.im.v1.message
         patch_call = getattr(message_api, "patch", None)
         request = _hfc_build_patch_message_request(message_id, content)
@@ -4924,16 +4996,21 @@ async def _hfc_update_native_command_card(adapter: Any, message_id: str, card: d
             request_body = body_builder(msg_type="interactive", content=content)
             request = request_builder(message_id, request_body)
             update_call = message_api.update
-        _hfc_info(f"native command card update attempting: message_id={message_id!r}")
+        message_ref = _hfc_log_reference("message", message_id)
+        _hfc_info(f"native command card update attempting: {message_ref}")
         response = await run_blocking(update_call, request)
         success = _hfc_update_response_success(response)
         if not success:
             _hfc_warn(f"native command card update failed: {_hfc_update_response_error(response)}")
         else:
-            _hfc_info(f"native command card update succeeded: message_id={message_id!r}")
+            _hfc_info(f"native command card update succeeded: {message_ref}")
         return success
     except Exception as exc:
-        _hfc_warn(f"native command card update failed: {exc.__class__.__name__}: {exc}")
+        _hfc_warn(
+            "native command card update failed: "
+            f"{_hfc_exception_summary(exc)} "
+            f"{_hfc_log_reference('message', message_id)}"
+        )
         return False
 
 
@@ -4962,7 +5039,7 @@ async def _hfc_handle_feishu_card_action_event(self: Any, data: Any) -> None:
             card, message_id = resolved
             _hfc_info(
                 "background slash_confirm resolved without direct update: "
-                f"message_id={message_id!r}"
+                f"{_hfc_log_reference('message', message_id)}"
             )
         else:
             _hfc_info("background slash_confirm ignored: unresolved")
@@ -4975,7 +5052,7 @@ async def _hfc_handle_feishu_card_action_event(self: Any, data: Any) -> None:
             card, message_id = resolved
             _hfc_info(
                 "background model_picker resolved without direct update: "
-                f"message_id={message_id!r}"
+                f"{_hfc_log_reference('message', message_id)}"
             )
         else:
             _hfc_info("background model_picker ignored: unresolved")
@@ -5087,7 +5164,8 @@ def _hfc_refresh_feishu_event_handler(adapter: Any) -> bool:
     except Exception as exc:
         setattr(adapter, "_hfc_command_card_event_handler_refresh_scheduled", False)
         _hfc_warn(
-            f"Feishu card action callback refresh failed: {exc.__class__.__name__}: {exc}"
+            "Feishu card action callback refresh failed: "
+            f"{_hfc_exception_summary(exc)}"
         )
         return False
 

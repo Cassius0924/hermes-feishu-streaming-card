@@ -2,6 +2,7 @@ import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
+import inspect
 import math
 import sys
 import threading
@@ -8449,3 +8450,85 @@ def test_operations_select_rejected_admission_is_claimed_without_forward(monkeyp
     )
 
     assert response.card is None
+
+
+def test_hook_runtime_routes_every_card_serializer_through_delivery_limits():
+    source = inspect.getsource(hook_runtime)
+
+    assert "json.dumps(card, ensure_ascii=False)" not in source
+    assert source.count("serialize_card_for_delivery(card)") >= 7
+
+
+def test_native_command_card_update_rejects_oversize_before_sdk(monkeypatch):
+    calls = []
+
+    class DummyAdapter:
+        _client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(message=SimpleNamespace(patch=lambda request: None))
+            )
+        )
+
+        async def _run_blocking(self, func, request):
+            calls.append((func, request))
+            return SimpleNamespace(success=lambda: True)
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_hfc_build_patch_message_request",
+        lambda supplied_id, content: SimpleNamespace(
+            message_id=supplied_id,
+            request_body=SimpleNamespace(content=content),
+        ),
+    )
+
+    result = asyncio.run(
+        hook_runtime._hfc_update_native_command_card(
+            DummyAdapter(),
+            "om_sensitive_update_id",
+            {"elements": [{"tag": "markdown", "content": "x" * 40_000}]},
+        )
+    )
+
+    assert result is False
+    assert calls == []
+
+
+def test_native_command_card_logs_never_expose_raw_identifiers(
+    monkeypatch, caplog, capsys
+):
+    message_id = "om_sensitive_message_123"
+
+    class DummyAdapter:
+        _client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(message=SimpleNamespace(patch=lambda request: None))
+            )
+        )
+
+        async def _run_blocking(self, func, request):
+            raise RuntimeError(f"remote rejected {message_id}")
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_hfc_build_patch_message_request",
+        lambda supplied_id, content: SimpleNamespace(
+            message_id=supplied_id,
+            request_body=SimpleNamespace(content=content),
+        ),
+    )
+    caplog.set_level("INFO", logger=hook_runtime.__name__)
+
+    result = asyncio.run(
+        hook_runtime._hfc_update_native_command_card(
+            DummyAdapter(),
+            message_id,
+            {"elements": [{"tag": "markdown", "content": "done"}]},
+        )
+    )
+
+    output = caplog.text + capsys.readouterr().err
+    assert result is False
+    assert message_id not in output
+    assert "message#" in output
+    assert "RuntimeError" in output
