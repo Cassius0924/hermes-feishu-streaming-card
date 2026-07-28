@@ -230,6 +230,51 @@ async def test_installed_hook_forwards_streaming_tool_and_completion_events(
         await client.close()
 
 
+async def test_installed_standard_hook_keeps_full_native_answer_on_limit_handoff(
+    tmp_path,
+    monkeypatch,
+):
+    feishu_client = _OperationsFeishuClient()
+    app = create_app(feishu_client)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    huge_answer = "NATIVE-ANSWER-" + ("密" * 40_000)
+    try:
+        hermes_dir = copy_hermes(tmp_path)
+        monkeypatch.setenv(
+            "HERMES_FEISHU_CARD_EVENT_URL",
+            str(client.make_url("/events")),
+        )
+        install = run_cli("install", "--hermes-dir", str(hermes_dir), "--yes")
+        assert install.returncode == 0, install.stderr
+        module = load_run_py(hermes_dir / "gateway" / "run.py")
+
+        async def oversized_agent_result(source, event_message_id=None):
+            del source, event_message_id
+            return {
+                "response": huge_answer,
+                "duration": 0.25,
+                "input_tokens": 7,
+                "output_tokens": 40_000,
+            }
+
+        monkeypatch.setattr(module, "_run_agent", oversized_agent_result)
+
+        result = await module._handle_message_with_agent(Message(), Hooks())
+        await _wait_for(
+            lambda: any(
+                "完整内容已切换为 Hermes 原生消息发送" in str(card)
+                for _message_id, card in feishu_client.updated
+            )
+        )
+    finally:
+        await client.close()
+
+    assert result == huge_answer
+    assert len(feishu_client.sent) == 1
+    assert all("NATIVE-ANSWER" not in str(card) for _, card in feishu_client.updated)
+
+
 class _CallbackCard:
     def __init__(self):
         self.type = None

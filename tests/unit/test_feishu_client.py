@@ -2,6 +2,8 @@ import json
 
 import pytest
 
+from hermes_feishu_card.card_limits import serialize_card_json
+
 from hermes_feishu_card.feishu_client import (
     FeishuAPIError,
     FeishuClient,
@@ -124,6 +126,7 @@ def test_build_message_payload_serializes_card():
     assert payload["receive_id"] == "oc_abc"
     assert payload["msg_type"] == "interactive"
     assert '"schema": "2.0"' in payload["content"]
+    assert payload["content"] == serialize_card_json(card)
     assert json.loads(payload["content"]) == card
 
 

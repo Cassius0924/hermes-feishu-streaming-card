@@ -720,7 +720,12 @@ def emit_cron_delivery(local_vars: dict[str, Any]) -> bool:
         payload = build_cron_event(local_vars)
         if payload is None:
             return False
-        return _post_json_sync(config.event_url, payload, TERMINAL_TIMEOUT_SECONDS)
+        result = _post_json_sync_response(
+            config.event_url,
+            payload,
+            TERMINAL_TIMEOUT_SECONDS,
+        )
+        return _event_was_applied(result)
     except Exception:
         return False
 

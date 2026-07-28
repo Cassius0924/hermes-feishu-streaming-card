@@ -1,9 +1,12 @@
 from hermes_feishu_card.render import MAIN_CONTENT_CHUNK_CHARS
 from hermes_feishu_card.text import (
     StreamingTextNormalizer,
+    count_markdown_tables,
     normalize_stream_text,
+    scan_markdown_blocks,
     should_flush_text,
     split_markdown_blocks,
+    transform_table_overflow,
 )
 
 
@@ -93,15 +96,131 @@ def test_count_markdown_tables_zero():
 
 
 def test_count_markdown_tables_normal():
-    from hermes_feishu_card.text import count_markdown_tables
     text = "| a | b |\n| --- | --- |\n| 1 | 2 |\n\n| x | y |\n| --- | --- |\n| 3 | 4 |"
     assert count_markdown_tables(text) == 2
 
 
 def test_count_markdown_tables_seven():
-    from hermes_feishu_card.text import count_markdown_tables
     text = "\n\n".join([f"| col |\n| --- |\n| {i} |" for i in range(7)])
     assert count_markdown_tables(text) == 7
+
+
+def test_scanner_ignores_backtick_and_tilde_fenced_fake_tables():
+    text = """before
+
+```markdown
+| fake |
+| --- |
+| one |
+```
+
+~~~
+fake | value
+--- | ---
+one | two
+~~~
+
+real | value
+--- | ---
+one | two
+"""
+
+    blocks = scan_markdown_blocks(text)
+
+    assert count_markdown_tables(text) == 1
+    assert [block.kind for block in blocks].count("table") == 1
+    table = next(block.table for block in blocks if block.kind == "table")
+    assert table is not None
+    assert table.headers == ("real", "value")
+    assert table.rows == (("one", "two"),)
+
+
+def test_scanner_handles_outer_pipes_escaped_pipes_inline_code_and_ragged_rows():
+    text = """| Name | Value |  |
+| :--- | ---: | --- |
+| escaped | left\\|right | tail |
+| inline | `a|b` |
+"""
+
+    table = next(
+        block.table for block in scan_markdown_blocks(text) if block.kind == "table"
+    )
+
+    assert table is not None
+    assert table.headers == ("Name", "Value", "")
+    assert table.rows == (
+        ("escaped", "left\\|right", "tail"),
+        ("inline", "`a|b`"),
+    )
+
+
+def test_compact_overflow_preserves_all_cells_with_stable_header_fallbacks():
+    tables = [
+        f"| H |\n| --- |\n| {index} |" for index in range(5)
+    ]
+    tables.extend(
+        [
+            "| Name | Name |  |\n| --- | --- | --- |\n| alice | alias | extra |\n| bob |",
+            "A | B\n--- | ---\nlast-a | last-b",
+        ]
+    )
+    source = "\n\n".join(tables) + "\n\nTAIL MUST LIVE"
+
+    result = transform_table_overflow(source, mode="compact")
+
+    assert result.source_table_count == 7
+    assert result.compacted_table_count == 2
+    assert result.truncated_table_count == 0
+    assert count_markdown_tables(result.text) == 5
+    assert result.text.count("已转换为紧凑字段列表") == 1
+    assert "**Table 6 · Row 1**" in result.text
+    assert "- Name: alice" in result.text
+    assert "- Name (2): alias" in result.text
+    assert "- Column 3: extra" in result.text
+    assert "**Table 6 · Row 2**" in result.text
+    assert "- Name: bob" in result.text
+    assert "**Table 7 · Row 1**" in result.text
+    assert "- A: last-a" in result.text
+    assert "- B: last-b" in result.text
+    assert result.text.endswith("TAIL MUST LIVE")
+
+
+def test_truncate_overflow_removes_only_tables_and_preserves_later_prose():
+    source = "\n\n".join(
+        f"| H |\n| --- |\n| {index} |" for index in range(7)
+    ) + "\n\nTAIL MUST LIVE"
+
+    result = transform_table_overflow(source, mode="truncate")
+
+    assert result.source_table_count == 7
+    assert result.compacted_table_count == 0
+    assert result.truncated_table_count == 2
+    assert count_markdown_tables(result.text) == 5
+    assert result.text.count("超出部分已省略") == 1
+    assert result.text.endswith("TAIL MUST LIVE")
+
+
+def test_compact_overflow_preserves_trailing_prose_whitespace_verbatim():
+    source = "\n\n".join(
+        f"| H |\n| --- |\n| {index} |" for index in range(6)
+    ) + "\n\nTAIL  "
+
+    result = transform_table_overflow(source, mode="compact")
+
+    assert result.text.endswith("TAIL  ")
+
+
+def test_compact_empty_overflow_table_preserves_its_headers():
+    source = "\n\n".join(
+        [f"| H |\n| --- |\n| {index} |" for index in range(5)]
+        + ["| Name |  |\n| --- | --- |"]
+    )
+
+    result = transform_table_overflow(source, mode="compact")
+
+    assert "**Table 6**" in result.text
+    assert "- Columns: Name, Column 2" in result.text
+    assert "- Rows: （空）" in result.text
 
 
 def test_max_card_tables_constant():
@@ -178,3 +297,12 @@ def test_split_markdown_blocks_handles_oversized_table_row_without_plain_fragmen
             assert lines[0].startswith("|")
             assert lines[1].startswith("|")
             assert all(line.startswith("|") and line.endswith("|") for line in lines[2:])
+
+
+def test_split_markdown_blocks_keeps_oversized_empty_table_structurally_valid():
+    table = f"| {'H' * 3000} |\n| --- |\n"
+
+    chunks = split_markdown_blocks(table, MAIN_CONTENT_CHUNK_CHARS)
+
+    assert chunks == [table]
+    assert count_markdown_tables(chunks[0]) == 1

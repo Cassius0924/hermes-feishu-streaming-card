@@ -26,6 +26,19 @@ def test_thinking_accumulates_and_strips_tags():
     assert session.thinking_text == "先分析结束。"
 
 
+def test_terminal_native_disposition_defaults_empty_and_can_be_persisted():
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+
+    assert session.terminal_disposition == ""
+    assert session.terminal_limit_reason == ""
+
+    session.terminal_disposition = "native"
+    session.terminal_limit_reason = "json_bytes"
+
+    assert session.terminal_disposition == "native"
+    assert session.terminal_limit_reason == "json_bytes"
+
+
 def test_thinking_append_block_preserves_complete_interim_messages():
     session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
 

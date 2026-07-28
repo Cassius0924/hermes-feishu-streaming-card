@@ -16,6 +16,7 @@ from hermes_feishu_card import hook_runtime
 from hermes_feishu_card import flush as flush_module
 from hermes_feishu_card import server as sidecar_server
 from hermes_feishu_card.bots import RouteResult
+from hermes_feishu_card.card_limits import inspect_card_limits
 from hermes_feishu_card.events import SidecarEvent
 from hermes_feishu_card.event_auth import sign_event_request
 from hermes_feishu_card.feishu_client import FeishuAPIError
@@ -766,6 +767,13 @@ async def test_health_reports_healthy_status_and_active_sessions(client):
         "feishu_update_latency_ms": 0,
         "cron_cards_sent": 0,
         "cron_fallbacks": 0,
+        "table_compactions": 0,
+        "table_truncations": 0,
+        "card_limit_deferrals": 0,
+        "card_native_handoffs": 0,
+        "card_limit_json_bytes": 0,
+        "card_limit_elements": 0,
+        "card_limit_tables": 0,
         "recovery_plans_available": 0,
         "recovery_attempts": 0,
         "recovery_successes": 0,
@@ -1100,6 +1108,48 @@ async def test_terminal_update_fetches_configured_subscription_usage_once(monkey
     assert "最终答案" in str(card)
 
 
+async def test_late_subscription_usage_cannot_change_terminal_card_disposition(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+
+    async def oversized_fetch(_hermes_root):
+        await asyncio.sleep(0.05)
+        return "SENSITIVE-USAGE-" + ("密" * 40_000)
+
+    monkeypatch.setattr(
+        sidecar_server,
+        "fetch_codex_subscription_usage",
+        oversized_fetch,
+    )
+    app = create_app(
+        feishu_client,
+        card_config={
+            "flush_interval_ms": 0,
+            "footer_fields": ["duration", "subscription_usage"],
+        },
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        started_at = asyncio.get_running_loop().time()
+        completed = await test_client.post(
+            "/events",
+            json=event_payload("message.completed", 1, {"answer": "最终答案"}),
+        )
+        completed_body = await completed.json()
+        elapsed = asyncio.get_running_loop().time() - started_at
+        _message_id, card = await wait_for_card_update(feishu_client, "最终答案")
+    finally:
+        await test_client.close()
+
+    assert completed_body == {"ok": True, "applied": True}
+    assert elapsed < 0.04
+    assert "SENSITIVE-USAGE" not in str(card)
+    assert inspect_card_limits(card).safe is True
+
+
 async def test_terminal_update_does_not_fetch_unconfigured_subscription_usage(
     client, monkeypatch
 ):
@@ -1337,6 +1387,8 @@ async def test_hfc_monitor_command_reports_safe_metrics(client):
     metrics.events_received = 3
     metrics.update_coalesced = 2
     metrics.update_queue_peak = 4
+    metrics.table_compactions = 2
+    metrics.card_native_handoffs = 1
 
     response = await test_client.post(
         "/commands",
@@ -1358,6 +1410,8 @@ async def test_hfc_monitor_command_reports_safe_metrics(client):
     assert "events_received: 3" in content
     assert "update_coalesced: 2" in content
     assert "update_queue_peak: 4" in content
+    assert "table_compactions: 2" in content
+    assert "card_native_handoffs: 1" in content
     assert "active_sessions: 0" in content
     assert "oc_monitor_secret" not in content
     assert "om_monitor_secret" not in content
@@ -4127,6 +4181,135 @@ async def test_event_lifecycle_sends_then_updates_final_card(client):
     assert metrics["feishu_update_successes"] == 2
     assert metrics["feishu_update_failures"] == 0
     assert metrics["feishu_update_retries"] == 0
+
+
+async def test_nonterminal_oversize_updates_existing_card_with_waiting_handoff(client):
+    test_client, feishu_client = client
+    sensitive = "SENSITIVE-NONTERMINAL-" + ("密" * 40_000)
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    delta = await test_client.post(
+        "/events",
+        json=event_payload("answer.delta", 1, {"text": sensitive}),
+    )
+
+    assert await delta.json() == {"ok": True, "applied": True}
+    _, waiting_card = await wait_for_card_update(
+        feishu_client,
+        "内容较长，完成后将由 Hermes 原生消息发送",
+    )
+    assert "SENSITIVE-NONTERMINAL" not in str(waiting_card)
+    metrics = (await (await test_client.get("/health")).json())["metrics"]
+    assert metrics["card_limit_deferrals"] == 1
+    assert metrics["card_limit_json_bytes"] == 1
+
+
+async def test_existing_card_terminal_oversize_hands_off_once_and_retry_is_native(client):
+    test_client, feishu_client = client
+    sensitive = "SENSITIVE-TERMINAL-" + ("密" * 40_000)
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": sensitive}),
+    )
+
+    assert await completed.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    _, handoff_card = await wait_for_card_update(
+        feishu_client,
+        "完整内容已切换为 Hermes 原生消息发送",
+    )
+    assert "SENSITIVE-TERMINAL" not in str(handoff_card)
+    update_count = len(feishu_client.updated)
+
+    duplicate = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": sensitive}),
+    )
+    await asyncio.sleep(0.05)
+
+    assert await duplicate.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    assert len(feishu_client.updated) == update_count
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    assert session.terminal_disposition == "native"
+    assert session.terminal_limit_reason == "json_bytes"
+    metrics = (await (await test_client.get("/health")).json())["metrics"]
+    assert metrics["events_applied"] == 2
+    assert metrics["events_ignored"] == 0
+    assert metrics["card_native_handoffs"] == 1
+    assert metrics["card_limit_json_bytes"] == 1
+
+
+async def test_terminal_only_oversize_cron_uses_native_without_sending_handoff_card(client):
+    test_client, feishu_client = client
+    sensitive = "SENSITIVE-CRON-" + ("密" * 40_000)
+    payload = event_payload(
+        "message.completed",
+        0,
+        {"answer": sensitive, "delivery_kind": "cron"},
+        message_id="cron_oversize",
+    )
+
+    completed = await test_client.post("/events", json=payload)
+    duplicate = await test_client.post("/events", json=payload)
+
+    expected = {"ok": True, "applied": False, "disposition": "native"}
+    assert await completed.json() == expected
+    assert await duplicate.json() == expected
+    assert feishu_client.sent == []
+    assert feishu_client.updated == []
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    assert session.answer_text == sensitive
+    assert session.terminal_disposition == "native"
+    metrics = (await (await test_client.get("/health")).json())["metrics"]
+    assert metrics["events_applied"] == 1
+    assert metrics["events_ignored"] == 0
+    assert metrics["cron_cards_sent"] == 0
+    assert metrics["cron_fallbacks"] == 1
+    assert metrics["card_native_handoffs"] == 1
+
+
+async def test_existing_card_oversize_cron_records_native_fallback(client):
+    test_client, feishu_client = client
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"delivery_kind": "cron"},
+            message_id="cron_existing",
+        ),
+    )
+    completed = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": "密" * 40_000, "delivery_kind": "cron"},
+            message_id="cron_existing",
+        ),
+    )
+
+    assert await completed.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    await wait_for_card_update(
+        feishu_client,
+        "完整内容已切换为 Hermes 原生消息发送",
+    )
+    metrics = (await (await test_client.get("/health")).json())["metrics"]
+    assert metrics["cron_fallbacks"] == 1
 
 
 async def test_v4_runtime_header_and_interim_body_share_one_card(client):

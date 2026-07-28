@@ -43,7 +43,11 @@ from .operations_transport import (
     derive_operation_transport_secret,
 )
 from .profile_sources import PROFILE_SOURCE_FALLBACK, PROFILE_SOURCES
-from .render import _is_initial_loading, render_card
+from .render import (
+    CardRenderResult,
+    _is_initial_loading,
+    render_card_result,
+)
 from .session import CardSession
 from .status import StatusConfig
 from .subscription_usage import fetch_codex_subscription_usage
@@ -1962,6 +1966,13 @@ def _hfc_monitor_lines(request: web.Request, event: SidecarEvent) -> list[str]:
         "feishu_update_successes",
         "feishu_update_failures",
         "feishu_update_retries",
+        "table_compactions",
+        "table_truncations",
+        "card_limit_deferrals",
+        "card_native_handoffs",
+        "card_limit_json_bytes",
+        "card_limit_elements",
+        "card_limit_tables",
     )
     lines = ["**/hfc monitor**", "", *_hfc_readiness_lines(request)]
     lines.extend([f"- {key}: {snapshot.get(key, 0)}" for key in keys])
@@ -2390,10 +2401,30 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 )
                 request.app[SESSION_CARD_CONFIGS_KEY][session_key] = session_card_config
                 _refresh_session_display_status(request, session)
+                render_result = _render_session_card_result_for_app(
+                    request.app, session
+                )
+                _record_card_render_decision(metrics, render_result)
+                if event_is_terminal and render_result.disposition == "native":
+                    session.terminal_disposition = "native"
+                    session.terminal_limit_reason = render_result.limit_reason
+                    if is_cron_completed:
+                        metrics.cron_fallbacks += 1
+                    metrics.events_applied += 1
+                    request.app[DIAGNOSTICS_KEY]["last_terminal_event"] = {
+                        "message_id_hash": _diagnostic_id_hash(event.message_id),
+                        "event": event.event,
+                        "sequence": event.sequence,
+                        "applied": False,
+                        "disposition": "native",
+                        "session_status": session.status,
+                        "answer_chars": len(session.answer_text),
+                    }
+                    return _native_disposition_response(), None
                 delivery = await _send_card(
                     request,
                     event.chat_id,
-                    _render_session_card(request, session),
+                    render_result.card,
                     route.bot_id,
                     thread_id=_thread_id_for_event(event),
                     reply_to_message_id=_reply_to_message_id_for_event(event),
@@ -2480,8 +2511,19 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
         and event_is_terminal
         and session.status in {"completed", "failed"}
     )
+    if terminal_already_handled and session.terminal_disposition == "native":
+        return _native_disposition_response(), None
     if terminal_already_handled:
         applied = True
+    render_result: CardRenderResult | None = None
+    if applied and not terminal_already_handled:
+        render_result = _render_session_card_result_for_app(request.app, session)
+        _record_card_render_decision(metrics, render_result)
+        if event_is_terminal and render_result.disposition == "native":
+            session.terminal_disposition = "native"
+            session.terminal_limit_reason = render_result.limit_reason
+            if _delivery_kind(event) == "cron":
+                metrics.cron_fallbacks += 1
     if applied and event.event.startswith("interaction."):
         _store_interaction_result(request.app, session)
     if event_is_terminal:
@@ -2489,7 +2531,14 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             "message_id_hash": _diagnostic_id_hash(event.message_id),
             "event": event.event,
             "sequence": event.sequence,
-            "applied": applied,
+            "applied": applied
+            and not (
+                render_result is not None
+                and render_result.disposition == "native"
+            ),
+            "disposition": (
+                render_result.disposition if render_result is not None else "card"
+            ),
             "session_status": session.status,
             "answer_chars": len(session.answer_text),
         }
@@ -2497,7 +2546,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
         metrics.events_applied += 1
         return web.json_response({"ok": True, "applied": True}), None
     post_lock_task = None
-    if applied and feishu_message_id is not None:
+    if applied and feishu_message_id is not None and render_result is not None:
         if event_is_terminal:
             _store_card_summary(request.app, event, session, feishu_message_id)
         is_terminal = event_is_terminal
@@ -2515,8 +2564,24 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             latest_session = sessions.get(session_key)
             if latest_session is None:
                 return False
-            await _populate_subscription_usage(request.app, latest_session)
-            latest_card = _render_session_card(request, latest_session)
+            latest_card = render_result.card
+            if is_terminal and render_result.disposition == "card":
+                await _populate_subscription_usage(request.app, latest_session)
+                populated_result = _render_session_card_result_for_app(
+                    request.app, latest_session
+                )
+                if populated_result.disposition == "card":
+                    latest_card = populated_result.card
+                else:
+                    # The terminal response has already acknowledged card delivery.
+                    # Drop only the optional late footer data rather than losing the
+                    # full answer or switching disposition after Hermes decided.
+                    latest_session.subscription_usage = ""
+                    bounded_result = _render_session_card_result_for_app(
+                        request.app, latest_session
+                    )
+                    if bounded_result.disposition == "card":
+                        latest_card = bounded_result.card
             updated = await _update_card_for_app(
                 request.app,
                 feishu_message_id,
@@ -2552,8 +2617,23 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
         metrics.events_applied += 1
     else:
         metrics.events_ignored += 1
-    response_payload = {"ok": True, "applied": applied}
-    if applied and event.event == "system.notice" and post_lock_task is not None:
+    native_disposition = bool(
+        applied
+        and render_result is not None
+        and render_result.disposition == "native"
+    )
+    response_payload = {
+        "ok": True,
+        "applied": applied and not native_disposition,
+    }
+    if native_disposition:
+        response_payload["disposition"] = "native"
+    if (
+        applied
+        and not native_disposition
+        and event.event == "system.notice"
+        and post_lock_task is not None
+    ):
         response_payload["delivery"] = {"outcome": "accepted"}
     if event.event == "interaction.requested":
         response_payload["interaction_mode"] = _interaction_mode_for_session_key(
@@ -2952,6 +3032,12 @@ def _render_session_card(request: web.Request, session: CardSession) -> dict[str
 def _render_session_card_for_app(
     app: web.Application, session: CardSession
 ) -> dict[str, Any]:
+    return _render_session_card_result_for_app(app, session).card
+
+
+def _render_session_card_result_for_app(
+    app: web.Application, session: CardSession
+) -> CardRenderResult:
     footer_fields = _footer_fields_for_session(app, session)
     card_config = app[SESSION_CARD_CONFIGS_KEY].get(
         _session_key_for_session(app, session),
@@ -2964,7 +3050,15 @@ def _render_session_card_for_app(
         app,
         _session_key_for_session(app, session),
     )
-    return render_card(
+    raw_table_overflow_mode = card_config.get("table_overflow_mode", "compact")
+    table_overflow_mode = (
+        raw_table_overflow_mode.strip().lower()
+        if isinstance(raw_table_overflow_mode, str)
+        else "compact"
+    )
+    if table_overflow_mode not in {"compact", "truncate"}:
+        table_overflow_mode = "compact"
+    return render_card_result(
         session,
         footer_fields=footer_fields,
         title=title,
@@ -2986,6 +3080,31 @@ def _render_session_card_for_app(
             if isinstance(card_config.get("text_sizes"), dict)
             else None
         ),
+        table_overflow_mode=table_overflow_mode,
+    )
+
+
+def _record_card_render_decision(
+    metrics: SidecarMetrics, result: CardRenderResult
+) -> None:
+    metrics.table_compactions += result.table_overflow.compacted_table_count
+    metrics.table_truncations += result.table_overflow.truncated_table_count
+    if result.disposition == "deferred_native":
+        metrics.card_limit_deferrals += 1
+    elif result.disposition == "native":
+        metrics.card_native_handoffs += 1
+    for violation in result.inspection.violations:
+        if violation == "json_bytes":
+            metrics.card_limit_json_bytes += 1
+        elif violation == "elements":
+            metrics.card_limit_elements += 1
+        elif violation == "tables":
+            metrics.card_limit_tables += 1
+
+
+def _native_disposition_response() -> web.Response:
+    return web.json_response(
+        {"ok": True, "applied": False, "disposition": "native"}
     )
 
 

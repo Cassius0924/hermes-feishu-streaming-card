@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 import html
 import json
 import re
 import time as _time
 from collections.abc import Mapping
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
+from .card_limits import CardLimitInspection, inspect_card_limits
 from .session import CardSession
 from .status import StatusConfig, resolve_display_status
-from .text import normalize_stream_text, split_markdown_blocks
+from .text import (
+    TableOverflowResult,
+    normalize_stream_text,
+    split_markdown_blocks,
+    transform_table_overflow,
+)
 
 DEFAULT_FOOTER_FIELDS = (
     "duration",
@@ -68,6 +75,16 @@ _RUNTIME_URL_SECRET_RE = re.compile(
 )
 _TOOL_DURATION_LINE_RE = re.compile(r"^耗时:\s*(.+?)\s*$")
 
+
+@dataclass(frozen=True)
+class CardRenderResult:
+    card: Dict[str, Any]
+    disposition: Literal["card", "deferred_native", "native"]
+    inspection: CardLimitInspection
+    table_overflow: TableOverflowResult
+    limit_reason: str = ""
+
+
 def _spinner_text(label: str = "生成中") -> str:
     return f"{_spinner_frame()} {label}"
 
@@ -75,6 +92,7 @@ def _spinner_text(label: str = "生成中") -> str:
 def _spinner_frame() -> str:
     frame = _SPINNER_FRAMES[int(_time.time() * 8) % len(_SPINNER_FRAMES)]
     return frame
+
 
 def render_card(
     session: CardSession,
@@ -88,9 +106,97 @@ def render_card(
     max_tool_result_chars: int = 600,
     status_config: Optional[StatusConfig] = None,
     text_sizes: Mapping[str, Any] | None = None,
+    table_overflow_mode: str = "compact",
+) -> Dict[str, Any]:
+    return render_card_result(
+        session,
+        footer_fields=footer_fields,
+        title=title,
+        interaction_mode=interaction_mode,
+        show_reasoning=show_reasoning,
+        timeline_expanded=timeline_expanded,
+        max_timeline_items=max_timeline_items,
+        max_reasoning_chars=max_reasoning_chars,
+        max_tool_result_chars=max_tool_result_chars,
+        status_config=status_config,
+        text_sizes=text_sizes,
+        table_overflow_mode=table_overflow_mode,
+    ).card
+
+
+def render_card_result(
+    session: CardSession,
+    footer_fields: list[str] | tuple[str, ...] | None = None,
+    title: str = DEFAULT_TITLE,
+    interaction_mode: str = "callback",
+    show_reasoning: bool = True,
+    timeline_expanded: bool = False,
+    max_timeline_items: int = 12,
+    max_reasoning_chars: int = 1200,
+    max_tool_result_chars: int = 600,
+    status_config: Optional[StatusConfig] = None,
+    text_sizes: Mapping[str, Any] | None = None,
+    table_overflow_mode: str = "compact",
+) -> CardRenderResult:
+    primary_text = _primary_text_for_session(session)
+    table_overflow = transform_table_overflow(
+        primary_text,
+        mode=table_overflow_mode,
+    )
+    card = _render_card_unchecked(
+        session,
+        footer_fields=footer_fields,
+        title=title,
+        interaction_mode=interaction_mode,
+        show_reasoning=show_reasoning,
+        timeline_expanded=timeline_expanded,
+        max_timeline_items=max_timeline_items,
+        max_reasoning_chars=max_reasoning_chars,
+        max_tool_result_chars=max_tool_result_chars,
+        status_config=status_config,
+        text_sizes=text_sizes,
+        table_overflow_mode=table_overflow_mode,
+    )
+    inspection = inspect_card_limits(card)
+    if inspection.safe:
+        return CardRenderResult(
+            card=card,
+            disposition="card",
+            inspection=inspection,
+            table_overflow=table_overflow,
+        )
+
+    terminal = session.status in {"completed", "failed"}
+    disposition: Literal["deferred_native", "native"] = (
+        "native" if terminal else "deferred_native"
+    )
+    return CardRenderResult(
+        card=_render_limit_handoff_card(
+            title=title,
+            terminal=terminal,
+        ),
+        disposition=disposition,
+        inspection=inspection,
+        table_overflow=table_overflow,
+        limit_reason=inspection.primary_reason,
+    )
+
+
+def _render_card_unchecked(
+    session: CardSession,
+    footer_fields: list[str] | tuple[str, ...] | None = None,
+    title: str = DEFAULT_TITLE,
+    interaction_mode: str = "callback",
+    show_reasoning: bool = True,
+    timeline_expanded: bool = False,
+    max_timeline_items: int = 12,
+    max_reasoning_chars: int = 1200,
+    max_tool_result_chars: int = 600,
+    status_config: Optional[StatusConfig] = None,
+    text_sizes: Mapping[str, Any] | None = None,
+    table_overflow_mode: str = "compact",
 ) -> Dict[str, Any]:
     used_text_size_roles: set[str] = set()
-    initial_loading = _is_initial_loading(session)
     status = _render_status(session, status_config=status_config)
     display_status = resolve_display_status(
         session, status_config or StatusConfig.defaults()
@@ -100,16 +206,7 @@ def render_card(
         and session.delivery_kind == "chat"
         and bool(session.reply_to_message_id)
     )
-    if session.status in {"completed", "failed"}:
-        primary_text = normalize_stream_text(session.answer_text)
-    elif session.answer_text:
-        primary_text = normalize_stream_text(session.answer_text)
-    elif session.thinking_text:
-        primary_text = normalize_stream_text(session.thinking_text)
-    elif session.latest_tool_preview or session.tools:
-        primary_text = ""
-    else:
-        primary_text = _spinner_text("正在加载上下文…")
+    primary_text = _primary_text_for_session(session)
     attachment_summary = _render_attachment_summary(session)
     footer = _render_footer(
         session,
@@ -135,6 +232,7 @@ def render_card(
     if primary_text:
         elements = _render_main_content_elements(
             primary_text,
+            table_overflow_mode=table_overflow_mode,
             text_size=_role_text_size(
                 text_sizes,
                 main_role,
@@ -225,6 +323,61 @@ def render_card(
     return card
 
 
+def _primary_text_for_session(session: CardSession) -> str:
+    if session.status in {"completed", "failed"}:
+        return normalize_stream_text(session.answer_text)
+    if session.answer_text:
+        return normalize_stream_text(session.answer_text)
+    if session.thinking_text:
+        return normalize_stream_text(session.thinking_text)
+    if session.latest_tool_preview or session.tools:
+        return ""
+    return _spinner_text("正在加载上下文…")
+
+
+def _render_limit_handoff_card(*, title: str, terminal: bool) -> Dict[str, Any]:
+    configured_title = (
+        title.strip()
+        if isinstance(title, str) and title.strip()
+        else DEFAULT_TITLE
+    )
+    if len(configured_title) > 80:
+        configured_title = configured_title[:79].rstrip() + "…"
+    if terminal:
+        content = "完整内容已切换为 Hermes 原生消息发送。"
+        summary = "已切换为原生消息"
+        template = "green"
+        footer = "已完成"
+    else:
+        content = "内容较长，完成后将由 Hermes 原生消息发送。"
+        summary = "等待原生消息"
+        template = "orange"
+        footer = "生成中"
+    return {
+        "schema": "2.0",
+        "config": {
+            "update_multi": True,
+            "summary": {"content": summary},
+        },
+        "header": {
+            "template": template,
+            "title": {"tag": "plain_text", "content": configured_title},
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "element_id": "main_content", "content": content},
+                {"tag": "hr", "element_id": "main_divider"},
+                {
+                    "tag": "markdown",
+                    "element_id": "footer",
+                    "content": footer,
+                    "text_size": "x-small",
+                },
+            ]
+        },
+    }
+
+
 def _render_status(
     session: CardSession, *, status_config: Optional[StatusConfig] = None
 ) -> Dict[str, str]:
@@ -291,22 +444,15 @@ def _sanitize_runtime_header(text: str) -> str:
 
 
 def _render_main_content_elements(
-    main_text: str, *, text_size: str | None = None
+    main_text: str,
+    *,
+    text_size: str | None = None,
+    table_overflow_mode: str = "compact",
 ) -> list[Dict[str, Any]]:
-    import re
-
-    from .text import count_markdown_tables, MAX_CARD_TABLES
-    table_count = count_markdown_tables(main_text)
-    if table_count > MAX_CARD_TABLES:
-        matches = list(re.finditer(r'^\|[-: ]+\|', main_text, re.MULTILINE))
-        cutoff = matches[MAX_CARD_TABLES - 1].end()
-        rest = main_text[cutoff:]
-        next_para = re.search(r'\n\n', rest)
-        if next_para:
-            cutoff += next_para.start()
-        main_text = main_text[:cutoff].rstrip() + (
-            "\n\n> 内容含超过 5 个表格，超出部分已省略。"
-        )
+    main_text = transform_table_overflow(
+        main_text,
+        mode=table_overflow_mode,
+    ).text
     chunks = split_markdown_blocks(main_text, MAIN_CONTENT_CHUNK_CHARS)
     elements = []
     for index, chunk in enumerate(chunks):

@@ -87,6 +87,8 @@ class CardSession:
     reply_to_message_id: str = ""
     notice_title: str = ""
     notice_level: str = "info"
+    terminal_disposition: str = ""
+    terminal_limit_reason: str = ""
     _tool_call_count: int = field(default=0)
     _answer_archive_index: int | None = None
     timeline: CardTimeline = field(default_factory=CardTimeline)

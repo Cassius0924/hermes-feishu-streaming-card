@@ -38,6 +38,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "max_timeline_items": 12,
         "max_reasoning_chars": 1200,
         "max_tool_result_chars": 600,
+        "table_overflow_mode": "compact",
         "footer_fields": [
             "duration",
             "model",
@@ -76,6 +77,7 @@ CARD_TEXT_SIZE_DEFAULTS = {
     "footer": "x-small",
 }
 CARD_TEXT_SIZE_DEVICE_KEYS = frozenset({"default", "pc", "mobile"})
+CARD_TABLE_OVERFLOW_MODES = frozenset({"compact", "truncate"})
 
 
 def normalize_text_sizes(
@@ -109,6 +111,17 @@ def normalize_text_sizes(
             "pc": device_values.get("pc", fallback),
             "mobile": device_values.get("mobile", fallback),
         }
+    return normalized
+
+
+def normalize_table_overflow_mode(
+    value: object, *, path: str = "card.table_overflow_mode"
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{path} must be compact or truncate")
+    normalized = value.strip().lower()
+    if normalized not in CARD_TABLE_OVERFLOW_MODES:
+        raise ValueError(f"{path} must be compact or truncate")
     return normalized
 
 
@@ -219,7 +232,7 @@ def load_config(
         if selected_env_path != config_path.parent / ".env":
             _apply_env_path_overrides(config, selected_env_path)
     _apply_env_overrides(config)
-    _normalize_config_text_sizes(config)
+    _normalize_config_card_options(config)
     _normalize_integrity_mode(config)
     config["server"]["port"] = _normalize_port(config["server"]["port"], "server.port")
     return config
@@ -242,9 +255,9 @@ def _normalize_integrity_mode(config: dict[str, Any]) -> None:
     integrity["mode"] = mode
 
 
-def _normalize_config_text_sizes(config: dict[str, Any]) -> None:
-    _normalize_card_text_sizes(config.get("card"), path="card")
-    _normalize_bot_text_sizes(config.get("bots"), path="bots")
+def _normalize_config_card_options(config: dict[str, Any]) -> None:
+    _normalize_card_config(config.get("card"), path="card")
+    _normalize_bot_card_configs(config.get("bots"), path="bots")
     profiles = config.get("profiles")
     if not isinstance(profiles, Mapping):
         return
@@ -252,11 +265,11 @@ def _normalize_config_text_sizes(config: dict[str, Any]) -> None:
         if not isinstance(profile, Mapping):
             continue
         profile_path = f"profiles.{profile_id}"
-        _normalize_card_text_sizes(profile.get("card"), path=f"{profile_path}.card")
-        _normalize_bot_text_sizes(profile.get("bots"), path=f"{profile_path}.bots")
+        _normalize_card_config(profile.get("card"), path=f"{profile_path}.card")
+        _normalize_bot_card_configs(profile.get("bots"), path=f"{profile_path}.bots")
 
 
-def _normalize_bot_text_sizes(value: object, *, path: str) -> None:
+def _normalize_bot_card_configs(value: object, *, path: str) -> None:
     if not isinstance(value, Mapping):
         return
     items = value.get("items")
@@ -265,17 +278,22 @@ def _normalize_bot_text_sizes(value: object, *, path: str) -> None:
     for bot_id, bot in items.items():
         if not isinstance(bot, Mapping):
             continue
-        _normalize_card_text_sizes(
+        _normalize_card_config(
             bot.get("card"), path=f"{path}.items.{bot_id}.card"
         )
 
 
-def _normalize_card_text_sizes(value: object, *, path: str) -> None:
-    if not isinstance(value, dict) or "text_sizes" not in value:
+def _normalize_card_config(value: object, *, path: str) -> None:
+    if not isinstance(value, dict):
         return
-    value["text_sizes"] = normalize_text_sizes(
-        value["text_sizes"], path=f"{path}.text_sizes"
-    )
+    if "text_sizes" in value:
+        value["text_sizes"] = normalize_text_sizes(
+            value["text_sizes"], path=f"{path}.text_sizes"
+        )
+    if "table_overflow_mode" in value:
+        value["table_overflow_mode"] = normalize_table_overflow_mode(
+            value["table_overflow_mode"], path=f"{path}.table_overflow_mode"
+        )
 
 
 def _merge_sections(config: dict[str, dict[str, Any]], loaded: dict[str, Any]) -> None:

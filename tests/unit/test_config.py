@@ -56,6 +56,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path):
             "max_timeline_items": 12,
             "max_reasoning_chars": 1200,
             "max_tool_result_chars": 600,
+            "table_overflow_mode": "compact",
             "footer_fields": [
                 "duration",
                 "model",
@@ -164,6 +165,7 @@ card:
         "max_timeline_items": 12,
         "max_reasoning_chars": 1200,
         "max_tool_result_chars": 600,
+        "table_overflow_mode": "compact",
         "footer_fields": [
             "duration",
             "model",
@@ -198,6 +200,77 @@ card:
             "mobile": "notation",
         },
     }
+
+
+def test_load_config_defaults_table_overflow_mode_to_compact(tmp_path):
+    config = load_config(tmp_path / "missing.yaml")
+
+    assert config["card"]["table_overflow_mode"] == "compact"
+
+
+def test_load_config_normalizes_table_overflow_mode_at_global_profile_and_bot_paths(
+    tmp_path,
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+card:
+  table_overflow_mode: truncate
+bots:
+  items:
+    sales:
+      card:
+        table_overflow_mode: compact
+profiles:
+  work:
+    card:
+      table_overflow_mode: compact
+    bots:
+      items:
+        support:
+          card:
+            table_overflow_mode: truncate
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["card"]["table_overflow_mode"] == "truncate"
+    assert config["bots"]["items"]["sales"]["card"]["table_overflow_mode"] == "compact"
+    assert config["profiles"]["work"]["card"]["table_overflow_mode"] == "compact"
+    assert (
+        config["profiles"]["work"]["bots"]["items"]["support"]["card"][
+            "table_overflow_mode"
+        ]
+        == "truncate"
+    )
+
+
+@pytest.mark.parametrize(
+    ("yaml_text", "expected_path"),
+    [
+        ("card:\n  table_overflow_mode: drop\n", "card.table_overflow_mode"),
+        (
+            "bots:\n  items:\n    sales:\n      card:\n        table_overflow_mode: 1\n",
+            "bots.items.sales.card.table_overflow_mode",
+        ),
+        (
+            "profiles:\n  work:\n    card:\n      table_overflow_mode: legacy\n",
+            "profiles.work.card.table_overflow_mode",
+        ),
+    ],
+)
+def test_load_config_rejects_invalid_table_overflow_mode_with_exact_path(
+    tmp_path, yaml_text, expected_path
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml_text, encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc_info:
+        load_config(path)
+
+    assert expected_path in str(exc_info.value)
 
 
 def test_normalize_text_sizes_uses_role_default_for_pc_only_mapping():

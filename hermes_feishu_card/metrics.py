@@ -38,6 +38,13 @@ class SidecarMetrics:
     feishu_update_latency_ms: int = 0
     cron_cards_sent: int = 0
     cron_fallbacks: int = 0
+    table_compactions: int = 0
+    table_truncations: int = 0
+    card_limit_deferrals: int = 0
+    card_native_handoffs: int = 0
+    card_limit_json_bytes: int = 0
+    card_limit_elements: int = 0
+    card_limit_tables: int = 0
     recovery_plans_available: int = 0
     recovery_attempts: int = 0
     recovery_successes: int = 0

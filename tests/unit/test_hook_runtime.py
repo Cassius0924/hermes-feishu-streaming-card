@@ -1555,7 +1555,7 @@ async def test_v400_hook_runtime_keeps_native_media_text_when_card_delivery_fail
             return SimpleNamespace(success=True, message_id="om_native_text")
 
     async def rejected(_url, _payload, _timeout):
-        return {"ok": False, "applied": False}
+        return {"ok": True, "applied": False, "disposition": "native"}
 
     monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
     monkeypatch.setattr(hook_runtime, "_post_json_response", rejected)
@@ -6500,8 +6500,13 @@ async def test_emit_cron_delivery_posts_from_running_loop_without_unawaited_warn
     monkeypatch,
     recwarn,
 ):
-    sender = SenderProbe()
-    monkeypatch.setattr(hook_runtime, "_post_json", sender)
+    payloads = []
+
+    def sender(url, payload, timeout):
+        payloads.append((url, payload, timeout))
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_sync_response", sender)
     monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
 
     result = hook_runtime.emit_cron_delivery(
@@ -6515,8 +6520,8 @@ async def test_emit_cron_delivery_posts_from_running_loop_without_unawaited_warn
     )
 
     assert result is True
-    assert len(sender.payloads) == 1
-    url, payload, timeout = sender.payloads[0]
+    assert len(payloads) == 1
+    url, payload, timeout = payloads[0]
     assert url == "http://sidecar.test/events"
     assert payload["event"] == "message.completed"
     assert payload["chat_id"] == "oc_cron"
@@ -6531,9 +6536,13 @@ async def test_emit_cron_delivery_posts_from_running_loop_without_unawaited_warn
 
 @pytest.mark.asyncio
 async def test_emit_cron_delivery_reports_sender_failure_from_running_loop(monkeypatch):
-    sender = SenderProbe()
-    sender.raise_error = True
-    monkeypatch.setattr(hook_runtime, "_post_json", sender)
+    payloads = []
+
+    def sender(url, payload, timeout):
+        payloads.append((url, payload, timeout))
+        raise RuntimeError("network failed")
+
+    monkeypatch.setattr(hook_runtime, "_post_json_sync_response", sender)
 
     result = hook_runtime.emit_cron_delivery(
         {
@@ -6546,7 +6555,31 @@ async def test_emit_cron_delivery_reports_sender_failure_from_running_loop(monke
     )
 
     assert result is False
-    assert len(sender.payloads) == 1
+    assert len(payloads) == 1
+
+
+def test_emit_cron_delivery_falls_through_when_sidecar_requests_native(monkeypatch):
+    posted = []
+
+    def native_response(url, payload, timeout):
+        posted.append((url, payload, timeout))
+        return {"ok": True, "applied": False, "disposition": "native"}
+
+    monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
+    monkeypatch.setattr(hook_runtime, "_post_json_sync_response", native_response)
+
+    result = hook_runtime.emit_cron_delivery(
+        {
+            "job": {
+                "id": "job-native",
+                "origin": {"platform": "feishu", "chat_id": "oc_cron"},
+            },
+            "content": "定时结果",
+        }
+    )
+
+    assert result is False
+    assert len(posted) == 1
 
 
 def test_emit_from_hermes_locals_threadsafe_uses_explicit_loop_from_sync_call(
