@@ -145,10 +145,16 @@ Hermes compatibility evidence is reported at two different levels:
 
 | Hermes release | Automated strategy detection | Real-source validation |
 |---|---|---|
-| Hermes 0.19.0 / `v2026.7.20` | Selects `gateway_run_013_plus` from version metadata and verified anchors | A read-only check against real local source confirmed V4.1 startup-before-redelivery, recovery-before-send, idempotency, and restore behavior |
+| Hermes 0.19.0 / `v2026.7.20` | Requires exact run + Base anchors and writes `manifest_version: 2` for run, required Base, and optional Cron | A read-only check against real local source confirmed V4.1 startup-before-redelivery, recovery-before-send, exact Base patch idempotency, and multi-target restore behavior |
 
 The real local source check does not claim that a real Gateway process or a
 real Feishu conversation passed E2E. Those remain separate release gates.
+This automated strategy detection and the real local source validation are
+separate evidence: the former selects and enforces the managed target set,
+while the latter checks the exact `v2026.7.20`, `0.19.0` source anchors.
+Legacy manifest v1 cannot prove Base ownership. Upgrade/repair migrates it only
+when every current source, backup, owned marker, and reversible patch verifies;
+future manifest versions fail closed and require the matching newer installer.
 
 `card.text_sizes` can configure the `body`, `reasoning`, `tool`, `notice`, and
 `footer` roles, with optional `default` / `pc` / `mobile` mappings. Physical

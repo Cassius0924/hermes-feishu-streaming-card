@@ -17,7 +17,10 @@ V4.1.0 增加按会话选择 Hermes 原生消息、无损处理超量表格、�
 - `card.table_overflow_mode: compact` 是默认值。Markdown-aware scanner 忽略 fenced code 中的假表格，并把第 6 张及后续表格按原顺序转换为可读字段列表；所有行和单元格保留。
 - 显式选择 `truncate` 可保留旧版“五张表格后省略”的行为，但 fenced code 不再消耗表格额度，表格后的普通正文也不会被误删。
 - 最终 card JSON 使用同一序列化器检查 5 张渲染表格、200 个 tagged element 与保守的 28,000 UTF-8 byte 预算。非终态超限先显示小型等待卡并继续收集；终态仍超限时不发送半截答案，而是返回稳定 handoff descriptor。已有卡片的短提示仅在当前 sidecar 进程内 best-effort PATCH，不阻塞原生答案，也不持久化正文或原始路由标识。
-- ACK-capable Gateway 用 descriptor 为每个逻辑分片生成稳定 Feishu UUID；Hermes delivery ledger 先持久化 `delivered`，随后才向 `POST /native-handoff/ack` 发送 `hfc-native-handoff-ack-v1` 签名确认。Gateway 重启时通过 `POST /native-handoff/recover` 与 `hfc-native-handoff-recovery-v1` 按 obligation hash 恢复 pending descriptor。ACK 失败不会回滚 ledger；未决记录在一小时协议窗口后进入 `uncertain` / 人工复核，而不是盲目重发。本机制在窗口内提供有效幂等，但不承诺永久 exactly-once。
+- ACK 能力只在默认 profile 的 Hermes Base 已生成最终 `text_content`、delivery ledger 已完成 `record_obligation` / `mark_attempting`、stable-UUID wrapper 完整、runtime plan 可指纹化且本轮没有附件/媒体时启用。Hermes 0.19 启动恢复不会遍历 secondary profile 的独立 ledger，因此 secondary profile 明确保留普通 native fail-open，不冒充可跨崩溃恢复。Gateway 与 sidecar 只协商 `native-ack-v2`、`stable-feishu-uuid-v2`、`exact-base-delivery-v1`，并只接受 `hfc-native-handoff-v2` descriptor；sidecar 同时持久化 obligation、exact-content、plan fingerprint 与 canonical `create` / `thread-create` route。任一条件缺失都回到 Hermes 普通随机 UUID fail-open，不从 raw completion 猜测。
+- ACK-capable Gateway 用 descriptor 为每个逻辑分片生成稳定 Feishu UUID；Hermes delivery ledger 先持久化 `delivered`，随后才向 `POST /native-handoff/ack` 发送 `hfc-native-handoff-ack-v1` 签名确认。Gateway 重启时通过 `POST /native-handoff/recover` 与 `hfc-native-handoff-recovery-v2` 精确匹配 obligation/content/plan/route 后恢复 pending descriptor，命中时发送 ledger 原始正文，不重复 `RECOVERED_MARKER`。若 terminal POST 已在 sidecar 落盘但响应丢失或格式损坏，Gateway 会立刻用同一四项 binding 做 recovery lookup，找回刚提交的 descriptor；若两次本机请求都不可用，则只能回到普通 fail-open，不能宣称 exactly-once。
+- ACK 失败不会回滚 ledger。一小时协议窗口后 exact descriptor 不再复用，sidecar 把未决记录标为 `uncertain`；Hermes 上游仍可通过带可见 `RECOVERED_MARKER` 的有界 native recovery 保护答案不丢失，该路径使用普通随机 UUID，不伪装成 exact 重试。本机制只在窗口内提供有效幂等，不承诺永久 exactly-once。
+- 这条 exact ledger ACK 契约只覆盖受管 Hermes 0.19 Base 默认 profile 的纯文本普通 final-answer。secondary profile、附件/媒体继续使用 Hermes 原生 best-effort 投递；Cron、direct command、旧 hook/new sidecar 组合或缺失任一 exact binding 时也保持普通原生 fail-open，不复用 descriptor，不扩大恢复承诺。
 
 ## Hermes 升级后的完整性监控
 
@@ -48,7 +51,7 @@ Docker Compose 继续以普通 setup、sidecar、Gateway 容器运行，固定�
 
 ## Hermes 兼容边界
 
-Hermes 0.19.0 / `v2026.7.20` 系列仍在 Gateway 运行时导入 `gateway.run.start_gateway`，因此 V4.1.0 保留可检测、可移除、可恢复的 AST-owned `gateway/run.py` hook。升级覆盖由认证 heartbeat 与 strict repair 处理，而不是安装范围更广、难以验证的 import-hook bridge。HFC 不手工编辑已安装 Hermes；所有源码变更仍只经官方 patcher/recovery transaction。
+Hermes 0.19.0 / `v2026.7.20` 系列仍在 Gateway 运行时导入 `gateway.run.start_gateway`，因此 V4.1.0 保留可检测、可移除、可恢复的 AST-owned `gateway/run.py` hook，并把 `gateway/platforms/base.py` 作为同一 `manifest_version: 2` 下的第三个 managed target。Base 只增加两个最小 hook：无独立正文路径收束，以及 ledger attempting 后、原生 send 前的 exact finalization；不复制或重跑 Hermes 媒体清洗 pipeline。run/base/可选 cron 的 backup、写入、restore 与 upgrade repair 统一验证和回滚。旧 manifest v1 不能证明 Base ownership，必须经严格 repair/install 验证后迁移。升级覆盖由认证 heartbeat 与 strict repair 处理，而不是 import-hook bridge。HFC 不手工编辑已安装 Hermes；所有源码变更仍只经官方 patcher/recovery transaction。
 
 ## 升级
 

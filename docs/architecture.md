@@ -6,7 +6,8 @@
 
 ```text
 Hermes Gateway
-  -> marker-wrapped minimal hook (gateway/run.py)
+  -> marker-wrapped lifecycle hook (gateway/run.py)
+  -> exact final-delivery hooks (gateway/platforms/base.py, Hermes 0.19+)
   -> hermes_feishu_card.hook_runtime
      -> signed POST /delivery/policy (before native suppression)
      -> authenticated/fail-open POST /events
@@ -15,7 +16,7 @@ Hermes Gateway
   -> policy + readiness + session + render + Feishu CardKit send/update
 ```
 
-V4.1 使用域分隔的事件数据面与四条控制动作：`hfc-policy-v1` per-chat policy、`hfc-runtime-v1` runtime readiness、`hfc-native-handoff-recovery-v1` pending descriptor 恢复，以及 `hfc-native-handoff-ack-v1` delivered 后确认。policy 在 hook 和 sidecar 两侧执行；runtime 事件只证明活性，不授权文件写入；handoff recovery 只提交 obligation hash，ACK 只能发生在 Hermes ledger 已持久化 `delivered` 之后。任一控制面失败都不应阻断 Hermes Agent 工作，安装/恢复 mutation 则继续 fail-closed。
+V4.1 使用域分隔的事件数据面与四条控制动作：`hfc-policy-v1` per-chat policy、`hfc-runtime-v1` runtime readiness、`hfc-native-handoff-recovery-v2` pending descriptor 恢复，以及 `hfc-native-handoff-ack-v1` delivered 后确认。policy 在 hook 和 sidecar 两侧执行；runtime 事件只证明活性，不授权文件写入；handoff recovery 只提交 obligation、exact content、delivery plan 与 canonical route 的单向 hash/枚举，不提交正文，ACK 只能发生在 Hermes ledger 已持久化 `delivered` 之后。任一控制面失败都不应阻断 Hermes Agent 工作，安装/恢复 mutation 则继续 fail-closed。
 
 Hermes hook 到 sidecar `/events` 的 fail-open 转发链路已经落地：sidecar 不可用或拒绝事件时，hook 不拖垮 Hermes，未被卡片路径确认接管的消息继续遵循 Hermes 原生 fallback。卡片已经接受的路径则抑制重复灰色原生文本。
 
@@ -23,7 +24,7 @@ Hermes hook 到 sidecar `/events` 的 fail-open 转发链路已经落地：sidec
 
 ### 最小 Hermes hook
 
-安装器只通过 `hermes_feishu_card.install.patcher` 修改 Hermes 的 `gateway/run.py`，插入可识别、可移除、可恢复的 marker block。复杂事件抽取、delta 合并、命令卡和 Feishu adapter 兼容逻辑位于 `hermes_feishu_card.hook_runtime`；hook 不保存飞书凭据，也不重写 Hermes 的会话 ownership、resume 或群聊准入规则。
+安装器只通过 `hermes_feishu_card.install.patcher` 修改 Hermes。生命周期入口位于 `gateway/run.py`；具备 delivery ledger 的 Hermes 0.19+ 还在 `gateway/platforms/base.py` 安装两个最小 exact hook：一个收束无独立正文的媒体/TTS 路径，另一个在 `record_obligation` / `mark_attempting` 后、原生 send 前提交 Base 已生成的 `text_content`。两份源码及可选 cron target 都使用可识别、可移除、可恢复的 marker block，并由同一 manifest/backup transaction 管理。复杂事件抽取、delta 合并、命令卡和 Feishu adapter 兼容逻辑位于 `hermes_feishu_card.hook_runtime`；hook 不复制 Hermes 媒体清洗 pipeline，不保存飞书凭据，也不重写 Hermes 的会话 ownership、resume 或群聊准入规则。
 
 ### HTTP sidecar
 
@@ -54,7 +55,7 @@ Windows non-loopback 在无法验证 state directory 的 ACL 私有性时 fail-c
 | `POST /events` | loopback 本机互信；显式非 loopback 强制事件鉴权 |
 | `POST /delivery/policy` | state-directory transport root、短 timestamp window 与 nonce replay protection；响应不回显 id |
 | `POST /runtime/events` | 独立 runtime domain 的认证 hello/heartbeat；只更新脱敏 readiness |
-| `POST /native-handoff/recover` | 独立 recovery domain；只用 obligation hash 查询一小时窗口内的 pending descriptor |
+| `POST /native-handoff/recover` | 独立 recovery domain；用 obligation/content/plan hash 与 `create`/`thread-create` route 精确匹配一小时窗口内的 pending descriptor，不发送正文 |
 | `POST /native-handoff/ack` | 独立 ACK domain；仅在 Hermes ledger 已持久化 `delivered` 后确认 handoff |
 | `POST /commands` | state-dir command transport proof |
 | `POST /card/actions` | interaction token 或 operations transport proof |

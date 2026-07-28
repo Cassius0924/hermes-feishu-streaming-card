@@ -2,15 +2,15 @@
 
 [中文](installer-safety.md) | [English](installer-safety.en.md)
 
-The installer is designed to perform only minimal, verifiable, recoverable writes. Version text changes can fall back to `gateway/run.py` anchors, but uncertain code structure, backups, manifests, or file-safety checks still fail closed.
+The installer performs only minimal, verifiable, recoverable writes. Version-text changes can fall back to supported source anchors, but uncertain structure, backups, manifests, or file-safety checks fail closed. For Hermes 0.19.0, `v2026.7.20+`, or source with the verified exact delivery-ledger structure, `gateway/run.py` and `gateway/platforms/base.py` are inseparable required targets; optional Cron remains capability-detected.
 
 ## Pre-install Checks
 
 Before installation, the installer verifies:
 
-- The Hermes directory exists and contains the expected `gateway/run.py`.
-- Hermes version metadata is parseable, or `gateway/run.py` contains a structure recognized by the current hook. Supported inputs include `VERSION=v2026.4.23+`, Git tag `v2026.4.23+`, `0.18.x` semantic versions, descriptive version strings, and unparseable versions paired with verifiable anchors.
-- `gateway/run.py` contains an insertion point recognized by the current hook.
+- The Hermes directory contains `gateway/run.py`; exact-Base releases must also contain `gateway/platforms/base.py`.
+- Version metadata is parseable, or source contains structures recognized by the current hooks. Supported inputs include `VERSION=v2026.4.23+`, Git tag `v2026.4.23+`, `0.18.x` / `0.19.x`, descriptive versions, and unparseable metadata with verified anchors.
+- `gateway/run.py` has a supported insertion point. When Base is required, media extraction, obligation, ledger attempting/delivered, and final-send structures must all match exactly.
 - Existing install state, backup, and manifest are not contradictory.
 - If the Hermes directory contains `venv/bin/python`, `.venv/bin/python`, or the Windows `Scripts/python.exe` equivalent, that runtime Python must be able to import `hermes_feishu_card.hook_runtime`; otherwise setup installs the current plugin release into that venv before patching Hermes.
 
@@ -24,7 +24,7 @@ python3 -m hermes_feishu_card.cli doctor --config config.yaml.example --hermes-d
 python3 -m hermes_feishu_card.cli doctor --config config.yaml.example --hermes-dir ~/.hermes/hermes-agent --json
 ```
 
-Diagnostic output includes Hermes support status, Hermes root, `gateway/run.py`, `run_py_exists`, `version_source`, `version`, `minimum_supported_version`, `hook_strategy`, `compatibility`, anchors, and `reason`. From V3.9.1, source-stripped Hermes roots that have valid anchors but no version metadata display `version: unknown (source-stripped metadata)` so an anchor strategy is not mistaken for an actual version. From V3.6.2, diagnostics also include `runtime_import`, which confirms whether the Python interpreter actually used by Hermes Gateway can import `hermes_feishu_card.hook_runtime`. `--explain` renders runtime import, streaming config, manifest/backup/run.py install state, and next-step recommendations as a human-readable summary. `--json` emits a machine-readable report with `schema_version`, top-level `status`, `runtime_import`, `install_state`, and `recommendations` for issue templates and automation. All `doctor` modes are read-only and do not write Hermes files.
+Diagnostic output includes support status, Hermes root, run/Base paths and existence, `base_required`, `exact_delivery_contract`, version source/value, minimum version, strategy, compatibility, anchors, and reason. Source-stripped roots with valid anchors but no metadata display `version: unknown (source-stripped metadata)`. Diagnostics also include runtime import and Feishu SDK capability. `--explain` renders runtime import, streaming, manifest/backup/multi-target state, and recommendations; `--json` provides the machine-readable equivalent. Every `doctor` mode is read-only.
 
 ## Repair
 
@@ -33,9 +33,9 @@ python3 -m hermes_feishu_card.cli repair --hermes-dir ~/.hermes/hermes-agent --y
 python3 -m hermes_feishu_card.cli setup --repair --hermes-dir ~/.hermes/hermes-agent --config ~/.hermes_feishu_card/config.yaml --yes
 ```
 
-`repair` only fixes install-state this project can verify. If backup is missing but the current `run.py` can safely remove this project's owned patch, it recreates the backup. If manifest is missing, malformed, or stale after backup recreation, it rebuilds the manifest. If the current unpatched source is identical to the old backup, it automatically clears the stale backup/manifest. V3.9.1 also recovers a narrowly defined marker-only state: the manifest patched hash must equal the expected patch rebuilt from the verified backup, and the current file may differ from that expected patch only on this project's owned BEGIN/END marker lines.
+`repair` fixes only install state this project can verify. V4.1 requires ownership evidence for run, required Base, and optional Cron to agree: if any Base marker, backup, or manifest evidence exists, repair must not restore run alone and then clear state. Missing backups or manifests may be rebuilt only when every managed target supports the same verified transaction. The narrow marker-only recovery still requires the expected patched hash rebuilt from a verified backup, with differences limited to owned BEGIN/END marker lines.
 
-If an intentional Hermes upgrade replaced the unpatched source so the current `run.py` (or cron source) differs from the verified old backup, recovery refuses to treat it as ordinary stale state by default. After confirming the difference came from an intentional Hermes upgrade, opt in explicitly:
+If an intentional Hermes upgrade replaced unpatched run, required Base, or optional Cron so it differs from a verified old backup, recovery refuses ordinary stale-state handling by default. After confirming an intentional upgrade, opt in explicitly:
 
 ```bash
 # Recover old state and reinstall from the upgraded source in one command
@@ -46,7 +46,7 @@ python3 -m hermes_feishu_card.cli repair --hermes-dir ~/.hermes/hermes-agent --a
 python3 -m hermes_feishu_card.cli install --hermes-dir ~/.hermes/hermes-agent --yes
 ```
 
-`setup` also accepts `--accept-hermes-upgrade`. The option never restores the old backup over upgraded Hermes source. It clears only verified stale HFC backup/manifest artifacts, after which installation backs up and patches the current upgraded source. The current source must parse and expose supported hook anchors, the manifest must be valid, and the old backup must be unchanged and match its manifest hash. Missing or corrupt backups, invalid manifests, symlinks, unreadable files, unknown markers, unsupported current source, or remaining owned patches still fail closed.
+`setup` also accepts `--accept-hermes-upgrade`. It never writes an old backup over upgraded source. It clears only verified stale HFC artifacts, then backs up and patches every currently required target. All source must parse with supported anchors, the manifest must validate, and every old backup must remain unchanged and match its hash. Missing or corrupt backups, invalid manifests, symlinks, unreadable files, unknown markers, an incompatible required Base, unsupported source, or remaining owned patches still fail closed.
 
 `status` and `start` resolve `HERMES_DIR` from an explicit `--hermes-dir`, the selected env file, the config-adjacent `.env`, or process environment, then check hook state read-only. When a Hermes upgrade replaced the source but the old backup/manifest still verify, they report `hook.status: upgrade_repair_required` and print the explicit recovery command plus `hermes gateway start`; `start` refuses before launching the sidecar, preventing a silent “healthy sidecar, missing Gateway hook” state. User edits, corruption, unsupported source, or incomplete evidence report `manual_review_required` without offering the `--accept-hermes-upgrade` shortcut.
 
@@ -60,18 +60,20 @@ When strict repair successfully reinstalls the hook, readiness reports `gateway.
 
 ## Backup And Manifest
 
-Installation saves a backup of `gateway/run.py` before writing the patched file, then writes a manifest. The manifest records at least:
+V4.1 saves every managed source backup, then writes `manifest_version: 2`. It records at least:
 
 - Relative `run_py` path.
 - Hash of the patched `run.py`.
 - Relative backup path.
 - Backup hash.
+- Required Base `base_py`, `base_patched_sha256`, `base_backup`, and `base_backup_sha256`; these four fields are all-or-none.
+- Equivalent optional Cron paths and hashes when that target is supported.
 
-`restore` and `uninstall` use the manifest to verify the current `run.py` and backup are in a state owned by this installer. If user changes or unknown tool changes are detected, the command refuses to overwrite.
+`restore` and `uninstall` verify run, required Base, optional Cron, and their backups as one transaction. A v1 manifest cannot prove Base ownership and migrates only through strict repair/install verification. Any target change, missing required backup, or partial field set refuses partial restore or ownership cleanup.
 
 ## Atomic Writes
 
-The installer writes `run.py`, backup files, and manifest files via temporary file replacement to avoid truncated files. If any install step fails, already-written state should be rolled back or cleaned up.
+Base (before run), run, optional Cron, backups, and manifest use temporary replacement. If any install or restore step fails, the entire multi-target transaction rolls back, preventing a restored run from leaving Base patched and orphaned.
 
 ## Restore And Uninstall
 
@@ -80,7 +82,7 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 python3 -m hermes_feishu_card.cli uninstall --hermes-dir ~/.hermes/hermes-agent --yes
 ```
 
-`restore` restores the Hermes file that existed before installation. `uninstall` removes the hook and install state owned by this plugin. Neither command should overwrite unverifiable user changes.
+`restore` restores every managed Hermes file that existed before installation. `uninstall` removes the same owned hooks and state. Both are all-target success or no-op and never overwrite unverifiable user changes.
 
 When migrating from legacy/dual historical installs, read [migration.en.md](migration.en.md). Historical `legacy/installer_v2.py`, `legacy/gateway_run_patch.py`, and `legacy/patch_feishu.py` wrote patches outside the current manifest model and must not be assumed recoverable by current `restore`.
 

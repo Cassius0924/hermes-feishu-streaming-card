@@ -17,12 +17,12 @@ See also: [docs/release-notes-v4.1.0.md](docs/release-notes-v4.1.0.md)
 ### Changed
 - `card.table_overflow_mode: compact` preserves table six onward as ordered field lists. `truncate` remains available explicitly, and fenced code no longer counts as tables.
 - The shared card serializer enforces five tables, 200 tagged elements, and a 28,000-byte JSON budget. Terminal overflow hands the complete answer back to Hermes native delivery instead of sending a partial card.
-- Terminal overflow now returns a stable descriptor: per-chunk Feishu UUIDs, Hermes-ledger-first `delivered`, signed ACK, and hash-only crash recovery keep retries bounded without claiming forever exactly-once semantics.
+- On the exact Hermes 0.19 final-answer path, terminal overflow now returns a stable descriptor bound to the Base delivery ledger's obligation, content hash, delivery-plan fingerprint, and canonical route. Per-chunk Feishu UUIDs, ledger-first `delivered`, and signed ACK keep retries bounded without claiming forever exactly-once semantics. Cron, direct-command, and incomplete-binding paths remain ordinary native fail-open and do not claim this ACK contract.
 - Multi-bot groups that depend on bot-to-bot mentions can opt into native creation through `native_chats`; the target app still needs Feishu's include-bot mention permission.
 - Docker Compose remains an ordinary unprivileged runtime flow and explicitly selects `detached` rather than systemd. The setup container runs `install-docker.sh` as root to prepare the shared volumes; the sidecar, Gateway, and probe run as non-root while CI exercises the patched Gateway, signed readiness, and signed event path.
 
 ### Compatibility and safety
-- Hermes 0.19.0 / `v2026.7.20` remains compatible with the existing AST-owned `gateway/run.py` hook. Runtime monitoring and strict repair replace broader import-time patching.
+- Hermes 0.19.0 / `v2026.7.20` remains compatible through AST-owned `gateway/run.py` and `gateway/platforms/base.py` hooks. V4.1 `manifest_version: 2` manages run, required Base, and optional Cron as one verified transaction; runtime monitoring and strict repair replace broader import-time patching.
 - Credits: @shutdown-awa (#157), @Jasonsun77 (#158), @Redeemer-w (#159), @zyq2552899783-lgtm (#162), @Cyber-Yichen (#156), and @wholegale39 (#160). The release retains their requirements and environment evidence without adopting implicit privilege escalation or an import-hook monkey patch.
 
 ## V4.0.21 — 2026-07-28

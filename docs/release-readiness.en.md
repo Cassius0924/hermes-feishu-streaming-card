@@ -148,7 +148,7 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 ## V4.1.0 Release Gates
 
 - Exact/profile-scoped `bindings.native_chats`, two-stage hook/sidecar enforcement, fail-open direct-card paths, and card-based `/hfc`: **focused matrix and real card → native → card acceptance pending**.
-- Default `table_overflow_mode=compact`, fenced fake-table exclusion, and a terminal native handoff above 28,000 bytes using stable UUIDs, the Hermes ledger, delivered-then-ACK order, and manual review outside the bounded window: **real seven-table and oversized-handoff acceptance pending**.
+- Default `table_overflow_mode=compact`, fenced fake-table exclusion, and a text-only terminal native handoff above 28,000 bytes using a V2 descriptor, stable UUIDs, the Hermes ledger, and delivered-then-ACK order; outside the window the exact descriptor expires while visible-marker bounded upstream recovery remains ordinary fail-open: **real seven-table and oversized-handoff acceptance pending**.
 - `integrity.mode` safe/notify/off, signed `runtime.hello` / `runtime.heartbeat`, strict repair, `sidecar.restart_required`, and no automatic Gateway restart: **upgrade simulation pending**.
 - All four `service.manager` modes, non-escalating `auto`, and ordinary Docker containers: **Linux manager and Docker Compose smoke pending**.
 - Full pytest, `git diff --check`, build/isolated `site-packages`, exact merge SHA, public tagged install, and Release assets: **release workflow pending**.

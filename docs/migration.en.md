@@ -28,7 +28,7 @@ python3 -m hermes_feishu_card.cli stop --config config.yaml.example
 python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --yes
 ```
 
-`restore` only handles install state that the current manifest can verify. If it reports `run.py changed since install`, `backup changed since install`, or `install state incomplete`, stop and inspect Hermes `gateway/run.py` manually.
+`restore` handles only state verified by the current manifest. V4.1 `manifest_version: 2` treats `gateway/run.py`, required Hermes 0.19 `gateway/platforms/base.py`, and optional Cron as one transaction; an incomplete target or backup never triggers partial restore. On changed source/backup, `install state incomplete`, or `newer installer required`, stop and inspect every managed target rather than fixing run alone.
 
 4. If Hermes previously used historical legacy/dual scripts such as `legacy/installer_v2.py`, `legacy/gateway_run_patch.py`, or `legacy/patch_feishu.py`, restore from the original backup created by those scripts. If no trusted backup exists, reinstall or check out the matching Hermes version before migration.
 
@@ -46,7 +46,7 @@ Continue only when the output says `hermes: supported` and `version`, `version_s
 python3 -m hermes_feishu_card.cli install --hermes-dir ~/.hermes/hermes-agent --yes
 ```
 
-The installer creates a backup and manifest, then installs a minimal hook that calls `hermes_feishu_card.hook_runtime`. Feishu CardKit, session state, health metrics, and retry counts live inside the sidecar process.
+The installer backs up every managed target, writes `manifest_version: 2`, and installs minimal calls into `hermes_feishu_card.hook_runtime`. For Hermes 0.19 / `v2026.7.20+` or verified exact-ledger source, required Base installs, restores, and rolls back with run. Feishu CardKit, session state, health metrics, and retry counts remain in the sidecar.
 
 7. Start and inspect the sidecar:
 
@@ -85,7 +85,7 @@ hermes-feishu-card integrity migrate-safe \
 
 Success prints `sidecar.restart_required: true` and `gateway.restart_required: false`. Restart the sidecar before signed `runtime.hello` / `runtime.heartbeat` events are evaluated in safe mode. If strict repair later reinstalls the hook, state changes to `gateway.restart_required: true`, but HFC never restarts Gateway automatically. Incomplete evidence, user edits, symlinks, dirty targets, branch rewinds, and source-stripped roots remain fail closed.
 
-`service.manager: auto` chooses only `systemd-user` or `detached`; it never silently enters `systemd-system` or invokes sudo. `systemd-system` is an explicit Linux transient-unit opt-in. Docker remains an ordinary container process with `detached`. Hermes 0.19.0 / `v2026.7.20` still uses the AST-owned `gateway/run.py` hook; runtime monitoring and strict repair handle upgrade replacement without an import-hook bridge.
+`service.manager: auto` chooses only `systemd-user` or `detached`; it never silently enters `systemd-system` or invokes sudo. `systemd-system` is an explicit Linux transient-unit opt-in. Docker remains an ordinary container process with `detached`. Hermes 0.19.0 / `v2026.7.20` uses AST-owned run + Base hooks. A legacy run-only manifest gains the Base backup/patch and migrates to v2 only under strict evidence; runtime monitoring and strict repair handle upgrade replacement without an import-hook bridge.
 
 ## Upgrading To V3.4.0
 
@@ -183,7 +183,7 @@ python3 -m hermes_feishu_card.cli stop --config config.yaml.example
 python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --yes
 ```
 
-If `restore` refuses to overwrite, do not force-delete the hook. Compare Hermes `gateway/run.py`, the installer backup, the manifest, and any external backup before manual recovery.
+If `restore` refuses to overwrite, do not force-delete a hook. Compare run, required Base, optional Cron, each installer backup, the manifest, and external backups before manual recovery. A future-version manifest must be handled by its matching newer installer.
 
 ## Verification Checklist
 

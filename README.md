@@ -37,7 +37,7 @@ Hermes 飞书流式卡片插件把 Hermes Agent Gateway 的飞书/Lark 回复变
 - **运维卡有明确边界**：`/hfc doctor` 可给出诊断、两步安全修复和重启确认；私聊不比较操作者，群聊只允许发起者确认。运维卡不可用时继续使用 CLI，不改变普通流式卡的 layout 或 footer。
 - **长内容保护**：长 Markdown 表格、fenced code block 按结构边界拆分，降低 raw markdown 和半截围栏问题。
 - **V4.1 按会话原生投递**：精确的 `bindings.native_chats` 可让指定会话回到 Hermes 原生消息；hook 与 sidecar 双重校验，策略失败时 fail-open，不吞消息。
-- **V4.1 无损表格溢出**：默认 `card.table_overflow_mode: compact` 把第 6 张及后续表格转成字段列表；最终卡片仍超出 28,000 byte 时通过稳定 UUID、Hermes ledger 和签名 ACK 交还完整原生答案，不发送半截内容。
+- **V4.1 无损表格溢出**：默认 `card.table_overflow_mode: compact` 把第 6 张及后续表格转成字段列表；最终卡片仍超出 28,000 byte 时不发送半截内容。Hermes 0.19 普通 final-answer 的 exact Base 路径以稳定 UUID、delivery ledger 和签名 ACK 有界恢复；Cron 等非 exact 路径保持原生 fail-open。
 - **V4.1 升级与服务安全**：认证 `runtime.hello` / `runtime.heartbeat` 区分进程存活与发卡 readiness；strict repair 不自动重启 Gateway，`service.manager: auto` 也不隐式进入 system service 或调用 sudo。
 - **可诊断、可恢复**：`doctor`、`/hfc status`、`/health` metrics、runtime import 检查、Hermes Feishu SDK 能力检查、safe repair/restore/uninstall 覆盖常见故障。若 Hermes adapter 使用 `extra_ua_tags` 而 Gateway venv 仍是旧版 `lark-oapi`，`doctor` 会报告 `feishu_sdk_incompatible`，`setup/install` 会补齐已验证的 `lark-oapi==1.6.8`。
 
@@ -131,7 +131,7 @@ streaming:
 
 不要设置 `display.platforms.feishu.streaming: false`。也不要把 `display.show_reasoning` 当成本插件必需开关；它可能把 reasoning 追加到最终回复里，反而干扰卡片流式体验。插件会直接处理 Hermes 的 `thinking.delta` / `answer.delta`。
 
-Hermes `v2026.4.23` 起的旧版和 Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0.19.0（`v2026.7.20`）均有兼容策略；`doctor` 会优先读取 `VERSION` 或 Git tag `v2026.4.23+`，也会在版本 metadata 不完整或不可解析时用 `gateway/run.py` anchors 兜底。自动化 strategy detection 会为 Hermes 0.19.0 选择 `gateway_run_013_plus`；另一次本机真实源码只读验证确认 V4.1 patcher 在 `v2026.7.20` 源码上保持启动早于 ledger redelivery、recovery 早于 adapter send，并可幂等恢复。后者只证明源码 patch 边界，不等同于真实 Gateway 或飞书 E2E。升级 Hermes 可能替换已注入 hook 的 `gateway/run.py`；`status` / `start` 会从配置旁 `.env` 的 `HERMES_DIR` 主动识别这种残留状态并给出安全恢复命令。确认是有意升级后，执行提示的 `install --accept-hermes-upgrade --yes`，再执行 `hermes gateway start`；若检测到用户改动或证据不完整，只会要求 `doctor --explain` 人工检查。
+Hermes `v2026.4.23` 起的旧版和 Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0.19.0（`v2026.7.20`）均有兼容策略；`doctor` 会优先读取 `VERSION` 或 Git tag `v2026.4.23+`，也会在版本 metadata 不完整或不可解析时用可验证 anchors 兜底。自动化 strategy detection 在 Hermes 0.19.0、`v2026.7.20+` 或检测到精确 ledger 结构时，要求安装器同时验证并管理 `gateway/run.py` 与 `gateway/platforms/base.py`；V4.1 `manifest_version: 2` 把 run、required Base、optional Cron 的 backup/write/restore 作为同一事务。另一次本机真实源码只读验证确认 patcher 保持启动早于 ledger redelivery、recovery 早于 adapter send，并可幂等恢复；它只证明源码 patch 边界，不等同于真实 Gateway 或飞书 E2E。升级 Hermes 可能替换受管源码；`status` / `start` 会从配置旁 `.env` 的 `HERMES_DIR` 主动识别残留状态并给出安全恢复命令。确认是有意升级后，执行提示的 `install --accept-hermes-upgrade --yes`，再执行 `hermes gateway start`；若检测到用户改动或证据不完整，只会要求 `doctor --explain` 人工检查。
 
 ## Docker 容器内安装
 
@@ -224,7 +224,8 @@ bash install-docker.sh
 
 ```text
 Hermes Gateway
-  -> minimal hook in gateway/run.py
+  -> minimal hooks in gateway/run.py
+     + required exact hook in gateway/platforms/base.py (Hermes 0.19)
      -> hermes_feishu_card.hook_runtime
         -> HTTP POST /events
            -> sidecar server
@@ -233,7 +234,7 @@ Hermes Gateway
               -> retry / coalescing / metrics / /health
 ```
 
-这是 sidecar-only 设计：Hermes hook 保持 fail-open，飞书发送、更新、状态机、重试、诊断都在 sidecar 中运行。历史 V2 实现归档在 `legacy/`，不是 active runtime。
+这是 sidecar-only 设计：Hermes 只保留安装器可检测、可恢复的最小 hook；飞书发送、更新、状态机、重试、诊断都在 sidecar 中运行。历史 V2 实现归档在 `legacy/`，不是 active runtime。
 
 ## 文档入口
 

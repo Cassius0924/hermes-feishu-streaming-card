@@ -2376,7 +2376,7 @@ def test_v410_release_docs_define_ack_multibot_and_compose_boundaries():
         for marker in (
             "POST /native-handoff/recover",
             "POST /native-handoff/ack",
-            "hfc-native-handoff-recovery-v1",
+            "hfc-native-handoff-recovery-v2",
             "hfc-native-handoff-ack-v1",
             "uncertain",
         ):

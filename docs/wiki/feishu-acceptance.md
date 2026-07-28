@@ -7,7 +7,7 @@
 - card → native → card：先让普通会话完成一张卡，执行 `chats use-native` 后从下一条新消息观察 Hermes 原生投递，再执行 `chats use-card` 恢复；正在运行的 turn 不能中途变轨，三步均不得重复正文。
 - native 工具与反馈：在 native chat 中完成一轮带工具回答，并分别验证普通命令、system notice、approval/clarify 与 picker 按 Hermes 原生路径可见；`/hfc status` / `/hfc doctor` 仍必须是卡片。
 - 表格：发送包含 7 张真实 Markdown 表格和一段 fenced fake table 的回答；默认 `compact` 只把前 5 张渲染为 table，其余字段列表保留全部行、单元格和后续正文。显式 `truncate` 单独做自动化兼容，不把数据丢失模式作为默认真实验收。
-- 预算 handoff：让最终序列化 card JSON 超过 28,000 byte。运行中只保留小型等待卡；完成后已有卡显示短 handoff，完整答案走 Hermes 原生消息。重复 terminal、Gateway ledger recovery 与 ACK retry 在一小时窗口内复用相同分片 UUID；窗口外未决状态进入 `uncertain` / 人工复核，不宣称永久 exactly-once。
+- 预算 handoff：在默认 profile 让无附件/媒体的最终序列化 card JSON 超过 28,000 byte。运行中只保留小型等待卡；完成后已有卡显示短 handoff，完整答案走 Hermes 原生消息。重复 terminal、Gateway ledger recovery、terminal 响应丢失后的 recovery lookup 与 ACK retry 在一小时窗口内复用相同分片 UUID；窗口外 exact descriptor 必须失效、sidecar 记录 `uncertain`。若 Hermes 随后执行有界 native recovery，消息必须带可见 `RECOVERED_MARKER`、使用普通随机 UUID，不能伪装成 exact retry；不宣称永久 exactly-once。再用 secondary profile 与带真实附件/媒体的回合确认它们继续走原生 best-effort，不广告 ACK capability。
 - integrity：先验证 `notify` 只报告；在严格 Git provenance fixture 中执行 `integrity migrate-safe`，确认 `sidecar.restart_required: true`、`gateway.restart_required: false`。safe repair 后确认 readiness 显示 `gateway.restart_required: true`，Gateway 未被自动重启；手动重启后新的 `runtime.hello` / `runtime.heartbeat` 恢复 ready。
 - service/Docker：Linux 覆盖 `auto`、`systemd-user`、`systemd-system`、`detached`，确认 `auto` 不调用 sudo/系统总线；Docker Compose 以普通 setup/sidecar/Gateway 容器运行，不使用 privileged 或 systemd。
 - 全程只记录脱敏计数、状态和 release version，不记录真实 chat/message/user id、secret、transport proof、本机路径、回答正文或 recovery fingerprint。真实验收、Linux/Docker smoke 和 public tag/install 未完成前，不得写成已经通过。

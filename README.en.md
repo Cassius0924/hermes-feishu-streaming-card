@@ -37,7 +37,7 @@ During execution, the Header follows real Hermes tool actions while public inter
 - **Bounded operations cards**: `/hfc doctor` can present diagnosis, two-step safe repair, and restart confirmation; private chats do not compare operators, while group confirmations stay with the initiator. When operations cards are unavailable, use the CLI; normal streaming-card layout and footer are unchanged.
 - **Long content protection**: long Markdown tables and fenced code blocks split on structure boundaries instead of raw character cuts.
 - **V4.1 per-chat native delivery**: exact `bindings.native_chats` entries return selected chats to Hermes native messages. Hook and sidecar both enforce the choice, and policy failures fail open instead of swallowing output.
-- **V4.1 lossless table overflow**: `card.table_overflow_mode: compact` converts table six onward into field lists. If the final card still exceeds 28,000 bytes, stable UUIDs, the Hermes ledger, and signed ACK return the complete native answer without sending a partial card.
+- **V4.1 lossless table overflow**: `card.table_overflow_mode: compact` converts table six onward into field lists and never sends a partial final card above 28,000 bytes. The exact Base path for ordinary Hermes 0.19 final answers adds bounded stable-UUID, delivery-ledger, and signed-ACK recovery; Cron and other non-exact paths remain native fail-open.
 - **V4.1 upgrade and service safety**: authenticated `runtime.hello` / `runtime.heartbeat` distinguishes liveness from delivery readiness; strict repair never restarts Gateway automatically, and `service.manager: auto` never enters a system service or invokes sudo.
 - **Diagnostics and recovery**: `doctor`, `/hfc status`, `/health` metrics, runtime import checks, Hermes Feishu SDK capability checks, and safe repair/restore/uninstall cover common failures. If the Hermes adapter uses `extra_ua_tags` while its Gateway venv still has an older `lark-oapi`, `doctor` reports `feishu_sdk_incompatible` and `setup/install` installs the verified `lark-oapi==1.6.8`.
 
@@ -132,7 +132,7 @@ streaming:
 
 Do not set `display.platforms.feishu.streaming: false`. Do not treat `display.show_reasoning` as required for this plugin; it can append reasoning blocks to the final answer and disrupt the streaming card experience. The plugin consumes Hermes `thinking.delta` / `answer.delta` directly.
 
-The compatibility matrix covers older Hermes starting at `v2026.4.23` and Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0.19.0 (`v2026.7.20`). Automated strategy detection selects `gateway_run_013_plus` for Hermes 0.19.0; a separate read-only validation against real local source from `v2026.7.20` confirmed that the V4.1 patcher places startup before ledger redelivery, recovery before adapter send, and restores idempotently. That source check is not a claim of a real Gateway or Feishu E2E run. `doctor` prefers `VERSION` or a Git tag, and can fall back to verified `gateway/run.py` anchors when version metadata is missing or unparseable. A Hermes upgrade can replace the injected `gateway/run.py`; `status` / `start` use `HERMES_DIR` from the config-adjacent `.env` to detect that stale state and print a safe recovery command. After confirming an intentional upgrade, run the suggested `install --accept-hermes-upgrade --yes`, then `hermes gateway start`; user edits or incomplete evidence remain fail-closed behind `doctor --explain`.
+The compatibility matrix covers older Hermes starting at `v2026.4.23` and Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0.19.0 (`v2026.7.20`). Automated strategy detection requires installation to verify and manage both `gateway/run.py` and `gateway/platforms/base.py` for Hermes 0.19.0, `v2026.7.20+`, or verified exact-ledger source; V4.1 `manifest_version: 2` treats run, required Base, and optional Cron backup/write/restore as one transaction. A separate read-only validation against real local source confirmed startup before ledger redelivery, recovery before adapter send, and idempotent restore, but is not a claim of a real Gateway or Feishu E2E run. `doctor` prefers `VERSION` or a Git tag and can fall back to verified anchors when metadata is missing or unparseable. A Hermes upgrade can replace managed source; `status` / `start` use `HERMES_DIR` from the config-adjacent `.env` to detect stale state and print a safe recovery command. After confirming an intentional upgrade, run the suggested `install --accept-hermes-upgrade --yes`, then `hermes gateway start`; user edits or incomplete evidence remain fail-closed behind `doctor --explain`.
 
 ## Docker Container Install
 
@@ -224,7 +224,8 @@ Full history: [CHANGELOG.md](CHANGELOG.md). Longer historical notes remain in th
 
 ```text
 Hermes Gateway
-  -> minimal hook in gateway/run.py
+  -> minimal hooks in gateway/run.py
+     + required exact hook in gateway/platforms/base.py (Hermes 0.19)
      -> hermes_feishu_card.hook_runtime
         -> HTTP POST /events
            -> sidecar server
@@ -233,7 +234,7 @@ Hermes Gateway
               -> retry / coalescing / metrics / /health
 ```
 
-This is a sidecar-only design: the Hermes hook stays fail-open, while Feishu delivery, card updates, session state, retries, and diagnostics live in the sidecar. Historical V2 code is archived under `legacy/` and is not the active runtime.
+This remains a sidecar-only design: Hermes keeps only installer-owned, detectable, restorable hooks, while Feishu delivery, card updates, session state, retries, and diagnostics live in the sidecar. Historical V2 code is archived under `legacy/` and is not the active runtime.
 
 ## Documentation
 

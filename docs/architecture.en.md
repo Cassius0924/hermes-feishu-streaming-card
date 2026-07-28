@@ -6,7 +6,8 @@ The active mainline uses a sidecar-only architecture. Hermes Agent keeps a minim
 
 ```text
 Hermes Gateway
-  -> marker-wrapped minimal hook (gateway/run.py)
+  -> marker-wrapped lifecycle hook (gateway/run.py)
+  -> exact final-delivery hooks (gateway/platforms/base.py, Hermes 0.19+)
   -> hermes_feishu_card.hook_runtime
      -> signed POST /delivery/policy (before native suppression)
      -> authenticated/fail-open POST /events
@@ -15,7 +16,7 @@ Hermes Gateway
   -> policy + readiness + session + render + Feishu CardKit send/update
 ```
 
-V4.1 domain-separates the event data plane from four control actions: `hfc-policy-v1` per-chat policy, `hfc-runtime-v1` runtime readiness, `hfc-native-handoff-recovery-v1` pending-descriptor recovery, and `hfc-native-handoff-ack-v1` post-delivery confirmation. Policy is enforced in both hook and sidecar. Runtime events prove liveness only and cannot authorize a file write; handoff recovery submits only an obligation hash, and ACK can run only after the Hermes ledger durably marks `delivered`. A control-plane failure must not stop Hermes Agent work, while install/recovery mutations remain fail closed.
+V4.1 domain-separates the event data plane from four control actions: `hfc-policy-v1` per-chat policy, `hfc-runtime-v1` runtime readiness, `hfc-native-handoff-recovery-v2` pending-descriptor recovery, and `hfc-native-handoff-ack-v1` post-delivery confirmation. Policy is enforced in both hook and sidecar. Runtime events prove liveness only and cannot authorize a file write. Recovery submits only one-way obligation, exact-content, and delivery-plan hashes plus a canonical-route enum, never answer text. ACK can run only after the Hermes ledger durably marks `delivered`. A control-plane failure must not stop Hermes Agent work, while install/recovery mutations remain fail closed.
 
 The Hermes hook-to-sidecar `/events` path is fail-open. Sidecar unavailability or event rejection must not bring down Hermes; a message not confirmed as accepted by the card path continues through Hermes' native fallback. Once the card path accepts delivery, the hook suppresses duplicate gray native text.
 
@@ -23,7 +24,7 @@ The Hermes hook-to-sidecar `/events` path is fail-open. Sidecar unavailability o
 
 ### Minimal Hermes hook
 
-The installer modifies Hermes `gateway/run.py` only through `hermes_feishu_card.install.patcher`, inserting marker blocks that can be detected, removed, and restored. Event extraction, delta coalescing, command cards, and Feishu adapter compatibility live in `hermes_feishu_card.hook_runtime`. The hook stores no Feishu credentials and does not rewrite Hermes session ownership, resume, or group-admission rules.
+The installer modifies Hermes only through `hermes_feishu_card.install.patcher`. Lifecycle hooks live in `gateway/run.py`; Hermes 0.19+ with a delivery ledger also receives two minimal exact hooks in `gateway/platforms/base.py`: one closes media/TTS paths with no independent text, and one submits Base-produced `text_content` after `record_obligation` / `mark_attempting` but before the native send. Both sources and the optional cron target use detectable, removable, restorable marker blocks under one manifest/backup transaction. Event extraction, delta coalescing, command cards, and Feishu adapter compatibility live in `hermes_feishu_card.hook_runtime`. HFC does not copy Hermes' media-cleaning pipeline, store Feishu credentials, or rewrite Hermes session ownership, resume, or group-admission rules.
 
 ### HTTP sidecar
 
@@ -54,7 +55,7 @@ Event authentication provides source authentication and integrity, not HTTP encr
 | `POST /events` | loopback local-process trust; explicit non-loopback requires event authentication |
 | `POST /delivery/policy` | state-directory transport root, short timestamp window, and nonce replay protection; responses do not echo ids |
 | `POST /runtime/events` | authenticated hello/heartbeat in a separate runtime domain; updates sanitized readiness only |
-| `POST /native-handoff/recover` | separate recovery domain; looks up a pending descriptor within the one-hour window by obligation hash only |
+| `POST /native-handoff/recover` | separate recovery domain; exactly matches obligation/content/plan hashes and a `create`/`thread-create` route within the one-hour window, without answer text |
 | `POST /native-handoff/ack` | separate ACK domain; confirms a handoff only after the Hermes ledger durably records `delivered` |
 | `POST /commands` | state-directory command transport proof |
 | `POST /card/actions` | interaction token or operations transport proof |
