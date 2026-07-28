@@ -37,7 +37,7 @@ Hermes 飞书流式卡片插件把 Hermes Agent Gateway 的飞书/Lark 回复变
 - **运维卡有明确边界**：`/hfc doctor` 可给出诊断、两步安全修复和重启确认；私聊不比较操作者，群聊只允许发起者确认。运维卡不可用时继续使用 CLI，不改变普通流式卡的 layout 或 footer。
 - **长内容保护**：长 Markdown 表格、fenced code block 按结构边界拆分，降低 raw markdown 和半截围栏问题。
 - **V4.1 按会话原生投递**：精确的 `bindings.native_chats` 可让指定会话回到 Hermes 原生消息；hook 与 sidecar 双重校验，策略失败时 fail-open，不吞消息。
-- **V4.1 无损表格溢出**：默认 `card.table_overflow_mode: compact` 把第 6 张及后续表格转成字段列表；最终卡片仍超出 28,000 byte 时把完整答案一次性交还原生投递，不发送半截内容。
+- **V4.1 无损表格溢出**：默认 `card.table_overflow_mode: compact` 把第 6 张及后续表格转成字段列表；最终卡片仍超出 28,000 byte 时通过稳定 UUID、Hermes ledger 和签名 ACK 交还完整原生答案，不发送半截内容。
 - **V4.1 升级与服务安全**：认证 `runtime.hello` / `runtime.heartbeat` 区分进程存活与发卡 readiness；strict repair 不自动重启 Gateway，`service.manager: auto` 也不隐式进入 system service 或调用 sudo。
 - **可诊断、可恢复**：`doctor`、`/hfc status`、`/health` metrics、runtime import 检查、Hermes Feishu SDK 能力检查、safe repair/restore/uninstall 覆盖常见故障。若 Hermes adapter 使用 `extra_ua_tags` 而 Gateway venv 仍是旧版 `lark-oapi`，`doctor` 会报告 `feishu_sdk_incompatible`，`setup/install` 会补齐已验证的 `lark-oapi==1.6.8`。
 

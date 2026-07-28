@@ -148,7 +148,7 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 ## V4.1.0 发布门禁
 
 - `bindings.native_chats` exact/profile-scoped，hook 与 sidecar 双重 enforcement，所有 direct card path fail-open，`/hfc` 保持卡片：**待完成聚焦矩阵与真实 card → native → card 验收**。
-- 默认 `table_overflow_mode=compact` 保留第 6 张及后续表格，fenced fake table 不计数；terminal 超过 28,000 byte 时完整答案只原生发送一次：**待完成真实 7-table 与 oversized handoff 验收**。
+- 默认 `table_overflow_mode=compact` 保留第 6 张及后续表格，fenced fake table 不计数；terminal 超过 28,000 byte 时使用稳定 UUID、Hermes ledger 与 delivered 后 ACK 交还完整原生答案，窗口外未决状态进入人工复核：**待完成真实 7-table 与 oversized handoff 验收**。
 - `integrity.mode` 的 safe/notify/off、认证 `runtime.hello` / `runtime.heartbeat`、strict repair、`sidecar.restart_required` 与不自动重启 Gateway：**待完成升级 simulation**。
 - `service.manager` 四模式、`auto` 不提权、Docker 普通容器：**待 Linux manager 与 Docker Compose smoke**。
 - 完整 pytest、`git diff --check`、build/isolated `site-packages`、exact merge SHA、public tagged install 和 Release assets：**发布流程待完成**。

@@ -2362,6 +2362,43 @@ def test_v410_release_docs_cover_native_policy_limits_integrity_and_services():
     assert re.search(r"FEISHU_APP_SECRET=(?!xxx\b)[^\s]+", public_docs) is None
 
 
+def test_v410_release_docs_define_ack_multibot_and_compose_boundaries():
+    notes = read_doc("docs/release-notes-v4.1.0.md")
+    notes_en = read_doc("docs/release-notes-v4.1.0.en.md")
+    guide = read_doc("docs/user-guide.md")
+    guide_en = read_doc("docs/user-guide.en.md")
+    protocol = read_doc("docs/event-protocol.md")
+    protocol_en = read_doc("docs/event-protocol.en.md")
+    controls = read_doc("docs/wiki/v4.1-safety-controls.md")
+
+    for text in (notes, notes_en, protocol, protocol_en):
+        for marker in (
+            "POST /native-handoff/recover",
+            "POST /native-handoff/ack",
+            "hfc-native-handoff-recovery-v1",
+            "hfc-native-handoff-ack-v1",
+            "uncertain",
+        ):
+            assert marker in text
+
+    assert "不承诺永久 exactly-once" in notes
+    assert "does not promise forever exactly-once" in notes_en
+
+    for text in (notes, notes_en, guide, guide_en, controls):
+        assert "#162" in text
+        assert "im:message.group_at_msg.include_bot:readonly" in text
+        assert "native_chats" in text
+
+    for text in (notes, notes_en, controls):
+        for marker in (
+            "install-docker.sh",
+            "non-root",
+            "runtime.hello",
+            "POST /events",
+        ):
+            assert marker in text
+
+
 def test_feishu_cli_playbook_is_linked_and_keeps_cli_optional():
     wiki = read_doc("docs/wiki/README.md")
     playbook = read_doc("docs/wiki/feishu-cli-playbook.md")

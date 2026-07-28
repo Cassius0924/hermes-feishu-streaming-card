@@ -15,7 +15,7 @@ Hermes Gateway
   -> policy + readiness + session + render + Feishu CardKit send/update
 ```
 
-V4.1 uses three domain-separated protocols: the event data plane, `hfc-policy-v1` per-chat policy, and `hfc-runtime-v1` runtime readiness. Policy is enforced in both hook and sidecar. Runtime events prove liveness only and cannot authorize a file write. A control-plane failure must not stop Hermes Agent work, while install/recovery mutations remain fail closed.
+V4.1 domain-separates the event data plane from four control actions: `hfc-policy-v1` per-chat policy, `hfc-runtime-v1` runtime readiness, `hfc-native-handoff-recovery-v1` pending-descriptor recovery, and `hfc-native-handoff-ack-v1` post-delivery confirmation. Policy is enforced in both hook and sidecar. Runtime events prove liveness only and cannot authorize a file write; handoff recovery submits only an obligation hash, and ACK can run only after the Hermes ledger durably marks `delivered`. A control-plane failure must not stop Hermes Agent work, while install/recovery mutations remain fail closed.
 
 The Hermes hook-to-sidecar `/events` path is fail-open. Sidecar unavailability or event rejection must not bring down Hermes; a message not confirmed as accepted by the card path continues through Hermes' native fallback. Once the card path accepts delivery, the hook suppresses duplicate gray native text.
 

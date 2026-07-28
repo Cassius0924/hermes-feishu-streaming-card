@@ -10,12 +10,14 @@ V4.1.0 增加按会话选择 Hermes 原生消息、无损处理超量表格、�
 - 使用 `chats use-native`、`chats use-card` 和 `chats list` 原子修改或查看策略。输出只显示掩码摘要；修改从该会话的下一条新消息开始生效，不改变正在运行的 turn。
 - hook 在抑制 Hermes 原生路径前调用带 `hfc-policy-v1` 域分隔签名的 `POST /delivery/policy`；sidecar 在创建 session 或发卡前再次检查。超时、认证失败、配置损坏或未知 profile 都 fail-open 到 Hermes 原生消息。
 - 普通回答、工具、approval/clarify、cron、system notice、命令反馈与 picker 使用同一策略；`/hfc help/status/doctor/monitor` 和显式 smoke card 仍是卡片运维面。
+- Issue #162 的多机器人群聊是一个明确例外：流式卡片通过后续 PATCH 加入的 `@bot` 不会新建一条 `im.message.receive_v1` 事件。需要 bot-to-bot 触发的群应加入 `bindings.native_chats`，让完整 post 在创建时携带 mention；被 @ 的目标应用还需开通 `im:message.group_at_msg.include_bot:readonly`。HFC 不根据答案内容在 turn 中途自动切换投递路径。
 
 ## 表格与卡片上限不再静默丢内容
 
 - `card.table_overflow_mode: compact` 是默认值。Markdown-aware scanner 忽略 fenced code 中的假表格，并把第 6 张及后续表格按原顺序转换为可读字段列表；所有行和单元格保留。
 - 显式选择 `truncate` 可保留旧版“五张表格后省略”的行为，但 fenced code 不再消耗表格额度，表格后的普通正文也不会被误删。
-- 最终 card JSON 使用同一序列化器检查 5 张渲染表格、200 个 tagged element 与保守的 28,000 UTF-8 byte 预算。非终态超限先显示小型等待卡并继续收集；终态仍超限时不发送半截答案，而是一次性回退完整 Hermes 原生答案。已有卡片只更新为不含正文摘录的 handoff 提示；重试保持幂等。
+- 最终 card JSON 使用同一序列化器检查 5 张渲染表格、200 个 tagged element 与保守的 28,000 UTF-8 byte 预算。非终态超限先显示小型等待卡并继续收集；终态仍超限时不发送半截答案，而是返回稳定 handoff descriptor。已有卡片的短提示仅在当前 sidecar 进程内 best-effort PATCH，不阻塞原生答案，也不持久化正文或原始路由标识。
+- ACK-capable Gateway 用 descriptor 为每个逻辑分片生成稳定 Feishu UUID；Hermes delivery ledger 先持久化 `delivered`，随后才向 `POST /native-handoff/ack` 发送 `hfc-native-handoff-ack-v1` 签名确认。Gateway 重启时通过 `POST /native-handoff/recover` 与 `hfc-native-handoff-recovery-v1` 按 obligation hash 恢复 pending descriptor。ACK 失败不会回滚 ledger；未决记录在一小时协议窗口后进入 `uncertain` / 人工复核，而不是盲目重发。本机制在窗口内提供有效幂等，但不承诺永久 exactly-once。
 
 ## Hermes 升级后的完整性监控
 
@@ -42,7 +44,7 @@ V4.1.0 增加按会话选择 Hermes 原生消息、无损处理超量表格、�
 - `detached`：在 macOS、Windows、容器或显式选择时使用项目已有的 owned detached process。
 - `systemd-system`：仅 Linux 显式 opt-in，使用 transient `systemd-run --system`；不写 `/etc/systemd/system`，不调用 `sudo`，权限不足时直接失败。
 
-Docker Compose 继续以普通 setup、sidecar、Gateway 容器运行，固定使用 `detached`，不在容器内启动 systemd，也不要求 privileged host integration。
+Docker Compose 继续以普通 setup、sidecar、Gateway 容器运行，固定使用 `detached`，不在容器内启动 systemd，也不要求 privileged host integration。CI 的发布拓扑 smoke 以 non-root 身份实际运行 `install-docker.sh`、patch fixture Hermes、启动 sidecar 与已打补丁 Gateway，等待签名 `runtime.hello` readiness，并通过真实签名 `POST /events` 验证从 hook 到 sidecar 的链路；它不是只检查 YAML 语法。
 
 ## Hermes 兼容边界
 
@@ -64,6 +66,7 @@ Release workflow 预期生成 `hermes-feishu-card-v4.1.0-macos.tar.gz`、`hermes
 - 感谢 @shutdown-awa 在 Issue #157 提出按聊天排除卡片输出的需求。
 - 感谢 @Jasonsun77 在 Issue #158 提供 Hermes fast-forward 后 hook 被覆盖的复现与证据。
 - 感谢 @Redeemer-w 在 Issue #159 报告五张表格后的内容丢失。
+- 感谢 @zyq2552899783-lgtm 在 Issue #162 提供流式卡片 PATCH 与原生 post 的 bot-to-bot mention 对照证据。
 - 感谢 @Cyber-Yichen 的 PR #156 提供 systemd 环境观察。V4.1.0 保留显式 manager 能力，但不采用 `auto` 隐式进入 system service 或提权的部分。
 - 感谢 @wholegale39 的 PR #160 提供 Hermes 新入口兼容调查。V4.1.0 采用现有 AST-owned hook、认证运行时监控和 strict repair，而不安装 import-time monkey patch。
 

@@ -15,7 +15,7 @@ Hermes Gateway
   -> policy + readiness + session + render + Feishu CardKit send/update
 ```
 
-V4.1 使用域分隔的三条协议：事件数据面、`hfc-policy-v1` per-chat policy、`hfc-runtime-v1` runtime readiness。policy 在 hook 和 sidecar 两侧执行；runtime 事件只证明活性，不授权文件写入。任一控制面失败都不应阻断 Hermes Agent 工作，安装/恢复 mutation 则继续 fail-closed。
+V4.1 使用域分隔的事件数据面与四条控制动作：`hfc-policy-v1` per-chat policy、`hfc-runtime-v1` runtime readiness、`hfc-native-handoff-recovery-v1` pending descriptor 恢复，以及 `hfc-native-handoff-ack-v1` delivered 后确认。policy 在 hook 和 sidecar 两侧执行；runtime 事件只证明活性，不授权文件写入；handoff recovery 只提交 obligation hash，ACK 只能发生在 Hermes ledger 已持久化 `delivered` 之后。任一控制面失败都不应阻断 Hermes Agent 工作，安装/恢复 mutation 则继续 fail-closed。
 
 Hermes hook 到 sidecar `/events` 的 fail-open 转发链路已经落地：sidecar 不可用或拒绝事件时，hook 不拖垮 Hermes，未被卡片路径确认接管的消息继续遵循 Hermes 原生 fallback。卡片已经接受的路径则抑制重复灰色原生文本。
 

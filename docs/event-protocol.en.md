@@ -34,15 +34,17 @@ During `思考中`, the card shows accumulated `thinking.delta` content and real
 
 ## V4.1 Control Protocols And Domain Separation
 
-V4.1 adds two local control planes beside the `/events` data plane. The three signing domains must remain distinct:
+V4.1 adds mutually isolated local control planes beside the `/events` data plane. Each action uses a distinct signing domain:
 
 | Endpoint | Purpose | Signing domain | Failure behavior |
 |---|---|---|---|
 | `POST /events` | Message lifecycle and card data plane | event domain | Hermes stays on native fail-open until card ownership is confirmed |
 | `POST /delivery/policy` | Per-chat decision before the hook suppresses native output | `hfc-policy-v1` | Timeout, invalid/replayed proof, config error, or unknown profile returns to native delivery |
 | `POST /runtime/events` | `runtime.hello` / `runtime.heartbeat` readiness | `hfc-runtime-v1` | Hermes work continues; sidecar readiness degrades and no source mutation is authorized |
+| `POST /native-handoff/recover` | Recover a pending native descriptor by Hermes-ledger obligation hash | `hfc-native-handoff-recovery-v1` | A failed lookup neither ACKs nor blindly resends; the ledger remains recoverable |
+| `POST /native-handoff/ack` | Confirm the native final after every chunk succeeds and the ledger is `delivered` | `hfc-native-handoff-ack-v1` | ACK failure never rolls back a delivered ledger; sidecar pending state eventually becomes uncertain |
 
-Policy and runtime proofs bind the exact raw body, a short timestamp window, and nonce replay protection. Responses never echo a chat id, transport root, path, source hash, or recovery fingerprint. `runtime.hello` / `runtime.heartbeat` carry only schema-bounded generation/package/sequence facts. Strict repair separately verifies Git, manifest, backup, blobs, anchors, and a fresh pre-mutation fingerprint.
+Policy, runtime, native-recovery, and native-ACK proofs bind the exact raw body, a short timestamp window, and nonce replay protection. Responses never echo a chat id, transport root, path, source hash, or recovery fingerprint. `runtime.hello` / `runtime.heartbeat` carry only schema-bounded generation/package/sequence facts. Strict repair separately verifies Git, manifest, backup, blobs, anchors, and a fresh pre-mutation fingerprint.
 
 A turn's delivery decision is pinned on its first event. A `bindings.native_chats` change affects only the next new message, and a duplicate terminal event cannot send once through cards and once natively. The sidecar checks policy again before creating `CardSession`, so hook preflight and server enforcement are both required.
 

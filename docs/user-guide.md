@@ -81,7 +81,9 @@ service:
 
 `bindings.native_chats` 在多 profile 模式下必须写在对应 `profiles.<id>.bindings` 内，且不会继承顶层列表。用 `chats use-native CHAT_ID --config CONFIG` 与 `chats use-card CHAT_ID --config CONFIG` 修改，用 `chats list --config CONFIG` 查看掩码结果；修改从下一条新消息生效。policy 请求、配置 reload 或 profile 校验失败会 fail-open 到 Hermes 原生消息，`/hfc` 运维面仍保持卡片。
 
-`table_overflow_mode: compact` 默认把第 6 张及后续表格转换为有序字段列表并保留全部数据；`truncate` 是显式旧行为。scanner 不把 fenced code 当表格。实际 card JSON 超过 5 张 table、200 个 tagged element 或 28,000 UTF-8 byte 时，非终态继续收集，终态把完整答案一次性交还 Hermes 原生投递，不发送截断卡。
+Issue #162 所述的多机器人群聊需要显式使用原生模式：把目标群加入 `bindings.native_chats`，让 post 创建时就携带 `@bot`；被 @ 的应用同时开通 `im:message.group_at_msg.include_bot:readonly`。流式卡片后续 PATCH 出现的 mention 不会补发一条 `im.message.receive_v1`，HFC 也不会在生成途中按答案内容自动切换。
+
+`table_overflow_mode: compact` 默认把第 6 张及后续表格转换为有序字段列表并保留全部数据；`truncate` 是显式旧行为。scanner 不把 fenced code 当表格。实际 card JSON 超过 5 张 table、200 个 tagged element 或 28,000 UTF-8 byte 时，非终态继续收集，终态通过稳定 descriptor、逐分片 UUID、Hermes delivery ledger 与 ledger `delivered` 后 ACK 交还完整原生答案。一小时窗口后的未决状态转为 `uncertain` / 人工复核，不承诺永久 exactly-once，也不发送截断卡。
 
 新安装写 `integrity.mode: safe`，旧配置缺段时按 `notify` 加载。旧安装显式执行 `integrity migrate-safe --config CONFIG --hermes-dir HERMES_DIR --yes` 后会得到 `sidecar.restart_required: true`、`gateway.restart_required: false`，需要重启 sidecar；若后续 strict repair 重新安装 hook，才会显示 `gateway.restart_required: true`，且 HFC 不自动重启 Gateway。认证 `runtime.hello` / `runtime.heartbeat` 用于区分进程存活与真实发卡 readiness。
 
