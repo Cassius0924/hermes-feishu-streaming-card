@@ -13,7 +13,7 @@
 - [x] 包元数据、当前安装入口、Docker Compose 默认、双语用户指南和发布门禁统一到 `v4.0.21`，不改变 UI 或配置。
 - [x] 真实飞书图片验收已通过（2026-07-28）：图片回合观测到 1 条带标记、非“生成中”的 completion card + 1 条 native image，无 uncertain-delivery warning；正常工具回合两段答案保留在同一卡，bot 原生标记重复为 0。
 - [x] sidecar `events_received/events_applied=23/23`、1 次发送成功、16 次更新成功；event/auth rejection、send/update failures、notice uncertain warnings、notice update failures 均为 0，Gateway Feishu WebSocket 已连接，Hermes venv site-packages 为 4.0.21。
-- [x] 最终本地发布门禁已通过：完整 pytest `1525 passed, 4 skipped in 53.44s`；`uv build` 生成 `hermes_feishu_streaming_card-4.0.21.tar.gz` 与 `hermes_feishu_streaming_card-4.0.21-py3-none-any.whl`；干净 Python 3.12 venv wheel 安装后的 import 位于 `site-packages`，package/distribution version 为 `4.0.21`，`hermes-feishu-card = hermes_feishu_card.cli:main` 存在，CLI `--help` exit 0。
+- [x] 最终本地发布门禁已通过：完整 pytest `1526 passed, 4 skipped in 53.56s`；`uv build` 生成 `hermes_feishu_streaming_card-4.0.21.tar.gz` 与 `hermes_feishu_streaming_card-4.0.21-py3-none-any.whl`；干净 Python 3.12 venv wheel 安装后的 import 位于 `site-packages`，package/distribution version 为 `4.0.21`，`hermes-feishu-card = hermes_feishu_card.cli:main` 存在，CLI `--help` exit 0。
 - [ ] 公开 tagged installer 与 Release assets 的 post-tag 验证仍待完成；验收不宣称截图或桌面/移动端视觉 QA。
 
 ### V4.0.20：notice 异步 ACK 语义热修（发布候选）

@@ -2213,7 +2213,7 @@ def test_v4021_docs_record_final_local_release_gate():
     todo = read_doc("TODO.md")
 
     gate_markers = (
-        "1525 passed, 4 skipped in 53.44s",
+        "1526 passed, 4 skipped in 53.56s",
         "uv build",
         "hermes_feishu_streaming_card-4.0.21.tar.gz",
         "hermes_feishu_streaming_card-4.0.21-py3-none-any.whl",
@@ -2227,7 +2227,7 @@ def test_v4021_docs_record_final_local_release_gate():
         for marker in gate_markers:
             assert marker in text
 
-    assert "1525 passed, 4 skipped in 53.44s" in changelog
+    assert "1526 passed, 4 skipped in 53.56s" in changelog
     assert "uv build" in changelog
     assert "hermes_feishu_streaming_card-4.0.21-py3-none-any.whl" in changelog
     assert "最终本地发布门禁已通过" in todo
