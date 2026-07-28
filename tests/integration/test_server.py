@@ -376,6 +376,7 @@ async def test_operations_callbacks_keep_full_recovery_fingerprint_internal(monk
             "/card/actions", json=operations_action_payload(confirm, chat_id="oc_private")
         )
         completed_body = await completed.json()
+        await _wait_until(lambda: bool(calls))
     finally:
         await test_client.close()
 
