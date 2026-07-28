@@ -20,6 +20,8 @@ def test_github_actions_runs_full_pytest_matrix():
     assert "runs-on: windows-latest" in text
     assert "ParseFile" in text
     assert "install.ps1" in text
+    assert "docker-compose-smoke:" in text
+    assert "docker compose -f docker-compose.example.yml config --quiet" in text
 
 
 def test_release_assets_workflow_supports_manual_package_dry_run():

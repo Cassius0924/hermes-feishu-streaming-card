@@ -42,6 +42,18 @@ jobs:
       - name: Test live handler compatibility
         run: python -m pytest tests/integration/test_feishu_sdk_compat.py -q
 
+  docker-compose-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate ordinary Docker Compose topology
+        env:
+          FEISHU_APP_ID: cli_test_only
+          FEISHU_APP_SECRET: test_only_not_a_real_secret
+          HFC_VERSION: v4.1.0
+        run: docker compose -f docker-compose.example.yml config --quiet
+
   powershell-installer:
     runs-on: windows-latest
 
