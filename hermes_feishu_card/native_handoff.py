@@ -98,6 +98,8 @@ class NativeHandoffStore:
             if expanded_root.is_absolute()
             else (Path.cwd() / expanded_root).absolute()
         )
+        if self.root == Path(self.root.anchor):
+            raise ValueError("handoff state root must not be a filesystem root")
         self.path = self.root / NATIVE_HANDOFF_STATE_NAME
         self.lock_path = self.root / NATIVE_HANDOFF_LOCK_NAME
         self.max_records = max_records

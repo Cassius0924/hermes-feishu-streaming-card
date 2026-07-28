@@ -39,6 +39,13 @@ def test_handoff_identity_is_stable_hash_and_does_not_contain_raw_ids():
     assert "private" not in first
 
 
+def test_store_rejects_filesystem_root_before_any_state_operation():
+    filesystem_root = Path(Path.cwd().anchor)
+
+    with pytest.raises(ValueError, match="filesystem root"):
+        NativeHandoffStore(filesystem_root)
+
+
 def test_store_persists_pending_then_committed_in_private_atomic_file(tmp_path):
     root = tmp_path / "state"
     store = NativeHandoffStore(root, now=lambda: 100.0)
