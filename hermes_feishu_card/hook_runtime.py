@@ -24,6 +24,7 @@ from urllib import error as urlerror
 from urllib import parse
 from urllib import request
 
+from . import __version__
 from .event_auth import sign_event_request
 from .operations import sign_transport_proof
 from .operations_transport import (
@@ -32,6 +33,7 @@ from .operations_transport import (
     sign_command_transport_proof,
 )
 from .status import normalize_display_status
+from .runtime_control import reset_runtime_control_for_tests, start_runtime_control
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +245,20 @@ def reset_runtime_state() -> None:
         _OPERATION_TRANSPORT_SECRETS.clear()
     _HFC_FEISHU_COMMAND_RESULT_CONTEXT.set(None)
     _HFC_FEISHU_NOTICE_CONTEXT.set(None)
+    reset_runtime_control_for_tests()
+
+
+def _ensure_runtime_control_started(config: RuntimeConfig | None = None) -> bool:
+    try:
+        resolved = config or load_runtime_config()
+        if not resolved.enabled:
+            return False
+        return start_runtime_control(
+            event_url=resolved.event_url,
+            package_version=__version__,
+        )
+    except Exception:
+        return False
 
 
 def load_runtime_config() -> RuntimeConfig:
@@ -520,6 +536,7 @@ def emit_from_hermes_locals(
         config = load_runtime_config()
         if not config.enabled:
             return False
+        _ensure_runtime_control_started(config)
         payload = build_event(event_name, local_vars)
         if payload is None:
             return False
@@ -544,6 +561,7 @@ def emit_from_hermes_locals_threadsafe(
         config = load_runtime_config()
         if not config.enabled:
             return False
+        _ensure_runtime_control_started(config)
         if _queue_coalesced_delta(config, local_vars, event_name):
             return True
         if _has_pending_deltas_for_local_vars(local_vars):
@@ -631,6 +649,7 @@ async def emit_from_hermes_locals_async(
         config = load_runtime_config()
         if not config.enabled:
             return False
+        _ensure_runtime_control_started(config)
         if event_name not in {"thinking.delta", "answer.delta"}:
             await _flush_pending_deltas_for_local_vars(local_vars)
         payload = build_event(event_name, local_vars)
@@ -697,6 +716,7 @@ def emit_cron_delivery(local_vars: dict[str, Any]) -> bool:
         config = load_runtime_config()
         if not config.enabled:
             return False
+        _ensure_runtime_control_started(config)
         payload = build_cron_event(local_vars)
         if payload is None:
             return False
@@ -4431,6 +4451,7 @@ async def complete_command_card_from_hermes_locals_async(
 
 def install_feishu_command_card_adapter_methods(runner: Any, event: Any = None) -> bool:
     try:
+        _ensure_runtime_control_started()
         adapters = getattr(runner, "adapters", None)
         if not isinstance(adapters, dict):
             if event is not None:

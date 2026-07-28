@@ -11,6 +11,11 @@ server:
   # and state-directory HMAC event authentication. Do not expose an unauthenticated sidecar.
   allow_non_loopback: false
 
+# New installations may repair only strictly verified stale HFC hook state.
+# Existing configs without this section load as `notify` until explicitly migrated.
+integrity:
+  mode: safe
+
 # ── Single Profile (minimal) ─────────────────────────────────────────────────
 # For simple setups with one Hermes profile and optionally multiple bots.
 feishu:

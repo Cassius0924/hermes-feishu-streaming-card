@@ -43,6 +43,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path):
             "chats": {},
             "group_rules": {"enabled": False},
         },
+        "integrity": {"mode": "notify"},
         "card": {
             "max_wait_ms": 800,
             "max_chars": 240,
@@ -112,12 +113,21 @@ def test_example_config_uses_current_sidecar_schema():
 
     assert "feishu" in raw
     assert "cardkit" not in raw
+    assert raw["integrity"] == {"mode": "safe"}
     assert config["feishu"] == {
         "app_id": "",
         "app_secret": "",
         "base_url": "https://open.feishu.cn/open-apis",
         "timeout_seconds": 30,
     }
+
+
+def test_new_setup_template_explicitly_enables_safe_integrity():
+    from hermes_feishu_card.cli import _default_setup_config_text
+
+    raw = yaml.safe_load(_default_setup_config_text())
+
+    assert raw["integrity"] == {"mode": "safe"}
 
 
 def test_load_config_shallow_merges_yaml_sections(tmp_path):
@@ -667,4 +677,29 @@ profiles:
     )
 
     with pytest.raises(ValueError, match="profile 'work' card must be a mapping"):
+        load_config(path)
+
+
+def test_existing_config_without_integrity_section_defaults_to_notify(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("server:\n  port: 8765\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config["integrity"] == {"mode": "notify"}
+
+
+@pytest.mark.parametrize("mode", ["safe", "notify", "off"])
+def test_integrity_mode_accepts_only_explicit_supported_values(tmp_path, mode):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"integrity:\n  mode: {mode}\n", encoding="utf-8")
+
+    assert load_config(path)["integrity"]["mode"] == mode
+
+
+def test_invalid_integrity_mode_is_rejected_with_exact_path(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("integrity:\n  mode: automatic\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="integrity.mode"):
         load_config(path)

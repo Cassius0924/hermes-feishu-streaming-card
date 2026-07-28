@@ -36,6 +36,7 @@ KNOWN_STATES = {
 }
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIT_HASH_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _OWNED_GATEWAY_MARKER_LINE_RE = re.compile(
     r"(?m)^[ \t]*# HERMES_FEISHU_CARD_[A-Z0-9_]+_(?:BEGIN|END)"
     r"[ \t]*(?:\r?\n|$)"
@@ -408,7 +409,7 @@ def _build_recovery_changes(
     old_manifest = _read_text(manifest_path) if manifest_path.exists() else None
     new_manifest = None
     if not state.clear_install_state:
-        new_manifest = _render_manifest(detection, state)
+        new_manifest = _render_manifest(detection, state, evidence.manifest)
     _append_optional_change(changes, manifest_path, old_manifest, new_manifest)
     return changes, quarantine_name
 
@@ -433,7 +434,11 @@ def _append_optional_change(
         changes.append((path, after))
 
 
-def _render_manifest(detection: HermesDetection, state: _RecoveryState) -> str:
+def _render_manifest(
+    detection: HermesDetection,
+    state: _RecoveryState,
+    previous_manifest: Optional[Dict[str, object]] = None,
+) -> str:
     if state.backup_text is None:
         raise RecoveryRefused("Gateway backup is required for the install manifest.")
     backup_path = detection.run_py.with_name(
@@ -459,7 +464,54 @@ def _render_manifest(detection: HermesDetection, state: _RecoveryState) -> str:
                 "cron_backup_sha256": _text_sha256(state.cron_backup_text),
             }
         )
+    integrity = _preserved_integrity_provenance(
+        previous_manifest,
+        state,
+        has_cron=detection.cron_py is not None and state.cron_text is not None,
+    )
+    if integrity is not None:
+        manifest["integrity"] = integrity
     return json.dumps(manifest, sort_keys=True) + "\n"
+
+
+def _preserved_integrity_provenance(
+    manifest: Optional[Dict[str, object]],
+    state: _RecoveryState,
+    *,
+    has_cron: bool,
+) -> Optional[Dict[str, object]]:
+    if not isinstance(manifest, dict) or state.backup_text is None:
+        return None
+    value = manifest.get("integrity")
+    if not isinstance(value, dict):
+        return None
+    git_head = value.get("git_head")
+    run_hash = value.get("run_blob_sha256")
+    if (
+        value.get("version") != 2
+        or not isinstance(git_head, str)
+        or _GIT_HASH_RE.fullmatch(git_head) is None
+        or not isinstance(run_hash, str)
+        or _HASH_RE.fullmatch(run_hash) is None
+        or run_hash != _text_sha256(state.backup_text)
+    ):
+        return None
+    preserved: Dict[str, object] = {
+        "version": 2,
+        "git_head": git_head,
+        "run_blob_sha256": run_hash,
+    }
+    if has_cron:
+        cron_hash = value.get("cron_blob_sha256")
+        if (
+            state.cron_backup_text is None
+            or not isinstance(cron_hash, str)
+            or _HASH_RE.fullmatch(cron_hash) is None
+            or cron_hash != _text_sha256(state.cron_backup_text)
+        ):
+            return None
+        preserved["cron_blob_sha256"] = cron_hash
+    return preserved
 
 
 def _commit_recovery_changes(

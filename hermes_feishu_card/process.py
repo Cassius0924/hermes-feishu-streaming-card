@@ -65,7 +65,7 @@ def start_sidecar(
         stop_pid(record["pid"])
         clear_pid()
 
-    state_dir().mkdir(parents=True, exist_ok=True)
+    state_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
     token = secrets.token_hex(16)
     command = _sidecar_command(config_path, env_file=env_file, token=token)
 

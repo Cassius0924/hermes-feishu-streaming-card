@@ -10,6 +10,12 @@ class SidecarMetrics:
     events_ignored: int = 0
     events_rejected: int = 0
     event_auth_rejections: int = 0
+    runtime_control_events_received: int = 0
+    runtime_control_events_accepted: int = 0
+    runtime_control_auth_rejections: int = 0
+    integrity_repair_attempts: int = 0
+    integrity_repair_successes: int = 0
+    integrity_repair_refusals: int = 0
     feishu_send_attempts: int = 0
     feishu_noop_attempts: int = 0
     feishu_send_successes: int = 0

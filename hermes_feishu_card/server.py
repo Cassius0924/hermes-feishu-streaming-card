@@ -49,6 +49,14 @@ from .status import StatusConfig
 from .subscription_usage import fetch_codex_subscription_usage
 from .install.detect import HermesDetection, detect_hermes
 from .install.recovery import execute_recovery, plan_recovery
+from .runtime_control import (
+    RUNTIME_HOOK_GENERATION,
+    RuntimeControlEvent,
+    RuntimeControlValidationError,
+    RuntimeIntegritySupervisor,
+    RuntimeProofVerifier,
+)
+from .integrity import RuntimeIntegrityCoordinator
 
 FEISHU_CLIENT_KEY = web.AppKey("feishu_client", Any)
 SESSIONS_KEY = web.AppKey("sessions", dict)
@@ -70,6 +78,14 @@ METRICS_KEY = web.AppKey("metrics", SidecarMetrics)
 NOOP_MODE_KEY = web.AppKey("noop_mode", bool)
 EVENT_AUTH_REQUIRED_KEY = web.AppKey("event_auth_required", bool)
 EVENT_AUTH_VERIFIER_KEY = web.AppKey("event_auth_verifier", EventProofVerifier)
+RUNTIME_AUTH_VERIFIER_KEY = web.AppKey("runtime_auth_verifier", RuntimeProofVerifier)
+RUNTIME_INTEGRITY_SUPERVISOR_KEY = web.AppKey(
+    "runtime_integrity_supervisor", RuntimeIntegritySupervisor
+)
+RUNTIME_INTEGRITY_COORDINATOR_KEY = web.AppKey(
+    "runtime_integrity_coordinator", RuntimeIntegrityCoordinator
+)
+RUNTIME_INTEGRITY_TASK_KEY = web.AppKey("runtime_integrity_task", asyncio.Task)
 MESSAGE_LOCKS_KEY = web.AppKey("message_locks", dict)
 MESSAGE_LOCK_USERS_KEY = web.AppKey("message_lock_users", dict)
 FOOTER_FIELDS_KEY = web.AppKey("footer_fields", Any)
@@ -106,6 +122,8 @@ CARD_ANIMATION_INTERVAL_SECONDS = 0.8
 CARD_ANIMATION_MAX_UPDATES = 15
 _CARD_ANIMATION_SLEEP = asyncio.sleep
 RUNTIME_CLEANUP_INTERVAL_SECONDS = 60.0
+RUNTIME_INTEGRITY_STARTUP_GRACE_SECONDS = 30.0
+RUNTIME_INTEGRITY_CHECK_INTERVAL_SECONDS = 15.0
 MAX_OPERATION_DELIVERIES = 200
 MAX_STALE_OPERATIONS_REPUBLISHES = 1
 MAX_CONCURRENT_OPERATION_DIAGNOSTICS = 4
@@ -181,6 +199,8 @@ def create_app(
     operations_transport_root_secret: bytes | None = None,
     event_auth_required: bool = False,
     noop_mode: bool = False,
+    integrity_mode: str = "notify",
+    expected_runtime_package_version: str = "",
 ) -> web.Application:
     valid_transport_root = (
         isinstance(operations_transport_root_secret, bytes)
@@ -210,6 +230,18 @@ def create_app(
         app[EVENT_AUTH_VERIFIER_KEY] = EventProofVerifier(
             operations_transport_root_secret
         )
+    runtime_supervisor = RuntimeIntegritySupervisor(
+        mode=integrity_mode,
+        expected_hook_generation=RUNTIME_HOOK_GENERATION,
+        expected_package_version=expected_runtime_package_version,
+    )
+    app[RUNTIME_INTEGRITY_SUPERVISOR_KEY] = runtime_supervisor
+    if valid_transport_root:
+        app[RUNTIME_AUTH_VERIFIER_KEY] = RuntimeProofVerifier(
+            operations_transport_root_secret
+        )
+    else:
+        runtime_supervisor.mark_control_auth_unavailable()
     app[MESSAGE_LOCKS_KEY] = {}
     app[MESSAGE_LOCK_USERS_KEY] = {}
     app[FLUSH_CONTROLLERS_KEY] = {}
@@ -251,6 +283,11 @@ def create_app(
     app[OPERATIONS_HERMES_ROOT_KEY] = resolve_operations_hermes_root(
         operations_hermes_root, config_path=operations_config
     )
+    app[RUNTIME_INTEGRITY_COORDINATOR_KEY] = RuntimeIntegrityCoordinator(
+        mode=integrity_mode,
+        hermes_root=app[OPERATIONS_HERMES_ROOT_KEY],
+        supervisor=runtime_supervisor,
+    )
     app[OPERATIONS_DELIVERIES_KEY] = {}
     if valid_transport_root:
         app[OPERATIONS_TRANSPORT_ROOT_KEY] = operations_transport_root_secret
@@ -266,11 +303,14 @@ def create_app(
     app.router.add_get("/interactions/{interaction_id}", _interaction_result)
     app.router.add_post("/card/actions", _card_actions)
     app.router.add_post("/commands", _commands)
+    app.router.add_post("/runtime/events", _runtime_events)
     app.router.add_post("/events", _events)
     app.on_startup.append(_start_runtime_cleanup)
+    app.on_startup.append(_start_runtime_integrity_monitor)
     app.on_cleanup.append(_stop_operations_diagnostics)
     app.on_cleanup.append(_stop_card_animations)
     app.on_cleanup.append(_stop_runtime_cleanup)
+    app.on_cleanup.append(_stop_runtime_integrity_monitor)
     return app
 
 
@@ -287,6 +327,56 @@ async def _stop_runtime_cleanup(app: web.Application) -> None:
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task
+
+
+async def _start_runtime_integrity_monitor(app: web.Application) -> None:
+    coordinator = app[RUNTIME_INTEGRITY_COORDINATOR_KEY]
+    if coordinator.mode == "off":
+        return
+    task = app.get(RUNTIME_INTEGRITY_TASK_KEY)
+    if task is None or task.done():
+        app[RUNTIME_INTEGRITY_TASK_KEY] = asyncio.create_task(
+            _runtime_integrity_monitor_loop(app)
+        )
+
+
+async def _stop_runtime_integrity_monitor(app: web.Application) -> None:
+    task = app.get(RUNTIME_INTEGRITY_TASK_KEY)
+    if task is None:
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+async def _runtime_integrity_monitor_loop(app: web.Application) -> None:
+    await asyncio.sleep(RUNTIME_INTEGRITY_STARTUP_GRACE_SECONDS)
+    last_reported: tuple[str, str] | None = None
+    while True:
+        coordinator = app[RUNTIME_INTEGRITY_COORDINATOR_KEY]
+        try:
+            await asyncio.to_thread(coordinator.check_once)
+        except Exception:
+            logger.warning(
+                "HFC runtime integrity check failed; manual diagnosis is required"
+            )
+            await asyncio.sleep(RUNTIME_INTEGRITY_CHECK_INTERVAL_SECONDS)
+            continue
+        snapshot = coordinator.snapshot()
+        metrics = app[METRICS_KEY]
+        metrics.integrity_repair_attempts = snapshot["repair_attempts"]
+        metrics.integrity_repair_successes = snapshot["repair_successes"]
+        metrics.integrity_repair_refusals = snapshot["repair_refusals"]
+        current = (str(snapshot["last_status"]), str(snapshot["last_reason"]))
+        if current != last_reported:
+            log = logger.info if current[0] in {"ready", "disabled"} else logger.warning
+            log(
+                "HFC runtime integrity status=%s reason=%s",
+                current[0],
+                current[1],
+            )
+            last_reported = current
+        await asyncio.sleep(RUNTIME_INTEGRITY_CHECK_INTERVAL_SECONDS)
 
 
 async def _stop_card_animations(app: web.Application) -> None:
@@ -337,6 +427,8 @@ async def _health(request: web.Request) -> web.Response:
         "noop_mode": request.app[NOOP_MODE_KEY],
         "delivery": {"mode": "noop" if request.app[NOOP_MODE_KEY] else "live"},
         "event_auth_required": request.app[EVENT_AUTH_REQUIRED_KEY],
+        "readiness": request.app[RUNTIME_INTEGRITY_SUPERVISOR_KEY].snapshot(),
+        "integrity": request.app[RUNTIME_INTEGRITY_COORDINATOR_KEY].snapshot(),
         "active_sessions": len(sessions),
         "process_pid": os.getpid(),
         "metrics": metrics.snapshot(),
@@ -962,7 +1054,13 @@ async def _build_operations_report(
 ) -> tuple[DiagnosticReport, HermesDetection]:
     routing = app[ROUTING_DIAGNOSTICS_KEY]
     last_route = routing.get("last_route") if isinstance(routing, dict) else None
-    health = {"routing": {"last_route": dict(last_route or {})}}
+    health = {
+        "status": "degraded" if app[NOOP_MODE_KEY] else "healthy",
+        "routing": {"last_route": dict(last_route or {})},
+        "readiness": app[RUNTIME_INTEGRITY_SUPERVISOR_KEY].snapshot(),
+        "integrity": app[RUNTIME_INTEGRITY_COORDINATOR_KEY].snapshot(),
+        "metrics": app[METRICS_KEY].snapshot(),
+    }
     async with _operations_diagnostic_semaphore(app):
         if preparing_operation_id and not app[OPERATIONS_STORE_KEY].is_preparing(
             preparing_operation_id
@@ -1631,6 +1729,43 @@ def _restart_output_status(output: str) -> str:
     return "suppressed"
 
 
+async def _runtime_events(request: web.Request) -> web.Response:
+    metrics: SidecarMetrics = request.app[METRICS_KEY]
+    verifier = request.app.get(RUNTIME_AUTH_VERIFIER_KEY)
+    if verifier is None:
+        return web.json_response(
+            {"ok": False, "error": "runtime control unavailable"},
+            status=503,
+        )
+    body = await request.read()
+    if len(body) > 4096:
+        return web.json_response(
+            {"ok": False, "error": "invalid runtime control event"},
+            status=400,
+        )
+    try:
+        verifier.verify(request.headers, body)
+    except RuntimeControlValidationError:
+        metrics.runtime_control_auth_rejections += 1
+        return web.json_response(
+            {"ok": False, "error": "runtime authentication failed"},
+            status=401,
+        )
+    metrics.runtime_control_events_received += 1
+    try:
+        payload = json.loads(body)
+        event = RuntimeControlEvent.from_dict(payload)
+    except (json.JSONDecodeError, RuntimeControlValidationError, TypeError, ValueError):
+        return web.json_response(
+            {"ok": False, "error": "invalid runtime control event"},
+            status=400,
+        )
+    accepted = request.app[RUNTIME_INTEGRITY_SUPERVISOR_KEY].record(event)
+    if accepted:
+        metrics.runtime_control_events_accepted += 1
+    return web.json_response({"ok": True, "accepted": accepted})
+
+
 async def _events(request: web.Request) -> web.Response:
     metrics: SidecarMetrics = request.app[METRICS_KEY]
     if request.app[EVENT_AUTH_REQUIRED_KEY]:
@@ -1764,7 +1899,8 @@ def _hfc_status_lines(
     return [
         "**/hfc status**",
         "",
-        f"- sidecar: healthy",
+        _hfc_sidecar_line(request),
+        *_hfc_readiness_lines(request),
         f"- active_sessions: {len(sessions)}",
         f"- events_received: {metrics.events_received}",
         f"- events_applied: {metrics.events_applied}",
@@ -1786,7 +1922,8 @@ def _hfc_doctor_lines(
     return [
         "**/hfc doctor**",
         "",
-        f"- sidecar: healthy",
+        _hfc_sidecar_line(request),
+        *_hfc_readiness_lines(request),
         f"- routing: {'ok' if not last_route_error else 'warning'}",
         f"- last_route_error: {last_route_error or 'none'}",
         f"- last_update_error: {last_update_error or 'none'}",
@@ -1804,6 +1941,9 @@ def _hfc_monitor_lines(request: web.Request, event: SidecarEvent) -> list[str]:
         "events_applied",
         "events_ignored",
         "events_rejected",
+        "runtime_control_events_received",
+        "runtime_control_events_accepted",
+        "runtime_control_auth_rejections",
         "update_scheduled",
         "update_coalesced",
         "update_queue_peak",
@@ -1823,11 +1963,38 @@ def _hfc_monitor_lines(request: web.Request, event: SidecarEvent) -> list[str]:
         "feishu_update_failures",
         "feishu_update_retries",
     )
-    lines = ["**/hfc monitor**", ""]
+    lines = ["**/hfc monitor**", "", *_hfc_readiness_lines(request)]
     lines.extend([f"- {key}: {snapshot.get(key, 0)}" for key in keys])
     lines.append(f"- active_sessions: {len(request.app[SESSIONS_KEY])}")
     lines.extend(_hfc_context_lines(event, None))
     return lines
+
+
+def _hfc_readiness_lines(request: web.Request) -> list[str]:
+    readiness = request.app[RUNTIME_INTEGRITY_SUPERVISOR_KEY].snapshot()
+    lines = [
+        f"- readiness: {readiness['status']}",
+        f"- readiness_reason: {readiness['reason']}",
+        f"- integrity.mode: {readiness['integrity_mode']}",
+        "- gateway.restart_required: "
+        f"{'true' if readiness['restart_required'] else 'false'}",
+    ]
+    action = {
+        "gateway_restart_required": "重启 Hermes Gateway 后重新检查",
+        "runtime_heartbeat_missing": "确认 Hermes Gateway 正在运行，必要时重启",
+        "runtime_heartbeat_stale": "检查 Hermes Gateway 状态，必要时重启",
+        "control_auth_unavailable": "重新运行 setup 并重启 sidecar 与 Gateway",
+        "manual_review_required": "运行 hermes-feishu-card doctor 后人工检查",
+    }.get(str(readiness["reason"]))
+    if action:
+        lines.append(f"- next_action: {action}")
+    return lines
+
+
+def _hfc_sidecar_line(request: web.Request) -> str:
+    readiness = request.app[RUNTIME_INTEGRITY_SUPERVISOR_KEY].snapshot()
+    status = str(readiness.get("status") or "degraded")
+    return f"- sidecar: {'ready' if status in {'ready', 'disabled'} else status}"
 
 
 def _hfc_context_lines(event: SidecarEvent, route: RouteResult | None) -> list[str]:

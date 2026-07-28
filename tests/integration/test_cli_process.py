@@ -207,6 +207,8 @@ def test_start_status_and_stop_manage_sidecar_process(tmp_path):
         assert "status: running" in status.stdout
         assert "health: degraded" in status.stdout
         assert "delivery.mode: noop" in status.stdout
+        assert "readiness: starting" in status.stdout
+        assert "integrity.mode: notify" in status.stdout
         assert "active_sessions: 0" in status.stdout
         assert "events_received: 1" in status.stdout
         assert "events_applied: 0" in status.stdout

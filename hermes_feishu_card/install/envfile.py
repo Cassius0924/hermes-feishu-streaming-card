@@ -11,6 +11,7 @@ HFC_ENV_KEYS = frozenset(
     {
         "HERMES_FEISHU_CARD_PROFILE_ID",
         "HERMES_FEISHU_CARD_EVENT_URL",
+        "HERMES_FEISHU_CARD_INTEGRITY_MODE",
         "HERMES_DIR",
     }
 )

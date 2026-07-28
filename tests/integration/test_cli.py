@@ -54,6 +54,45 @@ def test_status_reports_process_state(capsys):
     assert "running" in captured.out.lower() or "stopped" in captured.out.lower()
 
 
+def test_status_reports_runtime_readiness_and_fails_when_degraded(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda *_args, **_kwargs: {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "status_sidecar",
+        lambda _config: {
+            "running": True,
+            "pid": 123,
+            "health": {
+                "status": "healthy",
+                "active_sessions": 0,
+                "metrics": {},
+                "readiness": {
+                    "status": "degraded",
+                    "reason": "gateway_restart_required",
+                    "integrity_mode": "safe",
+                    "restart_required": True,
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(cli_module, "_lifecycle_hook_check", lambda _args: None)
+
+    exit_code = main(["status", "--config", "config.yaml"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "readiness: degraded" in output
+    assert "readiness.reason: gateway_restart_required" in output
+    assert "integrity.mode: safe" in output
+    assert "gateway.restart_required: true" in output
+
+
 def test_start_passes_explicit_env_file_to_sidecar(tmp_path, monkeypatch, capsys):
     config_path = tmp_path / "config.yaml"
     env_path = tmp_path / "CUSTOM.env"

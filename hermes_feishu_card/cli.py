@@ -33,6 +33,11 @@ from hermes_feishu_card.feishu_client import FeishuAPIError, FeishuClient, Feish
 from hermes_feishu_card.install.detect import HermesDetection, detect_hermes
 from hermes_feishu_card.install.envfile import read_hfc_env, update_hfc_env
 from hermes_feishu_card.install.manifest import file_sha256
+from hermes_feishu_card.install.integrity import (
+    IntegrityRepairRefused,
+    build_integrity_provenance,
+    migrate_integrity_manifest,
+)
 from hermes_feishu_card.install.recovery import (
     RecoveryRefused,
     _first_refusal,
@@ -78,6 +83,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_smoke_feishu_card(args)
     if args.command == "bots":
         return _run_bots(args)
+    if args.command == "integrity":
+        return _run_integrity(args)
     if args.command == "install":
         return _run_install(args)
     if args.command == "repair":
@@ -185,6 +192,22 @@ def _build_parser() -> argparse.ArgumentParser:
     bots_test.add_argument("--chat-id", required=True)
     bots_test.add_argument("--config", required=True)
     bots_test.add_argument("--profile-id")
+
+    integrity = subparsers.add_parser(
+        "integrity",
+        help="inspect or explicitly migrate runtime integrity controls",
+    )
+    integrity_subparsers = integrity.add_subparsers(dest="integrity_command")
+    integrity_migrate = integrity_subparsers.add_parser("migrate-safe")
+    integrity_migrate.add_argument("--config", required=True)
+    integrity_migrate.add_argument("--hermes-dir", required=True)
+    integrity_migrate.add_argument("--env-file")
+    integrity_migrate.add_argument(
+        "--yes",
+        action="store_true",
+        required=True,
+        help="confirm provenance migration and safe-mode activation",
+    )
 
     for command in ("install", "repair", "restore", "uninstall"):
         command_parser = subparsers.add_parser(command)
@@ -350,6 +373,11 @@ def _default_setup_config_text() -> str:
 server:
   host: 127.0.0.1
   port: 8765
+
+# New installations verify that the patched Hermes runtime stays active.
+# Existing configs without this section remain notification-only after upgrade.
+integrity:
+  mode: safe
 
 feishu:
   app_id: ""
@@ -1918,6 +1946,54 @@ def _run_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_integrity(args: argparse.Namespace) -> int:
+    if getattr(args, "integrity_command", None) != "migrate-safe":
+        print("error: an integrity subcommand is required", file=sys.stderr)
+        return 2
+    detection = detect_hermes(args.hermes_dir)
+    if not detection.supported:
+        print(_format_hermes_detection(detection), file=sys.stderr)
+        return 1
+    config_path = Path(args.config).expanduser()
+    env_path = (
+        Path(args.env_file).expanduser()
+        if args.env_file is not None
+        else config_path.parent / ".env"
+    )
+    manifest_path = detection.root / MANIFEST_NAME
+    try:
+        manifest_before = _read_text_preserve_newlines(manifest_path)
+        env_existed = env_path.exists()
+        env_before = (
+            _read_text_preserve_newlines(env_path) if env_existed else ""
+        )
+        migrate_integrity_manifest(detection)
+        update_hfc_env(
+            env_path,
+            {"HERMES_FEISHU_CARD_INTEGRITY_MODE": "safe"},
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        try:
+            if "manifest_before" in locals():
+                _atomic_write_text(manifest_path, manifest_before)
+            if "env_existed" in locals() and env_existed:
+                _atomic_write_text(env_path, env_before)
+            elif "env_existed" in locals():
+                env_path.unlink(missing_ok=True)
+        except OSError:
+            print(
+                "error: integrity migration rollback failed; manual review required",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print("integrity migration: verified")
+    print("integrity mode: safe")
+    print("gateway.restart_required: false")
+    return 0
+
+
 def _run_status(args: argparse.Namespace) -> int:
     try:
         config = load_config(args.config)
@@ -1926,6 +2002,7 @@ def _run_status(args: argparse.Namespace) -> int:
         return 1
 
     status = status_sidecar(config)
+    readiness_degraded = False
     if status["running"]:
         print("status: running")
         print(f"pid: {status['pid'] or 'unknown'}")
@@ -1935,6 +2012,35 @@ def _run_status(args: argparse.Namespace) -> int:
         delivery = status["health"].get("delivery")
         if isinstance(delivery, dict) and delivery.get("mode") == "noop":
             print("delivery.mode: noop")
+        readiness = status["health"].get("readiness")
+        if isinstance(readiness, dict):
+            readiness_status = str(readiness.get("status") or "unknown")
+            if readiness_status not in {"ready", "starting", "degraded", "disabled"}:
+                readiness_status = "unknown"
+            readiness_reason = str(readiness.get("reason") or "unknown")
+            if readiness_reason not in {
+                "runtime_ready",
+                "runtime_heartbeat_waiting",
+                "runtime_heartbeat_missing",
+                "runtime_heartbeat_stale",
+                "gateway_restart_required",
+                "manual_review_required",
+                "control_auth_unavailable",
+                "integrity_disabled",
+            }:
+                readiness_reason = "unknown"
+            integrity_mode = str(readiness.get("integrity_mode") or "unknown")
+            if integrity_mode not in {"safe", "notify", "off"}:
+                integrity_mode = "unknown"
+            restart_required = readiness.get("restart_required") is True
+            print(f"readiness: {readiness_status}")
+            print(f"readiness.reason: {readiness_reason}")
+            print(f"integrity.mode: {integrity_mode}")
+            print(
+                "gateway.restart_required: "
+                f"{'true' if restart_required else 'false'}"
+            )
+            readiness_degraded = readiness_status == "degraded"
         print(f"active_sessions: {status['health'].get('active_sessions', 0)}")
         metrics = status["health"].get("metrics", {})
         if isinstance(metrics, dict):
@@ -1965,10 +2071,10 @@ def _run_status(args: argparse.Namespace) -> int:
             print(f"pid: {status['pid']} stale")
     hook_check = _lifecycle_hook_check(args)
     if hook_check is None:
-        return 0
+        return 1 if readiness_degraded else 0
     hook_check["config"] = args.config
     _print_lifecycle_hook_check(hook_check)
-    return 1 if bool(hook_check["blocking"]) else 0
+    return 1 if readiness_degraded or bool(hook_check["blocking"]) else 0
 
 
 def _print_status_routing(health: dict[str, Any]) -> None:
@@ -2598,6 +2704,22 @@ def _write_manifest(
                 "cron_backup_sha256": file_sha256(cron_backup_path),
             }
         )
+    try:
+        manifest["integrity"] = build_integrity_provenance(
+            manifest_path.parent,
+            run_py=run_py,
+            run_source=_read_text_preserve_newlines(backup_path),
+            cron_py=(cron_py if cron_backup_path is not None else None),
+            cron_source=(
+                _read_text_preserve_newlines(cron_backup_path)
+                if cron_backup_path is not None and cron_backup_path.exists()
+                else None
+            ),
+        )
+    except IntegrityRepairRefused:
+        # Source-stripped/container installs remain supported, but cannot use
+        # automatic safe repair until provenance is explicitly available.
+        pass
     _atomic_write_text(manifest_path, json.dumps(manifest, sort_keys=True) + "\n")
 
 

@@ -738,6 +738,12 @@ async def test_health_reports_healthy_status_and_active_sessions(client):
         "events_ignored": 0,
         "events_rejected": 0,
         "event_auth_rejections": 0,
+        "runtime_control_events_received": 0,
+        "runtime_control_events_accepted": 0,
+        "runtime_control_auth_rejections": 0,
+        "integrity_repair_attempts": 0,
+        "integrity_repair_successes": 0,
+        "integrity_repair_refusals": 0,
         "feishu_send_attempts": 0,
         "feishu_noop_attempts": 0,
         "feishu_send_successes": 0,
@@ -1410,6 +1416,38 @@ async def test_hfc_doctor_sends_group_owned_operations_card(monkeypatch):
     assert "ou_initiator" not in str(card)
     assert "oc_group" not in str(card)
     assert operations_button(body["card"], "安全修复")
+
+
+async def test_operations_diagnosis_receives_sanitized_runtime_readiness(monkeypatch):
+    captured = {}
+    report = operations_report()
+
+    def build_report(*args, **_kwargs):
+        captured.update(args[4])
+        return report, SimpleNamespace(root=Path("/sanitized"))
+
+    monkeypatch.setattr(sidecar_server, "_build_operations_report_sync", build_report)
+    app = create_app(
+        FakeFeishuClient(),
+        operations_transport_root_secret=b"r" * 32,
+        integrity_mode="safe",
+        expected_runtime_package_version="4.1.0",
+    )
+    app[sidecar_server.RUNTIME_INTEGRITY_SUPERVISOR_KEY].mark_manual_review_required()
+    try:
+        await sidecar_server._build_operations_report(
+            app,
+            profile_id="default",
+            profile_source="default",
+        )
+    finally:
+        await sidecar_server._stop_operations_diagnostics(app)
+
+    assert captured["readiness"]["status"] == "degraded"
+    assert captured["readiness"]["reason"] == "manual_review_required"
+    assert captured["integrity"]["mode"] == "safe"
+    assert "runtime_id" not in json.dumps(captured)
+    assert "fingerprint" not in json.dumps(captured)
 
 
 async def test_hfc_doctor_acknowledges_before_slow_diagnosis_and_binds_operation(

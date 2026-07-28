@@ -120,6 +120,8 @@ def test_main_passes_boundary_to_create_app_when_bot_credentials_exist(monkeypat
     assert captured["kwargs"]["card_config"] == {"title": "Credentialed Card"}
     assert captured["kwargs"]["bot_router"] is not None
     assert captured["kwargs"]["operations_config_path"] == "config.yaml"
+    assert captured["kwargs"]["integrity_mode"] == "notify"
+    assert captured["kwargs"]["expected_runtime_package_version"] == runner.__version__
 
 
 def test_main_rejects_non_loopback_listener_without_explicit_opt_in(monkeypatch):

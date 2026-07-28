@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from hermes_feishu_card import hook_runtime
 from hermes_feishu_card.event_auth import sign_event_request
 from hermes_feishu_card.runtime_control import (
     RUNTIME_HOOK_GENERATION,
@@ -205,3 +206,40 @@ def test_supervisor_off_mode_is_disabled_even_without_runtime():
 
     assert supervisor.snapshot()["status"] == "disabled"
     assert supervisor.snapshot()["reason"] == "integrity_disabled"
+
+
+def test_existing_startup_adapter_call_starts_runtime_control_without_new_patch(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        hook_runtime,
+        "load_runtime_config",
+        lambda: type(
+            "Config",
+            (),
+            {
+                "enabled": True,
+                "event_url": "http://127.0.0.1:18765/events",
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "start_runtime_control",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+
+    assert (
+        hook_runtime.install_feishu_command_card_adapter_methods(
+            type("Runner", (), {"adapters": {}})()
+        )
+        is False
+    )
+
+    assert calls == [
+        {
+            "event_url": "http://127.0.0.1:18765/events",
+            "package_version": hook_runtime.__version__,
+        }
+    ]

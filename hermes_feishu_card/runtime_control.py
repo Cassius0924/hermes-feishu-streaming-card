@@ -323,6 +323,7 @@ class RuntimeIntegritySupervisor:
         self._generation_match = False
         self._restart_required = False
         self._manual_review_required = False
+        self._control_auth_unavailable = False
         self._lock = threading.Lock()
 
     def record(self, event: RuntimeControlEvent) -> bool:
@@ -355,6 +356,10 @@ class RuntimeIntegritySupervisor:
         with self._lock:
             self._manual_review_required = True
 
+    def mark_control_auth_unavailable(self) -> None:
+        with self._lock:
+            self._control_auth_unavailable = True
+
     def snapshot(self) -> dict[str, Any]:
         now = self._now()
         with self._lock:
@@ -362,10 +367,14 @@ class RuntimeIntegritySupervisor:
             generation_match = self._generation_match
             restart_required = self._restart_required
             manual_review_required = self._manual_review_required
+            control_auth_unavailable = self._control_auth_unavailable
 
         if self.mode == "off":
             status = "disabled"
             reason = "integrity_disabled"
+        elif control_auth_unavailable:
+            status = "degraded"
+            reason = "control_auth_unavailable"
         elif manual_review_required:
             status = "degraded"
             reason = "manual_review_required"

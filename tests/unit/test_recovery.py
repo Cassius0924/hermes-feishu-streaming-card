@@ -967,6 +967,41 @@ def test_plan_recovery_upgrades_manifest_verified_legacy_owned_patch(installed_s
     assert detection.run_py.read_text(encoding="utf-8") == patched
 
 
+def test_recovery_preserves_verified_integrity_provenance_when_sources_are_unchanged(
+    installed_state,
+):
+    detection, original, patched, manifest_path = installed_state
+    assert detection.cron_py is not None
+    cron_backup = detection.cron_py.with_name("scheduler.py.hermes_feishu_card.bak")
+    provenance = {
+        "version": 2,
+        "git_head": "a" * 40,
+        "run_blob_sha256": sha256(original.encode("utf-8")).hexdigest(),
+        "cron_blob_sha256": sha256(
+            cron_backup.read_text(encoding="utf-8").encode("utf-8")
+        ).hexdigest(),
+    }
+    marker = "# HERMES_FEISHU_CARD_COMPLETE_PATCH_BEGIN"
+    marker_index = patched.index(marker)
+    line_start = patched.rfind("\n", 0, marker_index) + 1
+    indent = patched[line_start:marker_index]
+    legacy_patched = patched.replace(
+        "".join(patcher._render_complete_hook_block(indent, "\n")),
+        "".join(patcher._render_v400_complete_hook_block(indent, "\n")),
+        1,
+    )
+    detection.run_py.write_text(legacy_patched, encoding="utf-8")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["patched_sha256"] = sha256(legacy_patched.encode("utf-8")).hexdigest()
+    manifest["integrity"] = provenance
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+    plan = plan_recovery(detection)
+
+    execute_recovery(detection, expected_fingerprint=plan.fingerprint)
+
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["integrity"] == provenance
+
+
 def test_plan_recovery_refuses_when_verified_backup_has_unsupported_anchors(
     installed_state,
 ):

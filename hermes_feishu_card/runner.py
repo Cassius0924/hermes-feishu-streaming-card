@@ -7,6 +7,7 @@ from typing import Any
 
 from aiohttp import web
 
+from . import __version__
 from .bots import BotRegistry, FeishuClientFactory, RoutingContext
 from .bots import resolve_card_config as _resolve_card_config
 from .config import load_config, resolve_operations_hermes_root
@@ -243,6 +244,10 @@ def main(argv: list[str] | None = None) -> int:
             ),
             operations_transport_root_secret=operations_transport_root_secret,
             event_auth_required=event_auth_required,
+            integrity_mode=str(
+                (config.get("integrity") or {}).get("mode") or "notify"
+            ),
+            expected_runtime_package_version=__version__,
         ),
         host=server["host"],
         port=server["port"],

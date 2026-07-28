@@ -23,6 +23,9 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "chats": {},
         "group_rules": {"enabled": False},
     },
+    # Missing values stay notification-only for upgraded existing configs.
+    # New setup templates explicitly write ``safe`` after validation.
+    "integrity": {"mode": "notify"},
     "card": {
         "max_wait_ms": 800,
         "max_chars": 240,
@@ -217,8 +220,26 @@ def load_config(
             _apply_env_path_overrides(config, selected_env_path)
     _apply_env_overrides(config)
     _normalize_config_text_sizes(config)
+    _normalize_integrity_mode(config)
     config["server"]["port"] = _normalize_port(config["server"]["port"], "server.port")
     return config
+
+
+def _normalize_integrity_mode(config: dict[str, Any]) -> None:
+    integrity = config.get("integrity")
+    if not isinstance(integrity, dict):
+        raise ValueError("Config section integrity must be a mapping")
+    raw_mode = integrity.get("mode", "notify")
+    # PyYAML follows YAML 1.1 and parses an unquoted ``off`` as False.
+    if raw_mode is False:
+        mode = "off"
+    elif isinstance(raw_mode, str):
+        mode = raw_mode.strip().lower()
+    else:
+        mode = ""
+    if mode not in {"safe", "notify", "off"}:
+        raise ValueError("integrity.mode must be safe, notify, or off")
+    integrity["mode"] = mode
 
 
 def _normalize_config_text_sizes(config: dict[str, Any]) -> None:
@@ -296,6 +317,11 @@ def _apply_env_mapping_overrides(
         raw_port = values["HERMES_FEISHU_CARD_PORT"]
         port = _normalize_port(raw_port, "HERMES_FEISHU_CARD_PORT")
         config.setdefault("server", {})["port"] = port
+
+    if "HERMES_FEISHU_CARD_INTEGRITY_MODE" in values:
+        config.setdefault("integrity", {})["mode"] = values[
+            "HERMES_FEISHU_CARD_INTEGRITY_MODE"
+        ]
 
     # profiles 模式下跳过顶层 feishu 凭据的环境变量覆盖
     profiles = config.get("profiles")

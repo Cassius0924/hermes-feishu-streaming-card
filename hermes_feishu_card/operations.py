@@ -26,6 +26,10 @@ _FINDING_COPY = {
     "hermes_unsupported": ("当前 Hermes 版本不受支持", "请使用受支持的 Hermes 版本后重新检测。"),
     "hermes_compatibility_partial": ("Hermes 兼容性不完整", "建议检查兼容性配置后重新检测。"),
     "runtime_import_failed": ("运行环境加载失败", "建议重新安装或检查运行环境。"),
+    "runtime_integrity_degraded": (
+        "卡片运行钩子未就绪",
+        "请按诊断提示重启 Hermes Gateway 或执行安全检查，然后重新检测。",
+    ),
     "feishu_sdk_incompatible": (
         "飞书连接 SDK 不兼容",
         "请重新运行 setup/install，并重启 Hermes Gateway。",
@@ -907,7 +911,8 @@ def _operations_summary(report: DiagnosticReport, operation: OperationRecord) ->
         message = str((operation.result or {}).get("message") or "").strip()
         return f"{content}\n\n{message}" if message else content
 
-    findings = report.to_dict(card_safe=True).get("findings")
+    safe_report = report.to_dict(card_safe=True)
+    findings = safe_report.get("findings")
     show_details = bool((operation.result or {}).get("show_details"))
     lines = [
         "**诊断详情**" if show_details else "**诊断摘要**",
@@ -922,6 +927,18 @@ def _operations_summary(report: DiagnosticReport, operation: OperationRecord) ->
             lines.append(f"- {summary}")
             if show_details:
                 lines.append(f"  - 建议：{detail}")
+    runtime = safe_report.get("runtime")
+    readiness = runtime.get("readiness") if isinstance(runtime, dict) else None
+    if isinstance(readiness, dict) and readiness.get("status") == "degraded":
+        next_action = {
+            "gateway_restart_required": "重启 Hermes Gateway 后重新检测。",
+            "runtime_heartbeat_missing": "确认 Hermes Gateway 正在运行，必要时重启。",
+            "runtime_heartbeat_stale": "检查 Hermes Gateway 状态，必要时重启。",
+            "control_auth_unavailable": "重新运行 setup，并重启 sidecar 与 Gateway。",
+            "manual_review_required": "运行 doctor，按安全诊断结果人工检查。",
+        }.get(str(readiness.get("reason") or ""))
+        if next_action:
+            lines.append(f"- 下一步：{next_action}")
     if len(lines) == 2:
         lines.append("- 未发现需要处理的问题。")
     return "\n".join(lines)

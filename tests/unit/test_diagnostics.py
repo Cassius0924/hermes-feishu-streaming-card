@@ -87,6 +87,66 @@ def test_card_safe_report_keeps_event_auth_rejection_counter(tmp_path):
     assert payload["runtime"]["metrics"]["event_auth_rejections"] == 3
 
 
+def test_runtime_integrity_readiness_is_reported_without_private_evidence(tmp_path):
+    report = build_diagnostic_report(
+        tmp_path / "private" / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+        _detection(tmp_path),
+        _recovery_plan(tmp_path),
+        health={
+            "status": "healthy",
+            "readiness": {
+                "status": "degraded",
+                "reason": "gateway_restart_required",
+                "integrity_mode": "safe",
+                "runtime_seen": True,
+                "generation_match": False,
+                "restart_required": True,
+                "last_seen_age_seconds": 4,
+                "runtime_id": "runtime-private-id",
+            },
+            "integrity": {
+                "mode": "safe",
+                "last_status": "repaired",
+                "last_reason": "gateway_restart_required",
+                "repair_attempts": 1,
+                "repair_successes": 1,
+                "repair_refusals": 0,
+                "fingerprint": "f" * 64,
+                "root": str(tmp_path / "private" / "hermes"),
+            },
+        },
+    )
+
+    payload = report.to_dict(card_safe=True)
+    serialized = json.dumps(payload, ensure_ascii=False)
+
+    assert payload["runtime"]["readiness"] == {
+        "status": "degraded",
+        "reason": "gateway_restart_required",
+        "integrity_mode": "safe",
+        "runtime_seen": True,
+        "generation_match": False,
+        "restart_required": True,
+        "last_seen_age_seconds": 4,
+    }
+    assert payload["runtime"]["integrity"] == {
+        "mode": "safe",
+        "last_status": "repaired",
+        "last_reason": "gateway_restart_required",
+        "repair_attempts": 1,
+        "repair_successes": 1,
+        "repair_refusals": 0,
+    }
+    assert any(
+        finding.code == "runtime_integrity_degraded"
+        for finding in report.findings
+    )
+    assert "runtime-private-id" not in serialized
+    assert "f" * 64 not in serialized
+    assert str(tmp_path) not in serialized
+
+
 def test_report_keeps_full_recovery_fingerprint_internal_and_redacts_output(tmp_path):
     plan = _recovery_plan(tmp_path, state="owned_incomplete")
     report = build_diagnostic_report(
