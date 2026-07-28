@@ -134,3 +134,31 @@ def test_update_hfc_env_preserves_private_file_mode(tmp_path):
     update_hfc_env(env_path, {"HERMES_FEISHU_CARD_PROFILE_ID": "child"})
 
     assert env_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_update_hfc_env_can_inject_bound_writer_without_changing_rendering(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("UNKNOWN=keep\n", encoding="utf-8")
+    env_path.chmod(0o640)
+    calls = []
+    committed = object()
+
+    def writer(path, contents, mode):
+        calls.append((path, contents, mode))
+        return committed
+
+    result = update_hfc_env(
+        env_path,
+        {"HERMES_FEISHU_CARD_INTEGRITY_MODE": "safe"},
+        writer=writer,
+    )
+
+    assert result is committed
+    assert calls == [
+        (
+            env_path,
+            "UNKNOWN=keep\nHERMES_FEISHU_CARD_INTEGRITY_MODE=safe\n",
+            0o640,
+        )
+    ]
+    assert env_path.read_text(encoding="utf-8") == "UNKNOWN=keep\n"

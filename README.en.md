@@ -36,6 +36,9 @@ During execution, the Header follows real Hermes tool actions while public inter
 - **Clearer group diagnostics**: `/hfc status` explains group chat binding state, the suggested bind command, and slash-command behavior boundaries.
 - **Bounded operations cards**: `/hfc doctor` can present diagnosis, two-step safe repair, and restart confirmation; private chats do not compare operators, while group confirmations stay with the initiator. When operations cards are unavailable, use the CLI; normal streaming-card layout and footer are unchanged.
 - **Long content protection**: long Markdown tables and fenced code blocks split on structure boundaries instead of raw character cuts.
+- **V4.1 per-chat native delivery**: exact `bindings.native_chats` entries return selected chats to Hermes native messages. Hook and sidecar both enforce the choice, and policy failures fail open instead of swallowing output.
+- **V4.1 lossless table overflow**: `card.table_overflow_mode: compact` converts table six onward into field lists and never sends a partial final card above 28,000 bytes. The exact Base path for ordinary Hermes 0.19 final answers adds bounded stable-UUID, delivery-ledger, and signed-ACK recovery; Cron and other non-exact paths remain native fail-open.
+- **V4.1 upgrade and service safety**: authenticated `runtime.hello` / `runtime.heartbeat` distinguishes liveness from delivery readiness; strict repair never restarts Gateway automatically, and `service.manager: auto` never enters a system service or invokes sudo.
 - **Diagnostics and recovery**: `doctor`, `/hfc status`, `/health` metrics, runtime import checks, Hermes Feishu SDK capability checks, and safe repair/restore/uninstall cover common failures. If the Hermes adapter uses `extra_ua_tags` while its Gateway venv still has an older `lark-oapi`, `doctor` reports `feishu_sdk_incompatible` and `setup/install` installs the verified `lark-oapi==1.6.8`.
 
 ## Problems Solved
@@ -90,8 +93,17 @@ feishu:
   app_secret: ""
 card:
   title: Hermes Agent
+  table_overflow_mode: compact
   footer_fields: [duration, model, input_tokens, output_tokens, context]
+bindings:
+  native_chats: []
+integrity:
+  mode: safe
+service:
+  manager: auto
 ```
+
+`native_chats` uses exact matching only; in multi-profile setups place it under the matching `profiles.<id>.bindings`. Existing configs without an `integrity` section load as `notify` and do not silently enable automatic repair. See [V4.1 safety controls and troubleshooting](docs/wiki/v4.1-safety-controls.md) for the complete boundary.
 
 To show remaining Codex subscription quota, add `subscription_usage` to `footer_fields`. The plugin calls Hermes native `fetch_account_usage("openai-codex")` only when explicitly enabled; older Hermes versions, missing login, or network failures silently omit the field without affecting card completion. `card.text_sizes` can configure `body`, `reasoning`, `tool`, `notice`, and `footer`, including `default` / `pc` / `mobile` device mappings; physical card width/height remain controlled by the Feishu/Lark client.
 
@@ -120,7 +132,7 @@ streaming:
 
 Do not set `display.platforms.feishu.streaming: false`. Do not treat `display.show_reasoning` as required for this plugin; it can append reasoning blocks to the final answer and disrupt the streaming card experience. The plugin consumes Hermes `thinking.delta` / `answer.delta` directly.
 
-The compatibility matrix covers older Hermes starting at `v2026.4.23` and Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x. `doctor` prefers `VERSION` or a Git tag, and can fall back to verified `gateway/run.py` anchors when version metadata is missing or unparseable. A Hermes upgrade can replace the injected `gateway/run.py`; `status` / `start` use `HERMES_DIR` from the config-adjacent `.env` to detect that stale state and print a safe recovery command. After confirming an intentional upgrade, run the suggested `install --accept-hermes-upgrade --yes`, then `hermes gateway start`; user edits or incomplete evidence remain fail-closed behind `doctor --explain`.
+The compatibility matrix covers older Hermes starting at `v2026.4.23` and Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0.19.0 (`v2026.7.20`). Automated strategy detection requires installation to verify and manage both `gateway/run.py` and `gateway/platforms/base.py` for Hermes 0.19.0, `v2026.7.20+`, or verified exact-ledger source; V4.1 `manifest_version: 2` treats run, required Base, and optional Cron backup/write/restore as one transaction. A separate read-only validation against real local source confirmed startup before ledger redelivery, recovery before adapter send, and idempotent restore, but is not a claim of a real Gateway or Feishu E2E run. `doctor` prefers `VERSION` or a Git tag and can fall back to verified anchors when metadata is missing or unparseable. A Hermes upgrade can replace managed source; `status` / `start` use `HERMES_DIR` from the config-adjacent `.env` to detect stale state and print a safe recovery command. After confirming an intentional upgrade, run the suggested `install --accept-hermes-upgrade --yes`, then `hermes gateway start`; user edits or incomplete evidence remain fail-closed behind `doctor --explain`.
 
 ## Docker Container Install
 
@@ -129,7 +141,7 @@ For an existing Hermes container:
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.0.21
+export HFC_VERSION=v4.1.0
 bash install-docker.sh
 ```
 
@@ -170,6 +182,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ![Feishu topic reply card continuity and reasoning/tool timeline showcase](docs/assets/feishu-topic-card-showcase-v389.png)
 | Version | Highlights |
 |---|---|
+| [v4.1.0](docs/release-notes-v4.1.0.en.md) | Exact per-chat card/native policy, lossless compaction after five tables, authenticated runtime integrity with strict repair, and four explicit sidecar managers with no privilege escalation from `auto` |
 | [v4.0.21](docs/release-notes-v4.0.21.en.md) | Issue #155 archives answers only at an explicit `answer -> tool` boundary so post-tool final answers stay visible; Issue #147 real Feishu acceptance observed a completion card plus native image with no matching native duplicate or uncertain-delivery warning; UI and configuration remain unchanged |
 | [v4.0.20](docs/release-notes-v4.0.20.en.md) | Fixes Issue #153: queued notice updates return `accepted` without false unknown-delivery warnings, while real PATCH failures retain redacted metrics and error codes |
 | [v4.0.19](docs/release-notes-v4.0.19.en.md) | Prevents the one-line installer from using `pip --user` inside the Hermes venv and stops immediately on pip failures, avoiding false upgrade success |
@@ -211,7 +224,8 @@ Full history: [CHANGELOG.md](CHANGELOG.md). Longer historical notes remain in th
 
 ```text
 Hermes Gateway
-  -> minimal hook in gateway/run.py
+  -> minimal hooks in gateway/run.py
+     + required exact hook in gateway/platforms/base.py (Hermes 0.19)
      -> hermes_feishu_card.hook_runtime
         -> HTTP POST /events
            -> sidecar server
@@ -220,7 +234,7 @@ Hermes Gateway
               -> retry / coalescing / metrics / /health
 ```
 
-This is a sidecar-only design: the Hermes hook stays fail-open, while Feishu delivery, card updates, session state, retries, and diagnostics live in the sidecar. Historical V2 code is archived under `legacy/` and is not the active runtime.
+This remains a sidecar-only design: Hermes keeps only installer-owned, detectable, restorable hooks, while Feishu delivery, card updates, session state, retries, and diagnostics live in the sidecar. Historical V2 code is archived under `legacy/` and is not the active runtime.
 
 ## Documentation
 
@@ -234,6 +248,7 @@ This is a sidecar-only design: the Hermes hook stays fail-open, while Feishu del
 - Release readiness: [中文](docs/release-readiness.md) / [English](docs/release-readiness.en.md)
 - Testing: [中文](docs/testing.md) / [English](docs/testing.en.md)
 - Maintainer wiki: [docs/wiki](docs/wiki/README.md)
+- V4.1 safety controls and troubleshooting: [docs/wiki/v4.1-safety-controls.md](docs/wiki/v4.1-safety-controls.md)
 
 ## Contributors
 
@@ -257,6 +272,8 @@ This is a sidecar-only design: the Hermes hook stays fail-open, while Feishu del
 
 ## Security
 Default `127.0.0.1` uses local-process trust; do not expose an unauthenticated sidecar to the network. Non-loopback starts only with explicit `server.allow_non_loopback: true` and requires state-directory HMAC event authentication, which does not replace TLS. Do not commit App Secret, tenant token, real chat_id, or unredacted screenshots. Production credentials belong in local config or environment variables.
+
+Windows non-loopback startup is rejected when state-directory ACL privacy cannot be verified. Windows loopback remains available under local-process trust without claiming that ACL privacy has been verified.
 
 ## License
 

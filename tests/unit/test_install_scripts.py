@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -473,6 +474,331 @@ def test_install_docker_sh_declares_container_defaults():
     assert 'ENV_FILE="${ENV_FILE:-/opt/data/.env}"' in script
     assert 'NO_PROMPT="${HFC_NO_PROMPT:-1}"' in script
     assert 'SKIP_START="${HFC_SKIP_START:-0}"' in script
+    assert 'SERVICE_MANAGER="${HERMES_FEISHU_CARD_SERVICE_MANAGER:-detached}"' in script
+    assert 'STATE_DIR="${HERMES_FEISHU_CARD_STATE_DIR:-}"' in script
+    assert 'STATE_DIR="${STATE_DIR:-$(dirname "$CONFIG_PATH")/state}"' in script
+
+
+def test_install_docker_sh_explicit_local_source_allows_credential_free_smoke(tmp_path):
+    hermes_dir = tmp_path / "opt" / "hermes"
+    data_dir = tmp_path / "opt" / "data"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text(
+        "# gateway\n", encoding="utf-8"
+    )
+    data_dir.mkdir(parents=True)
+    (data_dir / "config.yaml").write_text(
+        "server:\n  host: 127.0.0.1\n  port: 8765\n",
+        encoding="utf-8",
+    )
+    runtime_python = make_argument_capture_python(
+        hermes_dir / "venv" / "bin" / "python"
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(data_dir / "config.yaml"),
+            "HFC_ENV_FILE": str(data_dir / ".env"),
+            "HFC_INSTALL_SOURCE": str(ROOT),
+            "HFC_TEST_NOOP_DELIVERY": "1",
+            "HFC_SKIP_START": "1",
+            "HFC_PYTHON": str(runtime_python),
+        }
+    )
+    env.pop("FEISHU_APP_ID", None)
+    env.pop("FEISHU_APP_SECRET", None)
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    log = (tmp_path / "python.log").read_text(encoding="utf-8")
+    assert f"-m pip install --upgrade {ROOT}" in log
+    assert "git+https://" not in log
+    assert "hermes_feishu_card.cli doctor" in log
+    assert f"hermes_feishu_card.cli install --hermes-dir {hermes_dir} --yes" in log
+    assert "hermes_feishu_card.cli setup" not in log
+
+
+def test_install_docker_sh_noop_smoke_refuses_remote_install_source(tmp_path):
+    hermes_dir = tmp_path / "opt" / "hermes"
+    data_dir = tmp_path / "opt" / "data"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text(
+        "# gateway\n", encoding="utf-8"
+    )
+    data_dir.mkdir(parents=True)
+    runtime_python = make_argument_capture_python(
+        hermes_dir / "venv" / "bin" / "python"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(data_dir / "config.yaml"),
+            "HFC_ENV_FILE": str(data_dir / ".env"),
+            "HFC_TEST_NOOP_DELIVERY": "1",
+            "HFC_SKIP_START": "1",
+            "HFC_PYTHON": str(runtime_python),
+        }
+    )
+    env.pop("HFC_INSTALL_SOURCE", None)
+    env.pop("FEISHU_APP_ID", None)
+    env.pop("FEISHU_APP_SECRET", None)
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "HFC_TEST_NOOP_DELIVERY requires HFC_INSTALL_SOURCE" in result.stderr
+
+
+def test_install_docker_sh_local_source_alone_does_not_bypass_credentials(tmp_path):
+    hermes_dir = tmp_path / "opt" / "hermes"
+    data_dir = tmp_path / "opt" / "data"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text(
+        "# gateway\n", encoding="utf-8"
+    )
+    data_dir.mkdir(parents=True)
+    runtime_python = make_argument_capture_python(
+        hermes_dir / "venv" / "bin" / "python"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(data_dir / "config.yaml"),
+            "HFC_ENV_FILE": str(data_dir / ".env"),
+            "HFC_INSTALL_SOURCE": str(ROOT),
+            "HFC_SKIP_START": "1",
+            "HFC_PYTHON": str(runtime_python),
+        }
+    )
+    env.pop("HFC_TEST_NOOP_DELIVERY", None)
+    env.pop("FEISHU_APP_ID", None)
+    env.pop("FEISHU_APP_SECRET", None)
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "FEISHU_APP_ID/FEISHU_APP_SECRET are missing" in result.stderr
+
+
+def test_install_docker_sh_noop_smoke_rejects_relative_source(tmp_path):
+    hermes_dir = tmp_path / "opt" / "hermes"
+    data_dir = tmp_path / "opt" / "data"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text(
+        "# gateway\n", encoding="utf-8"
+    )
+    data_dir.mkdir(parents=True)
+    runtime_python = make_argument_capture_python(
+        hermes_dir / "venv" / "bin" / "python"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(data_dir / "config.yaml"),
+            "HFC_ENV_FILE": str(data_dir / ".env"),
+            "HFC_INSTALL_SOURCE": ".",
+            "HFC_TEST_NOOP_DELIVERY": "1",
+            "HFC_SKIP_START": "1",
+            "HFC_PYTHON": str(runtime_python),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "HFC_INSTALL_SOURCE must be an absolute local directory" in result.stderr
+
+
+def test_install_docker_sh_noop_smoke_rejects_symlink_source(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    source_link = tmp_path / "source-link"
+    source_link.symlink_to(source, target_is_directory=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "HFC_INSTALL_SOURCE": str(source_link),
+            "HFC_TEST_NOOP_DELIVERY": "1",
+            "HFC_SKIP_START": "1",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "HFC_INSTALL_SOURCE must not be a symlink" in result.stderr
+
+
+def test_install_docker_sh_noop_smoke_requires_skip_start():
+    env = os.environ.copy()
+    env.update(
+        {
+            "HFC_INSTALL_SOURCE": str(ROOT),
+            "HFC_TEST_NOOP_DELIVERY": "1",
+            "HFC_SKIP_START": "0",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "HFC_TEST_NOOP_DELIVERY requires HFC_SKIP_START=1" in result.stderr
+
+
+def test_install_docker_sh_makes_shared_state_private(tmp_path):
+    hermes_dir = tmp_path / "opt" / "hermes"
+    data_dir = tmp_path / "opt" / "data"
+    state_dir = tmp_path / "opt" / "hfc-state"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text(
+        "# gateway\n", encoding="utf-8"
+    )
+    data_dir.mkdir(parents=True)
+    state_dir.mkdir(parents=True, mode=0o755)
+    state_dir.chmod(0o755)
+    env_file = data_dir / ".env"
+    env_file.write_text(
+        "FEISHU_APP_ID=cli_docker\nFEISHU_APP_SECRET=docker_secret\n",
+        encoding="utf-8",
+    )
+    make_fake_docker_python(hermes_dir / "venv" / "bin" / "python")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(data_dir / "config.yaml"),
+            "HFC_ENV_FILE": str(env_file),
+            "HERMES_FEISHU_CARD_STATE_DIR": str(state_dir),
+            "HFC_SKIP_START": "1",
+            "HFC_VERSION": "main",
+        }
+    )
+    env.pop("HFC_PYTHON", None)
+    env.pop("FEISHU_APP_ID", None)
+    env.pop("FEISHU_APP_SECRET", None)
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert stat.S_IMODE(state_dir.stat().st_mode) == 0o700
+
+
+def test_docker_compose_uses_ordinary_setup_gateway_and_sidecar_processes():
+    compose_path = ROOT / "docker-compose.example.yml"
+    source = compose_path.read_text(encoding="utf-8")
+    compose = yaml.safe_load(source)
+    services = compose["services"]
+
+    assert set(services) == {"setup", "gateway", "sidecar"}
+    setup = services["setup"]
+    gateway = services["gateway"]
+    sidecar = services["sidecar"]
+
+    assert setup["command"] == ["bash", "/tmp/install-docker.sh"]
+    assert setup["environment"]["HFC_SKIP_START"] == "1"
+    assert sidecar["depends_on"]["setup"]["condition"] == "service_completed_successfully"
+    assert gateway["depends_on"]["sidecar"]["condition"] == "service_healthy"
+    assert sidecar["command"][:4] == [
+        "/opt/hermes/venv/bin/python",
+        "-m",
+        "hermes_feishu_card.runner",
+        "--config",
+    ]
+    assert "healthcheck" in sidecar
+
+    for service in services.values():
+        assert service.get("privileged") is not True
+        assert service.get("network_mode") != "host"
+        assert service.get("pid") != "host"
+        assert "hfc-state:/opt/hfc-state" in service["volumes"]
+
+    for service in (setup, sidecar):
+        environment = service["environment"]
+        assert environment["HERMES_FEISHU_CARD_STATE_DIR"] == "/opt/hfc-state"
+        assert environment["HERMES_FEISHU_CARD_SERVICE_MANAGER"] == "detached"
+        assert environment["HERMES_FEISHU_CARD_HOST"] == "0.0.0.0"
+        assert environment["HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK"] == "true"
+
+    assert gateway["environment"]["HERMES_FEISHU_CARD_STATE_DIR"] == "/opt/hfc-state"
+    assert (
+        gateway["environment"]["HERMES_FEISHU_CARD_EVENT_URL"]
+        == "http://sidecar:8765/events"
+    )
+    assert "hfc-state" in compose["volumes"]
+
+    lowered = source.lower()
+    for forbidden in (
+        "privileged:",
+        "network_mode: host",
+        "pid: host",
+        "systemd-run",
+        "systemctl",
+        "/etc/systemd",
+        "/run/systemd",
+        "/var/run/docker.sock",
+    ):
+        assert forbidden not in lowered
 
 
 def test_install_docker_sh_uses_container_defaults_and_hermes_venv(tmp_path):
@@ -703,6 +1029,100 @@ exit 0
     assert "--break-system-packages" in (tmp_path / "python.log").read_text(
         encoding="utf-8"
     )
+
+
+def run_install_docker_with_failing_pip(tmp_path, *, failure_mode):
+    hermes_dir = tmp_path / "opt" / "hermes"
+    data_dir = tmp_path / "opt" / "data"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text("# gateway\n", encoding="utf-8")
+    data_dir.mkdir(parents=True)
+    env_file = data_dir / ".env"
+    env_file.write_text(
+        "FEISHU_APP_ID=cli_docker\nFEISHU_APP_SECRET=docker_secret\n",
+        encoding="utf-8",
+    )
+    fake_python = hermes_dir / "venv" / "bin" / "python"
+    fake_python.parent.mkdir(parents=True, exist_ok=True)
+    fake_python.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$FAKE_PYTHON_LOG"
+if [ "$1" = "-m" ] && [ "$2" = "pip" ] && [ "$3" = "--version" ]; then
+  exit 0
+fi
+if [ "$1" = "-m" ] && [ "$2" = "pip" ] && [ "$3" = "install" ]; then
+  case "$FAKE_PIP_FAILURE_MODE:$*" in
+    ordinary:*) echo "fatal package install failure" >&2; exit 9 ;;
+    externally:*--break-system-packages*)
+      echo "externally managed retry still failed" >&2
+      exit 13
+      ;;
+    externally:*) echo "error: externally-managed-environment" >&2; exit 1 ;;
+  esac
+fi
+if [ "$1" = "-m" ] && [ "$2" = "hermes_feishu_card.cli" ] && [ "$3" = "setup" ]; then
+  touch "$SETUP_MARKER"
+  exit 0
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+
+    setup_marker = tmp_path / "setup-ran"
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_PIP_FAILURE_MODE": failure_mode,
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "SETUP_MARKER": str(setup_marker),
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(data_dir / "config.yaml"),
+            "HFC_ENV_FILE": str(env_file),
+            "HFC_VERSION": "main",
+            "HFC_SKIP_START": "1",
+        }
+    )
+    env.pop("HFC_PYTHON", None)
+    env.pop("FEISHU_APP_ID", None)
+    env.pop("FEISHU_APP_SECRET", None)
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result, setup_marker, tmp_path / "python.log"
+
+
+def test_install_docker_sh_stops_when_pip_install_fails(tmp_path):
+    result, setup_marker, python_log = run_install_docker_with_failing_pip(
+        tmp_path, failure_mode="ordinary"
+    )
+
+    assert result.returncode == 9
+    assert "fatal package install failure" in result.stderr
+    assert not setup_marker.exists()
+    assert "hermes_feishu_card.cli" not in python_log.read_text(encoding="utf-8")
+
+
+def test_install_docker_sh_stops_when_externally_managed_retry_fails(tmp_path):
+    result, setup_marker, python_log = run_install_docker_with_failing_pip(
+        tmp_path, failure_mode="externally"
+    )
+
+    assert result.returncode == 13
+    assert "retrying with --break-system-packages" in result.stdout
+    assert "externally managed retry still failed" in result.stderr
+    assert not setup_marker.exists()
+    log = python_log.read_text(encoding="utf-8")
+    assert "--break-system-packages" in log
+    assert "hermes_feishu_card.cli" not in log
 
 
 def test_install_docker_sh_fails_without_hermes_venv_python(tmp_path):

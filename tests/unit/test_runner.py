@@ -3,6 +3,7 @@ from pathlib import Path
 
 from hermes_feishu_card.bots import FeishuClientFactory
 from hermes_feishu_card.feishu_client import FeishuAPIError, FeishuClient
+from hermes_feishu_card.delivery_policy import ReloadingDeliveryPolicyProvider
 import hermes_feishu_card.runner as runner
 from hermes_feishu_card.runner import (
     NoopFeishuClient,
@@ -95,7 +96,10 @@ def test_feishu_boundary_router_accepts_optional_event_data_fields():
     assert result.bot_id == "sales"
 
 
-def test_main_passes_boundary_to_create_app_when_bot_credentials_exist(monkeypatch):
+def test_main_passes_boundary_to_create_app_when_bot_credentials_exist(
+    monkeypatch,
+    tmp_path,
+):
     config = {
         "server": {"host": "127.0.0.1", "port": 0},
         "feishu": {"app_id": "cli_default", "app_secret": "default-secret"},
@@ -104,6 +108,8 @@ def test_main_passes_boundary_to_create_app_when_bot_credentials_exist(monkeypat
     captured = {}
 
     monkeypatch.setattr(runner, "load_config", lambda path, **_kwargs: config)
+    private_state = tmp_path / "private-state"
+    monkeypatch.setattr(runner, "state_dir", lambda: private_state, raising=False)
 
     def fake_create_app(feishu_client, **kwargs):
         captured["feishu_client"] = feishu_client
@@ -120,6 +126,13 @@ def test_main_passes_boundary_to_create_app_when_bot_credentials_exist(monkeypat
     assert captured["kwargs"]["card_config"] == {"title": "Credentialed Card"}
     assert captured["kwargs"]["bot_router"] is not None
     assert captured["kwargs"]["operations_config_path"] == "config.yaml"
+    assert captured["kwargs"]["integrity_mode"] == "notify"
+    assert captured["kwargs"]["expected_runtime_package_version"] == runner.__version__
+    assert captured["kwargs"]["runtime_integrity_state_directory"] == private_state
+    assert isinstance(
+        captured["kwargs"]["delivery_policy"],
+        ReloadingDeliveryPolicyProvider,
+    )
 
 
 def test_main_rejects_non_loopback_listener_without_explicit_opt_in(monkeypatch):
@@ -180,6 +193,9 @@ def test_main_enforces_event_auth_for_explicit_non_loopback_listener(monkeypatch
     monkeypatch.setattr(runner, "load_config", lambda path: config)
     monkeypatch.setattr(runner, "ensure_transport_root_secret", lambda: root_secret)
     monkeypatch.setattr(
+        runner, "transport_root_privacy_verified", lambda: True, raising=False
+    )
+    monkeypatch.setattr(
         runner,
         "create_app",
         lambda _client, **kwargs: captured.update(kwargs) or object(),
@@ -195,6 +211,53 @@ def test_main_enforces_event_auth_for_explicit_non_loopback_listener(monkeypatch
     assert captured["event_auth_required"] is True
     assert captured["operations_transport_root_secret"] == root_secret
     assert captured["run_app"]["host"] == "0.0.0.0"
+
+
+def test_main_rejects_non_loopback_when_windows_acl_privacy_is_unverified(monkeypatch):
+    config = {
+        "server": {
+            "host": "0.0.0.0",
+            "port": 8765,
+            "allow_non_loopback": True,
+        },
+        "feishu": {},
+        "card": {},
+    }
+    monkeypatch.setattr(runner, "load_config", lambda path: config)
+    monkeypatch.setattr(runner, "ensure_transport_root_secret", lambda: b"r" * 32)
+    monkeypatch.setattr(
+        runner, "transport_root_privacy_verified", lambda: False, raising=False
+    )
+    monkeypatch.setattr(
+        runner.web,
+        "run_app",
+        lambda *_args, **_kwargs: pytest.fail("unverified listener must not start"),
+    )
+
+    with pytest.raises(RuntimeError, match="private state directory"):
+        main(["--config", "config.yaml"])
+
+
+def test_main_warns_when_loopback_transport_acl_privacy_is_unverified(
+    monkeypatch, caplog
+):
+    config = {
+        "server": {"host": "127.0.0.1", "port": 8765},
+        "feishu": {},
+        "card": {},
+    }
+    monkeypatch.setattr(runner, "load_config", lambda path: config)
+    monkeypatch.setattr(runner, "ensure_transport_root_secret", lambda: b"r" * 32)
+    monkeypatch.setattr(
+        runner, "transport_root_privacy_verified", lambda: False, raising=False
+    )
+    monkeypatch.setattr(runner, "create_app", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(runner.web, "run_app", lambda *_args, **_kwargs: None)
+
+    assert main(["--config", "config.yaml"]) == 0
+
+    assert "ACL privacy is unverified" in caplog.text
+    assert "loopback local-process trust only" in caplog.text
 
 
 def test_main_keeps_loopback_listener_backward_compatible(monkeypatch):

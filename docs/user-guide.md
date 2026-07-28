@@ -64,6 +64,31 @@ V3.8.2 起，最终答案保留在主内容区，pre-tool answer 会按“正文
 | 多机器人、多群聊、多 profile 难确认路由 | `bindings.chats`、`group_rules` 安全诊断、profile-aware session key、`/health.routing` 诊断 |
 | sidecar 或 hook 出问题难定位 | `doctor`、runtime import 检查、`/health` metrics、fail-closed installer、restore/uninstall |
 
+## V4.1.0 投递策略、内容保护与运行安全
+
+按会话切换只使用精确匹配：
+
+```yaml
+bindings:
+  native_chats: []
+card:
+  table_overflow_mode: compact  # compact | truncate
+integrity:
+  mode: safe  # safe | notify | off
+service:
+  manager: auto  # auto | systemd-user | systemd-system | detached
+```
+
+`bindings.native_chats` 在多 profile 模式下必须写在对应 `profiles.<id>.bindings` 内，且不会继承顶层列表。用 `chats use-native CHAT_ID --config CONFIG` 与 `chats use-card CHAT_ID --config CONFIG` 修改，用 `chats list --config CONFIG` 查看掩码结果；修改从下一条新消息生效。policy 请求、配置 reload 或 profile 校验失败会 fail-open 到 Hermes 原生消息，`/hfc` 运维面仍保持卡片。
+
+Issue #162 所述的多机器人群聊需要显式使用原生模式：把目标群加入 `bindings.native_chats`，让 post 创建时就携带 `@bot`；被 @ 的应用同时开通 `im:message.group_at_msg.include_bot:readonly`、保留 `im.message.receive_v1` 事件订阅，并在新增权限后发布新版本使权限生效。流式卡片后续 PATCH 出现的 mention 不会补发一条 `im.message.receive_v1`，HFC 也不会在生成途中按答案内容自动切换。
+
+`table_overflow_mode: compact` 默认把第 6 张及后续表格转换为有序字段列表并保留全部数据；`truncate` 是显式旧行为。scanner 不把 fenced code 当表格。实际 card JSON 超过 5 张 table、200 个 tagged element 或 28,000 UTF-8 byte 时，非终态继续收集，终态不发送截断卡。Hermes 0.19 默认 profile 的无附件普通 final-answer，只有在受管 Base 已给出真实 ledger obligation，并且 content/plan/route exact binding 完整时，才通过 V2 descriptor、逐分片 UUID 与 ledger `delivered` 后 ACK 提供一小时窗口内的 bounded idempotency；terminal 响应丢失会先用相同 binding 查询刚提交的 descriptor。窗口外 descriptor 失效、sidecar 标记 `uncertain`，Hermes 仍可能用带可见 `RECOVERED_MARKER` 的有界普通 native recovery 避免丢答案，该随机 UUID 路径不属于 exact 契约。Hermes 0.19 startup recovery 不遍历 secondary profile 的独立 ledger，所以 secondary profile、附件/媒体、Cron、direct command 与缺失 exact binding 的路径均保留原生 best-effort/fail-open，不承诺永久 exactly-once。
+
+新安装写 `integrity.mode: safe`，旧配置缺段时按 `notify` 加载。旧安装显式执行 `integrity migrate-safe --config CONFIG --hermes-dir HERMES_DIR --yes` 后会得到 `sidecar.restart_required: true`、`gateway.restart_required: false`，需要重启 sidecar；若后续 strict repair 重新安装 hook，才会显示 `gateway.restart_required: true`，且 HFC 不自动重启 Gateway。认证 `runtime.hello` / `runtime.heartbeat` 用于区分进程存活与真实发卡 readiness。
+
+`service.manager: auto` 只选择可用的 `systemd-user`，否则使用 `detached`，从不隐式进入 `systemd-system` 或调用 sudo。`systemd-system` 仅 Linux 显式 opt-in 且只用 transient unit；Docker 保持普通容器进程与 `detached`。完整排障见 [V4.1 安全控制与排障](wiki/v4.1-safety-controls.md)。
+
 ## V4.0.0 实时双轨卡片
 
 - 运行态 Header title 保留用户自定义标题（默认 `Hermes Agent`），subtitle 根据工具名和 Hermes `progress_callback.preview` 显示动作摘要；完整命令留在 timeline。
@@ -408,6 +433,7 @@ V3.6.0 面向真实线上使用后的排障和维护场景：当 Hermes 升级�
 
 - 默认 `server.host: 127.0.0.1` 属于本机进程互信；不要把 sidecar 未鉴权暴露到网络。
 - 非 loopback 必须显式设置 `server.allow_non_loopback: true`，并强制使用私有 state directory 的 HMAC 事件鉴权；事件鉴权不提供加密，公网仍需 TLS/mTLS 或受控反向代理。
+- Windows non-loopback 在无法验证 state directory 的 ACL 私有性时拒绝启动；Windows loopback 继续使用本机进程互信，但不宣称 ACL 私有性已验证。
 - `--config` 指向的配置文件同目录存在 `.env` 时，会自动读取 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`HERMES_FEISHU_CARD_HOST`、`HERMES_FEISHU_CARD_PORT`；`setup` / `start --env-file ...` 选中的 env file 也会进入同一配置加载链。
 - 优先级固定为 YAML < 配置同目录 `.env` < 显式选中的 env file < 真实进程环境变量；不会隐式读取全局 `~/.hermes/.env`。
 - 多 Profile 模式下继续要求每个 profile 显式配置 Feishu 凭据，顶层环境变量不会覆盖 profile 凭据。
@@ -482,7 +508,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.0.21`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.1.0`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -490,7 +516,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.0.21
+export HFC_VERSION=v4.1.0
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -621,7 +647,7 @@ bots:
 bindings:
   fallback_bot: default
   chats:
-    oc_5cc6a25d8815790fa890dd0226005e83: sales
+    oc_example_sales: sales
   group_rules:
     enabled: false
     require_mention: true
@@ -775,6 +801,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
+| [v4.1.0](release-notes-v4.1.0.md) | 2026-07-28 | 精确 per-chat 原生策略、超量表格无损 compact、认证 runtime 完整性与 strict repair、四种显式 service manager |
 | [v4.0.21](release-notes-v4.0.21.md) | 2026-07-28 | Issue #155：仅显式 `answer -> tool` 边界归档答案，避免 post-tool 最终答案进入 timeline；Issue #147 真实飞书验收已观测 completion card + native image、两段答案留在同一卡、无匹配原生重复或 uncertain-delivery warning；不宣称截图或桌面/移动端视觉 QA |
 | [v4.0.20](release-notes-v4.0.20.md) | 2026-07-22 | Issue #153：notice 异步 ACK 使用 `accepted`，真实 PATCH 失败增加脱敏指标和错误码 |
 | [v4.0.19](release-notes-v4.0.19.md) | 2026-07-22 | Hermes venv 安装不再误用 `pip --user`，pip 失败会立即中止并保留真实错误 |

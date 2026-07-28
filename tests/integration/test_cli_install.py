@@ -15,6 +15,15 @@ from hermes_feishu_card.install import patcher
 
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "hermes_v2026_4_23"
+EXACT_BASE_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base.py"
+)
+CRON_FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "fixtures"
+    / "hermes_cron"
+    / "scheduler.py"
+)
 BACKUP_NAME = "run.py.hermes_feishu_card.bak"
 MANIFEST_NAME = ".hermes_feishu_card_manifest"
 
@@ -36,6 +45,30 @@ def copy_hermes(tmp_path):
     return hermes_dir
 
 
+def initialize_git_fixture(hermes_dir):
+    subprocess.run(["git", "-C", str(hermes_dir), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(hermes_dir), "config", "user.name", "HFC Test"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(hermes_dir),
+            "config",
+            "user.email",
+            "hfc@example.invalid",
+        ],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(hermes_dir), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(hermes_dir), "commit", "-qm", "initial"],
+        check=True,
+    )
+
+
 def run_py(hermes_dir):
     return hermes_dir / "gateway" / "run.py"
 
@@ -48,6 +81,47 @@ def manifest_path(hermes_dir):
     return hermes_dir / MANIFEST_NAME
 
 
+def base_path(hermes_dir):
+    return hermes_dir / "gateway" / "platforms" / "base.py"
+
+
+def base_backup_path(hermes_dir):
+    return base_path(hermes_dir).with_name("base.py.hermes_feishu_card.bak")
+
+
+def make_exact_019_hermes(tmp_path):
+    hermes_dir = copy_hermes(tmp_path)
+    (hermes_dir / "VERSION").write_text("v0.19.0\n", encoding="utf-8")
+    target = base_path(hermes_dir)
+    target.parent.mkdir(parents=True)
+    shutil.copy2(EXACT_BASE_FIXTURE, target)
+    return hermes_dir
+
+
+def cron_path(hermes_dir):
+    return hermes_dir / "cron" / "scheduler.py"
+
+
+def cron_backup_path(hermes_dir):
+    return cron_path(hermes_dir).with_name("scheduler.py.hermes_feishu_card.bak")
+
+
+def make_cron_hermes(tmp_path):
+    hermes_dir = copy_hermes(tmp_path)
+    target = cron_path(hermes_dir)
+    target.parent.mkdir(parents=True)
+    shutil.copy2(CRON_FIXTURE, target)
+    return hermes_dir
+
+
+def make_exact_019_cron_hermes(tmp_path):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    target = cron_path(hermes_dir)
+    target.parent.mkdir(parents=True)
+    shutil.copy2(CRON_FIXTURE, target)
+    return hermes_dir
+
+
 def phase_one_placeholder(content):
     current = patcher.apply_patch(content)
     return current.replace(
@@ -58,6 +132,340 @@ def phase_one_placeholder(content):
         ),
         "        pass\n",
     )
+
+
+def test_restore_transaction_rollback_preserves_concurrent_replacement_and_continues(
+    tmp_path, monkeypatch
+):
+    raced = tmp_path / "raced.txt"
+    owned = tmp_path / "owned.txt"
+    failing = tmp_path / "failing.txt"
+    raced.write_text("raced-before\n", encoding="utf-8")
+    owned.write_text("owned-before\n", encoding="utf-8")
+    failing.write_text("failing-before\n", encoding="utf-8")
+    original_atomic_write = cli._atomic_write_text
+    writes = 0
+
+    def fail_after_concurrent_replacement(path, contents, **kwargs):
+        nonlocal writes
+        writes += 1
+        if writes == 3:
+            raced.unlink()
+            raced.write_text("user-concurrent-replacement\n", encoding="utf-8")
+            raise OSError("third target unavailable")
+        return original_atomic_write(path, contents, **kwargs)
+
+    monkeypatch.setattr(cli, "_atomic_write_text", fail_after_concurrent_replacement)
+
+    with pytest.raises(ValueError, match="manual review required"):
+        cli._write_targets_transactionally(
+            [
+                (raced, "raced-after\n"),
+                (owned, "owned-after\n"),
+                (failing, "failing-after\n"),
+            ]
+        )
+
+    assert raced.read_text(encoding="utf-8") == "user-concurrent-replacement\n"
+    assert owned.read_text(encoding="utf-8") == "owned-before\n"
+    assert failing.read_text(encoding="utf-8") == "failing-before\n"
+
+
+def test_atomic_write_temp_cleanup_stays_bound_to_staging_parent(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path / "managed"
+    parent.mkdir()
+    target = parent / "target.txt"
+    target.write_text("before\n", encoding="utf-8")
+    real_parent = tmp_path / "managed-real"
+    original_replace = cli.os.replace
+    decoy = None
+
+    def replace_parent_before_temp_replace(source, destination, *args, **kwargs):
+        nonlocal decoy
+        source_name = Path(source).name
+        if (
+            decoy is None
+            and source_name.startswith(".target.txt.")
+            and source_name.endswith(".tmp")
+        ):
+            parent.rename(real_parent)
+            parent.mkdir()
+            decoy = parent / source_name
+            decoy.write_text("after\n", encoding="utf-8")
+            (parent / target.name).write_text("USER-TARGET\n", encoding="utf-8")
+        return original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(cli.os, "replace", replace_parent_before_temp_replace)
+
+    with pytest.raises(ValueError, match="directory changed during write"):
+        cli._atomic_write_text(target, "after\n")
+
+    assert decoy is not None
+    assert decoy.read_text(encoding="utf-8") == "after\n"
+    assert (parent / target.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert not list(real_parent.glob(".target.txt.*.tmp"))
+    assert (real_parent / "target.txt").read_text(encoding="utf-8") == "before\n"
+
+
+def test_restore_transaction_prebinds_parent_across_atomic_write_entry_gap(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path / "managed"
+    parent.mkdir()
+    target = parent / "target.txt"
+    target.write_text("before\n", encoding="utf-8")
+    real_parent = tmp_path / "managed-real"
+    original_atomic_write = cli._atomic_write_text
+    injected = False
+
+    def swap_parent_before_atomic_open(path, contents, **kwargs):
+        nonlocal injected
+        if not injected:
+            parent.rename(real_parent)
+            parent.mkdir()
+            (parent / target.name).write_text("USER-TARGET\n", encoding="utf-8")
+            injected = True
+        return original_atomic_write(path, contents, **kwargs)
+
+    monkeypatch.setattr(cli, "_atomic_write_text", swap_parent_before_atomic_open)
+
+    with pytest.raises(ValueError, match="directory changed during write"):
+        cli._write_targets_transactionally([(target, "after\n")])
+
+    assert injected
+    assert (parent / target.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert (real_parent / target.name).read_text(encoding="utf-8") == "before\n"
+
+
+def test_restore_transaction_absent_rollback_unlink_stays_bound_to_parent(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path / "managed"
+    parent.mkdir()
+    created = parent / "created.txt"
+    failing = parent / "failing.txt"
+    failing.write_text("before\n", encoding="utf-8")
+    real_parent = tmp_path / "managed-real"
+    original_atomic_write = cli._atomic_write_text
+    original_unlink = cli.os.unlink
+    injected = False
+
+    def fail_second_write(path, contents, **kwargs):
+        if path == failing:
+            raise OSError("second target unavailable")
+        return original_atomic_write(path, contents, **kwargs)
+
+    def swap_parent_at_rollback_unlink(path, *args, **kwargs):
+        nonlocal injected
+        candidate = os.fspath(path)
+        if not injected and candidate in {os.fspath(created), created.name}:
+            parent.rename(real_parent)
+            parent.mkdir()
+            (parent / created.name).write_text("USER-TARGET\n", encoding="utf-8")
+            injected = True
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli, "_atomic_write_text", fail_second_write)
+    monkeypatch.setattr(cli.os, "unlink", swap_parent_at_rollback_unlink)
+
+    with pytest.raises(OSError, match="second target unavailable"):
+        cli._write_targets_transactionally(
+            [(created, "created\n"), (failing, "after\n")]
+        )
+
+    assert injected
+    assert (parent / created.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert not (real_parent / created.name).exists()
+
+
+def test_restore_transaction_final_sweep_rolls_back_prior_parent_swap(
+    tmp_path, monkeypatch
+):
+    first_parent = tmp_path / "first"
+    second_parent = tmp_path / "second"
+    first_parent.mkdir()
+    second_parent.mkdir()
+    first = first_parent / "first.txt"
+    second = second_parent / "second.txt"
+    first.write_text("first-before\n", encoding="utf-8")
+    second.write_text("second-before\n", encoding="utf-8")
+    real_parent = tmp_path / "first-real"
+    original_atomic_write = cli._atomic_write_text
+    injected = False
+
+    def swap_first_parent_after_second_commit(path, contents, **kwargs):
+        nonlocal injected
+        result = original_atomic_write(path, contents, **kwargs)
+        if path == second and not injected:
+            first_parent.rename(real_parent)
+            first_parent.mkdir()
+            (first_parent / first.name).write_text("USER-TARGET\n", encoding="utf-8")
+            injected = True
+        return result
+
+    monkeypatch.setattr(
+        cli, "_atomic_write_text", swap_first_parent_after_second_commit
+    )
+
+    with pytest.raises(ValueError, match="directory changed"):
+        cli._write_targets_transactionally(
+            [(first, "first-after\n"), (second, "second-after\n")]
+        )
+
+    assert injected
+    assert (first_parent / first.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert (real_parent / first.name).read_text(encoding="utf-8") == "first-before\n"
+    assert second.read_text(encoding="utf-8") == "second-before\n"
+
+
+def test_atomic_write_uses_portable_fallback_without_dirfd_support(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "config.yaml"
+    target.write_text("before\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "_cli_dirfd_binding_supported", lambda: False)
+
+    cli._atomic_write_text(target, "after\n")
+
+    assert target.read_text(encoding="utf-8") == "after\n"
+    assert not list(tmp_path.glob(".config.yaml.*.tmp"))
+
+
+def test_restore_transaction_fails_closed_without_dirfd_support(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "run.py"
+    target.write_text("before\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "_cli_dirfd_binding_supported", lambda: False)
+
+    with pytest.raises(ValueError, match="secure restore transaction requires"):
+        cli._write_targets_transactionally([(target, "after\n")])
+
+    assert target.read_text(encoding="utf-8") == "before\n"
+
+
+def test_integrity_migration_commits_manifest_and_env_in_one_transaction(
+    tmp_path, monkeypatch
+):
+    hermes_dir = copy_hermes(tmp_path)
+    initialize_git_fixture(hermes_dir)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    config_parent = tmp_path / "hfc-config"
+    config_parent.mkdir()
+    config_path = config_parent / "config.yaml"
+    env_path = config_parent / ".env"
+    original_transaction = cli._write_targets_transactionally
+    calls = []
+
+    def record_transaction(changes, **kwargs):
+        calls.append(([path for path, _contents in changes], kwargs))
+        return original_transaction(changes, **kwargs)
+
+    monkeypatch.setattr(cli, "_write_targets_transactionally", record_transaction)
+
+    result = cli._run_integrity(
+        Namespace(
+            integrity_command="migrate-safe",
+            hermes_dir=str(hermes_dir),
+            config=str(config_path),
+            env_file=None,
+        )
+    )
+
+    assert result == 0
+    assert len(calls) == 1
+    assert calls[0][0] == [manifest_path(hermes_dir), env_path]
+    assert calls[0][1]["expected_identities"]
+    assert calls[0][1]["expected_directories"]
+    assert "HERMES_FEISHU_CARD_INTEGRITY_MODE=safe" in env_path.read_text(
+        encoding="utf-8"
+    )
+    assert "integrity" in json.loads(
+        manifest_path(hermes_dir).read_text(encoding="utf-8")
+    )
+
+
+def test_integrity_migration_refuses_env_parent_swap_before_transaction(
+    tmp_path, monkeypatch
+):
+    hermes_dir = copy_hermes(tmp_path)
+    initialize_git_fixture(hermes_dir)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    config_parent = tmp_path / "hfc-config"
+    config_parent.mkdir()
+    env_path = config_parent / ".env"
+    env_path.write_text("UNKNOWN=keep\n", encoding="utf-8")
+    env_before = env_path.read_bytes()
+    real_parent = tmp_path / "hfc-config-real"
+    manifest_before = manifest_path(hermes_dir).read_bytes()
+    original_transaction = cli._write_targets_transactionally
+
+    def swap_before_transaction(changes, **kwargs):
+        config_parent.rename(real_parent)
+        config_parent.mkdir()
+        (config_parent / env_path.name).write_text(
+            "USER-TARGET\n", encoding="utf-8"
+        )
+        return original_transaction(changes, **kwargs)
+
+    monkeypatch.setattr(
+        cli, "_write_targets_transactionally", swap_before_transaction
+    )
+
+    result = cli._run_integrity(
+        Namespace(
+            integrity_command="migrate-safe",
+            hermes_dir=str(hermes_dir),
+            config=str(config_parent / "config.yaml"),
+            env_file=None,
+        )
+    )
+
+    assert result != 0
+    assert (config_parent / env_path.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert (real_parent / env_path.name).read_bytes() == env_before
+    assert manifest_path(hermes_dir).read_bytes() == manifest_before
+
+
+def test_integrity_migration_refuses_manifest_parent_swap_before_transaction(
+    tmp_path, monkeypatch
+):
+    hermes_dir = copy_hermes(tmp_path)
+    initialize_git_fixture(hermes_dir)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = manifest_path(hermes_dir)
+    manifest_before = manifest.read_bytes()
+    real_root = hermes_dir.with_name("hermes-real")
+    config_parent = tmp_path / "hfc-config"
+    config_parent.mkdir()
+    original_transaction = cli._write_targets_transactionally
+
+    def swap_before_transaction(changes, **kwargs):
+        hermes_dir.rename(real_root)
+        hermes_dir.mkdir()
+        (hermes_dir / MANIFEST_NAME).write_text(
+            "USER-TARGET\n", encoding="utf-8"
+        )
+        return original_transaction(changes, **kwargs)
+
+    monkeypatch.setattr(
+        cli, "_write_targets_transactionally", swap_before_transaction
+    )
+
+    result = cli._run_integrity(
+        Namespace(
+            integrity_command="migrate-safe",
+            hermes_dir=str(hermes_dir),
+            config=str(config_parent / "config.yaml"),
+            env_file=None,
+        )
+    )
+
+    assert result != 0
+    assert (hermes_dir / MANIFEST_NAME).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert (real_root / MANIFEST_NAME).read_bytes() == manifest_before
 
 
 def write_manifest(hermes_dir):
@@ -904,6 +1312,1179 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None):
     assert not (cron_dir / "scheduler.py.hermes_feishu_card.bak").exists()
 
 
+def test_install_and_restore_019_manages_exact_base_as_third_target(tmp_path):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    run_original = run_py(hermes_dir).read_bytes()
+    base_original = base_path(hermes_dir).read_bytes()
+
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+
+    assert patcher.EXACT_BASE_NO_TEXT_PATCH_BEGIN in base_path(hermes_dir).read_text(
+        encoding="utf-8"
+    )
+    assert patcher.EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN in base_path(
+        hermes_dir
+    ).read_text(encoding="utf-8")
+    manifest = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    assert manifest["manifest_version"] == 2
+    assert manifest["base_py"] == "gateway/platforms/base.py"
+    assert manifest["base_patched_sha256"] == cli.file_sha256(base_path(hermes_dir))
+    assert manifest["base_backup"] == (
+        "gateway/platforms/base.py.hermes_feishu_card.bak"
+    )
+    assert manifest["base_backup_sha256"] == cli.file_sha256(
+        base_backup_path(hermes_dir)
+    )
+
+    assert cli.main(["restore", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    assert run_py(hermes_dir).read_bytes() == run_original
+    assert base_path(hermes_dir).read_bytes() == base_original
+    assert not backup_path(hermes_dir).exists()
+    assert not base_backup_path(hermes_dir).exists()
+    assert not manifest_path(hermes_dir).exists()
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_legacy_manifest_does_not_touch_unowned_base_files(
+    tmp_path, command
+):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    manifest["manifest_version"] = 1
+    manifest_path(hermes_dir).write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    user_base = base_path(hermes_dir)
+    user_base.parent.mkdir(parents=True)
+    user_base.write_text("# user-owned base\n", encoding="utf-8")
+    orphan_backup = base_backup_path(hermes_dir)
+    orphan_backup.write_text("# user-owned backup\n", encoding="utf-8")
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert user_base.read_text(encoding="utf-8") == "# user-owned base\n"
+    assert orphan_backup.read_text(encoding="utf-8") == "# user-owned backup\n"
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_v1_manifest_refuses_exact_base_patch_pair_without_ownership_fields(
+    tmp_path, command
+):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    manifest["manifest_version"] = 1
+    for field in cli._BASE_MANIFEST_FIELDS:
+        manifest.pop(field)
+    manifest_path(hermes_dir).write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    evidence = {
+        "run.py": run_py(hermes_dir).read_bytes(),
+        "run backup": backup_path(hermes_dir).read_bytes(),
+        "manifest": manifest_path(hermes_dir).read_bytes(),
+        "exact Base": base_path(hermes_dir).read_bytes(),
+        "exact Base backup": base_backup_path(hermes_dir).read_bytes(),
+    }
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "exact Base evidence exists but manifest ownership is missing" in result.stderr
+    assert run_py(hermes_dir).read_bytes() == evidence["run.py"]
+    assert backup_path(hermes_dir).read_bytes() == evidence["run backup"]
+    assert manifest_path(hermes_dir).read_bytes() == evidence["manifest"]
+    assert base_path(hermes_dir).read_bytes() == evidence["exact Base"]
+    assert base_backup_path(hermes_dir).read_bytes() == evidence["exact Base backup"]
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+@pytest.mark.parametrize(
+    "missing_side",
+    ["backup", "target"],
+)
+def test_v1_manifest_refuses_single_sided_exact_base_evidence(
+    tmp_path, command, missing_side
+):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    manifest["manifest_version"] = 1
+    for field in cli._BASE_MANIFEST_FIELDS:
+        manifest.pop(field)
+    manifest_path(hermes_dir).write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    if missing_side == "backup":
+        base_backup_path(hermes_dir).unlink()
+    else:
+        base_path(hermes_dir).unlink()
+    evidence = {
+        path: path.read_bytes() if path.exists() else None
+        for path in (
+            run_py(hermes_dir),
+            backup_path(hermes_dir),
+            manifest_path(hermes_dir),
+            base_path(hermes_dir),
+            base_backup_path(hermes_dir),
+        )
+    }
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "exact Base evidence" in result.stderr
+    assert {
+        path: path.read_bytes() if path.exists() else None for path in evidence
+    } == evidence
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+@pytest.mark.parametrize(
+    "missing_side",
+    ["backup", "target"],
+)
+def test_v1_manifest_refuses_single_sided_cron_evidence(
+    tmp_path, command, missing_side
+):
+    hermes_dir = make_cron_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    manifest["manifest_version"] = 1
+    for field in cli._CRON_MANIFEST_FIELDS:
+        manifest.pop(field)
+    manifest_path(hermes_dir).write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    if missing_side == "backup":
+        cron_backup_path(hermes_dir).unlink()
+    else:
+        cron_path(hermes_dir).unlink()
+    evidence = {
+        path: path.read_bytes() if path.exists() else None
+        for path in (
+            run_py(hermes_dir),
+            backup_path(hermes_dir),
+            manifest_path(hermes_dir),
+            cron_path(hermes_dir),
+            cron_backup_path(hermes_dir),
+        )
+    }
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "cron evidence" in result.stderr
+    assert {
+        path: path.read_bytes() if path.exists() else None for path in evidence
+    } == evidence
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_v1_manifest_does_not_touch_unowned_unpatched_cron_files(
+    tmp_path, command
+):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    manifest["manifest_version"] = 1
+    manifest_path(hermes_dir).write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    user_cron = cron_path(hermes_dir)
+    user_cron.parent.mkdir(parents=True)
+    user_cron.write_text("# user-owned cron\n", encoding="utf-8")
+    user_backup = cron_backup_path(hermes_dir)
+    user_backup.write_text("# user-owned cron backup\n", encoding="utf-8")
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert user_cron.read_text(encoding="utf-8") == "# user-owned cron\n"
+    assert user_backup.read_text(encoding="utf-8") == "# user-owned cron backup\n"
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+@pytest.mark.parametrize(
+    ("factory", "target_path", "managed_backup_path", "ownership_fields"),
+    [
+        (
+            make_exact_019_hermes,
+            base_path,
+            base_backup_path,
+            cli._BASE_MANIFEST_FIELDS,
+        ),
+        (
+            make_cron_hermes,
+            cron_path,
+            cron_backup_path,
+            cli._CRON_MANIFEST_FIELDS,
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "evidence_state",
+    [
+        "patched_target_ordinary_backup",
+        "missing_target_patched_backup",
+        "unpatched_target_patched_backup",
+    ],
+)
+def test_v1_manifest_refuses_ambiguous_managed_target_and_backup_evidence(
+    tmp_path,
+    command,
+    factory,
+    target_path,
+    managed_backup_path,
+    ownership_fields,
+    evidence_state,
+):
+    hermes_dir = factory(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    manifest["manifest_version"] = 1
+    for field in ownership_fields:
+        manifest.pop(field)
+    manifest_path(hermes_dir).write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    target = target_path(hermes_dir)
+    managed_backup = managed_backup_path(hermes_dir)
+    patched = target.read_bytes()
+    unpatched = managed_backup.read_bytes()
+    if evidence_state == "patched_target_ordinary_backup":
+        managed_backup.write_text("# ordinary user backup\n", encoding="utf-8")
+    elif evidence_state == "missing_target_patched_backup":
+        target.unlink()
+        managed_backup.write_bytes(patched)
+    else:
+        target.write_bytes(unpatched)
+        managed_backup.write_bytes(patched)
+    evidence = {
+        path: path.read_bytes() if path.exists() else None
+        for path in (
+            run_py(hermes_dir),
+            backup_path(hermes_dir),
+            manifest_path(hermes_dir),
+            target,
+            managed_backup,
+        )
+    }
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert {path: path.read_bytes() if path.exists() else None for path in evidence} == evidence
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+@pytest.mark.parametrize(
+    ("user_target", "user_backup"),
+    [
+        (base_path, base_backup_path),
+        (cron_path, cron_backup_path),
+    ],
+)
+def test_v1_manifest_allows_missing_target_with_unhookable_user_backup(
+    tmp_path, command, user_target, user_backup
+):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    manifest["manifest_version"] = 1
+    manifest_path(hermes_dir).write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    target = user_target(hermes_dir)
+    target.unlink(missing_ok=True)
+    backup = user_backup(hermes_dir)
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    backup.write_text("# ordinary non-hookable user backup\n", encoding="utf-8")
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert not target.exists()
+    assert backup.read_text(encoding="utf-8") == (
+        "# ordinary non-hookable user backup\n"
+    )
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_commands_refuse_symlinked_manifest_before_reading(tmp_path, command):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = manifest_path(hermes_dir)
+    manifest.unlink()
+    manifest.symlink_to(hermes_dir / "missing-manifest")
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "manifest" in result.stderr
+    assert "symlink" in result.stderr
+    assert manifest.is_symlink()
+    assert backup_path(hermes_dir).exists()
+    assert "HERMES_FEISHU_CARD_PATCH_BEGIN" in run_py(hermes_dir).read_text(
+        encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_commands_refuse_symlinked_exact_base_backup(tmp_path, command):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    base_backup = base_backup_path(hermes_dir)
+    original_backup = base_backup.read_bytes()
+    symlink_target = hermes_dir / "base-backup-target.py"
+    symlink_target.write_bytes(original_backup)
+    base_backup.unlink()
+    base_backup.symlink_to(symlink_target)
+    manifest_before = manifest_path(hermes_dir).read_bytes()
+    run_before = run_py(hermes_dir).read_bytes()
+    base_before = base_path(hermes_dir).read_bytes()
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "exact Base backup" in result.stderr
+    assert "symlink" in result.stderr
+    assert base_backup.is_symlink()
+    assert symlink_target.read_bytes() == original_backup
+    assert manifest_path(hermes_dir).read_bytes() == manifest_before
+    assert run_py(hermes_dir).read_bytes() == run_before
+    assert base_path(hermes_dir).read_bytes() == base_before
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+@pytest.mark.parametrize(
+    "symlinked_path",
+    [
+        run_py,
+        backup_path,
+        cron_path,
+        cron_backup_path,
+    ],
+)
+def test_restore_commands_refuse_all_run_and_cron_symlink_evidence(
+    tmp_path, command, symlinked_path
+):
+    hermes_dir = make_cron_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    path = symlinked_path(hermes_dir)
+    original = path.read_bytes()
+    symlink_target = path.with_name(f"{path.name}.target")
+    symlink_target.write_bytes(original)
+    path.unlink()
+    path.symlink_to(symlink_target)
+    manifest_before = manifest_path(hermes_dir).read_bytes()
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+    assert path.is_symlink()
+    assert symlink_target.read_bytes() == original
+    assert manifest_path(hermes_dir).read_bytes() == manifest_before
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_commands_refuse_symlinked_hermes_root_before_reading(
+    tmp_path, command
+):
+    real_hermes_dir = copy_hermes(tmp_path / "real")
+    assert cli.main(["install", "--hermes-dir", str(real_hermes_dir), "--yes"]) == 0
+    hermes_link = tmp_path / "hermes-link"
+    hermes_link.symlink_to(real_hermes_dir, target_is_directory=True)
+    manifest_before = manifest_path(real_hermes_dir).read_bytes()
+    run_before = run_py(real_hermes_dir).read_bytes()
+    backup_before = backup_path(real_hermes_dir).read_bytes()
+
+    result = run_cli(command, "--hermes-dir", str(hermes_link), "--yes")
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+    assert hermes_link.is_symlink()
+    assert manifest_path(real_hermes_dir).read_bytes() == manifest_before
+    assert run_py(real_hermes_dir).read_bytes() == run_before
+    assert backup_path(real_hermes_dir).read_bytes() == backup_before
+
+
+@pytest.mark.parametrize(
+    ("factory", "parent_parts", "relative_evidence"),
+    [
+        (copy_hermes, ("gateway",), ("run.py", BACKUP_NAME)),
+        (make_cron_hermes, ("cron",), ("scheduler.py", "scheduler.py.hermes_feishu_card.bak")),
+        (make_exact_019_hermes, ("gateway", "platforms"), ("base.py", "base.py.hermes_feishu_card.bak")),
+    ],
+)
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_commands_refuse_symlinked_managed_parent_directories(
+    tmp_path, command, factory, parent_parts, relative_evidence
+):
+    hermes_dir = factory(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    parent = hermes_dir.joinpath(*parent_parts)
+    real_parent = parent.with_name(f"{parent.name}-real")
+    parent.rename(real_parent)
+    parent.symlink_to(real_parent, target_is_directory=True)
+    evidence_before = {
+        name: (real_parent / name).read_bytes() for name in relative_evidence
+    }
+    manifest_before = manifest_path(hermes_dir).read_bytes()
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+    assert parent.is_symlink()
+    assert manifest_path(hermes_dir).read_bytes() == manifest_before
+    assert {
+        name: (real_parent / name).read_bytes() for name in relative_evidence
+    } == evidence_before
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+@pytest.mark.parametrize(
+    "parent_parts",
+    [
+        (),
+        ("gateway",),
+        ("cron",),
+        ("gateway", "platforms"),
+    ],
+    ids=["hermes-root", "gateway", "cron", "gateway-platforms"],
+)
+def test_restore_commands_refuse_managed_parent_swap_after_outer_validation(
+    tmp_path, monkeypatch, command, parent_parts
+):
+    hermes_dir = make_exact_019_cron_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    managed_targets = [
+        base_path(hermes_dir),
+        run_py(hermes_dir),
+        cron_path(hermes_dir),
+    ]
+    evidence_paths = [
+        base_backup_path(hermes_dir),
+        backup_path(hermes_dir),
+        cron_backup_path(hermes_dir),
+        manifest_path(hermes_dir),
+    ]
+    targets_before = {path: path.read_bytes() for path in managed_targets}
+    evidence_before = {path: path.read_bytes() for path in evidence_paths}
+    raced_parent = hermes_dir.joinpath(*parent_parts)
+    real_parent = raced_parent.with_name(f"{raced_parent.name}-real")
+    original_assert = cli._assert_restore_evidence_set_unchanged
+    injected = False
+
+    def swap_parent_after_outer_validation(restore_identities):
+        nonlocal injected
+        original_assert(restore_identities)
+        if not injected:
+            raced_parent.rename(real_parent)
+            raced_parent.symlink_to(real_parent, target_is_directory=True)
+            injected = True
+
+    monkeypatch.setattr(
+        cli,
+        "_assert_restore_evidence_set_unchanged",
+        swap_parent_after_outer_validation,
+    )
+
+    runner = cli._run_restore if command == "restore" else cli._run_uninstall
+    result = runner(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert injected
+    assert raced_parent.is_symlink()
+    assert {path: path.read_bytes() for path in managed_targets} == targets_before
+    assert {path: path.read_bytes() for path in evidence_paths} == evidence_before
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_transaction_rolls_back_prior_targets_when_cron_parent_swaps(
+    tmp_path, monkeypatch, command
+):
+    hermes_dir = make_exact_019_cron_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    managed_targets = [
+        base_path(hermes_dir),
+        run_py(hermes_dir),
+        cron_path(hermes_dir),
+    ]
+    evidence_paths = [
+        base_backup_path(hermes_dir),
+        backup_path(hermes_dir),
+        cron_backup_path(hermes_dir),
+        manifest_path(hermes_dir),
+    ]
+    targets_before = {path: path.read_bytes() for path in managed_targets}
+    evidence_before = {path: path.read_bytes() for path in evidence_paths}
+    cron_parent = hermes_dir / "cron"
+    real_cron_parent = hermes_dir / "cron-real"
+    original_atomic_write = cli._atomic_write_text
+    injected = False
+
+    def swap_cron_after_run_write(path, contents, **kwargs):
+        nonlocal injected
+        result = original_atomic_write(path, contents, **kwargs)
+        if Path(path) == run_py(hermes_dir) and not injected:
+            cron_parent.rename(real_cron_parent)
+            cron_parent.symlink_to(real_cron_parent, target_is_directory=True)
+            injected = True
+        return result
+
+    monkeypatch.setattr(cli, "_atomic_write_text", swap_cron_after_run_write)
+
+    runner = cli._run_restore if command == "restore" else cli._run_uninstall
+    result = runner(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert injected
+    assert cron_parent.is_symlink()
+    assert {path: path.read_bytes() for path in managed_targets} == targets_before
+    assert {path: path.read_bytes() for path in evidence_paths} == evidence_before
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+@pytest.mark.parametrize(
+    "parent_parts",
+    [
+        (),
+        ("gateway",),
+        ("cron",),
+        ("gateway", "platforms"),
+    ],
+    ids=["hermes-root", "gateway", "cron", "gateway-platforms"],
+)
+def test_restore_cleanup_refuses_managed_parent_swap_before_unlink(
+    tmp_path, monkeypatch, command, parent_parts
+):
+    hermes_dir = make_exact_019_cron_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    evidence_paths = [
+        base_backup_path(hermes_dir),
+        backup_path(hermes_dir),
+        cron_backup_path(hermes_dir),
+        manifest_path(hermes_dir),
+    ]
+    evidence_before = {path: path.read_bytes() for path in evidence_paths}
+    raced_parent = hermes_dir.joinpath(*parent_parts)
+    real_parent = raced_parent.with_name(f"{raced_parent.name}-real")
+    original_writer = cli._write_targets_transactionally
+    injected = False
+
+    def swap_parent_after_target_transaction(changes, **kwargs):
+        nonlocal injected
+        result = original_writer(changes, **kwargs)
+        raced_parent.rename(real_parent)
+        raced_parent.symlink_to(real_parent, target_is_directory=True)
+        injected = True
+        return result
+
+    monkeypatch.setattr(
+        cli, "_write_targets_transactionally", swap_parent_after_target_transaction
+    )
+
+    runner = cli._run_restore if command == "restore" else cli._run_uninstall
+    result = runner(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert injected
+    assert raced_parent.is_symlink()
+    assert {path: path.read_bytes() for path in evidence_paths} == evidence_before
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_cleanup_unlink_stays_bound_when_parent_swaps_at_syscall(
+    tmp_path, monkeypatch, command
+):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    evidence = backup_path(hermes_dir)
+    parent = evidence.parent
+    real_parent = parent.with_name("gateway-real")
+    original_unlink = cli.os.unlink
+    injected = False
+
+    def swap_parent_at_evidence_unlink(path, *args, **kwargs):
+        nonlocal injected
+        candidate = os.fspath(path)
+        if not injected and candidate in {os.fspath(evidence), evidence.name}:
+            parent.rename(real_parent)
+            parent.mkdir()
+            (parent / evidence.name).write_text("USER-TARGET\n", encoding="utf-8")
+            injected = True
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli.os, "unlink", swap_parent_at_evidence_unlink)
+
+    runner = cli._run_restore if command == "restore" else cli._run_uninstall
+    result = runner(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result == 0
+    assert injected
+    assert (parent / evidence.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert not (real_parent / evidence.name).exists()
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_commands_refuse_symlinked_exact_base_target(tmp_path, command):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    target = base_path(hermes_dir)
+    original = target.read_bytes()
+    symlink_target = target.with_name("base-target.py")
+    symlink_target.write_bytes(original)
+    target.unlink()
+    target.symlink_to(symlink_target)
+    manifest_before = manifest_path(hermes_dir).read_bytes()
+    backup_before = base_backup_path(hermes_dir).read_bytes()
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "exact Base" in result.stderr
+    assert "symlink" in result.stderr
+    assert target.is_symlink()
+    assert symlink_target.read_bytes() == original
+    assert manifest_path(hermes_dir).read_bytes() == manifest_before
+    assert base_backup_path(hermes_dir).read_bytes() == backup_before
+
+
+def test_restore_refuses_leaf_swap_after_manifest_validation(tmp_path, monkeypatch):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    backup = backup_path(hermes_dir)
+    backup_before = backup.read_bytes()
+    symlink_target = backup.with_name("run-backup-target.py")
+    symlink_target.write_bytes(backup_before)
+    original_read = cli._read_restore_text
+
+    def replace_backup_after_manifest_read(path, expected_identity):
+        contents = original_read(path, expected_identity)
+        if path == manifest_path(hermes_dir):
+            backup.unlink()
+            backup.symlink_to(symlink_target)
+        return contents
+
+    monkeypatch.setattr(cli, "_read_restore_text", replace_backup_after_manifest_read)
+
+    result = cli._run_restore(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert backup.is_symlink()
+    assert symlink_target.read_bytes() == backup_before
+    assert manifest_path(hermes_dir).exists()
+
+
+def test_restore_refuses_backup_swap_before_cleanup(tmp_path, monkeypatch):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    backup = backup_path(hermes_dir)
+    backup_before = backup.read_bytes()
+    symlink_target = backup.with_name("run-backup-target.py")
+    symlink_target.write_bytes(backup_before)
+
+    def replace_backup_before_cleanup(_changes, **_kwargs):
+        backup.unlink()
+        backup.symlink_to(symlink_target)
+
+    monkeypatch.setattr(
+        cli, "_write_targets_transactionally", replace_backup_before_cleanup
+    )
+
+    result = cli._run_restore(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert backup.is_symlink()
+    assert symlink_target.read_bytes() == backup_before
+    assert manifest_path(hermes_dir).exists()
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+@pytest.mark.parametrize(
+    ("factory", "raced_path", "trigger_path"),
+    [
+        (make_exact_019_hermes, base_path, None),
+        (make_exact_019_hermes, run_py, base_path),
+        (make_exact_019_cron_hermes, cron_path, run_py),
+    ],
+)
+def test_restore_transaction_refuses_regular_inode_target_race_and_rolls_back(
+    tmp_path, monkeypatch, command, factory, raced_path, trigger_path
+):
+    hermes_dir = factory(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    target = raced_path(hermes_dir)
+    trigger = trigger_path(hermes_dir) if trigger_path is not None else None
+    managed_targets = [base_path(hermes_dir), run_py(hermes_dir)]
+    if cron_path(hermes_dir).exists():
+        managed_targets.append(cron_path(hermes_dir))
+    target_before = {path: path.read_bytes() for path in managed_targets}
+    evidence_paths = [backup_path(hermes_dir), base_backup_path(hermes_dir)]
+    if cron_backup_path(hermes_dir).exists():
+        evidence_paths.append(cron_backup_path(hermes_dir))
+    evidence_paths.append(manifest_path(hermes_dir))
+    evidence_before = {path: path.read_bytes() for path in evidence_paths}
+    raced_contents = b"# concurrent regular-inode replacement\n"
+    injected = False
+
+    def replace_raced_target():
+        nonlocal injected
+        target.unlink()
+        target.write_bytes(raced_contents)
+        injected = True
+
+    if trigger is None:
+        original_assert = cli._assert_restore_evidence_set_unchanged
+
+        def replace_after_outer_identity_check(restore_identities):
+            original_assert(restore_identities)
+            if not injected:
+                replace_raced_target()
+
+        monkeypatch.setattr(
+            cli,
+            "_assert_restore_evidence_set_unchanged",
+            replace_after_outer_identity_check,
+        )
+    else:
+        original_atomic_write = cli._atomic_write_text
+
+        def replace_after_prior_target_write(path, contents, **kwargs):
+            result = original_atomic_write(path, contents, **kwargs)
+            if Path(path) == trigger and not injected:
+                replace_raced_target()
+            return result
+
+        monkeypatch.setattr(cli, "_atomic_write_text", replace_after_prior_target_write)
+
+    runner = cli._run_restore if command == "restore" else cli._run_uninstall
+    result = runner(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert injected
+    assert target.read_bytes() == raced_contents
+    assert {
+        path: path.read_bytes() for path in managed_targets if path != target
+    } == {
+        path: contents for path, contents in target_before.items() if path != target
+    }
+    assert {path: path.read_bytes() for path in evidence_paths} == evidence_before
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_transaction_refuses_same_inode_base_content_race(
+    tmp_path, monkeypatch, command
+):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    target = base_path(hermes_dir)
+    inode_before = target.stat().st_ino
+    raced_contents = "# same-inode concurrent Base rewrite\n"
+    evidence_paths = [
+        backup_path(hermes_dir),
+        base_backup_path(hermes_dir),
+        manifest_path(hermes_dir),
+    ]
+    evidence_before = {path: path.read_bytes() for path in evidence_paths}
+    original_assert = cli._assert_restore_evidence_set_unchanged
+    injected = False
+
+    def rewrite_after_outer_identity_check(restore_identities):
+        nonlocal injected
+        original_assert(restore_identities)
+        if not injected:
+            target.write_text(raced_contents, encoding="utf-8")
+            injected = True
+
+    monkeypatch.setattr(
+        cli,
+        "_assert_restore_evidence_set_unchanged",
+        rewrite_after_outer_identity_check,
+    )
+
+    runner = cli._run_restore if command == "restore" else cli._run_uninstall
+    result = runner(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert injected
+    assert target.stat().st_ino == inode_before
+    assert target.read_text(encoding="utf-8") == raced_contents
+    assert {path: path.read_bytes() for path in evidence_paths} == evidence_before
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+@pytest.mark.parametrize("raced_evidence", [backup_path, manifest_path])
+def test_restore_cleanup_refuses_same_inode_evidence_content_race(
+    tmp_path, monkeypatch, command, raced_evidence
+):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    evidence = raced_evidence(hermes_dir)
+    inode_before = evidence.stat().st_ino
+    raced_contents = "# same-inode concurrent evidence rewrite\n"
+    run_backup = backup_path(hermes_dir)
+    install_manifest = manifest_path(hermes_dir)
+    original_writer = cli._write_targets_transactionally
+    injected = False
+
+    def rewrite_after_target_transaction(changes, **kwargs):
+        nonlocal injected
+        result = original_writer(changes, **kwargs)
+        evidence.write_text(raced_contents, encoding="utf-8")
+        injected = True
+        return result
+
+    monkeypatch.setattr(
+        cli, "_write_targets_transactionally", rewrite_after_target_transaction
+    )
+
+    runner = cli._run_restore if command == "restore" else cli._run_uninstall
+    result = runner(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert injected
+    assert evidence.stat().st_ino == inode_before
+    assert evidence.read_text(encoding="utf-8") == raced_contents
+    assert run_backup.exists()
+    assert install_manifest.exists()
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+@pytest.mark.parametrize("backup_present", [True, False])
+def test_manifestless_restore_refuses_run_target_drift_at_write_boundary(
+    tmp_path, monkeypatch, command, backup_present
+):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest_path(hermes_dir).unlink()
+    run_backup = backup_path(hermes_dir)
+    backup_before = run_backup.read_bytes()
+    if not backup_present:
+        run_backup.unlink()
+    target = run_py(hermes_dir)
+    raced_contents = b"# concurrent manifestless run rewrite\n"
+    original_assert = cli._assert_restore_evidence_set_unchanged
+    injected = False
+
+    def drift_after_outer_identity_check(restore_identities):
+        nonlocal injected
+        original_assert(restore_identities)
+        if not injected:
+            if backup_present:
+                target.unlink()
+                target.write_bytes(raced_contents)
+            else:
+                target.write_bytes(raced_contents)
+            injected = True
+
+    monkeypatch.setattr(
+        cli,
+        "_assert_restore_evidence_set_unchanged",
+        drift_after_outer_identity_check,
+    )
+
+    runner = cli._run_restore if command == "restore" else cli._run_uninstall
+    result = runner(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert injected
+    assert target.read_bytes() == raced_contents
+    assert not manifest_path(hermes_dir).exists()
+    if backup_present:
+        assert run_backup.read_bytes() == backup_before
+    else:
+        assert not run_backup.exists()
+
+
+def test_019_doctor_state_requires_base_ownership_but_install_can_migrate(tmp_path):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    legacy_manifest = json.loads(
+        manifest_path(hermes_dir).read_text(encoding="utf-8")
+    )
+    assert "base_py" not in legacy_manifest
+    (hermes_dir / "VERSION").write_text("v0.19.0\n", encoding="utf-8")
+    target = base_path(hermes_dir)
+    target.parent.mkdir(parents=True)
+    shutil.copy2(EXACT_BASE_FIXTURE, target)
+    detection = cli.detect_hermes(hermes_dir)
+
+    diagnosed = cli._diagnose_install_state(detection)
+
+    assert diagnosed["status"] == "incomplete"
+    assert "exact Base ownership" in diagnosed["message"]
+
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    migrated = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    assert set(cli._BASE_MANIFEST_FIELDS) <= set(migrated)
+
+
+def test_install_019_rolls_back_base_when_later_gateway_write_fails(
+    tmp_path, monkeypatch
+):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    run_original = run_py(hermes_dir).read_bytes()
+    base_original = base_path(hermes_dir).read_bytes()
+    original_atomic_write = cli._atomic_write_text
+    writes = []
+
+    def fail_gateway_after_base(path, contents, **kwargs):
+        writes.append(Path(path))
+        if Path(path) == run_py(hermes_dir):
+            raise OSError("gateway unavailable")
+        return original_atomic_write(path, contents, **kwargs)
+
+    monkeypatch.setattr(cli, "_atomic_write_text", fail_gateway_after_base)
+
+    result = cli._run_install(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert base_path(hermes_dir) in writes
+    assert writes.index(base_path(hermes_dir)) < writes.index(run_py(hermes_dir))
+    assert run_py(hermes_dir).read_bytes() == run_original
+    assert base_path(hermes_dir).read_bytes() == base_original
+    assert not backup_path(hermes_dir).exists()
+    assert not base_backup_path(hermes_dir).exists()
+    assert not manifest_path(hermes_dir).exists()
+
+
+def test_install_019_preserves_evidence_when_base_rollback_also_fails(
+    tmp_path, monkeypatch, capsys
+):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    base_original = base_path(hermes_dir).read_text(encoding="utf-8")
+    original_atomic_write = cli._atomic_write_text
+    base_writes = 0
+
+    def fail_gateway_and_base_rollback(path, contents, **kwargs):
+        nonlocal base_writes
+        path = Path(path)
+        if path == base_path(hermes_dir):
+            base_writes += 1
+            if base_writes > 1:
+                raise OSError("base rollback unavailable")
+        if path == run_py(hermes_dir):
+            raise OSError("gateway unavailable")
+        return original_atomic_write(path, contents, **kwargs)
+
+    monkeypatch.setattr(cli, "_atomic_write_text", fail_gateway_and_base_rollback)
+
+    result = cli._run_install(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    captured = capsys.readouterr()
+    assert result != 0
+    assert "install rollback failed; manual review required" in captured.err
+    assert base_writes == 2
+    assert base_path(hermes_dir).read_text(encoding="utf-8") != base_original
+    assert patcher.remove_base_patch(
+        base_path(hermes_dir).read_text(encoding="utf-8")
+    ) == base_original
+    assert backup_path(hermes_dir).exists()
+    assert base_backup_path(hermes_dir).exists()
+    assert not manifest_path(hermes_dir).exists()
+
+
+def test_reinstall_019_refuses_partial_base_manifest_contract(tmp_path):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    manifest.pop("base_backup_sha256")
+    manifest_path(hermes_dir).write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    result = cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"])
+
+    assert result != 0
+
+
+def test_restore_019_rolls_back_base_when_gateway_restore_fails(
+    tmp_path, monkeypatch
+):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    patched_run = run_py(hermes_dir).read_bytes()
+    patched_base = base_path(hermes_dir).read_bytes()
+    manifest_before = manifest_path(hermes_dir).read_bytes()
+    original_atomic_write = cli._atomic_write_text
+
+    def fail_gateway_restore(path, contents, **kwargs):
+        if Path(path) == run_py(hermes_dir):
+            raise OSError("gateway restore unavailable")
+        return original_atomic_write(path, contents, **kwargs)
+
+    monkeypatch.setattr(cli, "_atomic_write_text", fail_gateway_restore)
+
+    result = cli._run_restore(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert run_py(hermes_dir).read_bytes() == patched_run
+    assert base_path(hermes_dir).read_bytes() == patched_base
+    assert manifest_path(hermes_dir).read_bytes() == manifest_before
+    assert backup_path(hermes_dir).exists()
+    assert base_backup_path(hermes_dir).exists()
+
+
+def test_restore_019_without_manifest_refuses_base_evidence_without_mutation(
+    tmp_path,
+):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest_path(hermes_dir).unlink()
+    patched_run = run_py(hermes_dir).read_bytes()
+    patched_base = base_path(hermes_dir).read_bytes()
+    run_backup = backup_path(hermes_dir).read_bytes()
+    base_backup = base_backup_path(hermes_dir).read_bytes()
+
+    result = run_cli("restore", "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "exact Base evidence exists without manifest" in result.stderr
+    assert run_py(hermes_dir).read_bytes() == patched_run
+    assert base_path(hermes_dir).read_bytes() == patched_base
+    assert backup_path(hermes_dir).read_bytes() == run_backup
+    assert base_backup_path(hermes_dir).read_bytes() == base_backup
+    assert not manifest_path(hermes_dir).exists()
+
+
+def test_restore_019_without_run_backup_refuses_owned_base_without_mutation(
+    tmp_path,
+):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    backup_path(hermes_dir).unlink()
+    patched_run = run_py(hermes_dir).read_bytes()
+    patched_base = base_path(hermes_dir).read_bytes()
+    base_backup = base_backup_path(hermes_dir).read_bytes()
+    manifest = manifest_path(hermes_dir).read_bytes()
+
+    result = run_cli("restore", "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "owned exact Base state but run.py backup is missing" in result.stderr
+    assert run_py(hermes_dir).read_bytes() == patched_run
+    assert base_path(hermes_dir).read_bytes() == patched_base
+    assert not backup_path(hermes_dir).exists()
+    assert base_backup_path(hermes_dir).read_bytes() == base_backup
+    assert manifest_path(hermes_dir).read_bytes() == manifest
+
+
+def test_restore_without_manifest_refuses_cron_evidence_without_mutation(tmp_path):
+    hermes_dir = make_cron_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest_path(hermes_dir).unlink()
+    patched_run = run_py(hermes_dir).read_bytes()
+    patched_cron = cron_path(hermes_dir).read_bytes()
+    run_backup = backup_path(hermes_dir).read_bytes()
+    cron_backup = cron_backup_path(hermes_dir).read_bytes()
+
+    result = run_cli("restore", "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "cron evidence exists without manifest" in result.stderr
+    assert run_py(hermes_dir).read_bytes() == patched_run
+    assert cron_path(hermes_dir).read_bytes() == patched_cron
+    assert backup_path(hermes_dir).read_bytes() == run_backup
+    assert cron_backup_path(hermes_dir).read_bytes() == cron_backup
+    assert not manifest_path(hermes_dir).exists()
+
+
+def test_restore_without_run_backup_refuses_owned_cron_without_mutation(tmp_path):
+    hermes_dir = make_cron_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    backup_path(hermes_dir).unlink()
+    patched_run = run_py(hermes_dir).read_bytes()
+    patched_cron = cron_path(hermes_dir).read_bytes()
+    cron_backup = cron_backup_path(hermes_dir).read_bytes()
+    manifest = manifest_path(hermes_dir).read_bytes()
+
+    result = run_cli("restore", "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "owned cron state but run.py backup is missing" in result.stderr
+    assert run_py(hermes_dir).read_bytes() == patched_run
+    assert cron_path(hermes_dir).read_bytes() == patched_cron
+    assert not backup_path(hermes_dir).exists()
+    assert cron_backup_path(hermes_dir).read_bytes() == cron_backup
+    assert manifest_path(hermes_dir).read_bytes() == manifest
+
+
+@pytest.mark.parametrize("command", ["install", "repair", "restore", "uninstall"])
+@pytest.mark.parametrize("future_version", [999, "999"])
+def test_mutations_refuse_future_or_invalid_manifest_without_touching_unknown_targets(
+    tmp_path, command, future_version
+):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    future_target = hermes_dir / "gateway" / "future-owned-target.py"
+    future_target.write_text("FUTURE_OWNERSHIP = True\n", encoding="utf-8")
+    manifest = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    manifest["manifest_version"] = future_version
+    manifest["future_target"] = "gateway/future-owned-target.py"
+    manifest_path(hermes_dir).write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    before = {
+        path.relative_to(hermes_dir).as_posix(): path.read_bytes()
+        for path in hermes_dir.rglob("*")
+        if path.is_file()
+    }
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    after = {
+        path.relative_to(hermes_dir).as_posix(): path.read_bytes()
+        for path in hermes_dir.rglob("*")
+        if path.is_file()
+    }
+    assert result.returncode != 0
+    assert "newer installer required" in result.stderr
+    assert after == before
+
+
+@pytest.mark.parametrize("command", ["install", "repair", "restore", "uninstall"])
+def test_mutations_refuse_backup_only_cron_manifest_without_mutation(
+    tmp_path, command
+):
+    hermes_dir = make_cron_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    cron_backup = manifest["cron_backup"]
+    for field in (
+        "cron_py",
+        "cron_patched_sha256",
+        "cron_backup",
+        "cron_backup_sha256",
+    ):
+        manifest.pop(field)
+    manifest["cron_backup"] = cron_backup
+    manifest_path(hermes_dir).write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    before = {
+        path.relative_to(hermes_dir).as_posix(): path.read_bytes()
+        for path in hermes_dir.rglob("*")
+        if path.is_file()
+    }
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    after = {
+        path.relative_to(hermes_dir).as_posix(): path.read_bytes()
+        for path in hermes_dir.rglob("*")
+        if path.is_file()
+    }
+    assert result.returncode != 0
+    assert "cron ownership fields are incomplete" in result.stderr
+    assert after == before
+
+
 def test_repeat_install_ignores_unchanged_optional_cron_evidence(tmp_path):
     hermes_dir = copy_hermes(tmp_path)
     cron_dir = hermes_dir / "cron"
@@ -1004,11 +2585,14 @@ def test_install_failure_restores_run_py_and_removes_manifest_and_backup(
 ):
     hermes_dir = copy_hermes(tmp_path)
     original = run_py(hermes_dir).read_text(encoding="utf-8")
+    original_atomic_write = cli._atomic_write_text
 
-    def fail_manifest(*_args):
-        raise OSError("manifest unavailable")
+    def fail_manifest(path, contents, **kwargs):
+        if Path(path) == manifest_path(hermes_dir):
+            raise OSError("manifest unavailable")
+        return original_atomic_write(path, contents, **kwargs)
 
-    monkeypatch.setattr(cli, "_write_manifest", fail_manifest)
+    monkeypatch.setattr(cli, "_atomic_write_text", fail_manifest)
 
     result = cli._run_install(Namespace(hermes_dir=str(hermes_dir), yes=True))
 
@@ -1018,6 +2602,135 @@ def test_install_failure_restores_run_py_and_removes_manifest_and_backup(
     assert "HERMES_FEISHU_CARD_PATCH_BEGIN" not in current
     assert not manifest_path(hermes_dir).exists()
     assert not backup_path(hermes_dir).exists()
+
+
+def test_install_posix_commits_all_mutations_in_one_transaction(
+    tmp_path, monkeypatch
+):
+    if not cli._cli_dirfd_binding_supported():
+        pytest.skip("requires POSIX dirfd transaction support")
+    hermes_dir = copy_hermes(tmp_path)
+    original_writer = cli._write_targets_transactionally
+    calls = []
+
+    def record_transaction(changes, **kwargs):
+        calls.append(([path for path, _contents in changes], kwargs))
+        return original_writer(changes, **kwargs)
+
+    monkeypatch.setattr(cli, "_write_targets_transactionally", record_transaction)
+
+    result = cli._run_install(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result == 0
+    assert len(calls) == 1
+    assert calls[0][0] == [
+        backup_path(hermes_dir),
+        run_py(hermes_dir),
+        manifest_path(hermes_dir),
+    ]
+    assert calls[0][1]["expected_identities"]
+    assert calls[0][1]["expected_directories"]
+
+
+def test_install_transaction_refuses_parent_swap_at_entry(tmp_path, monkeypatch):
+    if not cli._cli_dirfd_binding_supported():
+        pytest.skip("requires POSIX dirfd transaction support")
+    hermes_dir = copy_hermes(tmp_path)
+    parent = run_py(hermes_dir).parent
+    real_parent = parent.with_name("gateway-real")
+    original_writer = cli._write_targets_transactionally
+    injected = False
+
+    def swap_parent_before_transaction(changes, **kwargs):
+        nonlocal injected
+        parent.rename(real_parent)
+        parent.mkdir()
+        (parent / "run.py").write_text("USER-TARGET\n", encoding="utf-8")
+        injected = True
+        return original_writer(changes, **kwargs)
+
+    monkeypatch.setattr(
+        cli, "_write_targets_transactionally", swap_parent_before_transaction
+    )
+
+    result = cli._run_install(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert injected
+    assert (parent / "run.py").read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert not (parent / BACKUP_NAME).exists()
+    assert not manifest_path(hermes_dir).exists()
+    assert (real_parent / "run.py").exists()
+
+
+def test_install_snapshot_precedes_original_read_parent_swap(tmp_path, monkeypatch):
+    if not cli._cli_dirfd_binding_supported():
+        pytest.skip("requires POSIX dirfd transaction support")
+    hermes_dir = copy_hermes(tmp_path)
+    target = run_py(hermes_dir)
+    parent = target.parent
+    real_parent = parent.with_name("gateway-real")
+    original_read = cli._read_restore_text
+    injected = False
+
+    def swap_parent_after_original_read(path, expected_snapshot):
+        nonlocal injected
+        contents = original_read(path, expected_snapshot)
+        if path == target and not injected:
+            parent.rename(real_parent)
+            parent.mkdir()
+            (parent / target.name).write_text(contents, encoding="utf-8")
+            injected = True
+        return contents
+
+    monkeypatch.setattr(cli, "_read_restore_text", swap_parent_after_original_read)
+
+    result = cli._run_install(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert injected
+    assert (parent / target.name).read_text(encoding="utf-8") == (
+        real_parent / target.name
+    ).read_text(encoding="utf-8")
+    assert not (parent / BACKUP_NAME).exists()
+    assert not manifest_path(hermes_dir).exists()
+
+
+def test_install_rollback_unlink_stays_bound_when_parent_swaps_at_syscall(
+    tmp_path, monkeypatch
+):
+    hermes_dir = copy_hermes(tmp_path)
+    evidence = backup_path(hermes_dir)
+    parent = evidence.parent
+    real_parent = parent.with_name("gateway-real")
+    original_atomic_write = cli._atomic_write_text
+    original_unlink = cli.os.unlink
+    injected = False
+
+    def fail_run_write(path, contents, **kwargs):
+        if path == run_py(hermes_dir):
+            raise OSError("run.py write failed")
+        return original_atomic_write(path, contents, **kwargs)
+
+    def swap_parent_at_evidence_unlink(path, *args, **kwargs):
+        nonlocal injected
+        candidate = os.fspath(path)
+        if not injected and candidate in {os.fspath(evidence), evidence.name}:
+            parent.rename(real_parent)
+            parent.mkdir()
+            (parent / evidence.name).write_text("USER-TARGET\n", encoding="utf-8")
+            injected = True
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli, "_atomic_write_text", fail_run_write)
+    monkeypatch.setattr(cli.os, "unlink", swap_parent_at_evidence_unlink)
+
+    result = cli._run_install(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert injected
+    assert (parent / evidence.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert not (real_parent / evidence.name).exists()
 
 
 def test_restore_refuses_to_overwrite_user_edited_run_py(tmp_path):
@@ -1596,6 +3309,71 @@ def test_repair_recreates_missing_backup_from_owned_patch(tmp_path):
     assert restore.returncode == 0, restore.stderr
 
 
+@pytest.mark.parametrize(
+    ("factory", "managed_backup", "ownership_fields"),
+    [
+        (make_exact_019_hermes, base_backup_path, cli._BASE_MANIFEST_FIELDS),
+        (make_cron_hermes, cron_backup_path, cli._CRON_MANIFEST_FIELDS),
+    ],
+)
+def test_repair_refuses_non_executable_empty_plan_for_owned_incomplete_state(
+    tmp_path, factory, managed_backup, ownership_fields
+):
+    hermes_dir = factory(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    manifest["manifest_version"] = 1
+    for field in ownership_fields:
+        manifest.pop(field)
+    manifest_path(hermes_dir).write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    managed_backup(hermes_dir).unlink()
+    run_py(hermes_dir).write_bytes(backup_path(hermes_dir).read_bytes())
+    evidence = {
+        path: path.read_bytes() if path.exists() else None
+        for path in (
+            run_py(hermes_dir),
+            backup_path(hermes_dir),
+            manifest_path(hermes_dir),
+            base_path(hermes_dir),
+            base_backup_path(hermes_dir),
+            cron_path(hermes_dir),
+            cron_backup_path(hermes_dir),
+        )
+    }
+
+    result = run_cli("repair", "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "error:" in result.stderr
+    assert "repair ok" not in result.stdout
+    assert "repair: no changes" not in result.stdout
+    assert {
+        path: path.read_bytes() if path.exists() else None for path in evidence
+    } == evidence
+
+
+def test_repair_healthy_installed_state_is_noop(tmp_path):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    evidence = {
+        path: path.read_bytes()
+        for path in (
+            run_py(hermes_dir),
+            backup_path(hermes_dir),
+            manifest_path(hermes_dir),
+        )
+    }
+
+    result = run_cli("repair", "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert "repair: no changes" in result.stdout
+    assert "repair ok" in result.stdout
+    assert {path: path.read_bytes() for path in evidence} == evidence
+
+
 def test_repair_refuses_user_edited_installed_run_py(tmp_path):
     hermes_dir = copy_hermes(tmp_path)
 
@@ -1845,8 +3623,12 @@ def test_existing_manifest_survives_manifest_rewrite_failure(tmp_path, monkeypat
     assert install_result.returncode == 0, install_result.stderr
     old_manifest = manifest_path(hermes_dir).read_text(encoding="utf-8")
 
-    def fail_atomic_write(*_args):
-        raise OSError("atomic manifest write failed")
+    original_atomic_write = cli._atomic_write_text
+
+    def fail_atomic_write(path, contents, **kwargs):
+        if Path(path) == manifest_path(hermes_dir):
+            raise OSError("atomic manifest write failed")
+        return original_atomic_write(path, contents, **kwargs)
 
     monkeypatch.setattr(cli, "_atomic_write_text", fail_atomic_write, raising=False)
 

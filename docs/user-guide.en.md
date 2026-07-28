@@ -64,6 +64,31 @@ Since V3.8.2, the final answer stays in the primary content area while pre-tool 
 | Multi-bot, group, and profile routing is hard to inspect | `bindings.chats`, safe `group_rules` diagnostics, profile-aware sessions, and `/health.routing` diagnostics |
 | Hook or sidecar failures are hard to debug | `doctor`, runtime import checks, `/health` metrics, fail-closed installer, restore/uninstall |
 
+## V4.1.0 Delivery Policy, Content Protection, and Runtime Safety
+
+Per-chat switching uses exact matching only:
+
+```yaml
+bindings:
+  native_chats: []
+card:
+  table_overflow_mode: compact  # compact | truncate
+integrity:
+  mode: safe  # safe | notify | off
+service:
+  manager: auto  # auto | systemd-user | systemd-system | detached
+```
+
+In multi-profile mode, `bindings.native_chats` must live under the matching `profiles.<id>.bindings` and never inherits the top-level list. Use `chats use-native CHAT_ID --config CONFIG` and `chats use-card CHAT_ID --config CONFIG` to change it, and `chats list --config CONFIG` for masked output. Changes affect the next new message. A policy-request, config-reload, or profile-validation failure fails open to Hermes native delivery, while `/hfc` stays a card-based management surface.
+
+Multi-bot groups from Issue #162 must opt into native mode: add the group to `bindings.native_chats` so the post carries `@bot` when it is created; grant the mentioned app `im:message.group_at_msg.include_bot:readonly`, keep its `im.message.receive_v1` subscription, and publish a new app version after adding the permission so it takes effect. A mention added by a later streaming-card PATCH does not retroactively create an `im.message.receive_v1` event, and HFC does not switch a live turn based on generated content.
+
+`table_overflow_mode: compact` converts table six onward into ordered field lists and retains all data; `truncate` is the explicit legacy choice. The scanner ignores fenced code. If the actual card JSON exceeds five tables, 200 tagged elements, or 28,000 UTF-8 bytes, non-terminal events keep collecting and a terminal event never sends a truncated card. Only a text-only ordinary Hermes 0.19 final answer from the default profile, with a managed Base ledger obligation and complete content/plan/route exact binding, receives a V2 descriptor, per-chunk UUIDs, and ACK after ledger `delivered` for bounded idempotency inside the one-hour window. A lost terminal response first performs the same-binding lookup for the just-committed descriptor. Outside the window the descriptor expires and the sidecar marks it `uncertain`; Hermes may still avoid answer loss through bounded ordinary native recovery with a visible `RECOVERED_MARKER`, but that random-UUID path is outside the exact contract. Hermes 0.19 startup recovery does not sweep independent secondary-profile ledgers, so secondary profiles, attachments/media, Cron, direct-command, and incomplete-binding paths keep native best-effort/fail-open behavior and do not promise forever exactly-once.
+
+New installs write `integrity.mode: safe`; an old config without the section loads as `notify`. After an older install explicitly runs `integrity migrate-safe --config CONFIG --hermes-dir HERMES_DIR --yes`, it reports `sidecar.restart_required: true` and `gateway.restart_required: false`; restart the sidecar. Only a later strict repair that reinstalls the hook reports `gateway.restart_required: true`, and HFC never restarts Gateway automatically. Signed `runtime.hello` / `runtime.heartbeat` events distinguish process liveness from actual delivery readiness.
+
+`service.manager: auto` selects an available `systemd-user` manager or falls back to `detached`; it never silently enters `systemd-system` or invokes sudo. `systemd-system` is an explicit Linux-only transient-unit opt-in. Docker stays an ordinary container process with `detached`. See [V4.1 safety controls and troubleshooting](wiki/v4.1-safety-controls.md) for the full boundary.
+
 ## V4.0.0 Live Dual-Stream Cards
 
 - The running Header title keeps the user-configured card name (`Hermes Agent` by default), while the subtitle derives concise searching, reading, editing, browsing, or terminal action summaries from the tool name and Hermes `progress_callback.preview`.
@@ -454,14 +479,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.0.21`.
+The Compose example defaults `HFC_VERSION` to `v4.1.0`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.0.21
+export HFC_VERSION=v4.1.0
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -500,7 +525,7 @@ python3 -m hermes_feishu_card.cli doctor \
 - **Attachment summaries and native media delivery**: cards show attachment summaries while the hook keeps Hermes native media/file delivery paths unsuppressed
 - **Tool call tracking**: `tool.updated` shows cumulative call count and status
 - **Runtime footer**: duration, model, tokens, context %. Non-terminal cards show a rotating braille spinner
-- **Table limit protection** (new in V3.3.0): auto-truncates tables exceeding Feishu's 5-table limit with a notice appended
+- **Table limit protection**: V4.1 defaults to lossless `compact` conversion after five rendered tables; explicit `truncate` preserves the earlier omission behavior
 - **Platform check fix** (new in V3.3.0): non-Feishu platforms no longer swallowed by the complete hook
 - **Fault isolation**: sidecar unavailable → Hermes hook fail-open, native text continues working
 - **Safe installer**: fail-closed, checks version and code structure before writing. `restore`/`uninstall` refuse on modified files
@@ -570,7 +595,7 @@ bots:
 bindings:
   fallback_bot: default
   chats:
-    oc_5cc6a25d8815790fa890dd0226005e83: sales
+    oc_example_sales: sales
   group_rules:
     enabled: false
     require_mention: true
@@ -698,12 +723,13 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 - **No cards after upgrading Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x**: run `doctor --config ... --hermes-dir ...` to inspect `hook_strategy`, `compatibility`, and anchors. If the installer reports that current unpatched source differs from the old backup and you have confirmed an intentional Hermes upgrade, run `install --hermes-dir ... --accept-hermes-upgrade --yes`; otherwise do not bypass the default refusal.
 - **Restore fails**: file modified → `restore`/`uninstall` refuse to overwrite. Run `doctor --explain` to inspect manifest/backup/run.py state; if it reports an automatic repair path, run `repair --hermes-dir ... --yes`. Use `repair --hermes-dir ... --accept-hermes-upgrade --yes` only after confirming that a Hermes upgrade replaced source; manually back up and inspect any other difference.
 - **Footer tokens wrong**: abnormal values filtered; if still wrong, inspect Hermes `tokens`/`context` metadata.
-- **Table limit exceeded**: V3.3.0 auto-truncates >5 tables with a notice. Reduce Markdown tables.
+- **Table limit exceeded**: V4.1 `compact` retains table six onward as field lists. A terminal card above the 28,000-byte budget hands the complete answer to Hermes native delivery rather than truncating it.
 
 ## Version History
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.1.0](release-notes-v4.1.0.en.md) | 2026-07-28 | Exact per-chat native policy, lossless compact rendering for excess tables, authenticated runtime integrity with strict repair, and four explicit service managers |
 | [v4.0.21](release-notes-v4.0.21.en.md) | 2026-07-28 | Issue #155 archives only at an explicit `answer -> tool` boundary so post-tool final answers stay visible; Issue #147 real Feishu acceptance observed a completion card plus native image and two answer segments in one card with no matching native duplicate or uncertain-delivery warning; it does not claim screenshot or desktop/mobile visual QA |
 | [v4.0.20](release-notes-v4.0.20.en.md) | 2026-07-22 | Issue #153: queued notice ACKs use `accepted`, with redacted metrics and codes for real PATCH failures |
 | [v4.0.19](release-notes-v4.0.19.en.md) | 2026-07-22 | Avoids `pip --user` inside the Hermes venv and stops immediately with the real pip failure |
@@ -811,3 +837,5 @@ Thanks to these contributors for improving the project:
 ## Security
 
 Default loopback uses local-process trust; do not expose an unauthenticated sidecar to the network. Non-loopback requires explicit `server.allow_non_loopback: true` and state-directory HMAC event authentication. Event authentication does not encrypt traffic, so public deployment still requires TLS/mTLS or a controlled reverse proxy. Do not commit App Secret, tenant token, or real chat_id. Production credentials belong in local config or environment variables.
+
+Windows non-loopback startup is rejected when state-directory ACL privacy cannot be verified. Windows loopback remains available under local-process trust without claiming that ACL privacy has been verified.

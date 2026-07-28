@@ -42,6 +42,34 @@ jobs:
       - name: Test live handler compatibility
         run: python -m pytest tests/integration/test_feishu_sdk_compat.py -q
 
+  docker-compose-runtime-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate published Docker Compose topology
+        env:
+          FEISHU_APP_ID: cli_test_only
+          FEISHU_APP_SECRET: test_only_not_a_real_secret
+          HFC_VERSION: v4.1.0
+        run: docker compose -f docker-compose.example.yml config --quiet
+      - name: Start published Compose smoke topology
+        run: >-
+          docker compose -f docker-compose.smoke.yml up
+          --detach --wait --wait-timeout 180 --quiet-pull gateway
+      - name: Show Compose logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.smoke.yml ps -a
+          docker compose -f docker-compose.smoke.yml logs --no-color setup sidecar gateway
+      - name: Probe installed Gateway and sidecar
+        run: >-
+          timeout 30 docker compose -f docker-compose.smoke.yml run
+          --rm --no-deps probe
+      - name: Clean Compose smoke resources
+        if: always()
+        run: docker compose -f docker-compose.smoke.yml down --volumes --remove-orphans
+
   powershell-installer:
     runs-on: windows-latest
 

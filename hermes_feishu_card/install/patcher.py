@@ -31,10 +31,22 @@ COMMAND_CARD_STARTUP_PATCH_BEGIN = (
     "# HERMES_FEISHU_CARD_COMMAND_CARD_STARTUP_PATCH_BEGIN"
 )
 COMMAND_CARD_STARTUP_PATCH_END = "# HERMES_FEISHU_CARD_COMMAND_CARD_STARTUP_PATCH_END"
+NATIVE_REDELIVERY_PATCH_BEGIN = "# HERMES_FEISHU_CARD_NATIVE_REDELIVERY_PATCH_BEGIN"
+NATIVE_REDELIVERY_PATCH_END = "# HERMES_FEISHU_CARD_NATIVE_REDELIVERY_PATCH_END"
 PLATFORM_NOTICE_PATCH_BEGIN = "# HERMES_FEISHU_CARD_PLATFORM_NOTICE_PATCH_BEGIN"
 PLATFORM_NOTICE_PATCH_END = "# HERMES_FEISHU_CARD_PLATFORM_NOTICE_PATCH_END"
 HFC_COMMAND_PATCH_BEGIN = "# HERMES_FEISHU_CARD_HFC_COMMAND_PATCH_BEGIN"
 HFC_COMMAND_PATCH_END = "# HERMES_FEISHU_CARD_HFC_COMMAND_PATCH_END"
+EXACT_BASE_NO_TEXT_PATCH_BEGIN = (
+    "# HERMES_FEISHU_CARD_EXACT_BASE_NO_TEXT_PATCH_BEGIN"
+)
+EXACT_BASE_NO_TEXT_PATCH_END = "# HERMES_FEISHU_CARD_EXACT_BASE_NO_TEXT_PATCH_END"
+EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN = (
+    "# HERMES_FEISHU_CARD_EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN"
+)
+EXACT_BASE_FINAL_DELIVERY_PATCH_END = (
+    "# HERMES_FEISHU_CARD_EXACT_BASE_FINAL_DELIVERY_PATCH_END"
+)
 
 _HANDLER_NAME = "_handle_message_with_agent"
 _CRON_DELIVER_NAME = "_deliver_result"
@@ -52,6 +64,7 @@ def apply_patch(content: str, strategy: str = "legacy_gateway_run") -> str:
     if strategy == "gateway_run_013_plus":
         content = _apply_cron_patch(content)
         content = _apply_command_card_startup_patch(content)
+        content = _apply_native_redelivery_patch(content)
         content = _apply_command_card_adapter_patch(content)
         content = _apply_hfc_command_patch(content)
         content = _apply_platform_notice_patch(content)
@@ -151,6 +164,66 @@ def apply_patch(content: str, strategy: str = "legacy_gateway_run") -> str:
 def apply_cron_patch(content: str) -> str:
     """Insert the Feishu card cron hook into a safe Hermes cron delivery function."""
     return _apply_cron_patch(content)
+
+
+def apply_base_patch(content: str) -> str:
+    """Patch Hermes' exact final-delivery pipeline without reimplementing it.
+
+    This entry point is intentionally separate from :func:`apply_patch`: it
+    operates on ``gateway/platforms/base.py``, while ``apply_patch`` owns
+    ``gateway/run.py``.  The structural contract is strict because placing
+    either hook on the wrong side of the delivery ledger can create a crash
+    window or acknowledge content that Hermes never attempted to send.
+    """
+    owned = _find_owned_exact_base_blocks(content, strict=True)
+    tree = _parse_exact_base_content(content)
+    lines = content.splitlines(keepends=True)
+    no_text_location, final_location = _find_exact_base_patch_locations(tree, lines)
+
+    if owned is not None:
+        _validate_exact_base_owned_locations(
+            owned,
+            no_text_location=no_text_location,
+            final_location=final_location,
+        )
+        return content
+
+    newline = _detect_newline(content)
+    no_text_index, no_text_indent = no_text_location
+    final_index, final_indent = final_location
+    no_text_hook = _render_exact_base_no_text_hook_block(no_text_indent, newline)
+    final_hook = _render_exact_base_final_delivery_hook_block(final_indent, newline)
+
+    # Insert bottom-up so the earlier location is not shifted by the later
+    # block. Both anchors are guaranteed to belong to the same exact pipeline.
+    lines = lines[:final_index] + final_hook + lines[final_index:]
+    lines = lines[:no_text_index] + no_text_hook + lines[no_text_index:]
+    return "".join(lines)
+
+
+def remove_base_patch(content: str) -> str:
+    """Strictly remove exact BasePlatformAdapter hooks owned by this project."""
+    owned = _find_owned_exact_base_blocks(content, strict=True)
+    if owned is None:
+        return content
+
+    tree = _parse_exact_base_content(content)
+    lines = content.splitlines(keepends=True)
+    no_text_location, final_location = _find_exact_base_patch_locations(tree, lines)
+    _validate_exact_base_owned_locations(
+        owned,
+        no_text_location=no_text_location,
+        final_location=final_location,
+    )
+    return _remove_exact_base_blocks(content, owned)
+
+
+def remove_base_patch_lenient(content: str) -> str:
+    """Remove owned Base hooks while accepting older generated block bodies."""
+    owned = _find_owned_exact_base_blocks(content, strict=False)
+    if owned is None:
+        return content
+    return _remove_exact_base_blocks(content, owned)
 
 
 def _apply_start_patch(content: str, *, strategy: str) -> str:
@@ -334,28 +407,61 @@ def _apply_command_card_startup_patch(content: str) -> str:
         "command card startup patch markers",
     )
     if owned_block is not None:
-        lines = content.splitlines(keepends=True)
-        begin_index, end_index = owned_block
-        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
-        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
-        expected = _render_command_card_startup_hook_block(indent, newline)
-        if lines[begin_index : end_index + 1] == expected:
-            return content
-        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+        stripped = _remove_simple_owned_patch(
+            content,
+            COMMAND_CARD_STARTUP_PATCH_BEGIN,
+            COMMAND_CARD_STARTUP_PATCH_END,
+            _render_command_card_startup_hook_block,
+            "command card startup patch markers",
+        )
+        if stripped != content:
+            return _apply_command_card_startup_patch(stripped)
 
     tree = _parse_content(content)
     func = _find_gateway_runner_method(tree, "start")
     if func is None:
         return content
-    drain = _find_recovered_watcher_drain(func)
-    if drain is None or drain.lineno is None:
+    anchor = _find_redelivery_startup_call(func) or _find_recovered_watcher_drain(func)
+    if anchor is None or anchor.lineno is None:
         return content
 
     lines = content.splitlines(keepends=True)
-    insert_at = drain.lineno - 1
+    insert_at = anchor.lineno - 1
     indent = _line_indent(lines, insert_at)
     newline = _line_ending(lines[insert_at]) or _detect_newline(content)
     hook = _render_command_card_startup_hook_block(indent, newline)
+    return "".join(lines[:insert_at] + hook + lines[insert_at:])
+
+
+def _apply_native_redelivery_patch(content: str) -> str:
+    owned_block = _find_simple_marker_block(
+        content,
+        NATIVE_REDELIVERY_PATCH_BEGIN,
+        NATIVE_REDELIVERY_PATCH_END,
+        "native redelivery patch markers",
+    )
+    if owned_block is not None:
+        lines = content.splitlines(keepends=True)
+        begin_index, end_index = owned_block
+        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
+        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
+        expected = _render_native_redelivery_hook_block(indent, newline)
+        if lines[begin_index : end_index + 1] == expected:
+            return content
+        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+
+    tree = _parse_content(content)
+    func = _find_gateway_runner_method(tree, "_redeliver_pending_obligations")
+    if func is None:
+        return content
+    send = _find_redelivery_adapter_send(func)
+    if send is None or send.lineno is None:
+        return content
+    lines = content.splitlines(keepends=True)
+    insert_at = send.lineno - 1
+    indent = _line_indent(lines, insert_at)
+    newline = _line_ending(lines[insert_at]) or _detect_newline(content)
+    hook = _render_native_redelivery_hook_block(indent, newline)
     return "".join(lines[:insert_at] + hook + lines[insert_at:])
 
 
@@ -437,6 +543,13 @@ def remove_patch(content: str) -> str:
         COMMAND_CARD_STARTUP_PATCH_END,
         _render_command_card_startup_hook_block,
         "command card startup patch markers",
+    )
+    content = _remove_simple_owned_patch(
+        content,
+        NATIVE_REDELIVERY_PATCH_BEGIN,
+        NATIVE_REDELIVERY_PATCH_END,
+        _render_native_redelivery_hook_block,
+        "native redelivery patch markers",
     )
     content = _remove_simple_owned_patch(
         content,
@@ -565,6 +678,7 @@ def remove_patch_lenient(content: str) -> str:
         (APPROVAL_PATCH_BEGIN, APPROVAL_PATCH_END),
         (STATUS_PATCH_BEGIN, STATUS_PATCH_END),
         (COMMAND_CARD_STARTUP_PATCH_BEGIN, COMMAND_CARD_STARTUP_PATCH_END),
+        (NATIVE_REDELIVERY_PATCH_BEGIN, NATIVE_REDELIVERY_PATCH_END),
         (COMMAND_CARD_PATCH_BEGIN, COMMAND_CARD_PATCH_END),
         (HFC_COMMAND_PATCH_BEGIN, HFC_COMMAND_PATCH_END),
         (PLATFORM_NOTICE_PATCH_BEGIN, PLATFORM_NOTICE_PATCH_END),
@@ -1137,6 +1251,11 @@ def _find_owned_complete_block(content: str):
     expected_with_anchor = _render_complete_hook_block_with_reply_anchor(indent, newline)
     expected = _render_complete_hook_block(indent, newline)
     v400 = _render_v400_complete_hook_block(indent, newline)
+    pre_exact_with_anchor = _render_pre_exact_complete_hook_block_with_reply_anchor(
+        indent, newline
+    )
+    pre_exact = _render_pre_exact_complete_hook_block(indent, newline)
+    pre_exact_v400 = _render_pre_exact_v400_complete_hook_block(indent, newline)
     legacy = _render_legacy_complete_hook_block(indent, newline)
     previous_async = _render_previous_async_complete_hook_block(indent, newline)
     previous_async_without_platform = (
@@ -1147,6 +1266,13 @@ def _find_owned_complete_block(content: str):
     )
     expected_silent = _with_silent_exception_handler(expected, indent, newline)
     v400_silent = _with_silent_exception_handler(v400, indent, newline)
+    pre_exact_with_anchor_silent = _with_silent_exception_handler(
+        pre_exact_with_anchor, indent, newline
+    )
+    pre_exact_silent = _with_silent_exception_handler(pre_exact, indent, newline)
+    pre_exact_v400_silent = _with_silent_exception_handler(
+        pre_exact_v400, indent, newline
+    )
     legacy_silent = _with_silent_exception_handler(legacy, indent, newline)
     previous_async_silent = _with_silent_exception_handler(
         previous_async, indent, newline
@@ -1159,12 +1285,18 @@ def _find_owned_complete_block(content: str):
         expected_with_anchor,
         expected,
         v400,
+        pre_exact_with_anchor,
+        pre_exact,
+        pre_exact_v400,
         legacy,
         previous_async,
         previous_async_without_platform,
         expected_with_anchor_silent,
         expected_silent,
         v400_silent,
+        pre_exact_with_anchor_silent,
+        pre_exact_silent,
+        pre_exact_v400_silent,
         legacy_silent,
         previous_async_silent,
         previous_async_without_platform_silent,
@@ -1318,6 +1450,506 @@ def _find_gateway_runner_method(tree, name: str):
     return None
 
 
+def _parse_exact_base_content(content: str):
+    try:
+        tree = ast.parse(content)
+    except SyntaxError as exc:
+        raise ValueError("could not find safe BasePlatformAdapter contract") from exc
+    return tree
+
+
+def _find_exact_base_patch_locations(tree, lines):
+    """Return the two insertion locations after validating Hermes' pipeline."""
+    method = _find_exact_base_process_method(tree)
+    method_nodes = list(ast.walk(method))
+
+    extract_media = _unique_exact_base_node(
+        method_nodes,
+        lambda node: _is_exact_assignment_call(
+            node,
+            targets=("media_files", "response"),
+            owner="self",
+            function="extract_media",
+            args=("response",),
+        ),
+    )
+    filter_media = _unique_exact_base_node(
+        method_nodes,
+        lambda node: _is_exact_assignment_call(
+            node,
+            targets=("media_files",),
+            owner="self",
+            function="filter_media_delivery_paths",
+            args=("media_files",),
+        ),
+    )
+    extract_images = _unique_exact_base_node(
+        method_nodes,
+        lambda node: _is_exact_assignment_call(
+            node,
+            targets=("images", "text_content"),
+            owner="self",
+            function="extract_images",
+            args=("response",),
+        ),
+    )
+    strip_text = _unique_exact_base_node(
+        method_nodes,
+        lambda node: _is_strip_assignment(
+            node,
+            target="text_content",
+            source="text_content",
+        ),
+    )
+    extract_local = _unique_exact_base_node(
+        method_nodes,
+        lambda node: _is_exact_assignment_call(
+            node,
+            targets=("local_files", "text_content"),
+            owner="self",
+            function="extract_local_files",
+            args=("text_content",),
+        ),
+    )
+    filter_local = _unique_exact_base_node(
+        method_nodes,
+        lambda node: _is_exact_assignment_call(
+            node,
+            targets=("local_files",),
+            owner="self",
+            function="filter_local_delivery_paths",
+            args=("local_files",),
+        ),
+    )
+    recovered = _unique_exact_base_node(
+        method_nodes,
+        lambda node: _is_strip_assignment(
+            node,
+            target="_recovered",
+            source="response",
+        ),
+    )
+    restore_text = _unique_exact_base_node(
+        method_nodes,
+        lambda node: _is_exact_name_assignment(
+            node,
+            target="text_content",
+            value="_recovered",
+        ),
+    )
+    final_metadata = _unique_exact_base_node(
+        method_nodes,
+        lambda node: _is_exact_assignment_call(
+            node,
+            targets=("_final_thread_metadata",),
+            owner=None,
+            function="_mark_notify_metadata",
+            args=("_thread_metadata",),
+        ),
+    )
+    tts_caption_default = _unique_exact_base_node(
+        method_nodes,
+        lambda node: _is_exact_constant_assignment(
+            node,
+            target="_tts_caption_delivered",
+            value=False,
+        ),
+    )
+    text_guard = _unique_exact_base_node(
+        method_nodes,
+        lambda node: isinstance(node, ast.If)
+        and _same_expression(
+            node.test,
+            "text_content and not _tts_caption_delivered",
+        ),
+    )
+
+    guard_nodes = list(ast.walk(text_guard))
+    delivery_adapter = _unique_exact_base_node(
+        guard_nodes,
+        lambda node: _is_exact_assignment_call(
+            node,
+            targets=("delivery_adapter",),
+            owner="self",
+            function="_final_delivery_adapter",
+            args=("event.source",),
+        ),
+    )
+    reply_anchor = _unique_exact_base_node(
+        guard_nodes,
+        lambda node: _is_exact_assignment_call(
+            node,
+            targets=("_reply_anchor",),
+            owner=None,
+            function="_reply_anchor_for_event",
+            args=("event",),
+        ),
+    )
+    compute_obligation = _unique_exact_base_node(
+        guard_nodes,
+        _is_exact_compute_obligation_assignment,
+    )
+    obligation_default = _unique_exact_base_node(
+        guard_nodes,
+        lambda node: _is_exact_constant_assignment(
+            node,
+            target="_obligation_id",
+            value=None,
+        )
+        and node.lineno < compute_obligation.lineno,
+    )
+    record_obligation = _unique_exact_base_node(
+        guard_nodes,
+        lambda node: _is_exact_ledger_call(
+            node,
+            function="record_obligation",
+            required_keywords={
+                "obligation_id": "_obligation_id",
+                "content": "text_content",
+            },
+        ),
+    )
+    mark_attempting = _unique_exact_base_node(
+        guard_nodes,
+        lambda node: _is_exact_positional_call(
+            node,
+            function="mark_attempting",
+            args=("_obligation_id",),
+        ),
+    )
+    send = _unique_exact_base_node(guard_nodes, _is_exact_final_send_assignment)
+    record_delivery = _unique_exact_base_node(
+        guard_nodes,
+        lambda node: _is_exact_positional_call(
+            node,
+            function="_record_delivery",
+            args=("result",),
+        ),
+    )
+    mark_delivered = _unique_exact_base_node(
+        guard_nodes,
+        lambda node: _is_exact_positional_call(
+            node,
+            function="mark_delivered",
+            args=("_obligation_id",),
+        ),
+    )
+    mark_failed = _unique_exact_base_node(
+        guard_nodes,
+        lambda node: _is_exact_mark_failed_call(node),
+    )
+
+    # The ledger operations must finish in one direct child statement before
+    # the send. Merely checking line order would accept a source drift where
+    # `_send_with_retry` moved inside the ledger try, reopening the exact crash
+    # window this patch is meant to close.
+    send_position = _direct_child_position(text_guard.body, send)
+    ledger_positions = {
+        _direct_child_position(text_guard.body, node)
+        for node in (compute_obligation, record_obligation, mark_attempting)
+    }
+    if (
+        send_position is None
+        or None in ledger_positions
+        or len(ledger_positions) != 1
+        or next(iter(ledger_positions)) >= send_position
+    ):
+        raise ValueError("could not find safe BasePlatformAdapter contract")
+
+    ordered = (
+        extract_media,
+        filter_media,
+        extract_images,
+        strip_text,
+        extract_local,
+        filter_local,
+        recovered,
+        restore_text,
+        final_metadata,
+        tts_caption_default,
+        text_guard,
+        delivery_adapter,
+        reply_anchor,
+        obligation_default,
+        compute_obligation,
+        record_obligation,
+        mark_attempting,
+        send,
+        record_delivery,
+        mark_delivered,
+        mark_failed,
+    )
+    if any(getattr(node, "lineno", None) is None for node in ordered):
+        raise ValueError("could not find safe BasePlatformAdapter contract")
+    line_numbers = [node.lineno for node in ordered]
+    if line_numbers != sorted(line_numbers) or len(set(line_numbers)) != len(line_numbers):
+        raise ValueError("could not find safe BasePlatformAdapter contract")
+
+    no_text_index = text_guard.lineno - 1
+    send_index = send.lineno - 1
+    return (
+        (no_text_index, _line_indent(lines, no_text_index)),
+        (send_index, _line_indent(lines, send_index)),
+    )
+
+
+def _find_exact_base_process_method(tree):
+    classes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BasePlatformAdapter"
+    ]
+    if len(classes) != 1:
+        raise ValueError("could not find safe BasePlatformAdapter contract")
+    methods = [
+        node
+        for node in classes[0].body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_process_message_background"
+    ]
+    if len(methods) != 1:
+        raise ValueError("could not find safe BasePlatformAdapter contract")
+    return methods[0]
+
+
+def _unique_exact_base_node(nodes, predicate):
+    matches = [node for node in nodes if predicate(node)]
+    if len(matches) != 1:
+        raise ValueError("could not find safe BasePlatformAdapter contract")
+    return matches[0]
+
+
+def _direct_child_position(body, target):
+    target_id = id(target)
+    for index, statement in enumerate(body):
+        if any(id(node) == target_id for node in ast.walk(statement)):
+            return index
+    return None
+
+
+def _assignment_target_names(node):
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+        return None
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    names = []
+    for target in targets:
+        if isinstance(target, ast.Name):
+            names.append(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if not all(isinstance(item, ast.Name) for item in target.elts):
+                return None
+            names.extend(item.id for item in target.elts)
+        else:
+            return None
+    return tuple(names)
+
+
+def _assignment_value(node):
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        return node.value
+    return None
+
+
+def _same_expression(node, source: str) -> bool:
+    expected = ast.parse(source, mode="eval").body
+    return ast.dump(node, include_attributes=False) == ast.dump(
+        expected,
+        include_attributes=False,
+    )
+
+
+def _call_function(call):
+    if not isinstance(call, ast.Call):
+        return None, None
+    func = call.func
+    if isinstance(func, ast.Name):
+        return None, func.id
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return func.value.id, func.attr
+    return None, None
+
+
+def _is_exact_assignment_call(node, *, targets, owner, function, args):
+    if _assignment_target_names(node) != targets:
+        return False
+    value = _assignment_value(node)
+    if isinstance(value, ast.Await):
+        value = value.value
+    actual_owner, actual_function = _call_function(value)
+    if (actual_owner, actual_function) != (owner, function):
+        return False
+    if value.keywords or len(value.args) != len(args):
+        return False
+    return all(_same_expression(arg, expected) for arg, expected in zip(value.args, args))
+
+
+def _is_strip_assignment(node, *, target: str, source: str) -> bool:
+    if _assignment_target_names(node) != (target,):
+        return False
+    outer = _assignment_value(node)
+    if not (
+        isinstance(outer, ast.Call)
+        and isinstance(outer.func, ast.Attribute)
+        and outer.func.attr == "strip"
+        and not outer.args
+        and not outer.keywords
+    ):
+        return False
+    inner = outer.func.value
+    return (
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == "_strip_media_directives"
+        and len(inner.args) == 1
+        and not inner.keywords
+        and _same_expression(inner.args[0], source)
+    )
+
+
+def _is_exact_name_assignment(node, *, target: str, value: str) -> bool:
+    return _assignment_target_names(node) == (target,) and _same_expression(
+        _assignment_value(node),
+        value,
+    )
+
+
+def _is_exact_constant_assignment(node, *, target: str, value) -> bool:
+    assigned = _assignment_value(node)
+    return (
+        _assignment_target_names(node) == (target,)
+        and isinstance(assigned, ast.Constant)
+        and assigned.value is value
+    )
+
+
+def _is_exact_compute_obligation_assignment(node) -> bool:
+    if _assignment_target_names(node) != ("_obligation_id",):
+        return False
+    call = _assignment_value(node)
+    owner, function = _call_function(call)
+    return (
+        owner is None
+        and function == "compute_obligation_id"
+        and len(call.args) == 3
+        and not call.keywords
+        and _same_expression(call.args[0], "session_key")
+        and _same_expression(call.args[2], "text_content")
+    )
+
+
+def _expression_call(node):
+    if not isinstance(node, ast.Expr):
+        return None
+    value = node.value
+    if isinstance(value, ast.Await):
+        value = value.value
+    return value if isinstance(value, ast.Call) else None
+
+
+def _is_exact_ledger_call(node, *, function: str, required_keywords) -> bool:
+    call = _expression_call(node)
+    owner, actual_function = _call_function(call)
+    if owner is not None or actual_function != function or call.args:
+        return False
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
+    return all(
+        name in keywords and _same_expression(keywords[name], expression)
+        for name, expression in required_keywords.items()
+    )
+
+
+def _is_exact_positional_call(node, *, function: str, args) -> bool:
+    call = _expression_call(node)
+    owner, actual_function = _call_function(call)
+    return (
+        owner is None
+        and actual_function == function
+        and not call.keywords
+        and len(call.args) == len(args)
+        and all(
+            _same_expression(arg, expected)
+            for arg, expected in zip(call.args, args)
+        )
+    )
+
+
+def _is_exact_final_send_assignment(node) -> bool:
+    if _assignment_target_names(node) != ("result",):
+        return False
+    value = _assignment_value(node)
+    if not isinstance(value, ast.Await) or not isinstance(value.value, ast.Call):
+        return False
+    call = value.value
+    if not (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == "_send_with_retry"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "delivery_adapter"
+        and not call.args
+    ):
+        return False
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
+    expected = {
+        "chat_id": "event.source.chat_id",
+        "content": "text_content",
+        "reply_to": "_reply_anchor",
+        "metadata": "_final_thread_metadata",
+    }
+    return set(keywords) == set(expected) and all(
+        _same_expression(keywords[name], expression)
+        for name, expression in expected.items()
+    )
+
+
+def _is_exact_mark_failed_call(node) -> bool:
+    call = _expression_call(node)
+    owner, function = _call_function(call)
+    return (
+        owner is None
+        and function == "mark_failed"
+        and len(call.args) == 2
+        and not call.keywords
+        and _same_expression(call.args[0], "_obligation_id")
+    )
+
+
+def _find_redelivery_startup_call(func):
+    for node in func.body:
+        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Await):
+            continue
+        call = node.value.value
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_redeliver_pending_obligations"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "self"
+        ):
+            return node
+    return None
+
+
+def _find_redelivery_adapter_send(func):
+    matches = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Await):
+            continue
+        call = node.value.value
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "send"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "adapter"
+            and any(
+                isinstance(target, ast.Name) and target.id == "result"
+                for target in node.targets
+            )
+        ):
+            matches.append(node)
+    return matches[0] if len(matches) == 1 else None
+
+
 def _find_recovered_watcher_drain(func):
     for node in func.body:
         if not isinstance(node, ast.Try):
@@ -1396,6 +2028,69 @@ def _find_simple_marker_block(
     return begin_index, end_index
 
 
+def _find_owned_exact_base_blocks(content: str, *, strict: bool):
+    error_label = "exact base patch markers"
+    no_text = _find_simple_marker_block(
+        content,
+        EXACT_BASE_NO_TEXT_PATCH_BEGIN,
+        EXACT_BASE_NO_TEXT_PATCH_END,
+        error_label,
+    )
+    final = _find_simple_marker_block(
+        content,
+        EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN,
+        EXACT_BASE_FINAL_DELIVERY_PATCH_END,
+        error_label,
+    )
+    if no_text is None and final is None:
+        return None
+    if no_text is None or final is None:
+        raise ValueError("corrupt exact base patch markers")
+
+    if no_text[1] >= final[0]:
+        raise ValueError("corrupt exact base patch markers")
+    if strict:
+        lines = content.splitlines(keepends=True)
+        no_text_indent = _leading_whitespace(
+            _strip_line_ending(lines[no_text[0]])
+        )
+        no_text_newline = _line_ending(lines[no_text[0]]) or _detect_newline(content)
+        final_indent = _leading_whitespace(_strip_line_ending(lines[final[0]]))
+        final_newline = _line_ending(lines[final[0]]) or _detect_newline(content)
+        if lines[no_text[0] : no_text[1] + 1] != _render_exact_base_no_text_hook_block(
+            no_text_indent,
+            no_text_newline,
+        ):
+            raise ValueError("corrupt exact base patch markers")
+        if lines[final[0] : final[1] + 1] != _render_exact_base_final_delivery_hook_block(
+            final_indent,
+            final_newline,
+        ):
+            raise ValueError("corrupt exact base patch markers")
+    return no_text, final
+
+
+def _validate_exact_base_owned_locations(
+    owned,
+    *,
+    no_text_location,
+    final_location,
+) -> None:
+    no_text, final = owned
+    if (
+        no_text[1] + 1 != no_text_location[0]
+        or final[1] + 1 != final_location[0]
+    ):
+        raise ValueError("corrupt exact base patch markers")
+
+
+def _remove_exact_base_blocks(content: str, owned) -> str:
+    lines = content.splitlines(keepends=True)
+    for begin_index, end_index in sorted(owned, reverse=True):
+        lines[begin_index : end_index + 1] = []
+    return "".join(lines)
+
+
 def _exact_marker_line_index(lines, marker: str):
     for index, line in enumerate(lines):
         body = _strip_line_ending(line)
@@ -1441,6 +2136,55 @@ def _with_silent_exception_handler(block: list[str], indent: str, newline: str):
             result.append(block[index])
             index += 1
     return result
+
+
+def _render_exact_base_no_text_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    return [
+        f"{indent}{EXACT_BASE_NO_TEXT_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import finalize_exact_base_no_text as "
+            f"_hfc_finalize_exact_base_no_text{newline}"
+        ),
+        f"{inner_indent}if not text_content or _tts_caption_delivered:{newline}",
+        f"{deeper_indent}await _hfc_finalize_exact_base_no_text({{{newline}",
+        f"{deeper_indent}    **locals(),{newline}",
+        f"{deeper_indent}    \"source\": event.source,{newline}",
+        f"{deeper_indent}}}){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{EXACT_BASE_NO_TEXT_PATCH_END}{newline}",
+    ]
+
+
+def _render_exact_base_final_delivery_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    return [
+        f"{indent}{EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import prepare_exact_base_final_delivery as "
+            f"_hfc_prepare_exact_base_final_delivery{newline}"
+        ),
+        (
+            f"{inner_indent}delivery_adapter, text_content, _reply_anchor, "
+            f"_final_thread_metadata = await "
+            f"_hfc_prepare_exact_base_final_delivery({{{newline}"
+        ),
+        f"{inner_indent}    **locals(),{newline}",
+        f"{inner_indent}    \"source\": event.source,{newline}",
+        f"{inner_indent}    \"delivery_adapter\": delivery_adapter,{newline}",
+        f"{inner_indent}    \"content\": text_content,{newline}",
+        f"{inner_indent}    \"obligation_id\": _obligation_id,{newline}",
+        f"{inner_indent}    \"reply_to\": _reply_anchor,{newline}",
+        f"{inner_indent}    \"metadata\": _final_thread_metadata,{newline}",
+        f"{inner_indent}}}){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{EXACT_BASE_FINAL_DELIVERY_PATCH_END}{newline}",
+    ]
 
 
 def _render_hook_block_without_commands(
@@ -1538,6 +2282,107 @@ def _render_hook_block(indent: str, newline: str, strategy: str = "legacy_gatewa
 def _render_complete_hook_block(indent: str, newline: str):
     inner_indent = _child_indent(indent)
     deeper_indent = _child_indent(inner_indent)
+    deepest_indent = _child_indent(deeper_indent)
+    return [
+        f"{indent}{COMPLETE_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import build_event as _hfc_build_event{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import emit_from_hermes_locals_async as _hfc_emit_async{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import can_stage_exact_base_completion as _hfc_can_stage_exact{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import stage_message_completed_from_hermes_locals_async as _hfc_stage_exact{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import should_suppress_native_response as _hfc_should_suppress{newline}"
+        ),
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import native_media_only_response as _hfc_media_only{newline}"
+        ),
+        f"{inner_indent}_hfc_completed_locals = {{{newline}",
+        f"{deeper_indent}**locals(),{newline}",
+        f"{deeper_indent}\"answer\": response,{newline}",
+        f"{deeper_indent}\"duration\": _response_time,{newline}",
+        f"{deeper_indent}\"model\": agent_result.get(\"model\", \"\"),{newline}",
+        f"{deeper_indent}\"tokens\": {{{newline}",
+        f"{deeper_indent}    \"input_tokens\": agent_result.get(\"input_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"output_tokens\": agent_result.get(\"output_tokens\", 0),{newline}",
+        f"{deeper_indent}}},{newline}",
+        f"{deeper_indent}\"context\": {{{newline}",
+        f"{deeper_indent}    \"used_tokens\": agent_result.get(\"last_prompt_tokens\", 0),{newline}",
+        f"{deeper_indent}    \"max_tokens\": agent_result.get(\"context_length\", 0),{newline}",
+        f"{deeper_indent}}},{newline}",
+        f"{inner_indent}}}{newline}",
+        f"{inner_indent}_hfc_exact_staged = False{newline}",
+        f"{inner_indent}if _hfc_can_stage_exact(_hfc_completed_locals):{newline}",
+        f"{deeper_indent}_hfc_exact_staged = await _hfc_stage_exact(_hfc_completed_locals){newline}",
+        f"{inner_indent}if not _hfc_exact_staged:{newline}",
+        f"{deeper_indent}_hfc_completed_event = _hfc_build_event(\"message.completed\", _hfc_completed_locals, preview=True){newline}",
+        f"{deeper_indent}_hfc_attachments = []{newline}",
+        f"{deeper_indent}_hfc_native_delivery = \"allowed\"{newline}",
+        f"{deeper_indent}if _hfc_completed_event is not None:{newline}",
+        f"{deepest_indent}_hfc_completed_data = _hfc_completed_event.get(\"data\", {{}}){newline}",
+        f"{deepest_indent}_hfc_attachments = _hfc_completed_data.get(\"attachments\", []){newline}",
+        f"{deepest_indent}_hfc_native_delivery = _hfc_completed_data.get(\"native_delivery\", \"required\" if _hfc_attachments else \"allowed\"){newline}",
+        f"{deeper_indent}_hfc_card_delivered = await _hfc_emit_async(_hfc_completed_locals, event_name=\"message.completed\"){newline}",
+        f"{deeper_indent}_hfc_platform = getattr(source.platform, \"value\", source.platform){newline}",
+        f"{deeper_indent}if str(_hfc_platform).lower() == \"feishu\" and _hfc_card_delivered and _hfc_native_delivery == \"required\":{newline}",
+        f"{deepest_indent}response = _hfc_media_only(response){newline}",
+        f"{deeper_indent}if _hfc_should_suppress(_hfc_platform, _hfc_card_delivered, _hfc_attachments, _hfc_native_delivery):{newline}",
+        f"{deepest_indent}return None{newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{COMPLETE_PATCH_END}{newline}",
+    ]
+
+
+def _render_complete_hook_block_with_reply_anchor(indent: str, newline: str):
+    """Completion hook for gateway_run_013_plus handlers.
+
+    Derives an explicit message_id from the same reply anchor the started and
+    delta hooks use, so the terminal event always lands on the session that
+    owns the card instead of relying on the ambiguous terminal fallback cache
+    (which can make build_event return None on streamed turns).
+    """
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
+    block = list(_render_complete_hook_block(indent, newline))
+    anchor_lines = [
+        f"{inner_indent}_hfc_completed_message_id = None{newline}",
+        f"{inner_indent}try:{newline}",
+        f"{deeper_indent}_hfc_completed_message_id = self._reply_anchor_for_event(event){newline}",
+        f"{inner_indent}except Exception:{newline}",
+        f"{deeper_indent}_hfc_completed_message_id = getattr(event, \"message_id\", None){newline}",
+    ]
+    import_index = next(
+        index
+        for index, line in enumerate(block)
+        if "native_media_only_response as _hfc_media_only" in line
+    )
+    block[import_index + 1 : import_index + 1] = anchor_lines
+    locals_index = next(
+        index for index, line in enumerate(block) if "**locals()," in line
+    )
+    block[locals_index + 1 : locals_index + 1] = [
+        f"{deeper_indent}\"message_id\": _hfc_completed_message_id,{newline}"
+    ]
+    return block
+
+
+def _render_pre_exact_complete_hook_block(indent: str, newline: str):
+    """Render the last V4.1 block for narrow, owned upgrade migration only."""
+    inner_indent = _child_indent(indent)
+    deeper_indent = _child_indent(inner_indent)
     return [
         f"{indent}{COMPLETE_PATCH_BEGIN}{newline}",
         f"{indent}try:{newline}",
@@ -1589,30 +2434,25 @@ def _render_complete_hook_block(indent: str, newline: str):
     ]
 
 
-def _render_complete_hook_block_with_reply_anchor(indent: str, newline: str):
-    """Completion hook for gateway_run_013_plus handlers.
-
-    Derives an explicit message_id from the same reply anchor the started and
-    delta hooks use, so the terminal event always lands on the session that
-    owns the card instead of relying on the ambiguous terminal fallback cache
-    (which can make build_event return None on streamed turns).
-    """
+def _render_pre_exact_complete_hook_block_with_reply_anchor(
+    indent: str,
+    newline: str,
+):
     inner_indent = _child_indent(indent)
     deeper_indent = _child_indent(inner_indent)
-    block = list(_render_complete_hook_block(indent, newline))
-    anchor_lines = [
+    block = list(_render_pre_exact_complete_hook_block(indent, newline))
+    import_index = next(
+        index
+        for index, line in enumerate(block)
+        if "native_media_only_response as _hfc_media_only" in line
+    )
+    block[import_index + 1 : import_index + 1] = [
         f"{inner_indent}_hfc_completed_message_id = None{newline}",
         f"{inner_indent}try:{newline}",
         f"{deeper_indent}_hfc_completed_message_id = self._reply_anchor_for_event(event){newline}",
         f"{inner_indent}except Exception:{newline}",
         f"{deeper_indent}_hfc_completed_message_id = getattr(event, \"message_id\", None){newline}",
     ]
-    import_index = next(
-        index
-        for index, line in enumerate(block)
-        if "native_media_only_response as _hfc_media_only" in line
-    )
-    block[import_index + 1 : import_index + 1] = anchor_lines
     locals_index = next(
         index for index, line in enumerate(block) if "**locals()," in line
     )
@@ -1620,6 +2460,16 @@ def _render_complete_hook_block_with_reply_anchor(indent: str, newline: str):
         f"{deeper_indent}\"message_id\": _hfc_completed_message_id,{newline}"
     ]
     return block
+
+
+def _render_pre_exact_v400_complete_hook_block(indent: str, newline: str):
+    return [
+        line
+        for line in _render_pre_exact_complete_hook_block(indent, newline)
+        if "native_media_only_response as _hfc_media_only" not in line
+        and '_hfc_native_delivery == "required"' not in line
+        and "response = _hfc_media_only(response)" not in line
+    ]
 
 
 def _render_v400_complete_hook_block(indent: str, newline: str):
@@ -2097,6 +2947,28 @@ def _render_command_card_startup_hook_block(indent: str, newline: str):
         f"{inner_indent}_hfc_install_command_cards(self){newline}",
         *_render_hook_exception_handler(indent, newline),
         f"{indent}{COMMAND_CARD_STARTUP_PATCH_END}{newline}",
+    ]
+
+
+def _render_native_redelivery_hook_block(indent: str, newline: str):
+    inner_indent = _child_indent(indent)
+    return [
+        f"{indent}{NATIVE_REDELIVERY_PATCH_BEGIN}{newline}",
+        f"{indent}try:{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import prepare_native_handoff_recovery as _hfc_prepare_native_handoff_recovery{newline}"
+        ),
+        f"{inner_indent}await _hfc_prepare_native_handoff_recovery({newline}",
+        f"{inner_indent}    adapter=adapter,{newline}",
+        f"{inner_indent}    obligation_id=row.get(\"obligation_id\"),{newline}",
+        f"{inner_indent}    chat_id=row.get(\"chat_id\"),{newline}",
+        f"{inner_indent}    content=content,{newline}",
+        f"{inner_indent}    original_content=row.get(\"content\"),{newline}",
+        f"{inner_indent}    thread_id=row.get(\"thread_id\") or \"\",{newline}",
+        f"{inner_indent}){newline}",
+        *_render_hook_exception_handler(indent, newline),
+        f"{indent}{NATIVE_REDELIVERY_PATCH_END}{newline}",
     ]
 
 

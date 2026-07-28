@@ -28,7 +28,7 @@ python3 -m hermes_feishu_card.cli stop --config config.yaml.example
 python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --yes
 ```
 
-`restore` 只会恢复本插件 manifest 能校验的安装状态。若提示 `run.py changed since install`、`backup changed since install` 或 `install state incomplete`，说明文件状态无法自动确认，应停止并人工检查 Hermes `gateway/run.py`。
+`restore` 只会恢复本插件 manifest 能校验的安装状态。V4.1 的 `manifest_version: 2` 把 `gateway/run.py`、Hermes 0.19 required `gateway/platforms/base.py` 与 optional Cron 作为同一事务；任一目标或 backup 不完整都不会部分恢复。若提示 source/backup changed、`install state incomplete` 或 `newer installer required`，应停止并检查全部受管目标，不能只处理 `run.py`。
 
 4. 如果当前 Hermes 曾运行历史 legacy/dual 安装脚本，例如 `legacy/installer_v2.py`、`legacy/gateway_run_patch.py` 或 `legacy/patch_feishu.py`，先用当时保留的原始备份恢复 Hermes 文件。若没有可信备份，建议重新安装或重新 checkout 对应版本的 Hermes，再迁移。
 
@@ -46,7 +46,7 @@ python3 -m hermes_feishu_card.cli doctor --config config.yaml.example --hermes-d
 python3 -m hermes_feishu_card.cli install --hermes-dir ~/.hermes/hermes-agent --yes
 ```
 
-安装器会创建备份和 manifest，并以最小 hook 调用 `hermes_feishu_card.hook_runtime`。飞书 CardKit、会话状态、健康指标和重试计数都在 sidecar 进程内完成。
+安装器会为全部受管目标创建备份和 `manifest_version: 2`，再以最小 hook 调用 `hermes_feishu_card.hook_runtime`。Hermes 0.19 / `v2026.7.20+` 或检测到 exact ledger 结构时，required Base 必须与 run 一起安装、恢复和回滚。飞书 CardKit、会话状态、健康指标和重试计数都在 sidecar 进程内完成。
 
 7. 启动并检查 sidecar：
 
@@ -56,6 +56,36 @@ python3 -m hermes_feishu_card.cli status --config config.yaml.example
 ```
 
 `status` 应显示 `status: running`、`active_sessions` 和 metrics。未配置飞书凭据时会使用 no-op client；配置真实凭据时只从本机配置或环境变量读取。
+
+## 升级到 V4.1.0
+
+V4.1.0 保持旧会话的卡片默认与旧配置的非自动变更边界。建议先升级包并重新运行 setup/install，再按需加入：
+
+```yaml
+bindings:
+  native_chats: []
+card:
+  table_overflow_mode: compact  # compact | truncate
+integrity:
+  mode: notify  # 旧配置保持 notify；显式迁移后再 safe
+service:
+  manager: auto  # auto | systemd-user | systemd-system | detached
+```
+
+`bindings.native_chats` 只精确匹配。用 `chats use-native`、`chats use-card`、`chats list` 管理；多 profile 必须加 `--profile-id` 并写入对应 profile。`table_overflow_mode: compact` 无损转换第 6 张及后续表格，`truncate` 保留显式旧行为；终态 card JSON 超过 28,000 byte 时交还完整 Hermes 原生答案。
+
+旧配置缺少 `integrity` 段时会按 `notify` 加载。只有已验证 Git provenance、backup、manifest、owned blobs 和 anchors 的安装才能显式迁移：
+
+```bash
+hermes-feishu-card integrity migrate-safe \
+  --config ~/.hermes/config.yaml \
+  --hermes-dir ~/.hermes/hermes-agent \
+  --yes
+```
+
+成功后输出 `sidecar.restart_required: true`、`gateway.restart_required: false`；重启 sidecar 后，认证 `runtime.hello` / `runtime.heartbeat` 才开始按 safe 模式评估。若 strict repair 真的重新安装 hook，状态会改为 `gateway.restart_required: true`，但 HFC 不会自动重启 Gateway。证据不足、用户编辑、symlink、dirty target、branch rewind 或 source-stripped root 都保持 fail-closed。
+
+`service.manager: auto` 只选择 `systemd-user` 或 `detached`，不隐式进入 `systemd-system`，不调用 sudo。`systemd-system` 是 Linux transient unit 的显式 opt-in；Docker 继续用普通容器进程和 `detached`。Hermes 0.19.0 / `v2026.7.20` 使用 AST-owned run + Base hooks；旧 run-only manifest 只有在严格证据下才会补建 Base backup、重打 Base patch 并迁移为 manifest v2。升级覆盖通过 runtime 监控和 strict repair 处理，不安装 import-hook bridge。
 
 ## 升级到 V3.4.0
 
@@ -155,7 +185,7 @@ python3 -m hermes_feishu_card.cli stop --config config.yaml.example
 python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --yes
 ```
 
-若 `restore` 拒绝覆盖，说明当前 Hermes 文件、备份或 manifest 已与安装时不一致。此时不要强行删除 hook；应先对比 Hermes `gateway/run.py`、备份文件和外部备份，再选择人工恢复或重新安装 Hermes。
+若 `restore` 拒绝覆盖，说明当前 Hermes 文件、备份或 manifest 已与安装时不一致。此时不要强行删除 hook；应先对比 run、required Base、optional Cron、各自备份和外部备份，再选择人工恢复或重新安装 Hermes。未来版本 manifest 必须由对应新版安装器处理。
 
 ## 验证清单
 

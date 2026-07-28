@@ -12,6 +12,8 @@ from urllib.parse import quote, urlparse
 
 import aiohttp
 
+from .card_limits import serialize_card_for_delivery
+
 
 _RETRYABLE_HTTP_STATUSES = {429, 502, 503, 504}
 _SEND_MAX_ATTEMPTS = 3
@@ -150,7 +152,7 @@ class FeishuClient:
         return {
             "receive_id": receive_id,
             "msg_type": "interactive",
-            "content": json.dumps(card, ensure_ascii=False),
+            "content": serialize_card_for_delivery(card),
         }
 
     async def send_card(
@@ -265,8 +267,8 @@ class FeishuClient:
             raise ValueError("message_id is required")
         if not isinstance(card, dict):
             raise TypeError("card must be a dict")
+        content = serialize_card_for_delivery(card)
         token = await self._tenant_token()
-        content = json.dumps(card, ensure_ascii=False)
         await self._request_json(
             "PATCH",
             f"/im/v1/messages/{quote(message_id, safe='')}",

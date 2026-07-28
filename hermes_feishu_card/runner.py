@@ -7,13 +7,19 @@ from typing import Any
 
 from aiohttp import web
 
+from . import __version__
 from .bots import BotRegistry, FeishuClientFactory, RoutingContext
 from .bots import resolve_card_config as _resolve_card_config
 from .config import load_config, resolve_operations_hermes_root
+from .delivery_policy import ReloadingDeliveryPolicyProvider
 from .event_auth import is_loopback_host
 from .feishu_client import FeishuAPIError, FeishuClient, FeishuClientConfig
 from .server import create_app
-from .operations_transport import ensure_transport_root_secret
+from .operations_transport import (
+    ensure_transport_root_secret,
+    transport_root_privacy_verified,
+)
+from .process import state_dir
 
 
 logger = logging.getLogger(__name__)
@@ -218,7 +224,23 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError(
             "non-loopback sidecar binding requires event authentication"
         )
+    transport_privacy_verified = transport_root_privacy_verified()
+    if event_auth_required and not transport_privacy_verified:
+        raise RuntimeError(
+            "non-loopback sidecar binding requires a private state directory "
+            "with verified access controls"
+        )
+    if not event_auth_required and not transport_privacy_verified:
+        logger.warning(
+            "State-directory ACL privacy is unverified on this platform; "
+            "continuing with loopback local-process trust only."
+        )
     noop_mode = not _has_any_feishu_credentials(config)
+    delivery_policy = ReloadingDeliveryPolicyProvider(
+        args.config,
+        initial_config=config,
+        env_file=args.env_file,
+    )
     if not noop_mode:
         boundary = build_feishu_boundary(config)
     else:
@@ -243,6 +265,12 @@ def main(argv: list[str] | None = None) -> int:
             ),
             operations_transport_root_secret=operations_transport_root_secret,
             event_auth_required=event_auth_required,
+            integrity_mode=str(
+                (config.get("integrity") or {}).get("mode") or "notify"
+            ),
+            expected_runtime_package_version=__version__,
+            runtime_integrity_state_directory=state_dir(),
+            delivery_policy=delivery_policy,
         ),
         host=server["host"],
         port=server["port"],

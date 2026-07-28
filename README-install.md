@@ -72,7 +72,7 @@ delivery. Real file/media paths still keep Hermes' native attachment delivery
 path available.
 
 From V3.8.13, Hermes upgrades are more resilient: version metadata accepts
-`v2026.7.7.2`, `0.18.2`, and descriptive strings such as
+`v2026.7.7.2`, `0.18.2`, `v2026.7.20`, `0.19.0`, and descriptive strings such as
 `Hermes Agent v0.18.2 (...)`; if readable version metadata is unparseable,
 verified `gateway/run.py` anchors can still decide support. `repair` also
 clears stale backup/manifest state left after an upstream Hermes upgrade
@@ -130,6 +130,32 @@ initiating user, while private chats do not add an extra identity comparison.
 Recognized model names receive HTML-escaped semantic color inside the existing
 footer; its layout, field order, separators, and text size are unchanged.
 
+V4.1.0 adds exact `bindings.native_chats`, lossless
+`card.table_overflow_mode: compact`, signed `runtime.hello` /
+`runtime.heartbeat`, and explicit `service.manager`. New setup files use
+`integrity.mode: safe`; an existing config without the section loads as
+`notify` and is not silently migrated. To opt an older verified install into
+safe mode, run `hermes-feishu-card integrity migrate-safe --config CONFIG
+--hermes-dir HERMES_DIR --yes`, then restart the sidecar as reported by
+`sidecar.restart_required: true`. The migration itself reports
+`gateway.restart_required: false`; a later strict repair may require an
+operator-chosen Gateway restart, but HFC never performs it automatically.
+
+Hermes compatibility evidence is reported at two different levels:
+
+| Hermes release | Automated strategy detection | Real-source validation |
+|---|---|---|
+| Hermes 0.19.0 / `v2026.7.20` | Requires exact run + Base anchors and writes `manifest_version: 2` for run, required Base, and optional Cron | A read-only check against real local source confirmed V4.1 startup-before-redelivery, recovery-before-send, exact Base patch idempotency, and multi-target restore behavior |
+
+The real local source check does not claim that a real Gateway process or a
+real Feishu conversation passed E2E. Those remain separate release gates.
+This automated strategy detection and the real local source validation are
+separate evidence: the former selects and enforces the managed target set,
+while the latter checks the exact `v2026.7.20`, `0.19.0` source anchors.
+Legacy manifest v1 cannot prove Base ownership. Upgrade/repair migrates it only
+when every current source, backup, owned marker, and reversible patch verifies;
+future manifest versions fail closed and require the matching newer installer.
+
 `card.text_sizes` can configure the `body`, `reasoning`, `tool`, `notice`, and
 `footer` roles, with optional `default` / `pc` / `mobile` mappings. Physical
 card width/height are controlled by the Feishu/Lark client and are not an
@@ -154,11 +180,13 @@ installs do not print pip's root-user warning. If Python reports
 install succeeds.
 
 `install.sh` prefers the Python interpreter under the selected Hermes venv. Set
-`HFC_PYTHON` only when an explicit interpreter override is required. On Linux
-with a working systemd user manager, `setup` and `start` run the sidecar in a
-restartable transient user service. This gives it a cgroup independent from
-`hermes-gateway`, so restarting the Gateway does not terminate the sidecar.
-Other platforms keep the detached-process fallback.
+`HFC_PYTHON` only when an explicit interpreter override is required.
+`service.manager` accepts `auto`, `systemd-user`, `systemd-system`, and
+`detached`. `auto` uses a working user manager when available and otherwise
+uses the owned detached process; it never probes the system bus, invokes
+`sudo`, or silently crosses a privilege boundary. `systemd-system` is an
+explicit Linux-only transient-unit opt-in and writes no persistent unit under
+`/etc`. Docker and other containers should select `detached`.
 
 ## macOS / Linux
 
@@ -187,6 +215,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 | `FEISHU_APP_SECRET` | unset | Feishu/Lark app secret. |
 | `HFC_SKIP_START` | `0` | Set to `1` to install hook without starting sidecar. |
 | `HFC_NO_PROMPT` | `0` | Set to `1` for non-interactive installs. |
+| `HERMES_FEISHU_CARD_SERVICE_MANAGER` | `auto` | `auto`, `systemd-user`, `systemd-system`, or `detached`; containers use `detached`. |
+| `HERMES_FEISHU_CARD_INTEGRITY_MODE` | config/migration value | `safe`, `notify`, or `off`; do not place transport secrets here. |
 
 ## Docker Containers
 
@@ -195,10 +225,16 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
+Compose uses `HERMES_FEISHU_CARD_SERVICE_MANAGER=detached`. The setup container
+runs the published `install-docker.sh` as root so it can prepare shared-volume
+ownership. The sidecar, patched Gateway, and probe then run as non-root ordinary
+container processes. The topology does not start systemd, invoke `sudo`, request
+a privileged container, or mount host system-service directories.
+
 ```
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.0.21
+export HFC_VERSION=v4.1.0
 bash install-docker.sh
 ```
 
@@ -207,9 +243,13 @@ V3.8.6 also supports Docker/source-stripped Hermes roots that contain
 case `doctor --explain` reports `version_source: gateway anchors` and uses the
 verified Gateway code anchors to choose the hook strategy.
 
-Existing-container Docker smoke for V3.9.0 (fresh/pinned install, safe repair,
-user-edit refusal, main/child profile routing, and final `doctor`) is pending
-acceptance; this document does not claim it has been run.
+The V4.1.0 automated Compose gate runs the published installer against a fixture
+Hermes tree, imports the patched Gateway, waits for signed `runtime.hello`
+readiness, sends a signed `POST /events`, and checks the resulting receipt and
+sanitized health metrics. A passing automated gate is required before release,
+but it does not replace acceptance on a real Docker deployment or in real
+Feishu. Real Docker and real Feishu scenarios remain pending acceptance until
+their respective release evidence is recorded.
 
 ## One-Line Install
 

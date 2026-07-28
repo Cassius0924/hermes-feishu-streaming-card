@@ -26,6 +26,10 @@ _FINDING_COPY = {
     "hermes_unsupported": ("当前 Hermes 版本不受支持", "请使用受支持的 Hermes 版本后重新检测。"),
     "hermes_compatibility_partial": ("Hermes 兼容性不完整", "建议检查兼容性配置后重新检测。"),
     "runtime_import_failed": ("运行环境加载失败", "建议重新安装或检查运行环境。"),
+    "runtime_integrity_degraded": (
+        "卡片运行钩子未就绪",
+        "请按诊断提示重启 Hermes Gateway 或执行安全检查，然后重新检测。",
+    ),
     "feishu_sdk_incompatible": (
         "飞书连接 SDK 不兼容",
         "请重新运行 setup/install，并重启 Hermes Gateway。",
@@ -51,6 +55,23 @@ _FINDING_COPY = {
     "backup_missing": ("缺少可用备份", "建议先确认备份状态。"),
     "backup_read_error": ("备份读取失败", "建议检查备份状态后重新检测。"),
     "backup_source_mismatch": ("备份来源不一致", "建议核对备份状态后再操作。"),
+    "base_backup_hash_mismatch": ("精确投递备份状态不一致", "建议核对 Base 备份后再操作。"),
+    "base_backup_invalid": ("精确投递备份不可用", "建议检查 Base 备份后重新检测。"),
+    "base_backup_read_error": ("精确投递备份读取失败", "建议检查 Base 备份状态。"),
+    "base_backup_symlink_refused": ("精确投递备份链接不安全", "建议检查 Base 安装目录。"),
+    "base_current_read_error": ("精确投递文件读取失败", "建议检查 Base 文件状态。"),
+    "base_evidence_unavailable": ("精确投递证据不可用", "建议人工检查 Base 安装状态。"),
+    "base_install_state_incomplete": ("精确投递安装状态不完整", "建议先执行安全检查。"),
+    "base_manifest_backup_hash_invalid": ("精确投递备份记录异常", "建议核对 Base 安装记录。"),
+    "base_manifest_current_hash_invalid": ("精确投递当前记录异常", "建议核对 Base 安装记录。"),
+    "base_manifest_incomplete": ("精确投递安装记录不完整", "建议检查 Base 安装状态。"),
+    "base_manifest_path_mismatch": ("精确投递安装路径不一致", "建议核对 Base 安装目录。"),
+    "base_marker_error": ("精确投递安装标记异常", "建议检查 Base 安装状态。"),
+    "base_patch_mismatch": ("精确投递补丁状态不一致", "建议检查 Base 安装状态。"),
+    "base_source_mismatch": ("精确投递来源不一致", "建议确认 Hermes 升级后再修复。"),
+    "base_source_missing": ("缺少精确投递来源文件", "建议检查 Hermes 安装完整性。"),
+    "base_symlink_refused": ("精确投递文件链接不安全", "建议检查 Base 安装目录。"),
+    "hermes_upgrade_base_source_accepted": ("已确认 Hermes 精确投递文件升级", "可继续执行安全修复。"),
     "manifest_backup_hash_invalid": ("备份记录需要检查", "建议核对安装记录与备份状态。"),
     "manifest_current_hash_invalid": ("当前记录需要检查", "建议核对安装记录与当前状态。"),
     "manifest_invalid": ("安装记录不可用", "建议检查安装状态后重新检测。"),
@@ -907,7 +928,8 @@ def _operations_summary(report: DiagnosticReport, operation: OperationRecord) ->
         message = str((operation.result or {}).get("message") or "").strip()
         return f"{content}\n\n{message}" if message else content
 
-    findings = report.to_dict(card_safe=True).get("findings")
+    safe_report = report.to_dict(card_safe=True)
+    findings = safe_report.get("findings")
     show_details = bool((operation.result or {}).get("show_details"))
     lines = [
         "**诊断详情**" if show_details else "**诊断摘要**",
@@ -922,6 +944,18 @@ def _operations_summary(report: DiagnosticReport, operation: OperationRecord) ->
             lines.append(f"- {summary}")
             if show_details:
                 lines.append(f"  - 建议：{detail}")
+    runtime = safe_report.get("runtime")
+    readiness = runtime.get("readiness") if isinstance(runtime, dict) else None
+    if isinstance(readiness, dict) and readiness.get("status") == "degraded":
+        next_action = {
+            "gateway_restart_required": "重启 Hermes Gateway 后重新检测。",
+            "runtime_heartbeat_missing": "确认 Hermes Gateway 正在运行，必要时重启。",
+            "runtime_heartbeat_stale": "检查 Hermes Gateway 状态，必要时重启。",
+            "control_auth_unavailable": "重新运行 setup，并重启 sidecar 与 Gateway。",
+            "manual_review_required": "运行 doctor，按安全诊断结果人工检查。",
+        }.get(str(readiness.get("reason") or ""))
+        if next_action:
+            lines.append(f"- 下一步：{next_action}")
     if len(lines) == 2:
         lines.append("- 未发现需要处理的问题。")
     return "\n".join(lines)

@@ -1043,6 +1043,41 @@ def test_operations_card_uses_static_safe_finding_copy_and_details_state():
         assert sensitive not in details_text
 
 
+def test_operations_card_explains_runtime_integrity_restart_action():
+    runtime_report = DiagnosticReport(
+        status="warning",
+        created_at=100.0,
+        config={},
+        hermes={},
+        streaming={},
+        install_state={"recovery_executable": False},
+        routing={},
+        runtime={
+            "readiness": {
+                "status": "degraded",
+                "reason": "gateway_restart_required",
+                "integrity_mode": "safe",
+            }
+        },
+        findings=(
+            DiagnosticFinding(
+                "runtime_integrity_degraded",
+                "warning",
+                "private runtime evidence",
+            ),
+        ),
+    )
+    store = OperationStore(secret=b"test", now=lambda: 100.0)
+    operation = store.create(group=False, **operation_kwargs())
+
+    card = render_operations_card(runtime_report, operation, "footer", store=store)
+    rendered = json.dumps(card, ensure_ascii=False)
+
+    assert "卡片运行钩子未就绪" in rendered
+    assert "重启 Hermes Gateway" in rendered
+    assert "private runtime evidence" not in rendered
+
+
 def test_operations_finding_copy_covers_every_card_safe_diagnostic_code():
     assert _CARD_FINDING_CODES <= set(_FINDING_COPY)
     for code in _CARD_FINDING_CODES:

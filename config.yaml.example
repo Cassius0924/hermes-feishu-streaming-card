@@ -1,4 +1,4 @@
-# Hermes Feishu Streaming Card V3.8.8 sidecar configuration
+# Hermes Feishu Streaming Card V4.1.0 sidecar configuration
 # Copy to a local path and fill credentials from your environment or secret store.
 # Default config path: ~/.hermes_feishu_card/config.yaml
 
@@ -10,6 +10,16 @@ server:
   # Keep local-process trust on loopback. Non-loopback requires explicit opt-in
   # and state-directory HMAC event authentication. Do not expose an unauthenticated sidecar.
   allow_non_loopback: false
+
+# New installations may repair only strictly verified stale HFC hook state.
+# Existing configs without this section load as `notify` until explicitly migrated.
+integrity:
+  mode: safe
+
+# Sidecar process ownership. `auto` selects user systemd only when available,
+# otherwise detached. It never enters system systemd or invokes sudo.
+service:
+  manager: auto
 
 # ── Single Profile (minimal) ─────────────────────────────────────────────────
 # For simple setups with one Hermes profile and optionally multiple bots.
@@ -32,6 +42,9 @@ card:
   interaction_mode: auto
   max_wait_ms: 800
   max_chars: 240
+  # compact preserves rows from table 6 onward as readable field lists.
+  # truncate keeps the legacy five-table behavior when explicitly selected.
+  table_overflow_mode: compact
   # Optional role-based CardKit text sizes. Roles: body, reasoning, tool,
   # notice, footer. Values may be scalar or default/pc/mobile mappings.
   # card width/height are controlled by the Feishu/Lark client.
@@ -98,6 +111,9 @@ bots:
 bindings:
   fallback_bot: default
   chats: {}
+  # Exact chat IDs listed here use Hermes native delivery for the next new turn.
+  # Wildcards are rejected. In multi-profile mode configure this per profile.
+  native_chats: []
   # Example:
   # oc_xxxxxxxxxxxx: sales
   # oc_yyyyyyyyyyyy: support
@@ -135,6 +151,7 @@ bindings:
 #     bindings:
 #       fallback_bot: default
 #       chats: {}
+#       native_chats: []
 #     card:
 #       title: Default Profile
 #
@@ -156,5 +173,6 @@ bindings:
 #     bindings:
 #       fallback_bot: default
 #       chats: {}
+#       native_chats: []
 #     card:
 #       title: Work Profile

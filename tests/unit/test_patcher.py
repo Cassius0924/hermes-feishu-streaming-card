@@ -313,6 +313,51 @@ def test_apply_patch_installs_command_card_adapter_before_recovered_watchers():
     assert patcher.remove_patch(patched) == content
 
 
+def test_v019_startup_installs_uuid_wrapper_before_delivery_ledger_redelivery():
+    content = (
+        "class GatewayRunner:\n"
+        "    async def start(self):\n"
+        "        await self._redeliver_pending_obligations()\n"
+        "        try:\n"
+        "            from tools.process_registry import process_registry\n"
+        "            watchers = process_registry.pending_watchers\n"
+        "            for watcher in watchers:\n"
+        "                self._run_process_watcher(watcher)\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "\n"
+        "    async def _redeliver_pending_obligations(self):\n"
+        "        for row in claimed:\n"
+        "            adapter = self.adapters[row['platform']]\n"
+        "            content = row['content']\n"
+        "            result = await adapter.send(\n"
+        "                chat_id=row['chat_id'],\n"
+        "                content=content,\n"
+        "                metadata=None,\n"
+        "            )\n"
+        "\n"
+        "    async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):\n"
+        "        response = 'ok'\n"
+        "        _response_time = 1\n"
+        "        agent_result = {}\n"
+        "        return response\n"
+    )
+
+    patched = patcher.apply_patch(content, strategy="gateway_run_013_plus")
+
+    ast.parse(patched)
+    assert patched.index(patcher.COMMAND_CARD_STARTUP_PATCH_BEGIN) < patched.index(
+        "await self._redeliver_pending_obligations()"
+    )
+    assert patched.index(patcher.NATIVE_REDELIVERY_PATCH_BEGIN) < patched.index(
+        "result = await adapter.send("
+    )
+    assert "obligation_id=row.get(\"obligation_id\")" in patched
+    assert "original_content=row.get(\"content\")" in patched
+    assert patcher.apply_patch(patched, strategy="gateway_run_013_plus") == patched
+    assert patcher.remove_patch(patched) == content
+
+
 @pytest.mark.parametrize(
     "runner_name, watcher_call",
     [
@@ -625,9 +670,9 @@ def test_apply_patch_upgrades_v400_completion_hook_with_media_text_split():
         "        from hermes_feishu_card.hook_runtime import native_media_only_response as _hfc_media_only\n",
         "",
     ).replace(
-        '        if str(_hfc_platform).lower() == "feishu" and '
-        '_hfc_card_delivered and _hfc_native_delivery == "required":\n'
-        "            response = _hfc_media_only(response)\n",
+            '            if str(_hfc_platform).lower() == "feishu" and '
+            '_hfc_card_delivered and _hfc_native_delivery == "required":\n'
+            "                response = _hfc_media_only(response)\n",
         "",
     )
 
@@ -1517,6 +1562,9 @@ def test_complete_hook_block_contains_suppression_guard():
     assert "should_suppress_native_response as _hfc_should_suppress" in block
     assert "getattr(source.platform, \"value\", source.platform)" in block
     assert "_hfc_attachments" in block
+    assert "can_stage_exact_base_completion as _hfc_can_stage_exact" in block
+    assert "stage_message_completed_from_hermes_locals_async as _hfc_stage_exact" in block
+    assert "if not _hfc_exact_staged:" in block
     assert "return None" in block
 
 
@@ -1562,6 +1610,26 @@ def test_complete_hook_inserted_before_already_sent_early_return():
         'if agent_result.get("already_sent")'
     )
     ast.parse(patched)
+
+
+def test_apply_patch_migrates_owned_pre_exact_completion_block():
+    old_block = "".join(
+        patcher._render_pre_exact_complete_hook_block_with_reply_anchor(
+            "        ",
+            "\n",
+        )
+    )
+    source = _ALREADY_SENT_HANDLER.replace(
+        '        if agent_result.get("already_sent")',
+        old_block + '        if agent_result.get("already_sent")',
+    )
+
+    upgraded = patcher.apply_patch(source, strategy="gateway_run_013_plus")
+
+    assert "stage_message_completed_from_hermes_locals_async" in upgraded
+    assert upgraded != source
+    assert patcher.apply_patch(upgraded, strategy="gateway_run_013_plus") == upgraded
+    ast.parse(upgraded)
 
 
 def test_complete_hook_keeps_final_return_location_without_already_sent_branch():
@@ -1678,3 +1746,211 @@ def test_queued_complete_patch_tolerates_interleaved_stream_confirmation():
     )
     assert marker_line < anchor_line
     ast.parse(patched)
+
+
+_EXACT_BASE_SOURCE = '''class BasePlatformAdapter:
+    async def _process_message_background(self, event, session_key):
+        delivery_attempted = False
+        delivery_succeeded = False
+
+        def _record_delivery(result):
+            return None
+
+        interrupt_event = self._active_sessions.get(session_key)
+        try:
+            response = await self._message_handler(event)
+            is_ephemeral_response = isinstance(response, EphemeralReply)
+            response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+            if response and interrupt_event.is_set() and session_key in self._pending_messages:
+                response = None
+            if not response:
+                logger.debug("empty response")
+            if response:
+                force_document_attachments = "[[as_document]]" in response
+                _response_pre_extract = response
+                media_files, response = self.extract_media(response)
+                media_files = self.filter_media_delivery_paths(media_files)
+                images, text_content = self.extract_images(response)
+                text_content = _strip_media_directives(text_content).strip()
+                local_files = []
+                if not is_ephemeral_response:
+                    local_files, text_content = self.extract_local_files(text_content)
+                    local_files = self.filter_local_delivery_paths(local_files)
+                if not (text_content or images or local_files or media_files):
+                    _recovered = _strip_media_directives(response).strip()
+                    if _recovered:
+                        text_content = _recovered
+                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _tts_path = None
+                if text_content and not media_files:
+                    _tts_path = await make_tts(text_content)
+                _tts_caption_delivered = False
+                if _tts_path:
+                    telegram_tts_caption = text_content
+                    tts_result = await self.play_tts(
+                        chat_id=event.source.chat_id,
+                        audio_path=_tts_path,
+                        caption=telegram_tts_caption,
+                        metadata=_final_thread_metadata,
+                    )
+                    _tts_caption_delivered = bool(
+                        telegram_tts_caption and getattr(tts_result, "success", False)
+                    )
+                # Send the text portion.
+                if text_content and not _tts_caption_delivered:
+                    delivery_adapter = self._final_delivery_adapter(event.source)
+                    _reply_anchor = _reply_anchor_for_event(event)
+                    _obligation_id = None
+                    if not is_ephemeral_response:
+                        try:
+                            from gateway.delivery_ledger import (
+                                compute_obligation_id,
+                                ledger_enabled,
+                                mark_attempting,
+                                record_obligation,
+                            )
+                            if ledger_enabled():
+                                _obligation_id = compute_obligation_id(
+                                    session_key,
+                                    str(getattr(event, "message_id", "") or ""),
+                                    text_content,
+                                )
+                                record_obligation(
+                                    obligation_id=_obligation_id,
+                                    session_key=session_key,
+                                    platform=str(event.source.platform.value),
+                                    chat_id=event.source.chat_id,
+                                    thread_id=getattr(event.source, "thread_id", None),
+                                    content=text_content,
+                                )
+                                mark_attempting(_obligation_id)
+                        except Exception:
+                            _obligation_id = None
+                    result = await delivery_adapter._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content=text_content,
+                        reply_to=_reply_anchor,
+                        metadata=_final_thread_metadata,
+                    )
+                    _record_delivery(result)
+                    if _obligation_id is not None:
+                        try:
+                            from gateway.delivery_ledger import mark_delivered, mark_failed
+                            if getattr(result, "success", False):
+                                mark_delivered(_obligation_id)
+                            else:
+                                mark_failed(_obligation_id, str(result.error or ""))
+                        except Exception:
+                            pass
+        finally:
+            self._active_sessions.pop(session_key, None)
+'''
+
+
+def test_apply_base_patch_inserts_exact_hooks_at_semantic_boundaries():
+    patched = patcher.apply_base_patch(_EXACT_BASE_SOURCE)
+
+    no_text = patched.index(patcher.EXACT_BASE_NO_TEXT_PATCH_BEGIN)
+    send_guard = patched.index("if text_content and not _tts_caption_delivered:")
+    ledger_attempt = patched.index("mark_attempting(_obligation_id)")
+    final = patched.index(patcher.EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN)
+    send = patched.index("result = await delivery_adapter._send_with_retry(")
+    assert no_text < send_guard < ledger_attempt < final < send
+    assert "if not text_content or _tts_caption_delivered:" in patched
+    assert "await _hfc_finalize_exact_base_no_text({" in patched
+    assert '"source": event.source' in patched
+    assert (
+        "delivery_adapter, text_content, _reply_anchor, _final_thread_metadata = "
+        "await _hfc_prepare_exact_base_final_delivery({" in patched
+    )
+    assert '"content": text_content' in patched
+    assert '"obligation_id": _obligation_id' in patched
+    assert '"reply_to": _reply_anchor' in patched
+    assert '"metadata": _final_thread_metadata' in patched
+    ast.parse(patched)
+    assert patcher.apply_base_patch(patched) == patched
+    assert patcher.remove_base_patch(patched) == _EXACT_BASE_SOURCE
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        _EXACT_BASE_SOURCE.replace("\n", "\r\n"),
+        _EXACT_BASE_SOURCE.rstrip("\n"),
+        _EXACT_BASE_SOURCE.replace("\n", "\r\n").rstrip("\r\n"),
+    ],
+)
+def test_base_patch_round_trip_is_byte_identical_for_newlines(content):
+    patched = patcher.apply_base_patch(content)
+
+    assert patcher.remove_base_patch(patched) == content
+    assert patcher.remove_base_patch_lenient(patched) == content
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        _EXACT_BASE_SOURCE.replace(
+            "media_files = self.filter_media_delivery_paths(media_files)",
+            "media_files = list(media_files)",
+        ),
+        _EXACT_BASE_SOURCE.replace(
+            "text_content = _strip_media_directives(text_content).strip()",
+            "text_content = text_content.strip()",
+        ),
+        _EXACT_BASE_SOURCE.replace(
+            "content=text_content,",
+            "content=response,",
+        ),
+        _EXACT_BASE_SOURCE.replace(
+            "reply_to=_reply_anchor,",
+            "reply_to=None,",
+        ),
+        _EXACT_BASE_SOURCE.replace(
+            "mark_attempting(_obligation_id)",
+            "mark_attempting('different')",
+        ),
+        _EXACT_BASE_SOURCE.replace(
+            "if text_content and not _tts_caption_delivered:",
+            "if text_content:",
+        ),
+        _EXACT_BASE_SOURCE
+        + "\nclass BasePlatformAdapter:\n"
+        + "    async def _process_message_background(self, event, session_key):\n"
+        + "        pass\n",
+    ],
+)
+def test_apply_base_patch_fails_closed_for_inexact_or_ambiguous_contract(content):
+    with pytest.raises(ValueError, match="safe BasePlatformAdapter contract"):
+        patcher.apply_base_patch(content)
+
+
+def test_remove_base_patch_strict_rejects_changed_owned_body_but_lenient_recovers():
+    patched = patcher.apply_base_patch(_EXACT_BASE_SOURCE)
+    corrupt = patched.replace(
+        "await _hfc_finalize_exact_base_no_text({",
+        "await _hfc_finalize_exact_base_no_text_changed({",
+        1,
+    )
+
+    with pytest.raises(ValueError, match="corrupt exact base patch markers"):
+        patcher.remove_base_patch(corrupt)
+    assert patcher.remove_base_patch_lenient(corrupt) == _EXACT_BASE_SOURCE
+
+
+def test_base_patch_rejects_partial_or_ambiguous_owned_markers():
+    patched = patcher.apply_base_patch(_EXACT_BASE_SOURCE)
+    partial = patched.replace(patcher.EXACT_BASE_FINAL_DELIVERY_PATCH_END, "", 1)
+    duplicate = patched.replace(
+        patcher.EXACT_BASE_NO_TEXT_PATCH_BEGIN,
+        patcher.EXACT_BASE_NO_TEXT_PATCH_BEGIN
+        + "\n                "
+        + patcher.EXACT_BASE_NO_TEXT_PATCH_BEGIN,
+        1,
+    )
+
+    for content in (partial, duplicate):
+        with pytest.raises(ValueError, match="corrupt exact base patch markers"):
+            patcher.apply_base_patch(content)
+        with pytest.raises(ValueError, match="corrupt exact base patch markers"):
+            patcher.remove_base_patch_lenient(content)

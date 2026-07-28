@@ -668,7 +668,8 @@ async def test_smoke_command_sends_and_updates_card(feishu_api, tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "smoke ok" in result.stdout
-    assert "om_message_1" in result.stdout
+    assert "message#" in result.stdout
+    assert "om_message_1" not in result.stdout
     assert [request[0] for request in requests] == ["token", "send", "update"]
 
 

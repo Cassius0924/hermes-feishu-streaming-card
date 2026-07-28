@@ -13,6 +13,9 @@ from hermes_feishu_card.config import (
 CONFIG_ENV_VARS = (
     "HERMES_FEISHU_CARD_HOST",
     "HERMES_FEISHU_CARD_PORT",
+    "HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK",
+    "HERMES_FEISHU_CARD_SERVICE_MANAGER",
+    "HERMES_FEISHU_CARD_INTEGRITY_MODE",
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
     "HERMES_DIR",
@@ -41,8 +44,11 @@ def test_load_config_missing_file_returns_defaults(tmp_path):
         "bots": {"default": "default", "items": {}},
         "bindings": {
             "chats": {},
+            "native_chats": [],
             "group_rules": {"enabled": False},
         },
+        "integrity": {"mode": "notify"},
+        "service": {"manager": "auto"},
         "card": {
             "max_wait_ms": 800,
             "max_chars": 240,
@@ -55,6 +61,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path):
             "max_timeline_items": 12,
             "max_reasoning_chars": 1200,
             "max_tool_result_chars": 600,
+            "table_overflow_mode": "compact",
             "footer_fields": [
                 "duration",
                 "model",
@@ -66,6 +73,114 @@ def test_load_config_missing_file_returns_defaults(tmp_path):
     }
 
 
+@pytest.mark.parametrize(
+    "manager", ["auto", "systemd-user", "systemd-system", "detached"]
+)
+def test_load_config_accepts_exact_service_managers(tmp_path, manager):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"service:\n  manager: {manager}\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config["service"] == {"manager": manager}
+
+
+@pytest.mark.parametrize(
+    "manager", ["", "systemd", "SYSTEMD-USER", "auto ", 1, True, None]
+)
+def test_load_config_rejects_invalid_service_manager(tmp_path, manager):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump({"service": {"manager": manager}}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="service.manager"):
+        load_config(path)
+
+
+def test_load_config_applies_container_service_and_listener_overrides(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_FEISHU_CARD_HOST", "0.0.0.0")
+    monkeypatch.setenv("HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK", "true")
+    monkeypatch.setenv("HERMES_FEISHU_CARD_SERVICE_MANAGER", "detached")
+
+    config = load_config(tmp_path / "missing.yaml")
+
+    assert config["server"]["host"] == "0.0.0.0"
+    assert config["server"]["allow_non_loopback"] is True
+    assert config["service"]["manager"] == "detached"
+
+
+@pytest.mark.parametrize("value", ["", "2", "sometimes"])
+def test_load_config_rejects_invalid_non_loopback_environment_boolean(
+    tmp_path, monkeypatch, value
+):
+    monkeypatch.setenv("HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK", value)
+
+    with pytest.raises(ValueError, match="HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK"):
+        load_config(tmp_path / "missing.yaml")
+
+
+def test_setup_template_writes_explicit_auto_service_manager():
+    from hermes_feishu_card.cli import _default_setup_config_text
+
+    config = yaml.safe_load(_default_setup_config_text())
+
+    assert config["service"] == {"manager": "auto"}
+
+
+def test_load_config_normalizes_native_chats_and_preserves_order(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+bindings:
+  native_chats:
+    - chat-b
+    - chat-a
+    - chat-b
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["bindings"]["native_chats"] == ["chat-b", "chat-a"]
+
+
+@pytest.mark.parametrize("value", ["'*'", "chat-a", "{}", "[1]"])
+def test_load_config_rejects_non_exact_native_chat_arrays(tmp_path, value):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"bindings:\n  native_chats: {value}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="bindings.native_chats"):
+        load_config(path)
+
+
+def test_load_config_normalizes_profile_native_chats_without_top_level_inheritance(
+    tmp_path,
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+bindings:
+  native_chats: [chat-top]
+profiles:
+  work:
+    bindings:
+      native_chats: [chat-work, chat-work]
+  personal: {}
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["bindings"]["native_chats"] == ["chat-top"]
+    assert config["profiles"]["work"]["bindings"]["native_chats"] == ["chat-work"]
+    assert config["profiles"]["personal"]["bindings"]["native_chats"] == []
+
+
 def test_operations_hermes_root_uses_process_hint_without_user_config(
     monkeypatch, tmp_path
 ):
@@ -75,7 +190,9 @@ def test_operations_hermes_root_uses_process_hint_without_user_config(
     assert resolve_operations_hermes_root() == hinted
 
 
-def test_operations_hermes_root_prefers_explicit_then_config_env_file(monkeypatch, tmp_path):
+def test_operations_hermes_root_prefers_explicit_then_process_environment(
+    monkeypatch, tmp_path
+):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("server: {}\n", encoding="utf-8")
     dotenv_root = tmp_path / "from-dotenv"
@@ -84,14 +201,14 @@ def test_operations_hermes_root_prefers_explicit_then_config_env_file(monkeypatc
     (tmp_path / ".env").write_text(f"HERMES_DIR={dotenv_root}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_DIR", str(process_root))
 
-    assert resolve_operations_hermes_root(config_path=config_path) == dotenv_root
+    assert resolve_operations_hermes_root(config_path=config_path) == process_root
     assert (
         resolve_operations_hermes_root(explicit_root, config_path=config_path)
         == explicit_root
     )
 
 
-def test_operations_hermes_root_prefers_selected_env_file_over_config_and_process(
+def test_operations_hermes_root_prefers_process_environment_over_selected_env_file(
     monkeypatch, tmp_path
 ):
     config_path = tmp_path / "config.yaml"
@@ -100,6 +217,20 @@ def test_operations_hermes_root_prefers_selected_env_file_over_config_and_proces
     (tmp_path / ".env").write_text("HERMES_DIR=config-root\n", encoding="utf-8")
     selected_env.write_text("HERMES_DIR=selected-root\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_DIR", "process-root")
+
+    assert resolve_operations_hermes_root(
+        config_path=config_path, env_file=selected_env
+    ) == Path("process-root")
+
+
+def test_operations_hermes_root_uses_selected_env_before_config_env(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    selected_env = tmp_path / "selected.env"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("HERMES_DIR=config-root\n", encoding="utf-8")
+    selected_env.write_text("HERMES_DIR=selected-root\n", encoding="utf-8")
+    for name in ("HERMES_DIR", "HFC_HERMES_DIR", "HERMES_AGENT_ROOT"):
+        monkeypatch.delenv(name, raising=False)
 
     assert resolve_operations_hermes_root(
         config_path=config_path, env_file=selected_env
@@ -112,12 +243,21 @@ def test_example_config_uses_current_sidecar_schema():
 
     assert "feishu" in raw
     assert "cardkit" not in raw
+    assert raw["integrity"] == {"mode": "safe"}
     assert config["feishu"] == {
         "app_id": "",
         "app_secret": "",
         "base_url": "https://open.feishu.cn/open-apis",
         "timeout_seconds": 30,
     }
+
+
+def test_new_setup_template_explicitly_enables_safe_integrity():
+    from hermes_feishu_card.cli import _default_setup_config_text
+
+    raw = yaml.safe_load(_default_setup_config_text())
+
+    assert raw["integrity"] == {"mode": "safe"}
 
 
 def test_load_config_shallow_merges_yaml_sections(tmp_path):
@@ -154,6 +294,7 @@ card:
         "max_timeline_items": 12,
         "max_reasoning_chars": 1200,
         "max_tool_result_chars": 600,
+        "table_overflow_mode": "compact",
         "footer_fields": [
             "duration",
             "model",
@@ -188,6 +329,77 @@ card:
             "mobile": "notation",
         },
     }
+
+
+def test_load_config_defaults_table_overflow_mode_to_compact(tmp_path):
+    config = load_config(tmp_path / "missing.yaml")
+
+    assert config["card"]["table_overflow_mode"] == "compact"
+
+
+def test_load_config_normalizes_table_overflow_mode_at_global_profile_and_bot_paths(
+    tmp_path,
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+card:
+  table_overflow_mode: truncate
+bots:
+  items:
+    sales:
+      card:
+        table_overflow_mode: compact
+profiles:
+  work:
+    card:
+      table_overflow_mode: compact
+    bots:
+      items:
+        support:
+          card:
+            table_overflow_mode: truncate
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["card"]["table_overflow_mode"] == "truncate"
+    assert config["bots"]["items"]["sales"]["card"]["table_overflow_mode"] == "compact"
+    assert config["profiles"]["work"]["card"]["table_overflow_mode"] == "compact"
+    assert (
+        config["profiles"]["work"]["bots"]["items"]["support"]["card"][
+            "table_overflow_mode"
+        ]
+        == "truncate"
+    )
+
+
+@pytest.mark.parametrize(
+    ("yaml_text", "expected_path"),
+    [
+        ("card:\n  table_overflow_mode: drop\n", "card.table_overflow_mode"),
+        (
+            "bots:\n  items:\n    sales:\n      card:\n        table_overflow_mode: 1\n",
+            "bots.items.sales.card.table_overflow_mode",
+        ),
+        (
+            "profiles:\n  work:\n    card:\n      table_overflow_mode: legacy\n",
+            "profiles.work.card.table_overflow_mode",
+        ),
+    ],
+)
+def test_load_config_rejects_invalid_table_overflow_mode_with_exact_path(
+    tmp_path, yaml_text, expected_path
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml_text, encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc_info:
+        load_config(path)
+
+    assert expected_path in str(exc_info.value)
 
 
 def test_normalize_text_sizes_uses_role_default_for_pc_only_mapping():
@@ -276,6 +488,7 @@ def test_load_config_defaults_include_multi_bot_sections(tmp_path):
     assert config["bots"] == {"default": "default", "items": {}}
     assert config["bindings"] == {
         "chats": {},
+        "native_chats": [],
         "group_rules": {"enabled": False},
     }
 
@@ -555,7 +768,11 @@ profiles:
     assert config["profiles"]["default"]["feishu"]["app_id"] == "cli_a"
     # 验证 work profile 自动继承了默认的 bots / bindings
     assert config["profiles"]["work"]["bots"]["default"] == "default"
-    assert config["profiles"]["work"]["bindings"] == {"chats": {}, "group_rules": {"enabled": False}}
+    assert config["profiles"]["work"]["bindings"] == {
+        "chats": {},
+        "native_chats": [],
+        "group_rules": {"enabled": False},
+    }
 
 
 def test_load_config_without_profiles_still_works(tmp_path):
@@ -667,4 +884,29 @@ profiles:
     )
 
     with pytest.raises(ValueError, match="profile 'work' card must be a mapping"):
+        load_config(path)
+
+
+def test_existing_config_without_integrity_section_defaults_to_notify(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("server:\n  port: 8765\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config["integrity"] == {"mode": "notify"}
+
+
+@pytest.mark.parametrize("mode", ["safe", "notify", "off"])
+def test_integrity_mode_accepts_only_explicit_supported_values(tmp_path, mode):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"integrity:\n  mode: {mode}\n", encoding="utf-8")
+
+    assert load_config(path)["integrity"]["mode"] == mode
+
+
+def test_invalid_integrity_mode_is_rejected_with_exact_path(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("integrity:\n  mode: automatic\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="integrity.mode"):
         load_config(path)

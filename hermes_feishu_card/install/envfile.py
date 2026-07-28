@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+from typing import Any, Callable
 from uuid import uuid4
 
 
@@ -11,6 +12,7 @@ HFC_ENV_KEYS = frozenset(
     {
         "HERMES_FEISHU_CARD_PROFILE_ID",
         "HERMES_FEISHU_CARD_EVENT_URL",
+        "HERMES_FEISHU_CARD_INTEGRITY_MODE",
         "HERMES_DIR",
     }
 )
@@ -21,11 +23,27 @@ _ASSIGNMENT_RE = re.compile(
 _UNQUOTED_VALUE_RE = re.compile(r"^[A-Za-z0-9_./:@%+,-]+$")
 
 
-def update_hfc_env(path: Path, updates: dict[str, str]) -> None:
+def update_hfc_env(
+    path: Path,
+    updates: dict[str, str],
+    *,
+    writer: Callable[[Path, str, int], Any] | None = None,
+) -> Any:
     """Atomically update HFC routing and Hermes-root values in a dotenv file."""
-    normalized = _validate_updates(updates)
     env_path = Path(path).expanduser()
     original = _read_text_preserve_newlines(env_path) if env_path.exists() else ""
+    contents = render_hfc_env(original, updates)
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    if writer is not None:
+        mode = env_path.stat().st_mode & 0o777 if env_path.exists() else 0o600
+        return writer(env_path, contents, mode)
+    _atomic_write_text(env_path, contents)
+    return None
+
+
+def render_hfc_env(original: str, updates: dict[str, str]) -> str:
+    """Render an HFC dotenv update from an explicit, already-read snapshot."""
+    normalized = _validate_updates(updates)
     newline = _preferred_newline(original)
     rendered = {key: f"{key}={_quote_value(value)}" for key, value in normalized.items()}
     seen: set[str] = set()
@@ -49,9 +67,7 @@ def update_hfc_env(path: Path, updates: dict[str, str]) -> None:
         contents += newline
     for key in missing:
         contents += rendered[key] + newline
-
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(env_path, contents)
+    return contents
 
 
 def read_hfc_env(path: Path) -> dict[str, str]:

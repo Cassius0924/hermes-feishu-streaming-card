@@ -9,16 +9,25 @@ import json
 import os
 from pathlib import Path
 import re
-import tempfile
+import stat
 import threading
 import time
 from typing import Dict, Iterator, List, Optional, Tuple
 from uuid import uuid4
 
 from .detect import HermesDetection
+from .manifest import (
+    CURRENT_INSTALL_MANIFEST_VERSION,
+    ManifestStructureError,
+    ManifestVersionError,
+    UNSUPPORTED_INSTALL_MANIFEST_VERSION_MESSAGE,
+    validate_install_manifest,
+)
 from .patcher import (
+    apply_base_patch,
     apply_cron_patch,
     apply_patch,
+    remove_base_patch,
     remove_cron_patch,
     remove_patch,
 )
@@ -36,6 +45,7 @@ KNOWN_STATES = {
 }
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIT_HASH_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _OWNED_GATEWAY_MARKER_LINE_RE = re.compile(
     r"(?m)^[ \t]*# HERMES_FEISHU_CARD_[A-Z0-9_]+_(?:BEGIN|END)"
     r"[ \t]*(?:\r?\n|$)"
@@ -46,6 +56,103 @@ _LOCK_NAME = ".hermes_feishu_card_recovery.lock"
 _LOCK_TIMEOUT_SECONDS = 10.0
 _PROCESS_LOCKS: Dict[str, threading.Lock] = {}
 _PROCESS_LOCKS_GUARD = threading.Lock()
+_OwnedWriteSnapshot = Tuple[int, int, str]
+_DirectoryIdentity = Tuple[int, int]
+_SECURE_DIRFD_TRANSACTIONS_SUPPORTED = (
+    os.name != "nt"
+    and hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "fchmod")
+    and all(
+        operation in getattr(os, "supports_dir_fd", set())
+        for operation in (os.open, os.stat, os.unlink, os.rename)
+    )
+)
+
+
+def _secure_dirfd_transactions_supported() -> bool:
+    return _SECURE_DIRFD_TRANSACTIONS_SUPPORTED
+
+
+def _require_secure_dirfd_transactions() -> None:
+    if not _secure_dirfd_transactions_supported():
+        raise RecoveryRefused(
+            "secure recovery requires directory-relative filesystem operations "
+            "on this platform"
+        )
+
+
+@dataclass
+class _StagedText:
+    path: Path
+    parent_fd: int
+    basename: str
+    identity: Tuple[int, int]
+    target_binding: _TargetBinding | None = None
+
+    def assert_owned(self) -> None:
+        current = os.stat(
+            self.basename,
+            dir_fd=self.parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != self.identity
+        ):
+            raise RecoveryRefused(
+                "recovery staged file changed before mutation"
+            )
+
+    def release(self) -> None:
+        if self.parent_fd < 0:
+            return
+        os.close(self.parent_fd)
+        self.parent_fd = -1
+
+    def cleanup(self) -> None:
+        if self.parent_fd < 0:
+            return
+        try:
+            current = os.stat(
+                self.basename,
+                dir_fd=self.parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            if (
+                stat.S_ISREG(current.st_mode)
+                and (current.st_dev, current.st_ino) == self.identity
+            ):
+                os.unlink(self.basename, dir_fd=self.parent_fd)
+        finally:
+            self.release()
+
+
+@dataclass
+class _TargetBinding:
+    path: Path
+    parent_fd: int
+    basename: str
+    parent_identity: _DirectoryIdentity
+
+    def assert_parent(self) -> None:
+        current = os.fstat(self.parent_fd)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != self.parent_identity
+        ):
+            raise RecoveryRefused(
+                "recovery target parent changed before mutation"
+            )
+
+    def release(self) -> None:
+        if self.parent_fd < 0:
+            return
+        os.close(self.parent_fd)
+        self.parent_fd = -1
 
 _ACTION_MESSAGES = {
     "restore_verified_backup": "run.py: restored verified backup",
@@ -55,6 +162,9 @@ _ACTION_MESSAGES = {
     "restore_verified_cron_backup": "cron scheduler: restored verified backup",
     "reapply_current_cron_hook": "cron scheduler: reapplied current hook",
     "rebuild_cron_backup": "cron backup: recreated",
+    "restore_verified_base_backup": "exact Base: restored verified backup",
+    "reapply_current_base_hook": "exact Base: reapplied current hook",
+    "rebuild_base_backup": "exact Base backup: recreated",
     "clear_stale_install_state": "install state: cleared stale unpatched state",
 }
 
@@ -79,6 +189,11 @@ class RecoveryEvidence:
     cron_backup_text: Optional[str]
     cron_backup_sha256: str
     cron_marker_error: str
+    base_current_text: Optional[str]
+    base_current_sha256: str
+    base_backup_text: Optional[str]
+    base_backup_sha256: str
+    base_marker_error: str
 
 
 @dataclass(frozen=True)
@@ -119,6 +234,8 @@ class _RecoveryState:
     backup_text: Optional[str]
     cron_text: Optional[str]
     cron_backup_text: Optional[str]
+    base_text: Optional[str]
+    base_backup_text: Optional[str]
     clear_install_state: bool = False
 
 
@@ -159,7 +276,11 @@ def execute_recovery(
     *,
     accept_hermes_upgrade: bool = False,
 ) -> RecoveryResult:
+    _require_secure_dirfd_transactions()
     with _root_lock(detection.root):
+        manifest = _read_manifest_evidence(detection.root / MANIFEST_NAME)
+        if manifest is not None and manifest.get(_MANIFEST_ERROR) == "unsupported_version":
+            raise RecoveryRefused(UNSUPPORTED_INSTALL_MANIFEST_VERSION_MESSAGE)
         fresh = plan_recovery(
             detection,
             accept_hermes_upgrade=accept_hermes_upgrade,
@@ -197,6 +318,8 @@ def _execute_fresh_plan(
         backup_text=evidence.backup_text,
         cron_text=evidence.cron_current_text,
         cron_backup_text=evidence.cron_backup_text,
+        base_text=evidence.base_current_text,
+        base_backup_text=evidence.base_backup_text,
     )
     quarantine_sources: List[Tuple[Path, str]] = []
     for action in plan.actions:
@@ -303,11 +426,27 @@ def _apply_recovery_action(
         if state.cron_text is None:
             raise RecoveryRefused("Cron source is unavailable.")
         state.cron_backup_text = remove_cron_patch(state.cron_text)
+    elif action == "restore_verified_base_backup":
+        if state.base_text is None or state.base_backup_text is None:
+            raise RecoveryRefused("Verified exact Base backup is unavailable.")
+        state.base_text = state.base_backup_text
+    elif action == "reapply_current_base_hook":
+        if state.base_text is None:
+            raise RecoveryRefused("Exact Base source is unavailable.")
+        source = state.base_backup_text
+        if source is None:
+            source = remove_base_patch(state.base_text)
+        state.base_text = apply_base_patch(source)
+    elif action == "rebuild_base_backup":
+        if state.base_text is None:
+            raise RecoveryRefused("Exact Base source is unavailable.")
+        state.base_backup_text = remove_base_patch(state.base_text)
     elif action == "rebuild_manifest":
         pass
     elif action == "clear_stale_install_state":
         state.backup_text = None
         state.cron_backup_text = None
+        state.base_backup_text = None
         state.clear_install_state = True
     else:
         raise RecoveryRefused("Unknown recovery action; refusing to mutate files.")
@@ -353,6 +492,25 @@ def _validate_recovery_state(
                     or remove_cron_patch(state.cron_text) != state.cron_backup_text
                 ):
                     raise ValueError("cron candidate does not match verified source")
+
+        if state.base_text is not None:
+            ast.parse(state.base_text)
+            base_unpatched = remove_base_patch(state.base_text)
+            if state.clear_install_state:
+                if base_unpatched != state.base_text:
+                    raise ValueError("owned exact Base patch remains")
+            elif state.base_backup_text is not None:
+                ast.parse(state.base_backup_text)
+                if remove_base_patch(state.base_backup_text) != state.base_backup_text:
+                    raise ValueError("exact Base backup contains owned patch")
+                expected_base = apply_base_patch(state.base_backup_text)
+                if (
+                    state.base_text != expected_base
+                    or remove_base_patch(state.base_text) != state.base_backup_text
+                ):
+                    raise ValueError(
+                        "exact Base candidate does not match verified source"
+                    )
     except (SyntaxError, ValueError) as exc:
         raise RecoveryRefused(
             "staged recovery validation failed; no files were changed"
@@ -405,10 +563,27 @@ def _build_recovery_changes(
             state.cron_backup_text,
         )
 
+    if detection.base_py is not None:
+        base_backup_path = detection.base_py.with_name(
+            f"{detection.base_py.name}{BACKUP_SUFFIX}"
+        )
+        _append_optional_change(
+            changes,
+            detection.base_py,
+            evidence.base_current_text,
+            state.base_text,
+        )
+        _append_optional_change(
+            changes,
+            base_backup_path,
+            evidence.base_backup_text,
+            state.base_backup_text,
+        )
+
     old_manifest = _read_text(manifest_path) if manifest_path.exists() else None
     new_manifest = None
     if not state.clear_install_state:
-        new_manifest = _render_manifest(detection, state)
+        new_manifest = _render_manifest(detection, state, evidence.manifest)
     _append_optional_change(changes, manifest_path, old_manifest, new_manifest)
     return changes, quarantine_name
 
@@ -433,13 +608,18 @@ def _append_optional_change(
         changes.append((path, after))
 
 
-def _render_manifest(detection: HermesDetection, state: _RecoveryState) -> str:
+def _render_manifest(
+    detection: HermesDetection,
+    state: _RecoveryState,
+    previous_manifest: Optional[Dict[str, object]] = None,
+) -> str:
     if state.backup_text is None:
         raise RecoveryRefused("Gateway backup is required for the install manifest.")
     backup_path = detection.run_py.with_name(
         f"{detection.run_py.name}{BACKUP_SUFFIX}"
     )
     manifest = {
+        "manifest_version": CURRENT_INSTALL_MANIFEST_VERSION,
         "run_py": _relative_path(detection.root, detection.run_py),
         "patched_sha256": _text_sha256(state.run_text),
         "backup": _relative_path(detection.root, backup_path),
@@ -459,7 +639,88 @@ def _render_manifest(detection: HermesDetection, state: _RecoveryState) -> str:
                 "cron_backup_sha256": _text_sha256(state.cron_backup_text),
             }
         )
+    has_base = bool(
+        detection.base_required
+        and detection.base_py is not None
+        and state.base_text is not None
+        and state.base_backup_text is not None
+        and remove_base_patch(state.base_text) != state.base_text
+    )
+    if has_base:
+        base_py = detection.base_py
+        if base_py is None or state.base_backup_text is None:
+            raise RecoveryRefused(
+                "Exact Base backup is required for the install manifest."
+            )
+        base_backup_path = base_py.with_name(f"{base_py.name}{BACKUP_SUFFIX}")
+        manifest.update(
+            {
+                "base_py": _relative_path(detection.root, base_py),
+                "base_patched_sha256": _text_sha256(state.base_text or ""),
+                "base_backup": _relative_path(detection.root, base_backup_path),
+                "base_backup_sha256": _text_sha256(state.base_backup_text),
+            }
+        )
+    integrity = _preserved_integrity_provenance(
+        previous_manifest,
+        state,
+        has_cron=detection.cron_py is not None and state.cron_text is not None,
+        has_base=has_base,
+    )
+    if integrity is not None:
+        manifest["integrity"] = integrity
     return json.dumps(manifest, sort_keys=True) + "\n"
+
+
+def _preserved_integrity_provenance(
+    manifest: Optional[Dict[str, object]],
+    state: _RecoveryState,
+    *,
+    has_cron: bool,
+    has_base: bool,
+) -> Optional[Dict[str, object]]:
+    if not isinstance(manifest, dict) or state.backup_text is None:
+        return None
+    value = manifest.get("integrity")
+    if not isinstance(value, dict):
+        return None
+    git_head = value.get("git_head")
+    run_hash = value.get("run_blob_sha256")
+    if (
+        value.get("version") != 2
+        or not isinstance(git_head, str)
+        or _GIT_HASH_RE.fullmatch(git_head) is None
+        or not isinstance(run_hash, str)
+        or _HASH_RE.fullmatch(run_hash) is None
+        or run_hash != _text_sha256(state.backup_text)
+    ):
+        return None
+    preserved: Dict[str, object] = {
+        "version": 2,
+        "git_head": git_head,
+        "run_blob_sha256": run_hash,
+    }
+    if has_cron:
+        cron_hash = value.get("cron_blob_sha256")
+        if (
+            state.cron_backup_text is None
+            or not isinstance(cron_hash, str)
+            or _HASH_RE.fullmatch(cron_hash) is None
+            or cron_hash != _text_sha256(state.cron_backup_text)
+        ):
+            return None
+        preserved["cron_blob_sha256"] = cron_hash
+    if has_base:
+        base_hash = value.get("base_blob_sha256")
+        if (
+            state.base_backup_text is None
+            or not isinstance(base_hash, str)
+            or _HASH_RE.fullmatch(base_hash) is None
+            or base_hash != _text_sha256(state.base_backup_text)
+        ):
+            return None
+        preserved["base_blob_sha256"] = base_hash
+    return preserved
 
 
 def _commit_recovery_changes(
@@ -469,20 +730,52 @@ def _commit_recovery_changes(
     *,
     accept_hermes_upgrade: bool = False,
 ) -> None:
+    _require_secure_dirfd_transactions()
     ordered_changes = [change for change in changes if change[1] is not None]
     ordered_changes.extend(change for change in changes if change[1] is None)
-    staged: Dict[Path, Path] = {}
-    rollback: Dict[Path, Path] = {}
+    target_ancestries, directory_snapshots = _snapshot_controlled_ancestries(
+        detection.root, [target for target, _contents in ordered_changes]
+    )
+    staged: Dict[Path, _StagedText] = {}
+    rollback: Dict[Path, _StagedText] = {}
+    target_bindings: Dict[Path, _TargetBinding] = {}
     originals: Dict[Path, Optional[str]] = {}
+    pre_write_snapshots: Dict[Path, Optional[_OwnedWriteSnapshot]] = {}
+    post_write_snapshots: Dict[Path, Optional[_OwnedWriteSnapshot]] = {}
     changed: List[Path] = []
     try:
         for target, contents in ordered_changes:
-            original = _read_text(target) if target.exists() else None
+            target_bindings[target] = _bind_target(target)
+            binding = target_bindings[target]
+            _assert_controlled_ancestry_unchanged(
+                target, target_ancestries, directory_snapshots
+            )
+            pre_write_snapshots[target] = _snapshot_prewrite_target(target)
+            bound_snapshot, original = _read_bound_target_text(
+                binding,
+                "recovery target changed during mutation",
+            )
+            if bound_snapshot != pre_write_snapshots[target]:
+                raise RecoveryRefused(
+                    "recovery target changed during mutation"
+                )
+            _assert_controlled_ancestry_unchanged(
+                target, target_ancestries, directory_snapshots
+            )
+            _assert_prewrite_target_unchanged(
+                target, pre_write_snapshots[target]
+            )
             originals[target] = original
             if original is not None:
-                rollback[target] = _stage_text(target, original)
+                rollback[target] = _stage_text(
+                    target, original, binding=binding
+                )
+                rollback[target].target_binding = target_bindings[target]
             if contents is not None:
-                staged[target] = _stage_text(target, contents)
+                staged[target] = _stage_text(
+                    target, contents, binding=binding
+                )
+                staged[target].target_binding = target_bindings[target]
 
         if (
             plan_recovery(
@@ -494,14 +787,56 @@ def _commit_recovery_changes(
             raise RecoveryRefused("recovery evidence changed; rerun diagnosis")
 
         for target, contents in ordered_changes:
-            changed.append(target)
+            _assert_controlled_ancestry_unchanged(
+                target, target_ancestries, directory_snapshots
+            )
+            _assert_prewrite_target_unchanged(
+                target, pre_write_snapshots[target]
+            )
+            binding = target_bindings[target]
+            binding.assert_parent()
+            _assert_bound_target_unchanged(
+                binding, pre_write_snapshots[target]
+            )
+            _assert_controlled_ancestry_unchanged(
+                target, target_ancestries, directory_snapshots
+            )
             if contents is None:
-                target.unlink(missing_ok=True)
+                os.unlink(binding.basename, dir_fd=binding.parent_fd)
+                changed.append(target)
+                post_write_snapshots[target] = None
+                _assert_bound_target_unchanged(binding, None)
             else:
                 _atomic_replace(staged[target], target)
                 staged.pop(target, None)
+                changed.append(target)
+                post_write_snapshots[target] = _snapshot_bound_write(
+                    binding, contents
+                )
+                _snapshot_owned_write(target, contents)
+            _assert_controlled_ancestry_unchanged(
+                target, target_ancestries, directory_snapshots
+            )
+        for target, _contents in ordered_changes:
+            _assert_controlled_ancestry_unchanged(
+                target, target_ancestries, directory_snapshots
+            )
+            binding = target_bindings[target]
+            binding.assert_parent()
+            _assert_bound_target_unchanged(
+                binding, post_write_snapshots[target]
+            )
     except Exception as exc:
-        rollback_error = _rollback_recovery_changes(changed, originals, rollback)
+        rollback_error = _rollback_recovery_changes(
+            changed,
+            originals,
+            rollback,
+            post_write_snapshots,
+            target_ancestries,
+            directory_snapshots,
+            target_bindings,
+            pre_write_snapshots,
+        )
         if rollback_error is not None:
             raise RecoveryRefused(
                 "recovery rollback failed; install state requires manual review"
@@ -509,49 +844,426 @@ def _commit_recovery_changes(
         raise
     finally:
         for temp_path in list(staged.values()) + list(rollback.values()):
-            temp_path.unlink(missing_ok=True)
+            temp_path.cleanup()
+        for binding in target_bindings.values():
+            binding.release()
 
 
 def _rollback_recovery_changes(
     changed: List[Path],
     originals: Dict[Path, Optional[str]],
-    rollback: Dict[Path, Path],
+    rollback: Dict[Path, _StagedText],
+    post_write_snapshots: Dict[Path, Optional[_OwnedWriteSnapshot]],
+    target_ancestries: Dict[Path, Tuple[Path, ...]],
+    directory_snapshots: Dict[Path, _DirectoryIdentity],
+    target_bindings: Dict[Path, _TargetBinding],
+    pre_write_snapshots: Dict[Path, Optional[_OwnedWriteSnapshot]],
 ) -> Optional[Exception]:
     first_error = None
     for target in reversed(changed):
         try:
+            if target not in post_write_snapshots:
+                raise RecoveryRefused("recovery lost write ownership")
+            binding = target_bindings[target]
+            binding.assert_parent()
+            _assert_bound_target_unchanged(
+                binding, post_write_snapshots[target]
+            )
             original = originals[target]
             if original is None:
-                target.unlink(missing_ok=True)
+                os.unlink(binding.basename, dir_fd=binding.parent_fd)
             else:
-                os.replace(str(rollback[target]), str(target))
+                rollback_file = rollback[target]
+                rollback_file.assert_owned()
+                os.replace(
+                    rollback_file.basename,
+                    binding.basename,
+                    src_dir_fd=rollback_file.parent_fd,
+                    dst_dir_fd=binding.parent_fd,
+                )
+                rollback_file.release()
                 rollback.pop(target, None)
-        except OSError as exc:
+            _assert_bound_target_restored(
+                binding, pre_write_snapshots[target]
+            )
+        except (OSError, RecoveryRefused) as exc:
             if first_error is None:
                 first_error = exc
     return first_error
 
 
-def _stage_text(target: Path, contents: str) -> Path:
-    descriptor, temp_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+def _bind_target(target: Path) -> _TargetBinding:
+    parent_fd = _open_staging_parent(target.parent)
+    opened = os.fstat(parent_fd)
+    return _TargetBinding(
+        path=target,
+        parent_fd=parent_fd,
+        basename=target.name,
+        parent_identity=(opened.st_dev, opened.st_ino),
     )
-    temp_path = Path(temp_name)
+
+
+def _snapshot_bound_write(
+    binding: _TargetBinding, expected_contents: str
+) -> _OwnedWriteSnapshot:
+    snapshot = _read_bound_target_snapshot(
+        binding, "recovery target changed during mutation"
+    )
+    if snapshot is None or snapshot[2] != _text_sha256(expected_contents):
+        raise RecoveryRefused("recovery could not verify committed write")
+    return snapshot
+
+
+def _assert_bound_target_unchanged(
+    binding: _TargetBinding, expected: Optional[_OwnedWriteSnapshot]
+) -> None:
+    binding.assert_parent()
+    current = _read_bound_target_snapshot(
+        binding, "recovery target changed during mutation"
+    )
+    if current != expected:
+        raise RecoveryRefused("recovery target changed during mutation")
+
+
+def _assert_bound_target_restored(
+    binding: _TargetBinding, expected: Optional[_OwnedWriteSnapshot]
+) -> None:
+    binding.assert_parent()
+    current = _read_bound_target_snapshot(
+        binding, "recovery rollback target changed"
+    )
+    if expected is None:
+        matches = current is None
+    else:
+        matches = current is not None and current[2] == expected[2]
+    if not matches:
+        raise RecoveryRefused("recovery rollback target changed")
+
+
+def _read_bound_target_snapshot(
+    binding: _TargetBinding, refusal: str
+) -> Optional[_OwnedWriteSnapshot]:
+    snapshot, _contents = _read_bound_target_text(binding, refusal)
+    return snapshot
+
+
+def _read_bound_target_text(
+    binding: _TargetBinding, refusal: str
+) -> Tuple[Optional[_OwnedWriteSnapshot], Optional[str]]:
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+        before = os.stat(
+            binding.basename,
+            dir_fd=binding.parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None, None
+    if not stat.S_ISREG(before.st_mode):
+        raise RecoveryRefused(refusal)
+    identity = (before.st_dev, before.st_ino)
+    descriptor = -1
+    digest = sha256()
+    payload = bytearray()
+    try:
+        descriptor = os.open(
+            binding.basename,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=binding.parent_fd,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != identity
+        ):
+            raise RecoveryRefused(refusal)
+        while chunk := os.read(descriptor, 64 * 1024):
+            digest.update(chunk)
+            payload.extend(chunk)
+    except OSError as exc:
+        raise RecoveryRefused(refusal) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    after = os.stat(
+        binding.basename,
+        dir_fd=binding.parent_fd,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or (after.st_dev, after.st_ino) != identity
+    ):
+        raise RecoveryRefused(refusal)
+    try:
+        contents = payload.decode("utf-8")
+    except UnicodeError as exc:
+        raise RecoveryRefused(refusal) from exc
+    return (before.st_dev, before.st_ino, digest.hexdigest()), contents
+
+
+def _snapshot_prewrite_target(
+    target: Path,
+) -> Optional[_OwnedWriteSnapshot]:
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        return None
+    return _read_regular_file_snapshot(
+        target, "recovery target is not safe before write"
+    )
+
+
+def _assert_prewrite_target_unchanged(
+    target: Path, expected: Optional[_OwnedWriteSnapshot]
+) -> None:
+    if expected is None:
+        try:
+            target.lstat()
+        except FileNotFoundError:
+            return
+        raise RecoveryRefused("recovery target changed before write")
+    current = _read_regular_file_snapshot(
+        target, "recovery target changed before write"
+    )
+    if current != expected:
+        raise RecoveryRefused("recovery target changed before write")
+
+
+def _snapshot_controlled_ancestries(
+    controlled_root: Path, targets: List[Path]
+) -> Tuple[
+    Dict[Path, Tuple[Path, ...]],
+    Dict[Path, _DirectoryIdentity],
+]:
+    target_ancestries: Dict[Path, Tuple[Path, ...]] = {}
+    directory_snapshots: Dict[Path, _DirectoryIdentity] = {}
+    for target in targets:
+        ancestry = _controlled_ancestry_paths(controlled_root, target)
+        target_ancestries[target] = ancestry
+        for directory in ancestry:
+            if directory not in directory_snapshots:
+                directory_snapshots[directory] = _read_directory_identity(
+                    directory,
+                    "recovery controlled ancestry is unsafe",
+                )
+    return target_ancestries, directory_snapshots
+
+
+def _controlled_ancestry_paths(
+    controlled_root: Path, target: Path
+) -> Tuple[Path, ...]:
+    root = Path(os.path.abspath(controlled_root))
+    absolute_target = Path(os.path.abspath(target))
+    try:
+        relative = absolute_target.relative_to(root)
+    except ValueError as exc:
+        raise RecoveryRefused(
+            "recovery target is outside controlled root"
+        ) from exc
+    if not relative.parts:
+        raise RecoveryRefused("recovery target is outside controlled root")
+    directories = [root]
+    current = root
+    for part in relative.parts[:-1]:
+        current = current / part
+        directories.append(current)
+    return tuple(directories)
+
+
+def _read_directory_identity(
+    directory: Path, refusal: str
+) -> _DirectoryIdentity:
+    try:
+        snapshot = directory.lstat()
+    except FileNotFoundError as exc:
+        raise RecoveryRefused(refusal) from exc
+    if not stat.S_ISDIR(snapshot.st_mode):
+        raise RecoveryRefused(refusal)
+    return snapshot.st_dev, snapshot.st_ino
+
+
+def _assert_controlled_ancestry_unchanged(
+    target: Path,
+    target_ancestries: Dict[Path, Tuple[Path, ...]],
+    directory_snapshots: Dict[Path, _DirectoryIdentity],
+) -> None:
+    for directory in target_ancestries[target]:
+        if _read_directory_identity(
+            directory,
+            "recovery target ancestry changed before write",
+        ) != directory_snapshots[directory]:
+            raise RecoveryRefused(
+                "recovery target ancestry changed before write"
+            )
+
+
+def _snapshot_owned_write(
+    target: Path, expected_contents: str
+) -> _OwnedWriteSnapshot:
+    snapshot = _read_owned_write_snapshot(target)
+    if snapshot[2] != _text_sha256(expected_contents):
+        raise RecoveryRefused("recovery could not verify committed write")
+    return snapshot
+
+
+def _assert_owned_write_unchanged(
+    target: Path, expected: Optional[_OwnedWriteSnapshot]
+) -> None:
+    if expected is None:
+        try:
+            target.lstat()
+        except FileNotFoundError:
+            return
+        raise RecoveryRefused("recovery target changed after write")
+    if _read_owned_write_snapshot(target) != expected:
+        raise RecoveryRefused("recovery target changed after write")
+
+
+def _read_owned_write_snapshot(target: Path) -> _OwnedWriteSnapshot:
+    return _read_regular_file_snapshot(
+        target, "recovery target changed after write"
+    )
+
+
+def _read_regular_file_snapshot(
+    target: Path, refusal: str
+) -> _OwnedWriteSnapshot:
+    try:
+        before = target.lstat()
+    except FileNotFoundError as exc:
+        raise RecoveryRefused(refusal) from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise RecoveryRefused(refusal)
+    identity = (before.st_dev, before.st_ino)
+    descriptor: int | None = None
+    digest = sha256()
+    try:
+        descriptor = os.open(
+            target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != identity
+        ):
+            raise RecoveryRefused(refusal)
+        while chunk := os.read(descriptor, 64 * 1024):
+            digest.update(chunk)
+    except OSError as exc:
+        raise RecoveryRefused(refusal) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    try:
+        after = target.lstat()
+    except FileNotFoundError as exc:
+        raise RecoveryRefused(refusal) from exc
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or (after.st_dev, after.st_ino) != identity
+    ):
+        raise RecoveryRefused(refusal)
+    return before.st_dev, before.st_ino, digest.hexdigest()
+
+
+def _stage_text(
+    target: Path,
+    contents: str,
+    *,
+    binding: _TargetBinding | None = None,
+) -> _StagedText:
+    if binding is None:
+        parent_fd = _open_staging_parent(target.parent)
+        target_name = target.name
+    else:
+        binding.assert_parent()
+        parent_fd = os.dup(binding.parent_fd)
+        target_name = binding.basename
+    descriptor = -1
+    staged: _StagedText | None = None
+    try:
+        basename = f".{target_name}.{uuid4().hex}.tmp"
+        descriptor = os.open(
+            basename,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        staged = _StagedText(
+            path=target.parent / basename,
+            parent_fd=parent_fd,
+            basename=basename,
+            identity=(os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino),
+        )
+        parent_fd = -1
+        try:
+            target_snapshot = os.stat(
+                target_name,
+                dir_fd=staged.parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            mode = 0o600
+        else:
+            if not stat.S_ISREG(target_snapshot.st_mode):
+                raise RecoveryRefused(
+                    "recovery target is not safe before write"
+                )
+            mode = stat.S_IMODE(target_snapshot.st_mode)
+        handle = os.fdopen(descriptor, "w", encoding="utf-8", newline="")
+        descriptor = -1
+        with handle:
             handle.write(contents)
             handle.flush()
             os.fsync(handle.fileno())
-        if target.exists():
-            os.chmod(str(temp_path), target.stat().st_mode)
-        return temp_path
+            os.fchmod(handle.fileno(), mode)
+        return staged
     except Exception:
-        temp_path.unlink(missing_ok=True)
+        if descriptor >= 0:
+            os.close(descriptor)
+        if staged is not None:
+            staged.cleanup()
+        elif parent_fd >= 0:
+            os.close(parent_fd)
         raise
 
 
-def _atomic_replace(staged: Path, target: Path) -> None:
-    os.replace(str(staged), str(target))
+def _open_staging_parent(parent: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        parent_fd = os.open(parent, flags)
+    except OSError as exc:
+        raise RecoveryRefused("recovery staging parent is unsafe") from exc
+    try:
+        opened = os.fstat(parent_fd)
+        current = parent.lstat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (current.st_dev, current.st_ino)
+        ):
+            raise RecoveryRefused("recovery staging parent is unsafe")
+        return parent_fd
+    except Exception:
+        os.close(parent_fd)
+        raise
+
+
+def _atomic_replace(staged: _StagedText, target: Path) -> None:
+    binding = staged.target_binding
+    if binding is None:
+        raise RecoveryRefused("recovery target binding is missing")
+    staged.assert_owned()
+    binding.assert_parent()
+    os.replace(
+        staged.basename,
+        binding.basename,
+        src_dir_fd=staged.parent_fd,
+        dst_dir_fd=binding.parent_fd,
+    )
+    staged.release()
 
 
 def _new_quarantine_path(source_path: Path) -> Path:
@@ -655,6 +1367,19 @@ def _read_evidence(detection: HermesDetection) -> RecoveryEvidence:
         cron_backup_sha256,
         cron_marker_error,
     ) = _read_cron_evidence(detection)
+    (
+        base_current_text,
+        base_current_sha256,
+        base_backup_text,
+        base_backup_sha256,
+        base_marker_error,
+    ) = _read_base_evidence(detection)
+    if not detection.base_required and not _base_manifest_fields(manifest):
+        base_current_text = None
+        base_current_sha256 = ""
+        base_backup_text = None
+        base_backup_sha256 = ""
+        base_marker_error = ""
 
     if run_py.is_symlink():
         return RecoveryEvidence(
@@ -669,6 +1394,11 @@ def _read_evidence(detection: HermesDetection) -> RecoveryEvidence:
             cron_backup_text=cron_backup_text,
             cron_backup_sha256=cron_backup_sha256,
             cron_marker_error=cron_marker_error,
+            base_current_text=base_current_text,
+            base_current_sha256=base_current_sha256,
+            base_backup_text=base_backup_text,
+            base_backup_sha256=base_backup_sha256,
+            base_marker_error=base_marker_error,
         )
 
     try:
@@ -686,6 +1416,11 @@ def _read_evidence(detection: HermesDetection) -> RecoveryEvidence:
             cron_backup_text=cron_backup_text,
             cron_backup_sha256=cron_backup_sha256,
             cron_marker_error=cron_marker_error,
+            base_current_text=base_current_text,
+            base_current_sha256=base_current_sha256,
+            base_backup_text=base_backup_text,
+            base_backup_sha256=base_backup_sha256,
+            base_marker_error=base_marker_error,
         )
 
     marker_error = ""
@@ -717,6 +1452,11 @@ def _read_evidence(detection: HermesDetection) -> RecoveryEvidence:
         cron_backup_text=cron_backup_text,
         cron_backup_sha256=cron_backup_sha256,
         cron_marker_error=cron_marker_error,
+        base_current_text=base_current_text,
+        base_current_sha256=base_current_sha256,
+        base_backup_text=base_backup_text,
+        base_backup_sha256=base_backup_sha256,
+        base_marker_error=base_marker_error,
     )
 
 
@@ -736,6 +1476,10 @@ def _classify_evidence(
         read_findings.append(_finding("cron_symlink_refused", "error"))
     elif evidence.cron_marker_error == "current_read_error":
         read_findings.append(_finding("cron_current_read_error", "error"))
+    if evidence.base_marker_error == "symlink_refused":
+        read_findings.append(_finding("base_symlink_refused", "error"))
+    elif evidence.base_marker_error == "current_read_error":
+        read_findings.append(_finding("base_current_read_error", "error"))
     if read_findings:
         return _classification("refused", False, (), read_findings, parts)
 
@@ -750,7 +1494,154 @@ def _classify_evidence(
         gateway.state,
         accept_hermes_upgrade=accept_hermes_upgrade,
     )
-    return _merge_classifications(gateway, cron, parts)
+    base = _classify_base_evidence(
+        detection,
+        evidence,
+        gateway.state,
+        accept_hermes_upgrade=accept_hermes_upgrade,
+    )
+    return _merge_classifications(gateway, cron, base, parts)
+
+
+def _classify_base_evidence(
+    detection: HermesDetection,
+    evidence: RecoveryEvidence,
+    gateway_state: str,
+    *,
+    accept_hermes_upgrade: bool,
+) -> RecoveryClassification:
+    parts = _fingerprint_parts(detection, evidence)
+    findings = []
+    manifest = evidence.manifest
+    manifest_fields = _base_manifest_fields(manifest)
+    manifest_has_any = bool(manifest_fields)
+    manifest_complete = len(manifest_fields) == 4
+    backup_present = evidence.base_backup_text is not None
+    backup_error = evidence.base_backup_sha256.startswith(_STATUS_PREFIX)
+    current = evidence.base_current_text
+    artifacts_present = manifest_has_any or backup_present or backup_error
+
+    if evidence.base_marker_error in {"symlink_refused", "current_read_error"}:
+        findings.append(_finding("base_evidence_unavailable", "error"))
+        return _classification("refused", False, (), findings, parts)
+    if current is None:
+        if detection.base_required or artifacts_present:
+            findings.append(_finding("base_source_missing", "error"))
+            return _classification("refused", False, (), findings, parts)
+        return _classification("clean", False, (), findings, parts)
+    if manifest_has_any and not manifest_complete:
+        findings.append(_finding("base_manifest_incomplete", "error"))
+        return _classification("owned_incomplete", False, (), findings, parts)
+    if backup_error:
+        findings.append(_finding("base_backup_unavailable", "error"))
+        return _classification("refused", False, (), findings, parts)
+
+    marker_corrupt = evidence.base_marker_error == "corrupt_patch_markers"
+    unpatched = current
+    has_patch = False
+    if not marker_corrupt:
+        try:
+            unpatched = remove_base_patch(current)
+            has_patch = unpatched != current
+        except ValueError:
+            marker_corrupt = True
+
+    if not artifacts_present and not has_patch:
+        if not detection.base_required:
+            return _classification("clean", False, (), findings, parts)
+        findings.append(_finding("base_install_state_incomplete", "error"))
+        reapply_error = _validate_base_reapplication(current)
+        if reapply_error:
+            findings.append(_finding("base_source_mismatch", "error"))
+        can_extend_owned_install = gateway_state in {
+            "installed",
+            "owned_incomplete",
+            "corrupt_owned",
+        }
+        actions = (
+            "rebuild_base_backup",
+            "reapply_current_base_hook",
+            "rebuild_manifest",
+        )
+        return _classification(
+            "owned_incomplete",
+            bool(can_extend_owned_install and not reapply_error),
+            actions if can_extend_owned_install else (),
+            findings,
+            parts,
+        )
+    checks = _check_base_manifest(detection, evidence)
+    findings.extend(checks.findings)
+    backup_checks = _check_base_backup(evidence)
+    findings.extend(backup_checks.findings)
+
+    if marker_corrupt:
+        executable = bool(
+            manifest_complete
+            and checks.valid
+            and checks.current_matches
+            and checks.backup_matches
+            and backup_checks.valid
+        )
+        findings.append(_finding("base_marker_error", "error"))
+        return _classification(
+            "corrupt_owned",
+            executable,
+            (
+                "restore_verified_base_backup",
+                "reapply_current_base_hook",
+                "rebuild_manifest",
+            ),
+            findings,
+            parts,
+        )
+
+    if has_patch:
+        candidate_matches = False
+        if backup_checks.valid and evidence.base_backup_text is not None:
+            try:
+                candidate_matches = (
+                    apply_base_patch(evidence.base_backup_text) == current
+                    and unpatched == evidence.base_backup_text
+                )
+            except ValueError:
+                candidate_matches = False
+        complete = bool(
+            manifest_complete
+            and checks.valid
+            and checks.current_matches
+            and checks.backup_matches
+            and backup_checks.valid
+            and candidate_matches
+        )
+        if complete:
+            return _classification("installed", False, (), findings, parts)
+        findings.append(_finding("base_patch_mismatch", "error"))
+        return _classification("owned_incomplete", False, (), findings, parts)
+
+    if not manifest_complete or not backup_checks.valid or not checks.valid:
+        findings.append(_finding("base_install_state_incomplete", "error"))
+        return _classification("owned_incomplete", False, (), findings, parts)
+    reapply_error = _validate_base_reapplication(current)
+    source_matches = evidence.base_backup_text == current
+    accepted_replacement = bool(
+        accept_hermes_upgrade and detection.supported and not reapply_error
+    )
+    executable = bool(not reapply_error and (source_matches or accepted_replacement))
+    if not executable:
+        findings.append(_finding("base_source_mismatch", "error"))
+    elif accepted_replacement and not source_matches:
+        findings.append(_finding("hermes_upgrade_base_source_accepted", "warning"))
+    actions = ["reapply_current_base_hook", "rebuild_manifest"]
+    if not source_matches:
+        actions.insert(0, "rebuild_base_backup")
+    return _classification(
+        "stale_unpatched",
+        executable,
+        tuple(actions),
+        findings,
+        parts,
+    )
 
 
 def _classify_gateway_evidence(
@@ -1252,9 +2143,10 @@ def _classify_cron_evidence(
 def _merge_classifications(
     gateway: RecoveryClassification,
     cron: RecoveryClassification,
+    base: RecoveryClassification,
     parts: Dict[str, str],
 ) -> RecoveryClassification:
-    states = {gateway.state, cron.state}
+    states = {gateway.state, cron.state, base.state}
     if "refused" in states:
         state = "refused"
     elif "corrupt_owned" in states:
@@ -1268,16 +2160,18 @@ def _merge_classifications(
     else:
         state = "clean"
 
-    actions, actions_safe = _merge_actions(gateway, cron)
-    findings = gateway.findings + cron.findings
+    actions, actions_safe = _merge_actions(gateway, cron, base)
+    findings = gateway.findings + cron.findings + base.findings
     healthy = {"clean", "installed"}
     executable = bool(
         state not in healthy
         and actions_safe
         and gateway.state != "refused"
         and cron.state != "refused"
+        and base.state != "refused"
         and (gateway.state in healthy or gateway.executable)
         and (cron.state in healthy or cron.executable)
+        and (base.state in healthy or base.executable)
     )
     return _classification(state, executable, actions, findings, parts)
 
@@ -1285,18 +2179,28 @@ def _merge_classifications(
 def _merge_actions(
     gateway: RecoveryClassification,
     cron: RecoveryClassification,
+    base: RecoveryClassification,
 ) -> Tuple[Tuple[str, ...], bool]:
     clear_action = "clear_stale_install_state"
     if clear_action not in gateway.actions:
-        return tuple(dict.fromkeys(gateway.actions + cron.actions)), True
+        return tuple(
+            dict.fromkeys(gateway.actions + cron.actions + base.actions)
+        ), True
 
-    if cron.state in {"clean", "stale_unpatched"}:
-        return (clear_action,), True
+    restore_actions = []
     if cron.state == "installed" or (
         cron.state == "corrupt_owned" and cron.executable
     ):
-        return ("restore_verified_cron_backup", clear_action), True
-    return (), False
+        restore_actions.append("restore_verified_cron_backup")
+    elif cron.state not in {"clean", "stale_unpatched"}:
+        return (), False
+    if base.state == "installed" or (
+        base.state == "corrupt_owned" and base.executable
+    ):
+        restore_actions.append("restore_verified_base_backup")
+    elif base.state not in {"clean", "stale_unpatched"}:
+        return (), False
+    return tuple((*restore_actions, clear_action)), True
 
 
 def _check_manifest(
@@ -1452,6 +2356,65 @@ def _check_cron_manifest(
     )
 
 
+def _base_manifest_fields(
+    manifest: Optional[Dict[str, object]],
+) -> set[str]:
+    if manifest is None or manifest.get(_MANIFEST_ERROR):
+        return set()
+    keys = {
+        "base_py",
+        "base_patched_sha256",
+        "base_backup",
+        "base_backup_sha256",
+    }
+    return keys.intersection(manifest)
+
+
+def _check_base_manifest(
+    detection: HermesDetection,
+    evidence: RecoveryEvidence,
+) -> _ManifestChecks:
+    manifest = evidence.manifest
+    if manifest is None or len(_base_manifest_fields(manifest)) != 4:
+        return _ManifestChecks(False, False, False, False, "", ())
+    base_py = detection.base_py
+    if base_py is None:
+        return _ManifestChecks(False, False, False, False, "", ())
+    backup_path = base_py.with_name(f"{base_py.name}{BACKUP_SUFFIX}")
+    paths_valid = bool(
+        manifest.get("base_py") == _relative_path(detection.root, base_py)
+        and manifest.get("base_backup")
+        == _relative_path(detection.root, backup_path)
+    )
+    findings = []
+    if not paths_valid:
+        findings.append(_finding("base_manifest_path_mismatch", "error"))
+    current_hash = _manifest_hash(manifest, "base_patched_sha256")
+    backup_hash = _manifest_hash(manifest, "base_backup_sha256")
+    if not current_hash:
+        findings.append(_finding("base_manifest_current_hash_invalid", "error"))
+    if not backup_hash:
+        findings.append(_finding("base_manifest_backup_hash_invalid", "error"))
+    current_matches = bool(
+        current_hash and evidence.base_current_sha256 == current_hash
+    )
+    backup_matches = bool(
+        backup_hash
+        and evidence.base_backup_text is not None
+        and evidence.base_backup_sha256 == backup_hash
+    )
+    if evidence.base_backup_text is not None and backup_hash and not backup_matches:
+        findings.append(_finding("base_backup_hash_mismatch", "error"))
+    return _ManifestChecks(
+        bool(paths_valid and current_hash and backup_hash),
+        paths_valid,
+        current_matches,
+        backup_matches,
+        backup_hash,
+        tuple(findings),
+    )
+
+
 def _check_backup(evidence: RecoveryEvidence) -> _BackupChecks:
     if evidence.backup_sha256 == f"{_STATUS_PREFIX}symlink":
         return _BackupChecks(False, (_finding("symlink_refused", "error"),))
@@ -1488,6 +2451,23 @@ def _check_cron_backup(evidence: RecoveryEvidence) -> _BackupChecks:
     return _BackupChecks(True, ())
 
 
+def _check_base_backup(evidence: RecoveryEvidence) -> _BackupChecks:
+    if evidence.base_backup_sha256 == f"{_STATUS_PREFIX}symlink":
+        return _BackupChecks(False, (_finding("base_backup_symlink_refused", "error"),))
+    if evidence.base_backup_sha256 == f"{_STATUS_PREFIX}read_error":
+        return _BackupChecks(False, (_finding("base_backup_read_error", "error"),))
+    if evidence.base_backup_text is None:
+        return _BackupChecks(False, ())
+    try:
+        ast.parse(evidence.base_backup_text)
+        if remove_base_patch(evidence.base_backup_text) != evidence.base_backup_text:
+            raise ValueError("owned exact Base patch in backup")
+        apply_base_patch(evidence.base_backup_text)
+    except (SyntaxError, ValueError):
+        return _BackupChecks(False, (_finding("base_backup_invalid", "error"),))
+    return _BackupChecks(True, ())
+
+
 def _validate_reapplication(
     detection: HermesDetection, source_text: Optional[str]
 ) -> str:
@@ -1514,6 +2494,22 @@ def _validate_cron_reapplication(source_text: Optional[str]) -> str:
             return "unsupported_anchors"
         ast.parse(candidate)
         if remove_cron_patch(candidate) != source_text:
+            return "marker_validation"
+    except (SyntaxError, ValueError):
+        return "unsupported_anchors"
+    return ""
+
+
+def _validate_base_reapplication(source_text: Optional[str]) -> str:
+    if source_text is None:
+        return "unsupported_anchors"
+    try:
+        ast.parse(source_text)
+        candidate = apply_base_patch(source_text)
+        if candidate == source_text:
+            return "unsupported_anchors"
+        ast.parse(candidate)
+        if remove_base_patch(candidate) != source_text:
             return "marker_validation"
     except (SyntaxError, ValueError):
         return "unsupported_anchors"
@@ -1567,20 +2563,28 @@ def _fingerprint_parts(
         manifest_backup_hash = ""
         manifest_cron_current_hash = ""
         manifest_cron_backup_hash = ""
+        manifest_base_current_hash = ""
+        manifest_base_backup_hash = ""
         run_path_matches = "false"
         backup_path_matches = "false"
         cron_path_matches = "false"
         cron_backup_path_matches = "false"
+        base_path_matches = "false"
+        base_backup_path_matches = "false"
     elif manifest.get(_MANIFEST_ERROR):
         manifest_state = str(manifest[_MANIFEST_ERROR])
         manifest_current_hash = ""
         manifest_backup_hash = ""
         manifest_cron_current_hash = ""
         manifest_cron_backup_hash = ""
+        manifest_base_current_hash = ""
+        manifest_base_backup_hash = ""
         run_path_matches = "false"
         backup_path_matches = "false"
         cron_path_matches = "false"
         cron_backup_path_matches = "false"
+        base_path_matches = "false"
+        base_backup_path_matches = "false"
     else:
         manifest_state = "present"
         manifest_current_hash = _manifest_hash(manifest, "patched_sha256")
@@ -1590,6 +2594,12 @@ def _fingerprint_parts(
         )
         manifest_cron_backup_hash = _manifest_hash(
             manifest, "cron_backup_sha256"
+        )
+        manifest_base_current_hash = _manifest_hash(
+            manifest, "base_patched_sha256"
+        )
+        manifest_base_backup_hash = _manifest_hash(
+            manifest, "base_backup_sha256"
         )
         expected_backup = detection.run_py.with_name(
             f"{detection.run_py.name}{BACKUP_SUFFIX}"
@@ -1616,10 +2626,31 @@ def _fingerprint_parts(
                 manifest.get("cron_backup")
                 == _relative_path(detection.root, expected_cron_backup)
             ).lower()
+        base_py = detection.base_py
+        if base_py is None:
+            base_path_matches = "false"
+            base_backup_path_matches = "false"
+        else:
+            expected_base_backup = base_py.with_name(
+                f"{base_py.name}{BACKUP_SUFFIX}"
+            )
+            base_path_matches = str(
+                manifest.get("base_py")
+                == _relative_path(detection.root, base_py)
+            ).lower()
+            base_backup_path_matches = str(
+                manifest.get("base_backup")
+                == _relative_path(detection.root, expected_base_backup)
+            ).lower()
 
     return {
         "backup_path_matches": backup_path_matches,
         "backup_sha256": evidence.backup_sha256,
+        "base_backup_path_matches": base_backup_path_matches,
+        "base_backup_sha256": evidence.base_backup_sha256,
+        "base_current_sha256": evidence.base_current_sha256,
+        "base_marker_error": evidence.base_marker_error,
+        "base_path_matches": base_path_matches,
         "cron_backup_path_matches": cron_backup_path_matches,
         "cron_backup_sha256": evidence.cron_backup_sha256,
         "cron_current_sha256": evidence.cron_current_sha256,
@@ -1630,6 +2661,8 @@ def _fingerprint_parts(
         "manifest_backup_sha256": manifest_backup_hash,
         "manifest_cron_backup_sha256": manifest_cron_backup_hash,
         "manifest_cron_current_sha256": manifest_cron_current_hash,
+        "manifest_base_backup_sha256": manifest_base_backup_hash,
+        "manifest_base_current_sha256": manifest_base_current_hash,
         "manifest_current_sha256": manifest_current_hash,
         "manifest_state": manifest_state,
         "marker_error": evidence.marker_error,
@@ -1680,6 +2713,46 @@ def _read_cron_evidence(
     )
 
 
+def _read_base_evidence(
+    detection: HermesDetection,
+) -> Tuple[Optional[str], str, Optional[str], str, str]:
+    base_py = detection.base_py
+    if base_py is None:
+        return None, "", None, "", ""
+    backup_path = base_py.with_name(f"{base_py.name}{BACKUP_SUFFIX}")
+    backup_text: Optional[str] = None
+    backup_sha256 = ""
+    if backup_path.is_symlink():
+        backup_sha256 = f"{_STATUS_PREFIX}symlink"
+    elif backup_path.exists():
+        try:
+            backup_text = _read_text(backup_path)
+            backup_sha256 = _text_sha256(backup_text)
+        except (OSError, UnicodeError):
+            backup_sha256 = f"{_STATUS_PREFIX}read_error"
+
+    if base_py.is_symlink():
+        return None, "", backup_text, backup_sha256, "symlink_refused"
+    if not base_py.exists():
+        return None, "", backup_text, backup_sha256, ""
+    try:
+        current_text = _read_text(base_py)
+    except (OSError, UnicodeError):
+        return None, "", backup_text, backup_sha256, "current_read_error"
+    marker_error = ""
+    try:
+        remove_base_patch(current_text)
+    except ValueError:
+        marker_error = "corrupt_patch_markers"
+    return (
+        current_text,
+        _text_sha256(current_text),
+        backup_text,
+        backup_sha256,
+        marker_error,
+    )
+
+
 def _manifest_has_cron_evidence(
     manifest: Optional[Dict[str, object]],
 ) -> bool:
@@ -1706,6 +2779,12 @@ def _read_manifest_evidence(path: Path) -> Optional[Dict[str, object]]:
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {_MANIFEST_ERROR: "invalid"}
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        return {_MANIFEST_ERROR: "invalid"}
+    try:
+        validate_install_manifest(value)
+    except ManifestVersionError:
+        return {_MANIFEST_ERROR: "unsupported_version"}
+    except ManifestStructureError:
         return {_MANIFEST_ERROR: "invalid"}
     return value
 

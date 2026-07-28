@@ -35,6 +35,8 @@
 4. 真实 Feishu 验收
    - 按 [真实飞书验收清单](feishu-acceptance.md) 选择相关 smoke。
 
+V4.1.0 还必须完成：card → native → card、native 工具/命令/notice、`/hfc` 卡片、7 表格 compact、fenced fake table、>28,000 byte terminal handoff；strict Hermes upgrade simulation 必须证明 notify、safe repair、`sidecar.restart_required`、不自动重启 Gateway与后续 `runtime.hello` ready。Linux 覆盖四种 `service.manager`，Docker Compose 使用普通非 privileged 容器且不运行 systemd。未完成的真实环境项必须明确写“未验证”，不能由单元测试代替。
+
 ## 必跑验证
 
 ```bash
@@ -92,4 +94,3 @@ gh run list --workflow release-assets.yml --limit 3
 - 如果需要用户再验证，列出最小验证步骤。
 
 不要把未验证的问题写成已解决。
-

@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 from .card_timeline import CardTimeline, TERMINAL_TOOL_STATUSES
 from .events import SidecarEvent
+from .native_handoff import NativeHandoffRecord
 from .status import StatusConfig, resolve_display_status
 from .text import StreamingTextNormalizer, normalize_stream_text
 
@@ -87,6 +88,12 @@ class CardSession:
     reply_to_message_id: str = ""
     notice_title: str = ""
     notice_level: str = "info"
+    terminal_disposition: str = ""
+    terminal_limit_reason: str = ""
+    terminal_handoff_record: NativeHandoffRecord | None = field(
+        default=None,
+        repr=False,
+    )
     _tool_call_count: int = field(default=0)
     _answer_archive_index: int | None = None
     timeline: CardTimeline = field(default_factory=CardTimeline)

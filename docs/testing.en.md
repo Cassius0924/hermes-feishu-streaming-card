@@ -28,6 +28,24 @@ python3 -m pytest tests/unit/test_hook_runtime.py tests/integration/test_hook_ru
 
 These tests verify that the installed Hermes hook can send `SidecarEvent` data to a mock sidecar and remains fail-open when sending fails. They use fixtures and a mock sidecar only; they do not access real Feishu.
 
+## V4.1.0 Safety-Control Regressions
+
+```bash
+python3 -m pytest \
+  tests/unit/test_delivery_policy.py \
+  tests/unit/test_text.py \
+  tests/unit/test_render.py \
+  tests/unit/test_runtime_control.py \
+  tests/unit/test_integrity.py \
+  tests/unit/test_process.py \
+  tests/integration/test_hook_runtime_integration.py \
+  tests/integration/test_server.py \
+  tests/integration/test_cli_integrity.py \
+  tests/integration/test_cli_process.py -q
+```
+
+This matrix covers exact/profile-scoped native policy with signatures/replay, fenced-code-safe table compact/truncate, the 28,000-byte terminal native handoff, `runtime.hello` / `runtime.heartbeat` readiness, strict safe repair, all four service managers, and the non-systemd Docker boundary. Loopback aiohttp tests may need an environment that allows local ephemeral ports. Automation does not replace real card → native → card, seven-table, oversized-handoff, Hermes-upgrade, Linux-manager, and ordinary Docker Compose acceptance.
+
 ## V4.0.21 content-integrity regressions
 
 ```bash
@@ -84,7 +102,7 @@ This command sends and updates a real test card. Run it only when local credenti
 python3 -m pytest tests/unit/test_docs.py -q
 ```
 
-Documentation tests are low-brittleness guards: they verify that README keeps sidecar-only, older Hermes `v2026.4.23` support range, and Hermes `0.13.0+` / `0.14.0` / `0.15.x` / `0.17.x` / `0.18.x` / `v2026.5.16+` / `v2026.6.19+` / `v2026.7.1+` compatibility statements, that mainline docs clearly say legacy/dual code is not the active runtime, and that the event protocol keeps declaring card states. They do not replace human documentation review.
+Documentation tests are low-brittleness guards: they verify that README keeps sidecar-only, older Hermes `v2026.4.23` support range, and Hermes `0.13.0+` / `0.14.0` / `0.15.x` / `0.17.x` / `0.18.x` / `0.19.0` / `v2026.5.16+` / `v2026.6.19+` / `v2026.7.1+` / `v2026.7.20` compatibility statements, that mainline docs clearly say legacy/dual code is not the active runtime, and that the event protocol keeps declaring card states. They do not replace human documentation review.
 
 ## E2E Visual Preview
 
@@ -117,7 +135,7 @@ python3 -m hermes_feishu_card.cli doctor --config config.yaml.example --hermes-d
 
 `doctor` requires an explicit `--config`. `--skip-hermes` is useful for repository dry-runs; real installation should use `--hermes-dir` for read-only Hermes detection. Output includes `version_source`, `version`, `minimum_supported_version`, `run_py_exists`, `hook_strategy`, `compatibility`, anchors, `reason`, and `runtime_import`. It does not write Hermes files, backups, or manifests. `--json` is for issues/automation, while `--explain` is for human troubleshooting and reports whether `repair --hermes-dir ... --yes` is available.
 
-The automated matrix explicitly covers Hermes `v2026.4.23`, `v2026.5.7`, `v2026.5.16`, `v2026.5.29`, `v2026.6.19+`, `v2026.7.1`, `v2026.7.7.2`, `0.13.0`, `v0.13.0`, `0.14.0`, `v0.14.0`, `0.15.1`, `v0.15.1`, `0.17.x`, `0.18.0`, `v0.18.0`, `0.18.2`, `v0.18.2`, and descriptive `Hermes Agent v0.18.2 (...)` hook strategy selection. Hermes `0.13.0+`, `0.14.0`, `0.15.x`, `0.17.x`, `0.18.x` / `v2026.5.16+` / `v2026.6.19+` / `v2026.7.1+` should report `gateway_run_013_plus`; older Hermes from `v2026.4.23` through `v2026.4.x` should report `legacy_gateway_run`. When `VERSION` and `.git` metadata are missing but verifiable `gateway/run.py` anchors exist, diagnostics should report `version_source: gateway anchors`; when `VERSION` exists but is unparseable and anchors validate, diagnostics should report `version_source: VERSION + gateway anchors`.
+The automated matrix explicitly covers Hermes `v2026.4.23`, `v2026.5.7`, `v2026.5.16`, `v2026.5.29`, `v2026.6.19+`, `v2026.7.1`, `v2026.7.7.2`, `v2026.7.20`, `0.13.0`, `v0.13.0`, `0.14.0`, `v0.14.0`, `0.15.1`, `v0.15.1`, `0.17.x`, `0.18.0`, `v0.18.0`, `0.18.2`, `v0.18.2`, Hermes 0.19.0, and descriptive `Hermes Agent v0.18.2 (...)` hook strategy selection. Automated strategy detection reports `gateway_run_013_plus` for Hermes `0.13.0+`, `0.14.0`, `0.15.x`, `0.17.x`, `0.18.x`, `0.19.0` / `v2026.5.16+` / `v2026.6.19+` / `v2026.7.1+` / `v2026.7.20`; older Hermes from `v2026.4.23` through `v2026.4.x` reports `legacy_gateway_run`. A separate read-only check against real local source from `v2026.7.20` confirmed V4.1 patcher insertion order, idempotency, and restore behavior; it is not a claim that a real Gateway or Feishu E2E run passed. When `VERSION` and `.git` metadata are missing but verifiable `gateway/run.py` anchors exist, diagnostics should report `version_source: gateway anchors`; when `VERSION` exists but is unparseable and anchors validate, diagnostics should report `version_source: VERSION + gateway anchors`.
 
 ## Real Feishu Integration
 

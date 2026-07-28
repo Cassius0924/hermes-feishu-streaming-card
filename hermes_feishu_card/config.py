@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from .delivery_policy import normalize_native_chats
+
 
 DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
     "server": {
@@ -21,8 +23,13 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
     "bots": {"default": "default", "items": {}},
     "bindings": {
         "chats": {},
+        "native_chats": [],
         "group_rules": {"enabled": False},
     },
+    # Missing values stay notification-only for upgraded existing configs.
+    # New setup templates explicitly write ``safe`` after validation.
+    "integrity": {"mode": "notify"},
+    "service": {"manager": "auto"},
     "card": {
         "max_wait_ms": 800,
         "max_chars": 240,
@@ -35,6 +42,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "max_timeline_items": 12,
         "max_reasoning_chars": 1200,
         "max_tool_result_chars": 600,
+        "table_overflow_mode": "compact",
         "footer_fields": [
             "duration",
             "model",
@@ -73,6 +81,10 @@ CARD_TEXT_SIZE_DEFAULTS = {
     "footer": "x-small",
 }
 CARD_TEXT_SIZE_DEVICE_KEYS = frozenset({"default", "pc", "mobile"})
+CARD_TABLE_OVERFLOW_MODES = frozenset({"compact", "truncate"})
+SERVICE_MANAGER_VALUES = frozenset(
+    {"auto", "systemd-user", "systemd-system", "detached"}
+)
 
 
 def normalize_text_sizes(
@@ -106,6 +118,17 @@ def normalize_text_sizes(
             "pc": device_values.get("pc", fallback),
             "mobile": device_values.get("mobile", fallback),
         }
+    return normalized
+
+
+def normalize_table_overflow_mode(
+    value: object, *, path: str = "card.table_overflow_mode"
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{path} must be compact or truncate")
+    normalized = value.strip().lower()
+    if normalized not in CARD_TABLE_OVERFLOW_MODES:
+        raise ValueError(f"{path} must be compact or truncate")
     return normalized
 
 
@@ -151,6 +174,10 @@ def resolve_operations_hermes_root(
     """Resolve the local Hermes source root without adding user configuration."""
     if explicit:
         return Path(explicit).expanduser()
+    for name in ("HERMES_DIR", "HFC_HERMES_DIR", "HERMES_AGENT_ROOT"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return Path(value).expanduser()
     if env_file is not None:
         dotenv = _read_dotenv(Path(env_file).expanduser())
         value = dotenv.get("HERMES_DIR", "").strip()
@@ -159,10 +186,6 @@ def resolve_operations_hermes_root(
     if config_path is not None:
         dotenv = _read_dotenv(Path(config_path).expanduser().parent / ".env")
         value = dotenv.get("HERMES_DIR", "").strip()
-        if value:
-            return Path(value).expanduser()
-    for name in ("HERMES_DIR", "HFC_HERMES_DIR", "HERMES_AGENT_ROOT"):
-        value = os.environ.get(name, "").strip()
         if value:
             return Path(value).expanduser()
     current = Path.cwd()
@@ -216,14 +239,64 @@ def load_config(
         if selected_env_path != config_path.parent / ".env":
             _apply_env_path_overrides(config, selected_env_path)
     _apply_env_overrides(config)
-    _normalize_config_text_sizes(config)
+    _normalize_config_card_options(config)
+    _normalize_integrity_mode(config)
+    _normalize_config_native_chats(config)
     config["server"]["port"] = _normalize_port(config["server"]["port"], "server.port")
+    _validate_service_manager(config)
     return config
 
 
-def _normalize_config_text_sizes(config: dict[str, Any]) -> None:
-    _normalize_card_text_sizes(config.get("card"), path="card")
-    _normalize_bot_text_sizes(config.get("bots"), path="bots")
+def _normalize_integrity_mode(config: dict[str, Any]) -> None:
+    integrity = config.get("integrity")
+    if not isinstance(integrity, dict):
+        raise ValueError("Config section integrity must be a mapping")
+    raw_mode = integrity.get("mode", "notify")
+    # PyYAML follows YAML 1.1 and parses an unquoted ``off`` as False.
+    if raw_mode is False:
+        mode = "off"
+    elif isinstance(raw_mode, str):
+        mode = raw_mode.strip().lower()
+    else:
+        mode = ""
+    if mode not in {"safe", "notify", "off"}:
+        raise ValueError("integrity.mode must be safe, notify, or off")
+    integrity["mode"] = mode
+
+
+def _validate_service_manager(config: dict[str, Any]) -> None:
+    service = config.get("service")
+    manager = service.get("manager") if isinstance(service, Mapping) else None
+    if not isinstance(manager, str) or manager not in SERVICE_MANAGER_VALUES:
+        values = ", ".join(sorted(SERVICE_MANAGER_VALUES))
+        raise ValueError(f"service.manager must be one of: {values}")
+
+
+def _normalize_config_native_chats(config: dict[str, Any]) -> None:
+    bindings = config.get("bindings")
+    if isinstance(bindings, dict):
+        bindings["native_chats"] = normalize_native_chats(
+            bindings.get("native_chats", []),
+            path="bindings.native_chats",
+        )
+    profiles = config.get("profiles")
+    if not isinstance(profiles, Mapping):
+        return
+    for profile_id, profile in profiles.items():
+        if not isinstance(profile, dict):
+            continue
+        profile_bindings = profile.get("bindings")
+        if not isinstance(profile_bindings, dict):
+            continue
+        profile_bindings["native_chats"] = normalize_native_chats(
+            profile_bindings.get("native_chats", []),
+            path=f"profiles.{profile_id}.bindings.native_chats",
+        )
+
+
+def _normalize_config_card_options(config: dict[str, Any]) -> None:
+    _normalize_card_config(config.get("card"), path="card")
+    _normalize_bot_card_configs(config.get("bots"), path="bots")
     profiles = config.get("profiles")
     if not isinstance(profiles, Mapping):
         return
@@ -231,11 +304,11 @@ def _normalize_config_text_sizes(config: dict[str, Any]) -> None:
         if not isinstance(profile, Mapping):
             continue
         profile_path = f"profiles.{profile_id}"
-        _normalize_card_text_sizes(profile.get("card"), path=f"{profile_path}.card")
-        _normalize_bot_text_sizes(profile.get("bots"), path=f"{profile_path}.bots")
+        _normalize_card_config(profile.get("card"), path=f"{profile_path}.card")
+        _normalize_bot_card_configs(profile.get("bots"), path=f"{profile_path}.bots")
 
 
-def _normalize_bot_text_sizes(value: object, *, path: str) -> None:
+def _normalize_bot_card_configs(value: object, *, path: str) -> None:
     if not isinstance(value, Mapping):
         return
     items = value.get("items")
@@ -244,17 +317,22 @@ def _normalize_bot_text_sizes(value: object, *, path: str) -> None:
     for bot_id, bot in items.items():
         if not isinstance(bot, Mapping):
             continue
-        _normalize_card_text_sizes(
+        _normalize_card_config(
             bot.get("card"), path=f"{path}.items.{bot_id}.card"
         )
 
 
-def _normalize_card_text_sizes(value: object, *, path: str) -> None:
-    if not isinstance(value, dict) or "text_sizes" not in value:
+def _normalize_card_config(value: object, *, path: str) -> None:
+    if not isinstance(value, dict):
         return
-    value["text_sizes"] = normalize_text_sizes(
-        value["text_sizes"], path=f"{path}.text_sizes"
-    )
+    if "text_sizes" in value:
+        value["text_sizes"] = normalize_text_sizes(
+            value["text_sizes"], path=f"{path}.text_sizes"
+        )
+    if "table_overflow_mode" in value:
+        value["table_overflow_mode"] = normalize_table_overflow_mode(
+            value["table_overflow_mode"], path=f"{path}.table_overflow_mode"
+        )
 
 
 def _merge_sections(config: dict[str, dict[str, Any]], loaded: dict[str, Any]) -> None:
@@ -296,6 +374,22 @@ def _apply_env_mapping_overrides(
         raw_port = values["HERMES_FEISHU_CARD_PORT"]
         port = _normalize_port(raw_port, "HERMES_FEISHU_CARD_PORT")
         config.setdefault("server", {})["port"] = port
+
+    if "HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK" in values:
+        config.setdefault("server", {})["allow_non_loopback"] = _normalize_boolean(
+            values["HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK"],
+            "HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK",
+        )
+
+    if "HERMES_FEISHU_CARD_SERVICE_MANAGER" in values:
+        config.setdefault("service", {})["manager"] = values[
+            "HERMES_FEISHU_CARD_SERVICE_MANAGER"
+        ]
+
+    if "HERMES_FEISHU_CARD_INTEGRITY_MODE" in values:
+        config.setdefault("integrity", {})["mode"] = values[
+            "HERMES_FEISHU_CARD_INTEGRITY_MODE"
+        ]
 
     # profiles 模式下跳过顶层 feishu 凭据的环境变量覆盖
     profiles = config.get("profiles")
@@ -371,3 +465,15 @@ def _normalize_port(value: Any, name: str) -> int:
     if not 1 <= port <= 65535:
         raise ValueError(f"{name} must be in range 1..65535")
     return port
+
+
+def _normalize_boolean(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"{name} must be a boolean")

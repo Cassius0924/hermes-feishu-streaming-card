@@ -12,6 +12,8 @@ from pathlib import Path
 CONFIG_ENV_VARS = {
     "HERMES_FEISHU_CARD_HOST",
     "HERMES_FEISHU_CARD_PORT",
+    "HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK",
+    "HERMES_FEISHU_CARD_SERVICE_MANAGER",
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
 }
@@ -49,7 +51,10 @@ def write_config(tmp_path: Path, port: int) -> Path:
 
 def process_env(tmp_path: Path) -> dict[str, str]:
     state_dir = tmp_path / "state"
-    return {"HERMES_FEISHU_CARD_STATE_DIR": str(state_dir)}
+    return {
+        "HERMES_FEISHU_CARD_STATE_DIR": str(state_dir),
+        "HERMES_FEISHU_CARD_SERVICE_MANAGER": "detached",
+    }
 
 
 def pidfile_path(tmp_path: Path) -> Path:
@@ -127,13 +132,15 @@ def test_status_reports_stopped_when_sidecar_is_not_running(tmp_path):
 def test_stop_rejects_pidfile_without_matching_health_token(tmp_path):
     config = write_config(tmp_path, free_port())
     env = process_env(tmp_path)
-    pidfile_path(tmp_path).parent.mkdir()
+    pidfile_path(tmp_path).parent.mkdir(mode=0o700)
+    pidfile_path(tmp_path).parent.chmod(0o700)
     sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         pidfile_path(tmp_path).write_text(
             json.dumps({"pid": sleeper.pid, "token": "not-sidecar"}) + "\n",
             encoding="utf-8",
         )
+        pidfile_path(tmp_path).chmod(0o600)
 
         result = run_cli("stop", "--config", str(config), env=env)
 
@@ -205,8 +212,11 @@ def test_start_status_and_stop_manage_sidecar_process(tmp_path):
 
         assert status.returncode == 0
         assert "status: running" in status.stdout
+        assert "manager: detached" in status.stdout
         assert "health: degraded" in status.stdout
         assert "delivery.mode: noop" in status.stdout
+        assert "readiness: starting" in status.stdout
+        assert "integrity.mode: notify" in status.stdout
         assert "active_sessions: 0" in status.stdout
         assert "events_received: 1" in status.stdout
         assert "events_applied: 0" in status.stdout

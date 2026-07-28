@@ -41,6 +41,8 @@ _SENSITIVE_KEYS = {
 }
 _PATH_KEYS = {
     "backup_path",
+    "base_backup_path",
+    "base_py",
     "config_path",
     "cron_backup_path",
     "cron_py",
@@ -56,6 +58,8 @@ _RAW_HASH_KEYS = {
     "current_sha256",
     "cron_backup_sha256",
     "cron_current_sha256",
+    "base_backup_sha256",
+    "base_current_sha256",
     "raw_hash",
     "sha256",
 }
@@ -74,6 +78,7 @@ _CARD_CAPABILITIES = {
     "attachment_delivery",
     "completion_return",
     "cron_delivery",
+    "exact_base_delivery",
     "message_handler",
     "reply_context",
     "run_agent",
@@ -104,6 +109,12 @@ _CARD_METRICS = {
     "recovery_plans_available",
     "recovery_refusals",
     "recovery_successes",
+    "runtime_control_auth_rejections",
+    "runtime_control_events_accepted",
+    "runtime_control_events_received",
+    "integrity_repair_attempts",
+    "integrity_repair_refusals",
+    "integrity_repair_successes",
     "sessions_collected",
     "terminal_drain_latency_ms",
     "terminal_drain_timeouts",
@@ -116,12 +127,15 @@ _CARD_METRICS = {
 _CARD_RECOVERY_ACTIONS = {
     "clear_stale_install_state",
     "reapply_current_cron_hook",
+    "reapply_current_base_hook",
     "reapply_current_hook",
     "rebuild_backup",
     "rebuild_cron_backup",
+    "rebuild_base_backup",
     "rebuild_manifest",
     "restore_verified_backup",
     "restore_verified_cron_backup",
+    "restore_verified_base_backup",
 }
 _CARD_FINDING_CODES = {
     "backup_hash_mismatch",
@@ -129,6 +143,22 @@ _CARD_FINDING_CODES = {
     "backup_missing",
     "backup_read_error",
     "backup_source_mismatch",
+    "base_backup_hash_mismatch",
+    "base_backup_invalid",
+    "base_backup_read_error",
+    "base_backup_symlink_refused",
+    "base_current_read_error",
+    "base_evidence_unavailable",
+    "base_install_state_incomplete",
+    "base_manifest_backup_hash_invalid",
+    "base_manifest_current_hash_invalid",
+    "base_manifest_incomplete",
+    "base_manifest_path_mismatch",
+    "base_marker_error",
+    "base_patch_mismatch",
+    "base_source_mismatch",
+    "base_source_missing",
+    "base_symlink_refused",
     "bot_unknown",
     "config_load_failed",
     "cron_backup_hash_mismatch",
@@ -154,6 +184,7 @@ _CARD_FINDING_CODES = {
     "feishu_sdk_incompatible",
     "hermes_check_skipped",
     "hermes_compatibility_partial",
+    "hermes_upgrade_base_source_accepted",
     "hermes_not_checked",
     "hermes_unsupported",
     "install_state_changed",
@@ -171,6 +202,7 @@ _CARD_FINDING_CODES = {
     "profile_unknown",
     "reapplication_invalid",
     "route_fallback",
+    "runtime_integrity_degraded",
     "runtime_import_failed",
     "streaming_disabled",
     "streaming_not_detected",
@@ -252,6 +284,18 @@ def build_diagnostic_report(
         "run_py_exists": detection.run_py_exists,
         "cron_py": str(detection.cron_py) if detection.cron_py is not None else None,
         "cron_py_exists": detection.cron_py_exists,
+        "base_py": str(detection.base_py) if detection.base_py is not None else None,
+        "base_py_exists": detection.base_py_exists,
+        "base_required": detection.base_required,
+        "base_hook_strategy": detection.base_hook_strategy,
+        "exact_delivery_contract": (
+            "ready"
+            if detection.base_required
+            and detection.capabilities.get("exact_base_delivery") is True
+            else "missing_or_unsupported"
+            if detection.base_required
+            else "not_required"
+        ),
         "version_source": detection.version_source,
         "version": detection.version,
         "minimum_supported_version": detection.minimum_version,
@@ -303,6 +347,7 @@ def build_diagnostic_report(
         routing,
         recovery_plan,
     )
+    findings = (*findings, *_runtime_integrity_findings(health_data))
     return DiagnosticReport(
         status=_status_for_findings(findings),
         created_at=time.time(),
@@ -487,6 +532,9 @@ def format_diagnostic_text(report: DiagnosticReport, explain: bool) -> str:
             details.append(f"compatibility {hermes['compatibility']}")
         suffix = f" ({', '.join(details)})" if details else ""
         lines.append(f"- Hermes: {hermes_status}{suffix}")
+        exact_contract = hermes.get("exact_delivery_contract")
+        if exact_contract:
+            lines.append(f"- Exact delivery contract: {exact_contract}")
     else:
         lines.append(f"- Hermes: {hermes_status}")
 
@@ -511,6 +559,12 @@ def format_diagnostic_text(report: DiagnosticReport, explain: bool) -> str:
         lines.append(
             f"- Install state: {report.install_state['status']} - "
             f"{report.install_state.get('message', '')}"
+        )
+    readiness = _mapping(report.runtime.get("readiness"))
+    if readiness.get("status"):
+        lines.append(
+            f"- Card runtime readiness: {readiness['status']} - "
+            f"{readiness.get('reason', '')}"
         )
 
     lines.extend(("", "Next steps"))
@@ -808,7 +862,141 @@ def _build_runtime(
         metrics = _mapping(health.get("metrics"))
         if metrics:
             runtime["metrics"] = dict(metrics)
+        readiness = _runtime_readiness(health.get("readiness"))
+        if readiness:
+            runtime["readiness"] = readiness
+        integrity = _runtime_integrity(health.get("integrity"))
+        if integrity:
+            runtime["integrity"] = integrity
     return runtime
+
+
+def _runtime_integrity_findings(
+    health: dict[str, object],
+) -> tuple[DiagnosticFinding, ...]:
+    readiness = _runtime_readiness(health.get("readiness"))
+    if readiness.get("status") != "degraded":
+        return ()
+    reason = str(readiness.get("reason") or "manual_review_required")
+    actions = {
+        "gateway_restart_required": (
+            "Restart Hermes Gateway through its normal service command, then recheck readiness.",
+        ),
+        "runtime_heartbeat_missing": (
+            "Confirm Hermes Gateway is running and restart it if the card runtime remains missing.",
+        ),
+        "runtime_heartbeat_stale": (
+            "Check Hermes Gateway health and restart it if the runtime heartbeat stays stale.",
+        ),
+        "control_auth_unavailable": (
+            "Rerun setup so the sidecar and Hermes hook share a valid private transport, then restart both services.",
+        ),
+        "manual_review_required": (
+            "Run hermes-feishu-card doctor and review verified install-state findings before changing files.",
+        ),
+    }.get(
+        reason,
+        ("Run hermes-feishu-card doctor and recheck runtime readiness.",),
+    )
+    return (
+        DiagnosticFinding(
+            "runtime_integrity_degraded",
+            "warning",
+            f"The Hermes card runtime is not ready ({reason}).",
+            "Hermes may continue natively while streaming-card delivery is unavailable.",
+            actions,
+        ),
+    )
+
+
+def _runtime_readiness(value: object) -> dict[str, object]:
+    data = _mapping(value)
+    status = _safe_enum(
+        data.get("status"), {"ready", "starting", "degraded", "disabled"}, ""
+    )
+    reason = _safe_enum(
+        data.get("reason"),
+        {
+            "runtime_ready",
+            "runtime_heartbeat_waiting",
+            "runtime_heartbeat_missing",
+            "runtime_heartbeat_stale",
+            "gateway_restart_required",
+            "manual_review_required",
+            "control_auth_unavailable",
+            "integrity_disabled",
+        },
+        "",
+    )
+    mode = _safe_enum(data.get("integrity_mode"), {"safe", "notify", "off"}, "")
+    if not status or not reason or not mode:
+        return {}
+    result: dict[str, object] = {
+        "status": status,
+        "reason": reason,
+        "integrity_mode": mode,
+    }
+    for key in ("runtime_seen", "generation_match", "restart_required"):
+        if isinstance(data.get(key), bool):
+            result[key] = data[key]
+    age = data.get("last_seen_age_seconds")
+    if age is None or (isinstance(age, int) and not isinstance(age, bool) and age >= 0):
+        result["last_seen_age_seconds"] = age
+    return result
+
+
+def _runtime_integrity(value: object) -> dict[str, object]:
+    data = _mapping(value)
+    mode = _safe_enum(data.get("mode"), {"safe", "notify", "off"}, "")
+    status = _safe_enum(
+        data.get("last_status"),
+        {
+            "idle",
+            "ready",
+            "disabled",
+            "repair_available",
+            "repaired",
+            "deduplicated",
+            "restart_required",
+            "manual_review_required",
+        },
+        "",
+    )
+    reason = _safe_enum(
+        data.get("last_reason"),
+        {
+            "",
+            "integrity_disabled",
+            "runtime_ready",
+            "gateway_restart_required",
+            "manual_review_required",
+            "control_auth_unavailable",
+            "integrity_evidence_unavailable",
+            "integrity_repair_refused",
+            "integrity_migration_required",
+            "recovery_not_required",
+            "recovery_evidence_not_executable",
+            "git_history_not_descendant",
+            "owned_backup_invalid",
+            "owned_backup_mismatch",
+            "git_target_modified",
+            "verified_git_upgrade",
+            "unsupported_anchors",
+        },
+        "",
+    )
+    if not mode or not status:
+        return {}
+    result: dict[str, object] = {
+        "mode": mode,
+        "last_status": status,
+        "last_reason": reason,
+    }
+    for key in ("repair_attempts", "repair_successes", "repair_refusals"):
+        count = data.get(key)
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            result[key] = count
+    return result
 
 
 def _last_route(health: dict[str, object]) -> dict[str, object] | None:
@@ -1012,10 +1200,12 @@ def _card_safe_hermes(value: object) -> dict[str, object]:
     )
     if status:
         result["status"] = status
-    for key in ("root", "run_py", "cron_py", "suggested_root"):
+    for key in ("root", "run_py", "cron_py", "base_py", "suggested_root"):
         _copy_path_hash(result, data, key)
     _copy_bool(result, data, "run_py_exists")
     _copy_bool(result, data, "cron_py_exists")
+    _copy_bool(result, data, "base_py_exists")
+    _copy_bool(result, data, "base_required")
     for key in ("version", "minimum_supported_version"):
         text = str(data.get(key) or "")
         if _SAFE_VERSION_RE.fullmatch(text):
@@ -1030,6 +1220,18 @@ def _card_safe_hermes(value: object) -> dict[str, object]:
     cron_strategy = _safe_enum(data.get("cron_hook_strategy"), {"cron_scheduler"}, "")
     if cron_strategy:
         result["cron_hook_strategy"] = cron_strategy
+    base_strategy = _safe_enum(
+        data.get("base_hook_strategy"), {"exact_base_delivery"}, ""
+    )
+    if base_strategy:
+        result["base_hook_strategy"] = base_strategy
+    exact_contract = _safe_enum(
+        data.get("exact_delivery_contract"),
+        {"ready", "not_required", "missing_or_unsupported"},
+        "",
+    )
+    if exact_contract:
+        result["exact_delivery_contract"] = exact_contract
     compatibility = _safe_enum(
         data.get("compatibility"), {"full", "partial", "unsupported"}, ""
     )
@@ -1143,6 +1345,12 @@ def _card_safe_runtime(value: object) -> dict[str, object]:
     status = _safe_enum(data.get("sidecar_status"), {"degraded", "healthy", "ok"}, "")
     if status:
         result["sidecar_status"] = status
+    readiness = _runtime_readiness(data.get("readiness"))
+    if readiness:
+        result["readiness"] = readiness
+    integrity = _runtime_integrity(data.get("integrity"))
+    if integrity:
+        result["integrity"] = integrity
     _copy_nonnegative_int(result, data, "active_sessions")
     metrics = _mapping(data.get("metrics"))
     safe_metrics: dict[str, object] = {}

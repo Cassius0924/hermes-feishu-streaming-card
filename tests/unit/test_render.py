@@ -1,4 +1,10 @@
-from hermes_feishu_card.render import _SPINNER_FRAMES, _colored_model_label, render_card
+from hermes_feishu_card.card_limits import inspect_card_limits
+from hermes_feishu_card.render import (
+    _SPINNER_FRAMES,
+    _colored_model_label,
+    render_card,
+    render_card_result,
+)
 from hermes_feishu_card.session import CardSession, InteractionState, ToolState
 from hermes_feishu_card.status import StatusConfig
 import pytest
@@ -1098,20 +1104,106 @@ def test_footer_still_static_for_failed():
     assert _render_footer(session) == "已停止"
 
 
-def test_render_card_truncates_tables_over_limit():
+def test_render_card_compacts_tables_over_limit_by_default_without_losing_prose():
     from hermes_feishu_card.session import CardSession
     from hermes_feishu_card.render import render_card
     session = CardSession(conversation_id="c", message_id="m", chat_id="c")
     session.answer_text = "\n\n".join(
         [f"Table {i}\n| col |\n| --- |\n| {i} |" for i in range(7)]
-    )
+    ) + "\n\nTAIL MUST LIVE"
     session.status = "completed"
     card = render_card(session)
     body_text = "".join(
         el.get("content", "") for el in card["body"]["elements"]
         if el.get("tag") == "markdown"
     )
+    assert "已转换为紧凑字段列表" in body_text
+    assert "**Table 6 · Row 1**" in body_text
+    assert "- col: 5" in body_text
+    assert "**Table 7 · Row 1**" in body_text
+    assert "- col: 6" in body_text
+    assert "TAIL MUST LIVE" in body_text
+    assert inspect_card_limits(card).table_count == 5
+
+
+def test_render_card_explicit_truncate_removes_only_overflow_tables():
+    session = CardSession(conversation_id="c", message_id="m", chat_id="c")
+    session.answer_text = "\n\n".join(
+        [f"Table {i}\n| col |\n| --- |\n| {i} |" for i in range(7)]
+    ) + "\n\nTAIL MUST LIVE"
+    session.status = "completed"
+
+    card = render_card(session, table_overflow_mode="truncate")
+    body_text = "".join(
+        element.get("content", "")
+        for element in card["body"]["elements"]
+        if element.get("tag") == "markdown"
+    )
+
     assert "超出部分已省略" in body_text
+    assert "| 4 |" in body_text
+    assert "| 5 |" not in body_text
+    assert "| 6 |" not in body_text
+    assert "TAIL MUST LIVE" in body_text
+
+
+def test_nonterminal_oversize_returns_small_deferred_native_waiting_card():
+    session = CardSession(conversation_id="c", message_id="m", chat_id="c")
+    sensitive = "SENSITIVE-NONTERMINAL-" + ("密" * 40_000)
+    session.answer_text = sensitive
+    session.status = "streaming"
+
+    result = render_card_result(session)
+    rendered = str(result.card)
+
+    assert result.disposition == "deferred_native"
+    assert result.limit_reason == "json_bytes"
+    assert "SENSITIVE-NONTERMINAL" not in rendered
+    assert "内容较长，完成后将由 Hermes 原生消息发送" in rendered
+    assert inspect_card_limits(result.card).safe is True
+
+
+def test_terminal_oversize_returns_small_native_handoff_without_full_answer():
+    session = CardSession(conversation_id="c", message_id="m", chat_id="c")
+    sensitive = "SENSITIVE-TERMINAL-" + ("密" * 40_000)
+    session.answer_text = sensitive
+    session.status = "completed"
+
+    result = render_card_result(session)
+    rendered = str(result.card)
+
+    assert result.disposition == "native"
+    assert result.limit_reason == "json_bytes"
+    assert "SENSITIVE-TERMINAL" not in rendered
+    assert "完整内容已切换为 Hermes 原生消息发送" in rendered
+    assert inspect_card_limits(result.card).safe is True
+
+
+def test_limit_handoff_remains_small_with_pathological_configured_title():
+    session = CardSession(conversation_id="c", message_id="m", chat_id="c")
+    session.answer_text = "密" * 40_000
+    session.status = "completed"
+
+    result = render_card_result(session, title="T" * 40_000)
+
+    assert result.disposition == "native"
+    assert inspect_card_limits(result.card).safe is True
+    assert len(result.card["header"]["title"]["content"]) <= 80
+
+
+def test_rendered_table_splitting_is_checked_after_final_card_shape():
+    session = CardSession(conversation_id="c", message_id="m", chat_id="c")
+    session.answer_text = (
+        "| key | value |\n| --- | --- |\n"
+        + "".join(f"| row-{index} | {'值' * 100} |\n" for index in range(180))
+    )
+    session.status = "completed"
+
+    result = render_card_result(session)
+
+    assert result.disposition == "native"
+    assert "tables" in result.inspection.violations
+    assert inspect_card_limits(result.card).safe is True
 
 
 def test_render_answer_stays_primary_over_public_interim_text():

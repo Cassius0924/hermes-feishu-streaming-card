@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.0.21`。它修复 Issue #155 的 answer/tool 归档边界，并锁定 Issue #147 图片/notice 组合回归；不改变卡片 UI 或配置。V3.9.1 已于 2026-07-11 发布，V4.0.20 及更早版本为历史发布记录；2026-07-28 真实飞书图片验收已通过。
+当前发布候选为 `4.1.0`。它增加 per-chat native policy、无损表格 compact、认证 runtime integrity 与显式 sidecar service manager。V3.9.1 已于 2026-07-11 发布，V4.0.21 及更早版本保留为历史发布记录；V4.1.0 的真实飞书、Linux/Docker、public tag/install 和 exact merge SHA 门禁只有完成后才会标记通过。
 
 ## 已具备
 
@@ -144,6 +144,14 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.1.0 发布门禁
+
+- `bindings.native_chats` exact/profile-scoped，hook 与 sidecar 双重 enforcement，所有 direct card path fail-open，`/hfc` 保持卡片：**待完成聚焦矩阵与真实 card → native → card 验收**。
+- 默认 `table_overflow_mode=compact` 保留第 6 张及后续表格，fenced fake table 不计数；无附件 terminal 超过 28,000 byte 时使用 V2 descriptor、稳定 UUID、Hermes ledger 与 delivered 后 ACK 交还完整原生答案；窗口外 exact descriptor 失效，带可见 recovered marker 的上游有界恢复仍保持普通 fail-open：**待完成真实 7-table 与 oversized handoff 验收**。
+- `integrity.mode` 的 safe/notify/off、认证 `runtime.hello` / `runtime.heartbeat`、strict repair、`sidecar.restart_required` 与不自动重启 Gateway：**待完成升级 simulation**。
+- `service.manager` 四模式、`auto` 不提权、Docker 普通容器：**待 Linux manager 与 Docker Compose smoke**。
+- 完整 pytest、`git diff --check`、build/isolated `site-packages`、exact merge SHA、public tagged install 和 Release assets：**发布流程待完成**。
 
 ## V4.0.21 发布门禁
 

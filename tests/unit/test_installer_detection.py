@@ -13,6 +13,9 @@ from hermes_feishu_card.install.patcher import PATCH_BEGIN, PATCH_END
 FIXTURE_ROOT = (
     Path(__file__).resolve().parents[1] / "fixtures" / "hermes_v2026_4_23"
 )
+EXACT_BASE_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base.py"
+)
 
 
 def test_detect_hermes_supports_v2026_4_23_fixture():
@@ -564,6 +567,7 @@ def test_detect_hermes_rejects_versions_below_minimum(tmp_path):
 
 def test_detect_hermes_uses_numeric_version_comparison(tmp_path):
     _write_hermes_root(tmp_path, version="v2026.10.1")
+    _write_exact_base(tmp_path)
 
     result = detect_hermes(tmp_path)
 
@@ -589,10 +593,15 @@ def test_detect_hermes_uses_numeric_version_comparison(tmp_path):
         ("v0.18.0", "gateway_run_013_plus"),
         ("0.18.2", "gateway_run_013_plus"),
         ("v0.18.2", "gateway_run_013_plus"),
+        ("0.19.0", "gateway_run_013_plus"),
+        ("v0.19.0", "gateway_run_013_plus"),
+        ("v2026.7.20", "gateway_run_013_plus"),
     ],
 )
 def test_detect_hermes_key_release_matrix(tmp_path, version, expected_strategy):
     _write_hermes_root(tmp_path, version=version)
+    if _requires_exact_fixture(version):
+        _write_exact_base(tmp_path)
 
     result = detect_hermes(tmp_path)
 
@@ -600,8 +609,86 @@ def test_detect_hermes_key_release_matrix(tmp_path, version, expected_strategy):
     assert result.hook_strategy == expected_strategy
 
 
+def test_detect_019_requires_exact_base_delivery_contract(tmp_path):
+    _write_hermes_root(tmp_path, version="v0.19.0")
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert result.base_required is True
+    assert result.base_py == tmp_path / "gateway" / "platforms" / "base.py"
+    assert result.base_py_exists is False
+    assert result.capabilities["exact_base_delivery"] is False
+    assert "gateway/platforms/base.py missing" in result.reason
+
+
+def test_detect_019_accepts_exact_base_delivery_contract(tmp_path):
+    _write_hermes_root(tmp_path, version="v0.19.0")
+    base_py = _write_exact_base(tmp_path)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.base_required is True
+    assert result.base_py == base_py
+    assert result.base_py_exists is True
+    assert result.base_hook_strategy == "exact_base_delivery"
+    assert result.capabilities["exact_base_delivery"] is True
+
+
+def test_detect_source_stripped_exact_ledger_requires_valid_base_contract(tmp_path):
+    _write_hermes_root(tmp_path, version=None)
+    base_py = _write_exact_base(tmp_path)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.version == "unknown"
+    assert result.base_required is True
+    assert result.base_py == base_py
+    assert result.capabilities["exact_base_delivery"] is True
+
+
+def test_detect_019_rejects_symlinked_exact_base(tmp_path):
+    _write_hermes_root(tmp_path, version="v0.19.0")
+    target = tmp_path / "base-target.py"
+    target.write_text(EXACT_BASE_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    base_py = tmp_path / "gateway" / "platforms" / "base.py"
+    base_py.parent.mkdir(parents=True)
+    base_py.symlink_to(target)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert result.base_required is True
+    assert "gateway/platforms/base.py must not be a symlink" in result.reason
+
+
+def test_detect_calendar_2026_7_20_requires_exact_base_contract(tmp_path):
+    _write_hermes_root(tmp_path, version="v2026.7.20")
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is False
+    assert result.base_required is True
+    assert result.capabilities["exact_base_delivery"] is False
+    assert "gateway/platforms/base.py missing" in result.reason
+
+
+def test_detect_verified_ledger_signals_require_base_on_earlier_version(tmp_path):
+    _write_hermes_root(tmp_path, version="v0.18.2")
+    _write_exact_base(tmp_path)
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.base_required is True
+    assert result.capabilities["exact_base_delivery"] is True
+
+
 def test_detect_hermes_version_components_are_semantic_not_calendar_bounds(tmp_path):
     _write_hermes_root(tmp_path, version="v2026.99.99")
+    _write_exact_base(tmp_path)
 
     result = detect_hermes(tmp_path)
 
@@ -932,6 +1019,19 @@ def _supported_run_py() -> str:
         "async def _handle_message_with_agent(message, hooks):\n"
         "    hooks.emit(\"agent:end\", {\"message\": message})\n"
     )
+
+
+def _write_exact_base(root: Path) -> Path:
+    base_py = root / "gateway" / "platforms" / "base.py"
+    base_py.parent.mkdir(parents=True, exist_ok=True)
+    base_py.write_text(EXACT_BASE_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    return base_py
+
+
+def _requires_exact_fixture(version: str) -> bool:
+    normalized = version.lstrip("v")
+    parts = tuple(int(part) for part in normalized.split("."))
+    return (parts[0] == 0 and parts >= (0, 19, 0)) or parts >= (2026, 7, 20)
 
 
 def _git(cwd: Path, *args: str) -> None:

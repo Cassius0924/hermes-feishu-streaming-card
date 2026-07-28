@@ -17,7 +17,9 @@ from aiohttp.test_utils import TestClient, TestServer
 from hermes_feishu_card import hook_runtime
 from hermes_feishu_card import server as sidecar_server
 from hermes_feishu_card.diagnostics import DiagnosticFinding, DiagnosticReport
+from hermes_feishu_card.delivery_policy import ChatDeliveryPolicy
 from hermes_feishu_card.feishu_client import FeishuAPIError
+from hermes_feishu_card.native_handoff import NativeHandoffStore
 from hermes_feishu_card.server import create_app
 from hermes_feishu_card.operations_transport import ensure_transport_root_secret
 
@@ -26,8 +28,18 @@ FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "hermes_v2026_4_23"
 
 
 @pytest.fixture(autouse=True)
-def reset_hook_runtime_state():
+def reset_hook_runtime_state(monkeypatch):
     hook_runtime.reset_runtime_state()
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "disposition": "card",
+            "ttl_ms": 1000,
+        },
+    )
+
     yield
     hook_runtime.reset_runtime_state()
 
@@ -116,6 +128,87 @@ async def test_installed_hook_preserves_handler_return_when_sender_fails(
     assert len(hooks.events) == 1
     assert hooks.events[0][0] == "agent:end"
     assert hooks.events[0][1]["message"].chat_id == "oc_fixture"
+
+
+async def test_installed_hook_naturally_falls_through_for_native_policy(
+    tmp_path, monkeypatch
+):
+    hermes_dir = copy_hermes(tmp_path)
+    posted = []
+
+    def native_policy(*_args, **_kwargs):
+        return {"ok": True, "disposition": "native", "ttl_ms": 1000}
+
+    async def unexpected_post(*args, **kwargs):
+        posted.append((args, kwargs))
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", native_policy)
+    monkeypatch.setattr(hook_runtime, "_post_json", unexpected_post)
+
+    install = run_cli("install", "--hermes-dir", str(hermes_dir), "--yes")
+    assert install.returncode == 0, install.stderr
+    module = load_run_py(hermes_dir / "gateway" / "run.py")
+
+    result = await module._handle_message_with_agent(Message(), Hooks())
+    await asyncio.sleep(0)
+
+    assert result == "fixture answer"
+    assert posted == []
+
+
+async def test_hook_signed_policy_query_and_server_native_boundary_end_to_end(
+    monkeypatch,
+):
+    root_secret = b"q" * 32
+
+    class NoSendClient:
+        def __init__(self):
+            self.sent = []
+
+        async def send_card(self, *args, **kwargs):
+            self.sent.append((args, kwargs))
+            return "unexpected"
+
+    feishu_client = NoSendClient()
+    app = create_app(
+        feishu_client,
+        operations_transport_root_secret=root_secret,
+        delivery_policy=ChatDeliveryPolicy(native_chats=("oc_native_e2e",)),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        monkeypatch.setenv(
+            "HERMES_FEISHU_CARD_EVENT_URL",
+            str(test_client.make_url("/events")),
+        )
+        monkeypatch.setattr(
+            hook_runtime,
+            "read_transport_root_secret",
+            lambda: root_secret,
+        )
+
+        def real_policy_fetch(url, payload, timeout):
+            return hook_runtime._post_json_sync_response(url, payload, timeout)
+
+        monkeypatch.setattr(
+            hook_runtime,
+            "_fetch_delivery_policy_sync",
+            real_policy_fetch,
+        )
+
+        handled = await hook_runtime.emit_from_hermes_locals_async(
+            {"chat_id": "oc_native_e2e", "message_id": "om_native_e2e"},
+            "message.started",
+        )
+        health = await (await test_client.get("/health")).json()
+    finally:
+        await test_client.close()
+
+    assert handled is False
+    assert feishu_client.sent == []
+    assert health["metrics"]["policy_queries"] == 1
+    assert health["active_sessions"] == 0
 
 
 async def test_installed_hook_posts_started_event_to_mock_sidecar(tmp_path, monkeypatch):
@@ -215,7 +308,9 @@ async def test_installed_hook_forwards_streaming_tool_and_completion_events(
             "profile_source": "fallback_default",
             "text": "answer fixture delta",
         }
-        assert received[4]["data"] == {
+        completed_data = dict(received[4]["data"])
+        native_handoff = completed_data.pop("native_handoff")
+        assert completed_data == {
             "profile_id": "default",
             "profile_source": "fallback_default",
             "answer": "fixture answer",
@@ -226,8 +321,59 @@ async def test_installed_hook_forwards_streaming_tool_and_completion_events(
             "attachments": [],
             "native_delivery": "allowed",
         }
+        assert set(native_handoff) == {"generation"}
+        assert len(native_handoff["generation"]) == 32
+        assert all(char in "0123456789abcdef" for char in native_handoff["generation"])
     finally:
         await client.close()
+
+
+async def test_installed_standard_hook_keeps_full_native_answer_on_limit_handoff(
+    tmp_path,
+    monkeypatch,
+):
+    feishu_client = _OperationsFeishuClient()
+    app = create_app(
+        feishu_client,
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    huge_answer = "NATIVE-ANSWER-" + ("密" * 40_000)
+    try:
+        hermes_dir = copy_hermes(tmp_path)
+        monkeypatch.setenv(
+            "HERMES_FEISHU_CARD_EVENT_URL",
+            str(client.make_url("/events")),
+        )
+        install = run_cli("install", "--hermes-dir", str(hermes_dir), "--yes")
+        assert install.returncode == 0, install.stderr
+        module = load_run_py(hermes_dir / "gateway" / "run.py")
+
+        async def oversized_agent_result(source, event_message_id=None):
+            del source, event_message_id
+            return {
+                "response": huge_answer,
+                "duration": 0.25,
+                "input_tokens": 7,
+                "output_tokens": 40_000,
+            }
+
+        monkeypatch.setattr(module, "_run_agent", oversized_agent_result)
+
+        result = await module._handle_message_with_agent(Message(), Hooks())
+        await _wait_for(
+            lambda: any(
+                "完整内容已切换为 Hermes 原生消息发送" in str(card)
+                for _message_id, card in feishu_client.updated
+            )
+        )
+    finally:
+        await client.close()
+
+    assert result == huge_answer
+    assert len(feishu_client.sent) == 1
+    assert all("NATIVE-ANSWER" not in str(card) for _, card in feishu_client.updated)
 
 
 class _CallbackCard:

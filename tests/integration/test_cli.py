@@ -54,6 +54,179 @@ def test_status_reports_process_state(capsys):
     assert "running" in captured.out.lower() or "stopped" in captured.out.lower()
 
 
+def test_status_reports_runtime_readiness_and_fails_when_degraded(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda *_args, **_kwargs: {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "status_sidecar",
+        lambda _config: {
+            "running": True,
+            "pid": 123,
+            "health": {
+                "status": "healthy",
+                "active_sessions": 0,
+                "metrics": {},
+                "readiness": {
+                    "status": "degraded",
+                    "reason": "gateway_restart_required",
+                    "integrity_mode": "safe",
+                    "restart_required": True,
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(cli_module, "_lifecycle_hook_check", lambda _args: None)
+
+    exit_code = main(["status", "--config", "config.yaml"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "readiness: degraded" in output
+    assert "readiness.reason: gateway_restart_required" in output
+    assert "integrity.mode: safe" in output
+    assert "gateway.restart_required: true" in output
+
+
+def test_status_reports_sanitized_integrity_repair_action(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda *_args, **_kwargs: {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "status_sidecar",
+        lambda _config: {
+            "running": True,
+            "pid": 123,
+            "manager": "detached",
+            "health": {
+                "status": "healthy",
+                "active_sessions": 0,
+                "metrics": {},
+                "readiness": {
+                    "status": "ready",
+                    "reason": "runtime_ready",
+                    "integrity_mode": "notify",
+                    "restart_required": False,
+                },
+                "integrity": {
+                    "mode": "notify",
+                    "last_status": "repair_available",
+                    "last_reason": "verified_git_upgrade",
+                    "repair_attempts": 0,
+                    "repair_successes": 0,
+                    "repair_refusals": 0,
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(cli_module, "_lifecycle_hook_check", lambda _args: None)
+
+    exit_code = main(["status", "--config", "config.yaml"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "integrity.status: repair_available" in output
+    assert "integrity.reason: verified_git_upgrade" in output
+    assert "integrity.next_action:" in output
+    assert "integrity migrate-safe" in output
+
+
+def test_status_reports_native_handoff_manual_review_without_identifiers(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda *_args, **_kwargs: {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "status_sidecar",
+        lambda _config: {
+            "running": True,
+            "pid": 123,
+            "manager": "detached",
+            "health": {
+                "status": "healthy",
+                "active_sessions": 0,
+                "metrics": {},
+                "native_handoffs": {
+                    "records": 4,
+                    "delivery_states": {
+                        "pending": 2,
+                        "acked": 1,
+                        "uncertain": 1,
+                    },
+                    "manual_review_required": True,
+                    "next_action": "review_native_delivery_before_manual_retry",
+                    "raw_identifier": "oc_must_not_leak",
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(cli_module, "_lifecycle_hook_check", lambda _args: None)
+
+    exit_code = main(["status", "--config", "config.yaml"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "native_handoff.records: 4" in output
+    assert "native_handoff.pending: 2" in output
+    assert "native_handoff.uncertain: 1" in output
+    assert "native_handoff.manual_review_required: true" in output
+    assert "native_handoff.next_action:" in output
+    assert "verify native conversation delivery" in output
+    assert "oc_must_not_leak" not in output
+
+
+def test_status_fails_closed_when_process_state_is_untrusted(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda *_args, **_kwargs: {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "status_sidecar",
+        lambda _config: {
+            "running": False,
+            "pid": None,
+            "health": None,
+            "pid_running": False,
+            "manager": "invalid",
+            "unit": "",
+            "error": "state directory path must not contain symbolic links",
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_lifecycle_hook_check",
+        lambda _args: (_ for _ in ()).throw(
+            AssertionError("untrusted process state must stop status evaluation")
+        ),
+    )
+
+    exit_code = main(["status", "--config", "config.yaml"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert (
+        captured.err
+        == "error: state directory path must not contain symbolic links\n"
+    )
+
+
 def test_start_passes_explicit_env_file_to_sidecar(tmp_path, monkeypatch, capsys):
     config_path = tmp_path / "config.yaml"
     env_path = tmp_path / "CUSTOM.env"
@@ -579,6 +752,51 @@ def test_module_doctor_explain_reports_summary_and_next_steps(tmp_path):
     assert "Runtime import:" in result.stdout
     assert "Install state: clean" in result.stdout
     assert "Next steps" in result.stdout
+
+
+def test_doctor_explain_reports_live_runtime_readiness(
+    tmp_path, monkeypatch, capsys
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("server:\n  port: 9014\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cli_module,
+        "status_sidecar",
+        lambda _config: {
+            "running": True,
+            "health": {
+                "status": "healthy",
+                "active_sessions": 0,
+                "readiness": {
+                    "status": "degraded",
+                    "reason": "gateway_restart_required",
+                    "integrity_mode": "safe",
+                    "restart_required": True,
+                },
+                "integrity": {
+                    "mode": "safe",
+                    "last_status": "restart_required",
+                    "last_reason": "gateway_restart_required",
+                },
+            },
+        },
+    )
+
+    exit_code = main(
+        [
+            "doctor",
+            "--config",
+            str(config_path),
+            "--hermes-dir",
+            str(FIXTURE),
+            "--explain",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Card runtime readiness: degraded - gateway_restart_required" in output
+    assert "The Hermes card runtime is not ready" in output
 
 
 @pytest.mark.parametrize(
@@ -1125,6 +1343,8 @@ bindings:
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "bound" in captured.out.lower()
+    assert "oc-chat-1" not in captured.out + captured.err
+    assert "chat#" in captured.out
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert config["bindings"]["chats"]["oc-chat-1"] == "sales"
 
@@ -1151,6 +1371,8 @@ bindings:
     assert first_exit_code == 0
     assert second_exit_code == 0
     assert "unbound" in captured.out.lower()
+    assert "oc-chat-1" not in captured.out + captured.err
+    assert "chat#" in captured.out
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert config["bindings"]["chats"] == {}
 
@@ -1221,7 +1443,8 @@ bots:
     captured = capsys.readouterr()
     assert exit_code == 0
     assert calls[0][1:] == ("sales", "oc-chat-1")
-    assert "om-message-1" in captured.out
+    assert "om-message-1" not in captured.out + captured.err
+    assert "message#" in captured.out
     assert "sales-secret" not in captured.out
 
 
@@ -1261,7 +1484,8 @@ profiles:
     assert exit_code == 0
     assert calls[0][0]["feishu"]["app_id"] == "cli-work-app"
     assert calls[0][1] == "oc-chat-1"
-    assert "om-profile-smoke" in captured.out
+    assert "om-profile-smoke" not in captured.out + captured.err
+    assert "message#" in captured.out
     assert "work-secret" not in captured.out
 
 
@@ -1307,5 +1531,97 @@ profiles:
     assert exit_code == 0
     assert calls[0][0]["bots"]["items"]["sales"]["app_id"] == "cli-work-sales"
     assert calls[0][1:] == ("sales", "oc-chat-1")
-    assert "om-profile-bot-smoke" in captured.out
+    assert "om-profile-bot-smoke" not in captured.out + captured.err
+    assert "message#" in captured.out
     assert "work-sales-secret" not in captured.out
+
+
+def test_chats_use_native_list_and_use_card_are_atomic_and_mask_chat_id(
+    tmp_path, capsys
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    raw_chat_id = "oc_private_native_chat"
+
+    assert main(["chats", "use-native", raw_chat_id, "--config", str(config_path)]) == 0
+    first = capsys.readouterr()
+    assert raw_chat_id not in first.out + first.err
+    assert "chat#" in first.out
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert data["bindings"]["native_chats"] == [raw_chat_id]
+
+    assert main(["chats", "list", "--config", str(config_path)]) == 0
+    listed = capsys.readouterr()
+    assert raw_chat_id not in listed.out + listed.err
+    assert "chat#" in listed.out
+
+    assert main(["chats", "use-card", raw_chat_id, "--config", str(config_path)]) == 0
+    removed = capsys.readouterr()
+    assert raw_chat_id not in removed.out + removed.err
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert data["bindings"]["native_chats"] == []
+
+
+def test_chats_mutation_preserves_private_config_permissions(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    config_path.chmod(0o600)
+
+    assert main(
+        [
+            "chats",
+            "use-native",
+            "oc_private_mode",
+            "--config",
+            str(config_path),
+        ]
+    ) == 0
+    capsys.readouterr()
+
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_chats_multi_profile_requires_explicit_existing_profile_without_id_leak(
+    tmp_path, capsys
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "profiles:\n  work:\n    bindings:\n      native_chats: []\n",
+        encoding="utf-8",
+    )
+    raw_chat_id = "oc_profile_private_chat"
+
+    assert main(["chats", "use-native", raw_chat_id, "--config", str(config_path)]) == 1
+    missing = capsys.readouterr()
+    assert raw_chat_id not in missing.out + missing.err
+    assert "profile" in missing.err.lower()
+
+    assert main(
+        [
+            "chats",
+            "use-native",
+            raw_chat_id,
+            "--profile-id",
+            "unknown",
+            "--config",
+            str(config_path),
+        ]
+    ) == 1
+    unknown = capsys.readouterr()
+    assert raw_chat_id not in unknown.out + unknown.err
+
+    assert main(
+        [
+            "chats",
+            "use-native",
+            raw_chat_id,
+            "--profile-id",
+            "work",
+            "--config",
+            str(config_path),
+        ]
+    ) == 0
+    success = capsys.readouterr()
+    assert raw_chat_id not in success.out + success.err
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert data["profiles"]["work"]["bindings"]["native_chats"] == [raw_chat_id]

@@ -20,6 +20,8 @@
    - 适合发版前按步骤核对版本号、测试、tag、release assets。
 6. [Fail-open 边界](fail-open-boundaries.md)
    - 适合判断异常时应退回 Hermes 原生路径，还是必须拒绝启动、请求或修复。
+7. [V4.1 安全控制与排障](v4.1-safety-controls.md)
+   - 适合配置 per-chat native policy、表格预算、runtime integrity 与 sidecar manager，并排查升级后的 readiness。
 
 ## 当前核心能力
 
@@ -30,6 +32,7 @@
 - 系统提示卡片化：`Working`、上下文窗口/压缩、session reset、skill loading、自我改进 review 等归一为 `system.notice`。
 - 全命令反馈卡片：所有进入 Hermes 的 slash command（含 built-in、alias、plugin/quick 和 unknown command）只要产生非空文本反馈，就由独立 Feishu interactive card 承载；`/update` 仍保持后台升级语义，仅将重启前反馈卡片化。
 - 安装与诊断：`install/setup/doctor/repair/restore/uninstall` 覆盖本机、Hermes venv、Docker/source-stripped Hermes。
+- V4.1 安全控制：exact `native_chats`、无损 table compact、认证 runtime readiness、strict repair 与不隐式提权的 service manager。
 
 ## 文档分层
 

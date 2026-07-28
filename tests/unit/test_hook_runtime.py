@@ -2,7 +2,9 @@ import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
+import inspect
 import math
+import re
 import sys
 import threading
 import time
@@ -13,7 +15,11 @@ from urllib import error
 import pytest
 
 from hermes_feishu_card import hook_runtime
-from hermes_feishu_card.event_auth import EventProofVerifier
+from hermes_feishu_card.event_auth import EventProofVerifier, PolicyProofVerifier
+
+
+_NATIVE_ACK_PLAN_RE = re.compile(r"invalid post payload", re.IGNORECASE)
+_NATIVE_ACK_PLAN_CONSTANT = ("text", "post", 5)
 
 
 def _operation_token(operation_id="operation-1"):
@@ -41,6 +47,20 @@ def clear_hook_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     hook_runtime.reset_runtime_state()
 
+    helpers_module = types.ModuleType("gateway.platforms.helpers")
+
+    def strip_markdown(text):
+        return str(text).strip()
+
+    strip_markdown.__module__ = helpers_module.__name__
+    helpers_module.strip_markdown = strip_markdown
+    monkeypatch.setitem(sys.modules, helpers_module.__name__, helpers_module)
+
+    def card_policy(*_args, **_kwargs):
+        return {"ok": True, "disposition": "card", "ttl_ms": 1000}
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", card_policy)
+
 
 def test_load_runtime_config_defaults():
     config = hook_runtime.load_runtime_config()
@@ -65,6 +85,22 @@ def test_load_runtime_config_custom_url_and_timeout(monkeypatch):
 
     assert config.event_url == "http://localhost:9000/events"
     assert config.timeout_seconds == 0.25
+
+
+def test_sync_policy_gate_cleans_native_state_when_identity_is_missing():
+    hook_runtime._HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(
+        hook_runtime._NativeMediaTextSuppression("oc_stale", "stale answer")
+    )
+
+    result = hook_runtime._policy_gate_sync(
+        hook_runtime.load_runtime_config(),
+        {"platform": "telegram", "message_id": "om_missing"},
+        "message.started",
+    )
+
+    assert result.card is False
+    assert result.identity is None
+    assert hook_runtime._HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.get() is None
 
 
 @pytest.mark.parametrize("value", ["1", "49", "5001", "abc"])
@@ -262,10 +298,9 @@ def test_build_event_extracts_direct_fields():
     assert payload["conversation_id"] == "conv_direct"
     assert payload["sequence"] == 0
     assert payload["platform"] == "feishu"
-    assert payload["data"] == {
-        "profile_id": "default",
-        "profile_source": "fallback_default",
-    }
+    assert payload["data"]["profile_id"] == "default"
+    assert payload["data"]["profile_source"] == "fallback_default"
+    assert len(payload["data"]["native_handoff"]["generation"]) == 32
 
 
 @pytest.mark.parametrize(
@@ -673,6 +708,9 @@ def test_build_completed_event_preserves_duration_and_tokens():
         },
     )
 
+    native_handoff = payload["data"].pop("native_handoff")
+    assert len(native_handoff["generation"]) == 32
+    assert set(native_handoff) == {"generation"}
     assert payload["data"] == {
         "profile_id": "default",
         "profile_source": "fallback_default",
@@ -1555,7 +1593,7 @@ async def test_v400_hook_runtime_keeps_native_media_text_when_card_delivery_fail
             return SimpleNamespace(success=True, message_id="om_native_text")
 
     async def rejected(_url, _payload, _timeout):
-        return {"ok": False, "applied": False}
+        return {"ok": True, "applied": False, "disposition": "native"}
 
     monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
     monkeypatch.setattr(hook_runtime, "_post_json_response", rejected)
@@ -2956,6 +2994,293 @@ def test_install_feishu_command_card_methods_repairs_stale_install_marker():
 
     assert result.success is True
     assert adapter.sent["msg_type"] == "interactive"
+
+
+def test_existing_slash_confirm_is_wrapped_and_native_calls_original_once(
+    monkeypatch,
+):
+    original_calls = []
+    sentinel = object()
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        async def send_slash_confirm(
+            self,
+            chat_id,
+            title,
+            message,
+            session_key,
+            confirm_id,
+            metadata=None,
+        ):
+            original_calls.append(
+                (chat_id, title, message, session_key, confirm_id, metadata)
+            )
+            return sentinel
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "disposition": "native",
+            "ttl_ms": 1000,
+        },
+    )
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    assert type(adapter).send_slash_confirm is hook_runtime._hfc_send_native_slash_confirm
+    assert callable(type(adapter).__dict__.get("_hfc_original_send_slash_confirm"))
+
+    result = asyncio.run(
+        adapter.send_slash_confirm(
+            "oc_native_original",
+            "Confirm",
+            "Details",
+            "session-1",
+            "confirm-1",
+            metadata={"reply_to_message_id": "om_reply"},
+        )
+    )
+
+    assert result is sentinel
+    assert original_calls == [
+        (
+            "oc_native_original",
+            "Confirm",
+            "Details",
+            "session-1",
+            "confirm-1",
+            {"reply_to_message_id": "om_reply"},
+        )
+    ]
+
+
+def test_inherited_slash_confirm_is_preserved_for_native_policy(monkeypatch):
+    original_calls = []
+    sentinel = object()
+
+    class BaseAdapter:
+        async def send_slash_confirm(self, *args, **kwargs):
+            original_calls.append((args, kwargs))
+            return sentinel
+
+    class DummyFeishuAdapter(BaseAdapter):
+        name = "feishu"
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "disposition": "native",
+            "ttl_ms": 1000,
+        },
+    )
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    result = asyncio.run(
+        adapter.send_slash_confirm(
+            "oc_inherited",
+            "Confirm",
+            "Details",
+            "session-2",
+            "confirm-2",
+        )
+    )
+
+    assert result is sentinel
+    assert len(original_calls) == 1
+
+
+def test_existing_model_and_resume_pickers_call_original_for_native_policy(
+    monkeypatch,
+):
+    model_calls = []
+    resume_calls = []
+    model_sentinel = object()
+    resume_sentinel = object()
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        async def send_model_picker(self, *args, **kwargs):
+            model_calls.append((args, kwargs))
+            return model_sentinel
+
+        async def send_resume_picker(self, **kwargs):
+            resume_calls.append(kwargs)
+            return resume_sentinel
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "disposition": "native",
+            "ttl_ms": 1000,
+        },
+    )
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    event = object()
+    original_handler = object()
+
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    assert type(adapter).send_model_picker is hook_runtime._hfc_send_native_model_picker
+    assert type(adapter).send_resume_picker is hook_runtime._hfc_send_native_resume_picker
+    assert callable(type(adapter).__dict__.get("_hfc_original_send_model_picker"))
+    assert callable(type(adapter).__dict__.get("_hfc_original_send_resume_picker"))
+    model_result = asyncio.run(
+        adapter.send_model_picker(
+            "oc_model_native",
+            [{"slug": "provider", "models": ["model"]}],
+            current_model="model",
+            current_provider="provider",
+            session_key="session-model",
+            on_model_selected=None,
+            metadata={"k": "v"},
+        )
+    )
+    resume_result = asyncio.run(
+        adapter.send_resume_picker(
+            chat_id="oc_resume_native",
+            sessions=[{"id": "session-1", "title": "One"}],
+            current_session_id="session-1",
+            runner=runner,
+            event=event,
+            original_handler=original_handler,
+            metadata={"reply_to_message_id": "om_resume"},
+        )
+    )
+
+    assert model_result is model_sentinel
+    assert resume_result is resume_sentinel
+    assert len(model_calls) == 1
+    assert resume_calls == [
+        {
+            "chat_id": "oc_resume_native",
+            "sessions": [{"id": "session-1", "title": "One"}],
+            "current_session_id": "session-1",
+            "runner": runner,
+            "event": event,
+            "original_handler": original_handler,
+            "metadata": {"reply_to_message_id": "om_resume"},
+        }
+    ]
+
+
+def test_existing_slash_confirm_uses_hfc_card_for_card_policy():
+    original_calls = []
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        def __init__(self):
+            self._client = object()
+            self.sent = []
+
+        async def send_slash_confirm(self, *args, **kwargs):
+            original_calls.append((args, kwargs))
+            return object()
+
+        async def _feishu_send_with_retry(self, **kwargs):
+            self.sent.append(kwargs)
+            return SimpleNamespace(success=True, message_id="om_hfc_confirm")
+
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    result = asyncio.run(
+        adapter.send_slash_confirm(
+            "oc_card_policy",
+            "Confirm",
+            "Details",
+            "session-card",
+            "confirm-card",
+        )
+    )
+
+    assert result.success is True
+    assert result.message_id == "om_hfc_confirm"
+    assert original_calls == []
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["msg_type"] == "interactive"
+
+
+def test_invalid_profile_delivery_context_keeps_direct_command_and_notice_native(
+    monkeypatch,
+):
+    policy_calls = []
+    original_calls = []
+
+    def unexpected_policy(*_args, **_kwargs):
+        policy_calls.append(True)
+        return {"ok": True, "disposition": "card", "ttl_ms": 1000}
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            original_calls.append((chat_id, content, reply_to, metadata))
+            return SimpleNamespace(success=True, message_id="om_native_direct")
+
+    source = SimpleNamespace(
+        platform="feishu",
+        chat_id="oc_invalid_direct",
+        message_id="om_invalid_direct",
+        profile_id="../work",
+    )
+    event = SimpleNamespace(
+        source=source,
+        message_id="om_invalid_direct",
+        get_command=lambda: "/new",
+    )
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        unexpected_policy,
+    )
+
+    assert hook_runtime.install_feishu_command_card_adapter_methods(
+        runner,
+        event=event,
+    )
+    context = hook_runtime._HFC_FEISHU_DELIVERY_CONTEXT.get()
+    assert context["profile_invalid"] is True
+
+    command_result = asyncio.run(
+        adapter.send("oc_invalid_direct", "Session reset", reply_to="om_reply")
+    )
+    notice_result = asyncio.run(
+        adapter.send(
+            "oc_invalid_direct",
+            "⏳ Working — 1 min — terminal",
+            reply_to="om_reply",
+        )
+    )
+
+    assert command_result.success is True
+    assert notice_result.success is True
+    assert policy_calls == []
+    assert original_calls == [
+        ("oc_invalid_direct", "Session reset", "om_reply", None),
+        (
+            "oc_invalid_direct",
+            "⏳ Working — 1 min — terminal",
+            "om_reply",
+            None,
+        ),
+    ]
 
 
 def test_install_feishu_command_card_methods_refreshes_live_callback_without_replacing_handler():
@@ -4681,6 +5006,29 @@ def test_complete_command_card_async_posts_completed_event(monkeypatch):
     assert payload["data"]["delivery_kind"] == "command"
 
 
+@pytest.mark.parametrize("sidecar_result", [None, "", {"ok": True}])
+def test_command_completion_does_not_suppress_without_explicit_commit(
+    monkeypatch,
+    sidecar_result,
+):
+    async def fake_post(_url, _payload, _timeout):
+        return sidecar_result
+
+    monkeypatch.setattr(hook_runtime, "_post_json_ordered_response", fake_post)
+
+    async def run():
+        return await hook_runtime.complete_command_card_from_hermes_locals_async(
+            {
+                "chat_id": "oc_abc",
+                "message_id": "om_command",
+                "conversation_id": "feishu:oc_abc",
+            },
+            answer="command result",
+        )
+
+    assert asyncio.run(run()) is False
+
+
 def test_request_interaction_retries_when_sidecar_reports_not_applied(monkeypatch):
     posted = []
     polls = iter(
@@ -6108,6 +6456,1597 @@ def test_build_event_treats_invalid_created_at_as_missing_for_fallback(monkeypat
     )
 
 
+def test_completed_event_defers_native_ack_until_exact_base_finalization():
+    event = SimpleNamespace()
+    payload = hook_runtime.build_event(
+        "message.completed",
+        {
+            "platform": "feishu",
+            "chat_id": "oc_private",
+            "conversation_id": "conversation-private",
+            "message_id": "message-private",
+            "event": event,
+            "answer": "final answer",
+            "_hfc_delivery_obligation_id": "obligation-private",
+            "created_at": 1777017600.0,
+        },
+    )
+
+    metadata = payload["data"]["native_handoff"]
+    assert metadata["generation"] == getattr(
+        event, "_hfc_native_handoff_generation"
+    )
+    assert len(metadata["generation"]) == 32
+    assert set(metadata) == {"generation"}
+
+
+@pytest.mark.parametrize(
+    ("local_vars", "expected"),
+    [
+        ({"platform": "feishu", "answer": "final", "agent_result": {}}, True),
+        (
+            {
+                "platform": "feishu",
+                "answer": "final",
+                "agent_result": {"already_sent": True},
+            },
+            False,
+        ),
+        ({"platform": "telegram", "answer": "final", "agent_result": {}}, False),
+        ({"platform": "feishu", "answer": "", "agent_result": {}}, False),
+    ],
+)
+def test_exact_base_staging_is_limited_to_unsent_feishu_final_text(
+    monkeypatch,
+    local_vars,
+    expected,
+):
+    monkeypatch.setattr(
+        hook_runtime,
+        "_exact_base_delivery_hook_available",
+        lambda: True,
+    )
+    assert hook_runtime.can_stage_exact_base_completion(local_vars) is expected
+
+
+@pytest.mark.asyncio
+async def test_exact_base_completion_stages_terminal_without_posting(monkeypatch):
+    posted = []
+
+    async def fake_post(*args, **kwargs):
+        posted.append((args, kwargs))
+        return {"ok": True, "applied": True}
+
+    async def no_pending(_local_vars):
+        return None
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_policy_gate_async",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=hook_runtime._PolicyGateResult(True, None),
+        ),
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "_flush_pending_deltas_for_local_vars",
+        no_pending,
+    )
+    monkeypatch.setattr(hook_runtime, "_post_json_ordered_response", fake_post)
+
+    staged = await hook_runtime.stage_message_completed_from_hermes_locals_async(
+        {
+            "platform": "feishu",
+            "chat_id": "oc_exact",
+            "conversation_id": "conversation-exact",
+            "message_id": "message-exact",
+            "answer": "raw MEDIA:/tmp/private.png",
+            "created_at": 1777017600.0,
+        }
+    )
+
+    assert staged is True
+    assert posted == []
+    stage = hook_runtime._HFC_EXACT_COMPLETION_STAGE.get()
+    assert stage["payload"]["data"]["answer"] == "raw"
+
+
+@pytest.mark.asyncio
+async def test_exact_base_text_only_finalizer_posts_same_ledger_text_and_obligation(
+    monkeypatch,
+):
+    async def no_pending(_local_vars):
+        return None
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_policy_gate_async",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=hook_runtime._PolicyGateResult(True, None),
+        ),
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "_flush_pending_deltas_for_local_vars",
+        no_pending,
+    )
+    assert await hook_runtime.stage_message_completed_from_hermes_locals_async(
+        {
+            "platform": "feishu",
+            "chat_id": "oc_exact",
+            "conversation_id": "conversation-exact",
+            "message_id": "message-exact",
+            "answer": "raw MEDIA:/tmp/private.png",
+            "created_at": 1777017600.0,
+        }
+    )
+    posted = []
+
+    async def fake_post(_url, payload, _timeout):
+        posted.append(payload)
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_ordered_response", fake_post)
+    monkeypatch.setattr(
+        hook_runtime,
+        "_native_handoff_plan_fingerprint",
+        lambda _adapter: "f" * 64,
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "_native_handoff_runtime_wrappers_ready",
+        lambda _adapter: True,
+    )
+    adapter = SimpleNamespace(name="feishu")
+    returned = await hook_runtime.prepare_exact_base_final_delivery(
+        {
+            "delivery_adapter": adapter,
+            "content": "exact ledger text",
+            "obligation_id": "obligation-private",
+            "reply_to": "om_parent",
+            "metadata": {"thread_id": "omt_topic", "notify": True},
+            "images": [],
+            "local_files": [],
+            "media_files": [],
+        }
+    )
+
+    returned_adapter, content, reply_to, metadata = returned
+    exact = posted[0]
+    handoff = exact["data"]["native_handoff"]
+    assert content == "exact ledger text"
+    assert reply_to == "om_parent"
+    assert metadata == {"thread_id": "omt_topic", "notify": True}
+    assert returned_adapter is not adapter
+    assert (await returned_adapter._send_with_retry()).success is True
+    assert exact["data"]["answer"] == "exact ledger text"
+    assert exact["data"]["native_delivery"] == "allowed"
+    assert exact["data"]["attachments"] == []
+    assert handoff["capabilities"] == [
+        "native-ack-v2",
+        "stable-feishu-uuid-v2",
+        "exact-base-delivery-v1",
+    ]
+    assert handoff["obligation_key"] == hook_runtime._native_handoff_obligation_key(
+        "obligation-private"
+    )
+    assert handoff["content_hash"] == hook_runtime._native_handoff_content_hash(
+        "exact ledger text"
+    )
+    assert handoff["plan_fingerprint"] == "f" * 64
+    assert handoff["route"] == "thread-create"
+    assert hook_runtime._HFC_EXACT_COMPLETION_STAGE.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("images", [("https://private.test/chart.png", "chart")]),
+        ("local_files", ["/tmp/private/report.pdf"]),
+        ("media_files", [("/tmp/private/demo.mp4", False)]),
+    ],
+)
+async def test_exact_base_attachments_never_advertise_ack_capability(
+    monkeypatch,
+    field,
+    value,
+):
+    async def no_pending(_local_vars):
+        return None
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_policy_gate_async",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=hook_runtime._PolicyGateResult(True, None),
+        ),
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "_flush_pending_deltas_for_local_vars",
+        no_pending,
+    )
+    assert await hook_runtime.stage_message_completed_from_hermes_locals_async(
+        {
+            "platform": "feishu",
+            "chat_id": "oc_exact",
+            "conversation_id": "conversation-exact",
+            "message_id": "message-exact",
+            "answer": "final with attachment",
+            "created_at": 1777017600.0,
+        }
+    )
+    posted = []
+
+    async def fake_terminal_post(_url, payload, _timeout):
+        posted.append(payload)
+        return {"ok": True, "applied": False, "disposition": "native"}
+
+    async def absent_recovery(_url, _payload, _timeout):
+        return {"ok": True, "found": False}
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_post_json_ordered_response",
+        fake_terminal_post,
+    )
+    monkeypatch.setattr(hook_runtime, "_post_json_response", absent_recovery)
+    monkeypatch.setattr(
+        hook_runtime,
+        "_native_handoff_plan_fingerprint",
+        lambda _adapter: "f" * 64,
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "_native_handoff_runtime_wrappers_ready",
+        lambda _adapter: True,
+    )
+    adapter = SimpleNamespace(name="feishu")
+
+    returned = await hook_runtime.prepare_exact_base_final_delivery(
+        {
+            "delivery_adapter": adapter,
+            "content": "exact ledger text",
+            "obligation_id": "obligation-private",
+            "reply_to": None,
+            "metadata": {},
+            "images": [],
+            "local_files": [],
+            "media_files": [],
+            field: value,
+        }
+    )
+
+    assert returned[0] is adapter
+    handoff = posted[0]["data"]["native_handoff"]
+    assert set(handoff) == {"generation"}
+    assert posted[0]["data"]["native_delivery"] == "required"
+    assert posted[0]["data"]["attachments"]
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile_id", "profile_source", "delivery_kind", "expected_ack"),
+    [
+        ("default", None, "", True),
+        ("default", None, "cron", False),
+        ("work", None, "", False),
+        ("default", "sanitized_locals", "", False),
+    ],
+)
+async def test_exact_base_ack_is_limited_to_verified_default_profile(
+    monkeypatch,
+    profile_id,
+    profile_source,
+    delivery_kind,
+    expected_ack,
+):
+    async def no_pending(_local_vars):
+        return None
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_policy_gate_async",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=hook_runtime._PolicyGateResult(True, None),
+        ),
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "_flush_pending_deltas_for_local_vars",
+        no_pending,
+    )
+    assert await hook_runtime.stage_message_completed_from_hermes_locals_async(
+        {
+            "platform": "feishu",
+            "chat_id": "oc_exact",
+            "conversation_id": "conversation-exact",
+            "message_id": "message-exact",
+            "profile_id": profile_id,
+            "answer": "profile-scoped final",
+            "created_at": 1777017600.0,
+            "delivery_kind": delivery_kind,
+        }
+    )
+    if profile_source is not None:
+        hook_runtime._HFC_EXACT_COMPLETION_STAGE.get()["payload"]["data"][
+            "profile_source"
+        ] = profile_source
+    posted = []
+    registrations = []
+
+    async def fake_post(_url, payload, _timeout):
+        posted.append(payload)
+        return {"ok": True, "applied": False, "disposition": "native"}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_ordered_response", fake_post)
+    monkeypatch.setattr(
+        hook_runtime,
+        "_native_handoff_plan_fingerprint",
+        lambda _adapter: "f" * 64,
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "_native_handoff_runtime_wrappers_ready",
+        lambda _adapter: True,
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "_register_native_handoff_descriptor",
+        lambda payload, result: registrations.append((payload, result)) or True,
+    )
+
+    await hook_runtime.prepare_exact_base_final_delivery(
+        {
+            "delivery_adapter": SimpleNamespace(name="feishu"),
+            "content": "profile-scoped final",
+            "obligation_id": "obligation-private",
+            "metadata": {},
+            "images": [],
+            "local_files": [],
+            "media_files": [],
+            "delivery_kind": delivery_kind,
+        }
+    )
+
+    handoff = posted[0]["data"]["native_handoff"]
+    assert ("capabilities" in handoff) is expected_ack
+    assert len(registrations) == int(expected_ack)
+    if not expected_ack:
+        assert set(handoff) == {"generation"}
+
+
+@pytest.mark.parametrize(
+    "scope_mutation",
+    [
+        {"event": "message.failed"},
+        {"delivery_kind": "cron"},
+        {"delivery_kind": "command"},
+        {"attachments": [{"kind": "image", "name": "private.png"}]},
+        {"native_delivery": "required"},
+        {"attachments": None},
+        {"native_delivery": None},
+    ],
+)
+def test_gateway_rejects_exact_binding_outside_ordinary_text_scope(
+    scope_mutation,
+):
+    answer = "ordinary exact final"
+    obligation_key = "a" * 64
+    content_hash = hook_runtime._native_handoff_content_hash(answer)
+    plan_fingerprint = "b" * 64
+    route = "create"
+    target_hash = hook_runtime.derive_native_handoff_target_hash(
+        profile_id="default",
+        chat_id="oc_exact",
+        thread_id="",
+        route=route,
+    )
+    metadata = {
+        "generation": "c" * 32,
+        "capabilities": [
+            "native-ack-v2",
+            "stable-feishu-uuid-v2",
+            "exact-base-delivery-v1",
+        ],
+        "obligation_key": obligation_key,
+        "content_hash": content_hash,
+        "plan_fingerprint": plan_fingerprint,
+        "route": route,
+        "target_hash": target_hash,
+        "provisional_uuid_seed": hook_runtime.derive_native_handoff_uuid_seed(
+            obligation_key=obligation_key,
+            content_hash=content_hash,
+            plan_fingerprint=plan_fingerprint,
+            route=route,
+            target_hash=target_hash,
+        ),
+    }
+    data = {
+        "answer": answer,
+        "attachments": [],
+        "native_delivery": "allowed",
+        "profile_id": "default",
+        "profile_source": "fallback_default",
+        "native_handoff": metadata,
+    }
+    for field, value in scope_mutation.items():
+        if field == "event":
+            continue
+        if value is None:
+            data.pop(field, None)
+        else:
+            data[field] = value
+    payload = {
+        "event": scope_mutation.get("event", "message.completed"),
+        "chat_id": "oc_exact",
+        "thread_id": "",
+        "data": data,
+    }
+
+    assert hook_runtime._native_handoff_binding_from_payload(payload) is None
+
+
+@pytest.mark.asyncio
+async def test_exact_base_no_text_finalizer_never_advertises_ack(monkeypatch):
+    async def no_pending(_local_vars):
+        return None
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_policy_gate_async",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=hook_runtime._PolicyGateResult(True, None),
+        ),
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "_flush_pending_deltas_for_local_vars",
+        no_pending,
+    )
+    assert await hook_runtime.stage_message_completed_from_hermes_locals_async(
+        {
+            "platform": "feishu",
+            "chat_id": "oc_exact",
+            "conversation_id": "conversation-exact",
+            "message_id": "message-exact",
+            "answer": "MEDIA:/tmp/private.png",
+            "created_at": 1777017600.0,
+        }
+    )
+    posted = []
+
+    async def fake_post(_url, payload, _timeout):
+        posted.append(payload)
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_ordered_response", fake_post)
+    await hook_runtime.finalize_exact_base_no_text(
+        {
+            "text_content": "",
+            "images": [],
+            "local_files": [],
+            "media_files": [("/tmp/private.png", False)],
+        }
+    )
+
+    handoff = posted[0]["data"]["native_handoff"]
+    assert set(handoff) == {"generation"}
+    assert posted[0]["data"]["answer"] == ""
+    assert posted[0]["data"]["native_delivery"] == "required"
+    assert posted[0]["data"]["attachments"][0]["name"] == "private.png"
+    assert "/tmp/private" not in json.dumps(posted[0])
+    assert hook_runtime._HFC_EXACT_COMPLETION_STAGE.get() is None
+
+
+class _NativeAckResponse:
+    def __init__(self, success=True, *, code=0, msg="", message_id="om_result"):
+        self._success = success
+        self.code = code
+        self.msg = msg
+        self.data = SimpleNamespace(message_id=message_id)
+
+    def success(self):
+        return self._success
+
+
+class _NativeAckAdapter:
+    name = "feishu"
+    MAX_MESSAGE_LENGTH = 5
+
+    def __init__(self, outcomes=None):
+        self._client = object()
+        self.outcomes = list(outcomes or [])
+        self.raw_calls = []
+
+    def format_message(self, content):
+        return content
+
+    def truncate_message(self, content, size):
+        return [content[index : index + size] for index in range(0, len(content), size)]
+
+    def _build_outbound_payload(self, chunk, *, prefer_post=False):
+        msg_type = "post" if prefer_post else "text"
+        return msg_type, json.dumps({"text": chunk})
+
+    @staticmethod
+    def _build_reply_message_body(*, content, msg_type, reply_in_thread, uuid_value):
+        return SimpleNamespace(
+            content=content,
+            msg_type=msg_type,
+            reply_in_thread=reply_in_thread,
+            uuid=uuid_value,
+        )
+
+    @staticmethod
+    def _build_create_message_body(*, receive_id, msg_type, content, uuid_value):
+        return SimpleNamespace(
+            receive_id=receive_id,
+            msg_type=msg_type,
+            content=content,
+            uuid=uuid_value,
+        )
+
+    async def _send_raw_message(self, *, chat_id, msg_type, payload, reply_to, metadata):
+        if reply_to:
+            body = self._build_reply_message_body(
+                content=payload,
+                msg_type=msg_type,
+                reply_in_thread=bool((metadata or {}).get("thread_id")),
+                uuid_value="random-reply",
+            )
+            route = "thread" if (metadata or {}).get("thread_id") else "reply"
+        else:
+            receive_id = (metadata or {}).get("thread_id") or chat_id
+            body = self._build_create_message_body(
+                receive_id=receive_id,
+                msg_type=msg_type,
+                content=payload,
+                uuid_value="random-create",
+            )
+            route = "thread" if (metadata or {}).get("thread_id") else "create"
+        self.raw_calls.append((payload, msg_type, route, body.uuid))
+        outcome = self.outcomes.pop(0) if self.outcomes else True
+        return _NativeAckResponse(success=outcome)
+
+    async def _feishu_send_with_retry(
+        self, *, chat_id, msg_type, payload, reply_to, metadata
+    ):
+        return await self._send_raw_message(
+            chat_id=chat_id,
+            msg_type=msg_type,
+            payload=payload,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    def _response_succeeded(self, response):
+        return response.success()
+
+    def _finalize_send_result(self, response, _message):
+        return SimpleNamespace(
+            success=bool(response and response.success()),
+            message_id="om_result" if response and response.success() else None,
+            error="" if response and response.success() else "send failed",
+        )
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH)
+        last_response = None
+        for chunk in chunks:
+            msg_type, payload = self._build_outbound_payload(chunk, prefer_post=False)
+            last_response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type=msg_type,
+                payload=payload,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        return self._finalize_send_result(last_response, "send failed")
+
+
+def test_native_handoff_plan_fingerprint_binds_loaded_runtime_semantics(monkeypatch):
+    adapter = _NativeAckAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+
+    first = hook_runtime._native_handoff_plan_fingerprint(adapter)
+    adapter_module = sys.modules[type(adapter).__module__]
+    monkeypatch.setattr(
+        adapter_module,
+        "_NATIVE_ACK_PLAN_RE",
+        re.compile(r"changed runtime regex", re.IGNORECASE),
+    )
+    second = hook_runtime._native_handoff_plan_fingerprint(adapter)
+
+    helpers = sys.modules["gateway.platforms.helpers"]
+
+    def changed_strip_markdown(text):
+        return str(text).replace("*", "").strip()
+
+    changed_strip_markdown.__module__ = helpers.__name__
+    helpers.strip_markdown = changed_strip_markdown
+    third = hook_runtime._native_handoff_plan_fingerprint(adapter)
+
+    assert all(len(value) == 64 for value in (first, second, third))
+    assert len({first, second, third}) == 3
+    assert len(hook_runtime._NATIVE_HANDOFF_PLAN_FINGERPRINTS) >= 3
+
+
+def test_native_handoff_plan_fingerprint_fails_closed_without_loaded_helper(
+    monkeypatch,
+):
+    adapter = _NativeAckAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    monkeypatch.delitem(sys.modules, "gateway.platforms.helpers", raising=False)
+
+    assert hook_runtime._native_handoff_plan_fingerprint(adapter) == ""
+
+
+class _NativeAckPostFallbackAdapter(_NativeAckAdapter):
+    async def _feishu_send_with_retry(
+        self, *, chat_id, msg_type, payload, reply_to, metadata
+    ):
+        response = await self._send_raw_message(
+            chat_id=chat_id,
+            msg_type=msg_type,
+            payload=payload,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if msg_type == "post" and not response.success():
+            response.msg = "invalid post payload"
+        return response
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        post = await self._feishu_send_with_retry(
+            chat_id=chat_id,
+            msg_type="post",
+            payload=json.dumps({"post": content}),
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if not post.success():
+            text = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="text",
+                payload=json.dumps({"text": content}),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return self._finalize_send_result(text, "send failed")
+        return self._finalize_send_result(post, "send failed")
+
+
+class _NativeAckRaisingAdapter(_NativeAckAdapter):
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        raise RuntimeError("adapter escaped")
+
+
+def _install_native_ack_context(
+    adapter,
+    content,
+    *,
+    expires_at=None,
+    obligation_key="",
+    thread_id="",
+):
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    obligation_key = obligation_key or hook_runtime._native_handoff_obligation_key(
+        "test-obligation"
+    )
+    plan_fingerprint = hook_runtime._native_handoff_plan_fingerprint(adapter)
+    assert len(plan_fingerprint) == 64
+    route = "thread-create" if thread_id else "create"
+    target_hash = hook_runtime.derive_native_handoff_target_hash(
+        profile_id="default",
+        chat_id="oc_native",
+        thread_id=thread_id,
+        route=route,
+    )
+    content_hash = hook_runtime._native_handoff_content_hash(content)
+    uuid_seed = hook_runtime.derive_native_handoff_uuid_seed(
+        obligation_key=obligation_key,
+        content_hash=content_hash,
+        plan_fingerprint=plan_fingerprint,
+        route=route,
+        target_hash=target_hash,
+    )
+    descriptor = {
+        "protocol": "hfc-native-handoff-v2",
+        "id": "a" * 64,
+        "uuid_seed": uuid_seed,
+        "expires_at": expires_at or (time.time() + 3600),
+    }
+    payload = {
+        "event": "message.completed",
+        "chat_id": "oc_native",
+        "thread_id": thread_id,
+        "data": {
+            "answer": content,
+            "attachments": [],
+            "native_delivery": "allowed",
+            "profile_id": "default",
+            "profile_source": "fallback_default",
+            "native_handoff": {
+                "capabilities": [
+                    "native-ack-v2",
+                    "stable-feishu-uuid-v2",
+                    "exact-base-delivery-v1",
+                ],
+                "obligation_key": obligation_key,
+                "content_hash": content_hash,
+                "plan_fingerprint": plan_fingerprint,
+                "route": route,
+                "target_hash": target_hash,
+                "provisional_uuid_seed": uuid_seed,
+            },
+        },
+    }
+    registered = hook_runtime._register_native_handoff_descriptor(
+        payload,
+        {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+            "native_handoff": descriptor,
+        },
+    )
+    assert registered is (descriptor["expires_at"] > time.time())
+    return descriptor
+
+
+def test_exact_native_handoff_rejects_old_sidecar_v1_descriptor():
+    adapter = _NativeAckAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    content = "rolling-upgrade answer"
+    payload = {
+        "event": "message.completed",
+        "chat_id": "oc_native",
+        "data": {
+            "answer": content,
+            "native_handoff": {
+                "capabilities": [
+                    "native-ack-v2",
+                    "stable-feishu-uuid-v2",
+                    "exact-base-delivery-v1",
+                ],
+                "obligation_key": hook_runtime._native_handoff_obligation_key(
+                    "rolling-upgrade-obligation"
+                ),
+                "content_hash": hook_runtime._native_handoff_content_hash(content),
+                "plan_fingerprint": hook_runtime._native_handoff_plan_fingerprint(
+                    adapter
+                ),
+                "route": "create",
+            },
+        },
+    }
+
+    registered = hook_runtime._register_native_handoff_descriptor(
+        payload,
+        {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+            "native_handoff": {
+                "protocol": "hfc-native-handoff-v1",
+                "id": "a" * 64,
+                "uuid_seed": "b" * 32,
+                "expires_at": time.time() + 3600,
+            },
+        },
+    )
+
+    assert registered is False
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is None
+
+
+@pytest.mark.parametrize(
+    "ok_value",
+    [pytest.param(None, id="missing"), False, "true", 1],
+)
+def test_exact_native_handoff_requires_explicit_boolean_ok(ok_value):
+    adapter = _NativeAckAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    content = "explicit commit answer"
+    payload = {
+        "event": "message.completed",
+        "chat_id": "oc_native",
+        "data": {
+            "answer": content,
+            "native_handoff": {
+                "capabilities": [
+                    "native-ack-v2",
+                    "stable-feishu-uuid-v2",
+                    "exact-base-delivery-v1",
+                ],
+                "obligation_key": hook_runtime._native_handoff_obligation_key(
+                    "explicit-commit-obligation"
+                ),
+                "content_hash": hook_runtime._native_handoff_content_hash(content),
+                "plan_fingerprint": hook_runtime._native_handoff_plan_fingerprint(
+                    adapter
+                ),
+                "route": "create",
+            },
+        },
+    }
+    result = {
+        "applied": False,
+        "disposition": "native",
+        "native_handoff": {
+            "protocol": "hfc-native-handoff-v2",
+            "id": "a" * 64,
+            "uuid_seed": "b" * 32,
+            "expires_at": time.time() + 3600,
+        },
+    }
+    if ok_value is not None:
+        result["ok"] = ok_value
+
+    assert hook_runtime._register_native_handoff_descriptor(payload, result) is False
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is None
+
+
+@pytest.mark.asyncio
+async def test_native_handoff_multichunk_stays_stable_until_ledger_ack(monkeypatch):
+    content = "abcdeabcde"
+    adapter = _NativeAckAdapter()
+    descriptor = _install_native_ack_context(adapter, content)
+    acked = []
+
+    async def fake_ack(value):
+        acked.append(value)
+        return len(acked) > 1
+
+    monkeypatch.setattr(hook_runtime, "_ack_native_handoff", fake_ack)
+    first = await adapter.send("oc_native", content)
+    first_uuids = [call[3] for call in adapter.raw_calls]
+    adapter.raw_calls.clear()
+    second = await adapter.send("oc_native", content)
+    second_uuids = [call[3] for call in adapter.raw_calls]
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is not None
+    hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+    adapter.raw_calls.clear()
+    third = await adapter.send("oc_native", content)
+    third_uuids = [call[3] for call in adapter.raw_calls]
+
+    assert first.success is True
+    assert second.success is True
+    assert len(first_uuids) == 2
+    assert first_uuids[0] != first_uuids[1]
+    assert first_uuids == second_uuids
+    assert all(len(value) <= 50 for value in first_uuids)
+    assert third.success is True
+    assert third_uuids == ["random-create", "random-create"]
+    assert descriptor["protocol"] == "hfc-native-handoff-v2"
+    assert acked == []
+
+
+@pytest.mark.asyncio
+async def test_native_handoff_middle_chunk_failure_is_not_masked_and_does_not_ack(monkeypatch):
+    content = "abcdefghijklmno"
+    adapter = _NativeAckAdapter(outcomes=[True, False, True])
+    _install_native_ack_context(adapter, content)
+    acked = []
+    monkeypatch.setattr(
+        hook_runtime,
+        "_ack_native_handoff",
+        lambda value: acked.append(value),
+    )
+
+    result = await adapter.send("oc_native", content)
+
+    assert result.success is False
+    assert len(adapter.raw_calls) == 3
+    assert acked == []
+
+
+@pytest.mark.asyncio
+async def test_delivery_ledger_is_durable_before_native_ack(monkeypatch):
+    order = []
+    gateway_module = types.ModuleType("gateway")
+    gateway_module.__path__ = []
+    ledger_module = types.ModuleType("gateway.delivery_ledger")
+
+    def mark_delivered(obligation_id):
+        order.append(("ledger", obligation_id))
+
+    ledger_module.mark_delivered = mark_delivered
+    ledger_module.mark_failed = lambda _obligation_id, _error="": None
+    gateway_module.delivery_ledger = ledger_module
+    monkeypatch.setitem(sys.modules, "gateway", gateway_module)
+    monkeypatch.setitem(sys.modules, "gateway.delivery_ledger", ledger_module)
+    raw_obligation = "obligation-private"
+    obligation_key = hook_runtime._native_handoff_obligation_key(raw_obligation)
+    adapter = _NativeAckAdapter()
+    descriptor = _install_native_ack_context(
+        adapter,
+        "terminal",
+        obligation_key=obligation_key,
+    )
+
+    async def fake_ack(value):
+        order.append(("ack", value))
+        return True
+
+    monkeypatch.setattr(hook_runtime, "_ack_native_handoff", fake_ack)
+    result = await adapter.send("oc_native", "terminal")
+
+    # Crash here: platform succeeded, but the ledger has not transitioned.
+    # The sidecar must still be pending so startup recovery can reuse UUIDs.
+    assert result.success is True
+    assert order == []
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is not None
+
+    ledger_module.mark_delivered("unrelated-obligation")
+    await asyncio.sleep(0)
+    assert order == [("ledger", "unrelated-obligation")]
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is not None
+
+    ledger_module.mark_delivered(raw_obligation)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert order == [
+        ("ledger", "unrelated-obligation"),
+        ("ledger", raw_obligation),
+        ("ack", descriptor),
+    ]
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is None
+
+
+@pytest.mark.asyncio
+async def test_delivery_ledger_mark_failure_forbids_native_ack(monkeypatch):
+    gateway_module = types.ModuleType("gateway")
+    gateway_module.__path__ = []
+    ledger_module = types.ModuleType("gateway.delivery_ledger")
+
+    def mark_delivered(_obligation_id):
+        raise OSError("ledger fsync failed")
+
+    ledger_module.mark_delivered = mark_delivered
+    ledger_module.mark_failed = lambda _obligation_id, _error="": None
+    gateway_module.delivery_ledger = ledger_module
+    monkeypatch.setitem(sys.modules, "gateway", gateway_module)
+    monkeypatch.setitem(sys.modules, "gateway.delivery_ledger", ledger_module)
+    raw_obligation = "obligation-private"
+    adapter = _NativeAckAdapter()
+    _install_native_ack_context(
+        adapter,
+        "terminal",
+        obligation_key=hook_runtime._native_handoff_obligation_key(raw_obligation),
+    )
+    acked = []
+
+    async def fake_ack(value):
+        acked.append(value)
+        return True
+
+    monkeypatch.setattr(hook_runtime, "_ack_native_handoff", fake_ack)
+    assert (await adapter.send("oc_native", "terminal")).success is True
+
+    with pytest.raises(OSError, match="fsync failed"):
+        ledger_module.mark_delivered(raw_obligation)
+    await asyncio.sleep(0)
+
+    assert acked == []
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mark_failed_raises", [False, True])
+async def test_delivery_ledger_failed_row_clears_descriptor_without_ack(
+    monkeypatch,
+    mark_failed_raises,
+):
+    gateway_module = types.ModuleType("gateway")
+    gateway_module.__path__ = []
+    ledger_module = types.ModuleType("gateway.delivery_ledger")
+    ledger_module.mark_delivered = lambda _obligation_id: None
+
+    def mark_failed(_obligation_id, _error=""):
+        if mark_failed_raises:
+            raise OSError("ledger failure transition failed")
+
+    ledger_module.mark_failed = mark_failed
+    gateway_module.delivery_ledger = ledger_module
+    monkeypatch.setitem(sys.modules, "gateway", gateway_module)
+    monkeypatch.setitem(sys.modules, "gateway.delivery_ledger", ledger_module)
+    raw_obligation = "obligation-private"
+    adapter = _NativeAckAdapter(outcomes=[False])
+    _install_native_ack_context(
+        adapter,
+        "same",
+        obligation_key=hook_runtime._native_handoff_obligation_key(raw_obligation),
+    )
+    acked = []
+
+    async def fake_ack(value):
+        acked.append(value)
+        return True
+
+    monkeypatch.setattr(hook_runtime, "_ack_native_handoff", fake_ack)
+    assert (await adapter.send("oc_native", "same")).success is False
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is not None
+
+    if mark_failed_raises:
+        with pytest.raises(OSError, match="failure transition failed"):
+            ledger_module.mark_failed(raw_obligation, "send failed")
+    else:
+        ledger_module.mark_failed(raw_obligation, "send failed")
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is None
+
+    adapter.outcomes = [True]
+    adapter.raw_calls.clear()
+    assert (await adapter.send("oc_native", "same")).success is True
+    assert adapter.raw_calls[0][3] == "random-create"
+    assert acked == []
+
+
+@pytest.mark.asyncio
+async def test_native_handoff_uses_canonical_create_routes_and_format_scoped_uuid(monkeypatch):
+    content = "same"
+    adapter = _NativeAckAdapter()
+    _install_native_ack_context(adapter, content)
+
+    async def retain_for_retry(_descriptor):
+        return False
+
+    monkeypatch.setattr(hook_runtime, "_ack_native_handoff", retain_for_retry)
+    await adapter.send("oc_native", content)
+    create_uuid = adapter.raw_calls[-1][3]
+    await adapter.send("oc_native", content, reply_to="om_parent")
+    canonical_create_uuid = adapter.raw_calls[-1][3]
+    assert adapter.raw_calls[-1][2] == "create"
+
+    thread_adapter = _NativeAckAdapter()
+    _install_native_ack_context(thread_adapter, content, thread_id="omt_topic")
+    await thread_adapter.send(
+        "oc_native",
+        content,
+        reply_to="om_parent",
+        metadata={"thread_id": "omt_topic"},
+    )
+    thread_uuid = thread_adapter.raw_calls[-1][3]
+
+    assert create_uuid == canonical_create_uuid
+    assert thread_adapter.raw_calls[-1][2] == "thread"
+    assert create_uuid != thread_uuid
+
+    fallback = _NativeAckPostFallbackAdapter(
+        outcomes=[False, True, False, True]
+    )
+    _install_native_ack_context(fallback, content)
+    await fallback.send("oc_native", content)
+    first = [call[3] for call in fallback.raw_calls]
+    fallback.raw_calls.clear()
+    await fallback.send("oc_native", content)
+    second = [call[3] for call in fallback.raw_calls]
+
+    assert len(first) == 2
+    assert first[0] != first[1]
+    assert first == second
+
+
+@pytest.mark.asyncio
+async def test_native_handoff_context_clears_after_exception_and_unrelated_send(monkeypatch):
+    adapter = _NativeAckRaisingAdapter()
+    _install_native_ack_context(adapter, "terminal")
+    with pytest.raises(RuntimeError, match="adapter escaped"):
+        await adapter.send("oc_native", "terminal")
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is None
+
+    ordinary = _NativeAckAdapter()
+    _install_native_ack_context(ordinary, "terminal")
+    result = await ordinary.send("oc_native", "unrelated")
+    assert result.success is True
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is None
+    assert [call[3] for call in ordinary.raw_calls] == ["random-create", "random-create"]
+
+
+@pytest.mark.asyncio
+async def test_expired_native_handoff_descriptor_fails_open_without_ack(monkeypatch):
+    adapter = _NativeAckAdapter()
+    descriptor = _install_native_ack_context(
+        adapter,
+        "terminal",
+        expires_at=time.time() - 1,
+    )
+    acked = []
+    monkeypatch.setattr(
+        hook_runtime,
+        "_ack_native_handoff",
+        lambda value: acked.append(value),
+    )
+
+    result = await adapter.send("oc_native", "terminal")
+
+    assert result.success is True
+    assert [call[3] for call in adapter.raw_calls] == ["random-create", "random-create"]
+    assert descriptor["expires_at"] < time.time()
+    assert acked == []
+
+
+def test_native_handoff_descriptor_requires_exact_base_content():
+    adapter = _NativeAckAdapter()
+    _install_native_ack_context(adapter, "answer")
+    assert hook_runtime._native_handoff_for_send(
+        adapter,
+        "oc_native",
+        "answer",
+        None,
+    ) is not None
+    _install_native_ack_context(adapter, "answer")
+    assert hook_runtime._native_handoff_for_send(
+        adapter,
+        "oc_native",
+        "answer\nMEDIA:/tmp/private.png",
+        None,
+    ) is None
+
+
+@pytest.mark.parametrize("result", [None, "", {"ok": True}, {"applied": True}])
+def test_terminal_delivery_requires_explicit_applied_commit(result):
+    assert hook_runtime._event_was_applied(result, strict=True) is False
+
+
+def test_terminal_delivery_accepts_only_explicit_applied_commit():
+    assert hook_runtime._event_was_applied(
+        {"ok": True, "applied": True},
+        strict=True,
+    ) is True
+
+
+async def _stage_exact_terminal(monkeypatch, *, answer="exact terminal"):
+    async def no_pending(_local_vars):
+        return None
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_policy_gate_async",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result=hook_runtime._PolicyGateResult(True, None),
+        ),
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "_flush_pending_deltas_for_local_vars",
+        no_pending,
+    )
+    assert await hook_runtime.stage_message_completed_from_hermes_locals_async(
+        {
+            "platform": "feishu",
+            "chat_id": "oc_native",
+            "conversation_id": "conversation-native",
+            "message_id": "message-native",
+            "answer": answer,
+            "created_at": 1777017600.0,
+        }
+    )
+
+
+def _install_test_delivery_ledger(monkeypatch, *, debug_rows=None):
+    gateway_module = types.ModuleType("gateway")
+    gateway_module.__path__ = []
+    ledger_module = types.ModuleType("gateway.delivery_ledger")
+    ledger_module.mark_delivered = lambda _obligation_id: None
+    ledger_module.mark_failed = lambda _obligation_id, _error="": None
+    if debug_rows is not None:
+        ledger_module.debug_rows = debug_rows
+    gateway_module.delivery_ledger = ledger_module
+    monkeypatch.setitem(sys.modules, "gateway", gateway_module)
+    monkeypatch.setitem(sys.modules, "gateway.delivery_ledger", ledger_module)
+    return ledger_module
+
+
+@pytest.mark.asyncio
+async def test_terminal_native_without_descriptor_recovers_full_exact_handoff(
+    monkeypatch,
+):
+    await _stage_exact_terminal(monkeypatch)
+    ledger = _install_test_delivery_ledger(monkeypatch)
+    adapter = _NativeAckAdapter()
+    assert hook_runtime.install_feishu_command_card_adapter_methods(
+        SimpleNamespace(adapters={"feishu": adapter})
+    )
+    terminal_payloads = []
+
+    async def terminal_post(_url, payload, _timeout):
+        terminal_payloads.append(payload)
+        return {"ok": True, "applied": False, "disposition": "native"}
+
+    async def recovery_post(url, payload, _timeout):
+        assert url.endswith("/native-handoff/recover")
+        return {
+            "ok": True,
+            "found": True,
+            "native_handoff": {
+                "protocol": "hfc-native-handoff-v2",
+                "id": "a" * 64,
+                "uuid_seed": hook_runtime.derive_native_handoff_uuid_seed(
+                    obligation_key=payload["obligation_key"],
+                    content_hash=payload["content_hash"],
+                    plan_fingerprint=payload["plan_fingerprint"],
+                    route=payload["route"],
+                    target_hash=payload["target_hash"],
+                ),
+                "expires_at": time.time() + 3600,
+            },
+        }
+
+    monkeypatch.setattr(hook_runtime, "_post_json_ordered_response", terminal_post)
+    monkeypatch.setattr(hook_runtime, "_post_json_response", recovery_post)
+    returned = await hook_runtime.prepare_exact_base_final_delivery(
+        {
+            "delivery_adapter": adapter,
+            "content": "exact terminal",
+            "obligation_id": "obligation-private",
+            "metadata": {},
+            "images": [],
+            "local_files": [],
+            "media_files": [],
+        }
+    )
+
+    context = hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get()
+    assert returned[0] is adapter
+    assert context is not None and context.get("provisional") is not True
+    assert context["descriptor"]["uuid_seed"] == terminal_payloads[0]["data"][
+        "native_handoff"
+    ]["provisional_uuid_seed"]
+    assert ledger.mark_delivered is hook_runtime._hfc_mark_delivery_ledger_delivered_then_ack
+
+
+@pytest.mark.asyncio
+async def test_double_response_loss_uses_target_bound_seed_then_relooks_up_for_ack(
+    monkeypatch,
+):
+    await _stage_exact_terminal(monkeypatch)
+    ledger = _install_test_delivery_ledger(monkeypatch)
+    adapter = _NativeAckAdapter()
+    assert hook_runtime.install_feishu_command_card_adapter_methods(
+        SimpleNamespace(adapters={"feishu": adapter})
+    )
+    terminal_payloads = []
+    recovery_calls = []
+    acked = []
+
+    async def lost_terminal(_url, payload, _timeout):
+        terminal_payloads.append(payload)
+        raise TimeoutError("terminal response lost")
+
+    async def recovery_then_ack(url, payload, _timeout):
+        if url.endswith("/native-handoff/recover"):
+            recovery_calls.append(payload)
+            if len(recovery_calls) == 1:
+                raise TimeoutError("recovery response lost")
+            return {
+                "ok": True,
+                "found": True,
+                "native_handoff": {
+                    "protocol": "hfc-native-handoff-v2",
+                    "id": "a" * 64,
+                    "uuid_seed": hook_runtime.derive_native_handoff_uuid_seed(
+                        obligation_key=payload["obligation_key"],
+                        content_hash=payload["content_hash"],
+                        plan_fingerprint=payload["plan_fingerprint"],
+                        route=payload["route"],
+                        target_hash=payload["target_hash"],
+                    ),
+                    "expires_at": time.time() + 3600,
+                },
+            }
+        acked.append(payload)
+        return {"ok": True, "acknowledged": True}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_ordered_response", lost_terminal)
+    monkeypatch.setattr(hook_runtime, "_post_json_response", recovery_then_ack)
+    returned = await hook_runtime.prepare_exact_base_final_delivery(
+        {
+            "delivery_adapter": adapter,
+            "content": "exact terminal",
+            "obligation_id": "obligation-private",
+            "metadata": {},
+            "images": [],
+            "local_files": [],
+            "media_files": [],
+        }
+    )
+    provisional = hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get()
+    result = await adapter.send("oc_native", "exact terminal")
+    sent_uuids = [call[3] for call in adapter.raw_calls]
+    ledger.mark_delivered("obligation-private")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    metadata = terminal_payloads[0]["data"]["native_handoff"]
+    assert returned[0] is adapter
+    assert provisional is not None and provisional["provisional"] is True
+    assert provisional["descriptor"] == {
+        "uuid_seed": metadata["provisional_uuid_seed"]
+    }
+    assert result.success is True
+    assert sent_uuids and all(value != "random-create" for value in sent_uuids)
+    assert len(recovery_calls) == 2
+    assert acked and acked[0]["uuid_seed"] == metadata["provisional_uuid_seed"]
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("age", "expected_provisional"), [(10.0, True), (3601.0, False)])
+async def test_startup_transport_unknown_provisional_is_bounded_by_ledger_age(
+    monkeypatch,
+    age,
+    expected_provisional,
+):
+    raw_obligation = "obligation-private"
+    now = time.time()
+    ledger = _install_test_delivery_ledger(
+        monkeypatch,
+        debug_rows=lambda limit=20: json.dumps(
+            [{"id": raw_obligation, "created_at": now - age}]
+        ),
+    )
+    adapter = _NativeAckAdapter()
+    assert hook_runtime.install_feishu_command_card_adapter_methods(
+        SimpleNamespace(adapters={"feishu": adapter})
+    )
+
+    async def lost_recovery(_url, _payload, _timeout):
+        raise TimeoutError("recovery response lost")
+
+    async def native_only(_chat_id):
+        return False
+
+    monkeypatch.setattr(hook_runtime, "_post_json_response", lost_recovery)
+    monkeypatch.setattr(hook_runtime, "_hfc_direct_card_allowed_async", native_only)
+    marker = "RECOVERED MARKER: exact terminal"
+    scope = await hook_runtime.prepare_native_handoff_recovery(
+        adapter=adapter,
+        obligation_id=raw_obligation,
+        chat_id="oc_native",
+        content=marker,
+        original_content="exact terminal",
+    )
+    result = await adapter.send("oc_native", marker)
+
+    assert (scope is not None) is expected_provisional
+    assert result.success is True
+    if expected_provisional:
+        context = hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get()
+        assert context is not None and context["provisional"] is True
+        assert "send_content" not in context
+        assert all(call[3] != "random-create" for call in adapter.raw_calls)
+    else:
+        assert all(call[3] == "random-create" for call in adapter.raw_calls)
+    assert ledger.mark_delivered is hook_runtime._hfc_mark_delivery_ledger_delivered_then_ack
+
+
+@pytest.mark.asyncio
+async def test_delivery_ledger_recovery_uses_opaque_lookup_stable_uuid_and_ack(
+    monkeypatch,
+):
+    posts = []
+
+    async def fake_post(url, payload, timeout):
+        posts.append((url, payload, timeout))
+        if url.endswith("/native-handoff/recover"):
+            uuid_seed = hook_runtime.derive_native_handoff_uuid_seed(
+                obligation_key=payload["obligation_key"],
+                content_hash=payload["content_hash"],
+                plan_fingerprint=payload["plan_fingerprint"],
+                route=payload["route"],
+                target_hash=payload["target_hash"],
+            )
+            return {
+                "ok": True,
+                "found": True,
+                "native_handoff": {
+                    "protocol": "hfc-native-handoff-v2",
+                    "id": "a" * 64,
+                    "uuid_seed": uuid_seed,
+                    "expires_at": time.time() + 3600,
+                },
+            }
+        return {"ok": True, "acknowledged": True}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_response", fake_post)
+    monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
+    gateway_module = types.ModuleType("gateway")
+    gateway_module.__path__ = []
+    ledger_module = types.ModuleType("gateway.delivery_ledger")
+    ledger_module.mark_delivered = lambda _obligation_id: None
+    ledger_module.mark_failed = lambda _obligation_id, _error="": None
+    gateway_module.delivery_ledger = ledger_module
+    monkeypatch.setitem(sys.modules, "gateway", gateway_module)
+    monkeypatch.setitem(sys.modules, "gateway.delivery_ledger", ledger_module)
+    adapter = _NativeAckAdapter()
+    assert hook_runtime.install_feishu_command_card_adapter_methods(
+        SimpleNamespace(adapters={"feishu": adapter})
+    )
+
+    scope = await hook_runtime.prepare_native_handoff_recovery(
+        adapter=adapter,
+        obligation_id="obligation-private",
+        chat_id="oc_private",
+        content="recovered final",
+        original_content="recovered final",
+    )
+    result = await adapter.send("oc_private", "recovered final")
+    assert len(posts) == 1
+    ledger_module.mark_delivered("obligation-private")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert scope is not None
+    assert result.success is True
+    assert adapter.raw_calls[0][3] != "random-create"
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is None
+    recovery_payload = posts[0][1]
+    assert recovery_payload["protocol"] == "hfc-native-handoff-recovery-v2"
+    assert len(recovery_payload["obligation_key"]) == 64
+    assert len(recovery_payload["content_hash"]) == 64
+    assert len(recovery_payload["plan_fingerprint"]) == 64
+    assert len(recovery_payload["target_hash"]) == 64
+    assert recovery_payload["route"] == "create"
+    assert "private" not in json.dumps(recovery_payload)
+    assert posts[1][0].endswith("/native-handoff/ack")
+
+
+@pytest.mark.asyncio
+async def test_partial_chunk_recovery_reuses_exact_ledger_content_and_uuid_plan(
+    monkeypatch,
+):
+    original_content = "abcdefghij"
+    recovered_marker = "RECOVERED MARKER: "
+    raw_obligation = "obligation-private"
+    obligation_key = hook_runtime._native_handoff_obligation_key(raw_obligation)
+    gateway_module = types.ModuleType("gateway")
+    gateway_module.__path__ = []
+    ledger_module = types.ModuleType("gateway.delivery_ledger")
+    ledger_module.RECOVERED_MARKER = recovered_marker
+    ledger_module.mark_delivered = lambda _obligation_id: None
+    ledger_module.mark_failed = lambda _obligation_id, _error="": None
+    gateway_module.delivery_ledger = ledger_module
+    monkeypatch.setitem(sys.modules, "gateway", gateway_module)
+    monkeypatch.setitem(sys.modules, "gateway.delivery_ledger", ledger_module)
+
+    initial = _NativeAckAdapter(outcomes=[True, False])
+    descriptor = _install_native_ack_context(
+        initial,
+        original_content,
+        obligation_key=obligation_key,
+    )
+    initial_result = await initial.send("oc_native", original_content)
+    initial_calls = list(initial.raw_calls)
+    assert initial_result.success is False
+    assert len(initial_calls) == 2
+    # Simulate the process dying after the first chunk may already have landed.
+    hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.set(None)
+
+    posts = []
+
+    async def fake_post(url, payload, timeout):
+        posts.append((url, payload, timeout))
+        if url.endswith("/native-handoff/recover"):
+            return {
+                "ok": True,
+                "found": True,
+                "native_handoff": descriptor,
+            }
+        return {"ok": True, "acknowledged": True}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_response", fake_post)
+    recovered = _NativeAckAdapter()
+    assert hook_runtime.install_feishu_command_card_adapter_methods(
+        SimpleNamespace(adapters={"feishu": recovered})
+    )
+    scope = await hook_runtime.prepare_native_handoff_recovery(
+        adapter=recovered,
+        obligation_id=raw_obligation,
+        chat_id="oc_native",
+        content=recovered_marker + original_content,
+        original_content=original_content,
+    )
+    recovered_result = await recovered.send(
+        "oc_native", recovered_marker + original_content
+    )
+
+    assert scope is not None
+    assert recovered_result.success is True
+    assert recovered.raw_calls == initial_calls
+    assert recovered_marker not in "".join(call[0] for call in recovered.raw_calls)
+    assert posts[0][0].endswith("/native-handoff/recover")
+
+
+@pytest.mark.asyncio
+async def test_expired_recovery_descriptor_preserves_upstream_marker_and_random_uuid(
+    monkeypatch,
+):
+    recovered_marker = "RECOVERED MARKER: "
+    original_content = "abcdefghij"
+
+    async def fake_post(_url, _payload, _timeout):
+        return {
+            "ok": True,
+            "found": True,
+            "native_handoff": {
+                "protocol": "hfc-native-handoff-v2",
+                "id": "a" * 64,
+                "uuid_seed": "b" * 32,
+                "expires_at": time.time() - 1,
+            },
+        }
+
+    async def native_only(_chat_id):
+        return False
+
+    monkeypatch.setattr(hook_runtime, "_post_json_response", fake_post)
+    monkeypatch.setattr(hook_runtime, "_hfc_direct_card_allowed_async", native_only)
+    adapter = _NativeAckAdapter()
+    assert hook_runtime.install_feishu_command_card_adapter_methods(
+        SimpleNamespace(adapters={"feishu": adapter})
+    )
+    assert await hook_runtime.prepare_native_handoff_recovery(
+        adapter=adapter,
+        obligation_id="obligation-private",
+        chat_id="oc_native",
+        content=recovered_marker + original_content,
+        original_content=original_content,
+    ) is None
+
+    result = await adapter.send("oc_native", recovered_marker + original_content)
+
+    assert result.success is True
+    assert all(call[3] == "random-create" for call in adapter.raw_calls)
+    delivered_text = "".join(json.loads(call[0])["text"] for call in adapter.raw_calls)
+    assert delivered_text == recovered_marker + original_content
+
+
+@pytest.mark.asyncio
+async def test_delivery_ledger_recovery_rejects_expired_descriptor(monkeypatch):
+    async def fake_post(_url, _payload, _timeout):
+        return {
+            "ok": True,
+            "found": True,
+            "native_handoff": {
+                "protocol": "hfc-native-handoff-v2",
+                "id": "a" * 64,
+                "uuid_seed": "b" * 32,
+                "expires_at": time.time() - 1,
+            },
+        }
+
+    monkeypatch.setattr(hook_runtime, "_post_json_response", fake_post)
+    adapter = _NativeAckAdapter()
+    assert hook_runtime.install_feishu_command_card_adapter_methods(
+        SimpleNamespace(adapters={"feishu": adapter})
+    )
+    assert await hook_runtime.prepare_native_handoff_recovery(
+        adapter=adapter,
+        obligation_id="obligation-private",
+        chat_id="oc_private",
+        content="recovered final",
+        original_content="recovered final",
+    ) is None
+    assert hook_runtime._HFC_NATIVE_HANDOFF_CONTEXT.get() is None
+
+
 @pytest.mark.parametrize("terminal_event", ["message.completed", "message.failed"])
 def test_build_event_explicit_terminal_closes_active_fallback(terminal_event):
     local_vars = {"chat_id": "oc_abc", "conversation_id": "conv_abc"}
@@ -6412,6 +8351,7 @@ async def test_emit_from_hermes_locals_threadsafe_schedules_on_running_loop(monk
     assert payload["data"] == {
         "profile_id": "default",
         "profile_source": "fallback_default",
+        "policy_new_turn": True,
         "text": "hello",
     }
     assert timeout == 0.8
@@ -6500,8 +8440,13 @@ async def test_emit_cron_delivery_posts_from_running_loop_without_unawaited_warn
     monkeypatch,
     recwarn,
 ):
-    sender = SenderProbe()
-    monkeypatch.setattr(hook_runtime, "_post_json", sender)
+    payloads = []
+
+    def sender(url, payload, timeout):
+        payloads.append((url, payload, timeout))
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_sync_response", sender)
     monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
 
     result = hook_runtime.emit_cron_delivery(
@@ -6515,8 +8460,8 @@ async def test_emit_cron_delivery_posts_from_running_loop_without_unawaited_warn
     )
 
     assert result is True
-    assert len(sender.payloads) == 1
-    url, payload, timeout = sender.payloads[0]
+    assert len(payloads) == 1
+    url, payload, timeout = payloads[0]
     assert url == "http://sidecar.test/events"
     assert payload["event"] == "message.completed"
     assert payload["chat_id"] == "oc_cron"
@@ -6531,9 +8476,13 @@ async def test_emit_cron_delivery_posts_from_running_loop_without_unawaited_warn
 
 @pytest.mark.asyncio
 async def test_emit_cron_delivery_reports_sender_failure_from_running_loop(monkeypatch):
-    sender = SenderProbe()
-    sender.raise_error = True
-    monkeypatch.setattr(hook_runtime, "_post_json", sender)
+    payloads = []
+
+    def sender(url, payload, timeout):
+        payloads.append((url, payload, timeout))
+        raise RuntimeError("network failed")
+
+    monkeypatch.setattr(hook_runtime, "_post_json_sync_response", sender)
 
     result = hook_runtime.emit_cron_delivery(
         {
@@ -6546,7 +8495,51 @@ async def test_emit_cron_delivery_reports_sender_failure_from_running_loop(monke
     )
 
     assert result is False
-    assert len(sender.payloads) == 1
+    assert len(payloads) == 1
+def test_emit_cron_delivery_falls_through_when_sidecar_requests_native(monkeypatch):
+    posted = []
+
+    def native_response(url, payload, timeout):
+        posted.append((url, payload, timeout))
+        return {"ok": True, "applied": False, "disposition": "native"}
+
+    monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
+    monkeypatch.setattr(hook_runtime, "_post_json_sync_response", native_response)
+
+    result = hook_runtime.emit_cron_delivery(
+        {
+            "job": {
+                "id": "job-native",
+                "origin": {"platform": "feishu", "chat_id": "oc_cron"},
+            },
+            "content": "定时结果",
+        }
+    )
+
+    assert result is False
+    assert len(posted) == 1
+
+
+@pytest.mark.parametrize("sidecar_result", [None, "", {"ok": True}])
+def test_cron_completion_does_not_suppress_without_explicit_commit(
+    monkeypatch,
+    sidecar_result,
+):
+    monkeypatch.setattr(
+        hook_runtime,
+        "_post_json_sync_response",
+        lambda _url, _payload, _timeout: sidecar_result,
+    )
+
+    assert hook_runtime.emit_cron_delivery(
+        {
+            "job": {
+                "id": "job-fail-open",
+                "origin": {"platform": "feishu", "chat_id": "oc_cron"},
+            },
+            "content": "定时结果",
+        }
+    ) is False
 
 
 def test_emit_from_hermes_locals_threadsafe_uses_explicit_loop_from_sync_call(
@@ -6591,6 +8584,7 @@ def test_emit_from_hermes_locals_threadsafe_uses_explicit_loop_from_sync_call(
     assert payload["data"] == {
         "profile_id": "default",
         "profile_source": "fallback_default",
+        "policy_new_turn": True,
         "tool_id": "tool_1",
         "name": "search",
         "status": "completed",
@@ -6691,7 +8685,7 @@ async def test_emit_from_hermes_locals_async_reports_sender_success(monkeypatch)
         event_name="message.completed",
     )
 
-    assert result is True
+    assert result is False
     assert len(sender.payloads) == 1
     url, payload, timeout = sender.payloads[0]
     assert url == "http://sidecar.test/events"
@@ -7141,6 +9135,500 @@ def test_interaction_select_ignores_incomplete_action(monkeypatch):
 
     assert called["posted"] is False
     assert response.card is None
+
+
+def test_native_policy_stops_before_event_sequence_and_delta_queue(monkeypatch):
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "disposition": "native",
+            "ttl_ms": 1000,
+        },
+    )
+    monkeypatch.setenv("HERMES_FEISHU_CARD_DELTA_COALESCE_MS", "1000")
+
+    handled = hook_runtime.emit_from_hermes_locals_threadsafe(
+        {
+            "chat_id": "oc_native",
+            "message_id": "om_native",
+            "text": "must stay native",
+        },
+        event_name="answer.delta",
+    )
+
+    assert handled is False
+    assert hook_runtime._SEQUENCES == {}
+    assert hook_runtime._PENDING_DELTAS == {}
+
+
+async def test_policy_failure_is_native_and_card_decision_is_pinned_for_turn(monkeypatch):
+    calls = []
+
+    def changing_policy(_url, _payload, _timeout):
+        calls.append(True)
+        if len(calls) == 1:
+            return {"ok": True, "disposition": "card", "ttl_ms": 0}
+        raise TimeoutError("policy unavailable")
+
+    posted = []
+
+    async def post(_url, payload, _timeout):
+        posted.append(payload["event"])
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", changing_policy)
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+    local_vars = {"chat_id": "oc_pin", "message_id": "om_pin"}
+
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        local_vars, "message.started"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**local_vars, "text": "x"}, "answer.delta"
+    )
+    assert calls == [True]
+    assert posted == ["message.started", "answer.delta"]
+
+    # A different new turn must query again; timeout fails open to Hermes native.
+    assert not await hook_runtime.emit_from_hermes_locals_async(
+        {"chat_id": "oc_pin", "message_id": "om_next"},
+        "message.started",
+    )
+    assert len(calls) == 2
+
+
+async def test_completed_topic_message_id_is_requeried_for_the_next_started_turn(
+    monkeypatch,
+):
+    calls = []
+
+    def policy(_url, _payload, _timeout):
+        calls.append(True)
+        return {
+            "ok": True,
+            "disposition": "card" if len(calls) == 1 else "native",
+            "ttl_ms": 1000,
+        }
+
+    async def post(_url, _payload, _timeout):
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", policy)
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+    local_vars = {"chat_id": "oc_topic", "message_id": "om_reused"}
+
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        local_vars, "message.started"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**local_vars, "answer": "first"}, "message.completed"
+    )
+    assert not await hook_runtime.emit_from_hermes_locals_async(
+        local_vars, "message.started"
+    )
+    assert len(calls) == 2
+
+
+async def test_first_event_without_message_id_requeries_policy_for_new_turn(
+    monkeypatch,
+):
+    calls = []
+
+    def policy(_url, _payload, _timeout):
+        calls.append(True)
+        return {
+            "ok": True,
+            "disposition": "card" if len(calls) == 1 else "native",
+            "ttl_ms": 1000,
+        }
+
+    async def post(_url, _payload, _timeout):
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", policy)
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+    first_turn = {"chat_id": "oc_missing_started", "message_id": "om_first"}
+
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        first_turn, "message.started"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**first_turn, "answer": "first"}, "message.completed"
+    )
+    assert not await hook_runtime.emit_from_hermes_locals_async(
+        {"chat_id": "oc_missing_started", "text": "next"},
+        "answer.delta",
+    )
+    assert len(calls) == 2
+
+
+async def test_reused_message_id_nonterminal_event_starts_new_policy_turn(
+    monkeypatch,
+):
+    calls = []
+
+    def policy(_url, _payload, _timeout):
+        calls.append(True)
+        return {
+            "ok": True,
+            "disposition": "card" if len(calls) == 1 else "native",
+            "ttl_ms": 1000,
+        }
+
+    async def post(_url, _payload, _timeout):
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", policy)
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+    reused = {"chat_id": "oc_reused_without_started", "message_id": "om_reused"}
+
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        reused, "message.started"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**reused, "answer": "first"}, "message.completed"
+    )
+    assert not await hook_runtime.emit_from_hermes_locals_async(
+        {**reused, "text": "next"}, "answer.delta"
+    )
+    assert not await hook_runtime.emit_from_hermes_locals_async(
+        {**reused, "text": "next again"}, "answer.delta"
+    )
+    assert len(calls) == 2
+
+
+async def test_reused_message_id_card_event_marks_new_turn_for_server(monkeypatch):
+    posted = []
+
+    async def post(_url, payload, _timeout):
+        posted.append(payload)
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+    reused = {"chat_id": "oc_reused_card", "message_id": "om_reused_card"}
+
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        reused, "message.started"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**reused, "answer": "first"}, "message.completed"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**reused, "text": "next"}, "answer.delta"
+    )
+
+    assert posted[-1]["event"] == "answer.delta"
+    assert posted[-1]["data"]["policy_new_turn"] is True
+
+
+async def test_invalid_explicit_profile_fails_native_before_policy_query(monkeypatch):
+    calls = []
+
+    def unexpected_policy(*_args, **_kwargs):
+        calls.append(True)
+        return {"ok": True, "disposition": "card", "ttl_ms": 1000}
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        unexpected_policy,
+    )
+
+    async def post(*_args, **_kwargs):
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+
+    handled = await hook_runtime.emit_from_hermes_locals_async(
+        {
+            "chat_id": "oc_invalid_profile",
+            "message_id": "om_invalid_profile",
+            "profile_id": "../work",
+        },
+        "message.started",
+    )
+
+    assert handled is False
+    assert calls == []
+
+
+async def test_terminal_policy_tombstone_remains_bounded_but_does_not_expire(
+    monkeypatch,
+):
+    now = [100.0]
+    calls = []
+
+    def policy(_url, _payload, _timeout):
+        calls.append(True)
+        return {
+            "ok": True,
+            "disposition": "card" if len(calls) == 1 else "native",
+            "ttl_ms": 1000,
+        }
+
+    async def post(_url, _payload, _timeout):
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", policy)
+
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+    turn = {"chat_id": "oc_terminal_replay", "message_id": "om_terminal_replay"}
+
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        turn, "message.started"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**turn, "answer": "done"}, "message.completed"
+    )
+    now[0] += 3600.0
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**turn, "answer": "done"}, "message.completed"
+    )
+    assert calls == [True]
+    assert len(hook_runtime._TERMINAL_POLICY_DECISIONS) == 1
+
+
+async def test_async_policy_gate_delegates_singleflight_off_event_loop(monkeypatch):
+    event_loop_thread = threading.get_ident()
+    worker_threads = []
+
+    def sync_gate(_config, _local_vars, _event_name):
+        worker_threads.append(threading.get_ident())
+        return hook_runtime._PolicyGateResult(True, None)
+
+    monkeypatch.setattr(hook_runtime, "_policy_gate_sync", sync_gate)
+
+    result = await hook_runtime._policy_gate_async(
+        hook_runtime.load_runtime_config(),
+        {"chat_id": "oc_thread_handoff"},
+        "answer.delta",
+    )
+
+    assert result.card is True
+    assert worker_threads and worker_threads[0] != event_loop_thread
+
+
+async def test_async_policy_gate_reuses_pinned_turn_without_worker_handoff(
+    monkeypatch,
+):
+    config = hook_runtime.load_runtime_config()
+    local_vars = {"chat_id": "oc_pinned_fast", "message_id": "om_pinned_fast"}
+
+    assert hook_runtime._policy_gate_sync(
+        config,
+        local_vars,
+        "message.started",
+    ).card
+
+    async def unexpected_to_thread(*_args, **_kwargs):
+        raise AssertionError("pinned decisions must stay on the fast path")
+
+    monkeypatch.setattr(hook_runtime.asyncio, "to_thread", unexpected_to_thread)
+
+    result = await hook_runtime._policy_gate_async(
+        config,
+        {**local_vars, "text": "delta"},
+        "answer.delta",
+    )
+
+    assert result.card is True
+
+
+async def test_async_policy_lock_is_not_idle_while_waiter_is_waking():
+    lock = asyncio.Lock()
+    await lock.acquire()
+    waiter = asyncio.create_task(lock.acquire())
+    await asyncio.sleep(0)
+
+    lock.release()
+
+    assert lock.locked() is False
+    assert hook_runtime._async_policy_lock_is_idle(lock) is False
+
+    await waiter
+    lock.release()
+    assert hook_runtime._async_policy_lock_is_idle(lock) is True
+
+
+def test_policy_headers_use_distinct_signed_domain(monkeypatch):
+    root = b"p" * 32
+    body = b'{"schema_version":"1"}'
+    monkeypatch.setattr(hook_runtime, "read_transport_root_secret", lambda: root)
+
+    headers = hook_runtime._post_headers(
+        "http://127.0.0.1:8765/delivery/policy",
+        body,
+    )
+
+    PolicyProofVerifier(root).verify(headers, body)
+    with pytest.raises(Exception):
+        EventProofVerifier(root).verify(headers, body)
+
+
+def test_policy_cache_is_bounded_and_reset_clears_all_policy_state():
+    config = hook_runtime.load_runtime_config()
+    for index in range(hook_runtime.POLICY_CACHE_LIMIT + 25):
+        identity = hook_runtime._policy_identity(
+            config,
+            {
+                "chat_id": f"oc_{index}",
+                "message_id": f"om_{index}",
+            },
+            "message.started",
+        )
+        assert identity is not None
+        hook_runtime._cache_policy_disposition(identity, "card", 1.0)
+        hook_runtime._pin_policy_disposition(identity, "card")
+
+    assert len(hook_runtime._POLICY_CACHE) == hook_runtime.POLICY_CACHE_LIMIT
+    assert len(hook_runtime._TURN_POLICY_DECISIONS) == hook_runtime.POLICY_CACHE_LIMIT
+
+    hook_runtime.reset_runtime_state()
+
+    assert hook_runtime._POLICY_CACHE == {}
+    assert hook_runtime._TURN_POLICY_DECISIONS == {}
+    assert hook_runtime._ACTIVE_POLICY_TURNS == {}
+    assert hook_runtime._TERMINAL_POLICY_DECISIONS == {}
+
+
+def test_policy_query_is_thread_safe_and_pins_one_decision_per_turn(monkeypatch):
+    calls = []
+    calls_lock = threading.Lock()
+
+    def slow_policy(*_args, **_kwargs):
+        with calls_lock:
+            calls.append(True)
+        time.sleep(0.02)
+        return {"ok": True, "disposition": "card", "ttl_ms": 0}
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", slow_policy)
+    config = hook_runtime.load_runtime_config()
+    local_vars = {"chat_id": "oc_thread", "message_id": "om_thread"}
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        results = list(
+            executor.map(
+                lambda _index: hook_runtime._policy_gate_sync(
+                    config,
+                    local_vars,
+                    "answer.delta",
+                ).card,
+                range(24),
+            )
+        )
+
+    assert results == [True] * 24
+    assert calls == [True]
+
+
+async def test_threadsafe_pending_flush_preserves_policy_new_turn_marker(
+    monkeypatch,
+):
+    flushed = []
+
+    async def flush(_config, event_locals, event_name):
+        flushed.append((event_locals, event_name))
+
+    monkeypatch.setattr(hook_runtime, "_queue_coalesced_delta", lambda *_args: False)
+    monkeypatch.setattr(
+        hook_runtime,
+        "_has_pending_deltas_for_local_vars",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(hook_runtime, "_flush_build_send_ordered", flush)
+
+    assert hook_runtime.emit_from_hermes_locals_threadsafe(
+        {"chat_id": "oc_pending_new", "message_id": "om_pending_new"},
+        "message.started",
+    )
+    await asyncio.sleep(0)
+
+    assert flushed[0][1] == "message.started"
+    assert flushed[0][0]["_hfc_policy_new_turn"] is True
+
+
+def test_cron_requires_applied_true_not_only_http_success(monkeypatch):
+    monkeypatch.setattr(
+        hook_runtime,
+        "_post_json_sync_response",
+        lambda *_args, **_kwargs: {"ok": True, "applied": False},
+    )
+
+    assert not hook_runtime.emit_cron_delivery(
+        {
+            "job": {
+                "id": "job-native",
+                "origin": {"platform": "feishu", "chat_id": "oc_cron"},
+            },
+            "content": "native cron result",
+        }
+    )
+
+
+async def test_native_direct_send_uses_original_content_once_and_clears_media_state(
+    monkeypatch,
+):
+    def native_policy(*_args, **_kwargs):
+        return {"ok": True, "disposition": "native", "ttl_ms": 1000}
+
+    calls = []
+
+    class Adapter:
+        async def original(self, chat_id, content, reply_to=None, metadata=None):
+            calls.append((chat_id, content, reply_to, metadata))
+            return SimpleNamespace(success=True, message_id="om_native")
+
+    Adapter._hfc_original_send = Adapter.original
+    hook_runtime._HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(
+        hook_runtime._NativeMediaTextSuppression("oc_native", "answer")
+    )
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", native_policy)
+
+    result = await hook_runtime._hfc_send_with_native_command_result_card(
+        Adapter(),
+        "oc_native",
+        "answer",
+    )
+
+    assert result.success is True
+    assert calls == [("oc_native", "answer", None, None)]
+    assert hook_runtime._HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.get() is None
+
+
+def test_native_platform_notice_falls_through_without_scheduling_card(monkeypatch):
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "disposition": "native",
+            "ttl_ms": 1000,
+        },
+    )
+    scheduled = []
+    monkeypatch.setattr(
+        hook_runtime,
+        "_hfc_schedule_platform_notice_card",
+        lambda **kwargs: scheduled.append(kwargs),
+    )
+    source = SimpleNamespace(
+        platform="feishu",
+        chat_id="oc_native_notice",
+        message_id="om_notice",
+    )
+    runner = SimpleNamespace(adapters={"feishu": object()})
+
+    handled = hook_runtime.handle_platform_notice_from_hermes(
+        runner,
+        source,
+        "⏳ Working — native notice",
+    )
+
+    assert handled is False
+    assert scheduled == []
 
 
 def test_interaction_select_returns_empty_response_when_sidecar_rejects(monkeypatch):
@@ -7630,3 +10118,85 @@ def test_operations_select_rejected_admission_is_claimed_without_forward(monkeyp
     )
 
     assert response.card is None
+
+
+def test_hook_runtime_routes_every_card_serializer_through_delivery_limits():
+    source = inspect.getsource(hook_runtime)
+
+    assert "json.dumps(card, ensure_ascii=False)" not in source
+    assert source.count("serialize_card_for_delivery(card)") >= 7
+
+
+def test_native_command_card_update_rejects_oversize_before_sdk(monkeypatch):
+    calls = []
+
+    class DummyAdapter:
+        _client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(message=SimpleNamespace(patch=lambda request: None))
+            )
+        )
+
+        async def _run_blocking(self, func, request):
+            calls.append((func, request))
+            return SimpleNamespace(success=lambda: True)
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_hfc_build_patch_message_request",
+        lambda supplied_id, content: SimpleNamespace(
+            message_id=supplied_id,
+            request_body=SimpleNamespace(content=content),
+        ),
+    )
+
+    result = asyncio.run(
+        hook_runtime._hfc_update_native_command_card(
+            DummyAdapter(),
+            "om_sensitive_update_id",
+            {"elements": [{"tag": "markdown", "content": "x" * 40_000}]},
+        )
+    )
+
+    assert result is False
+    assert calls == []
+
+
+def test_native_command_card_logs_never_expose_raw_identifiers(
+    monkeypatch, caplog, capsys
+):
+    message_id = "om_sensitive_message_123"
+
+    class DummyAdapter:
+        _client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(message=SimpleNamespace(patch=lambda request: None))
+            )
+        )
+
+        async def _run_blocking(self, func, request):
+            raise RuntimeError(f"remote rejected {message_id}")
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_hfc_build_patch_message_request",
+        lambda supplied_id, content: SimpleNamespace(
+            message_id=supplied_id,
+            request_body=SimpleNamespace(content=content),
+        ),
+    )
+    caplog.set_level("INFO", logger=hook_runtime.__name__)
+
+    result = asyncio.run(
+        hook_runtime._hfc_update_native_command_card(
+            DummyAdapter(),
+            message_id,
+            {"elements": [{"tag": "markdown", "content": "done"}]},
+        )
+    )
+
+    output = caplog.text + capsys.readouterr().err
+    assert result is False
+    assert message_id not in output
+    assert "message#" in output
+    assert "RuntimeError" in output

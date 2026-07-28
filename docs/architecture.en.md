@@ -6,12 +6,17 @@ The active mainline uses a sidecar-only architecture. Hermes Agent keeps a minim
 
 ```text
 Hermes Gateway
-  -> marker-wrapped minimal hook (gateway/run.py)
+  -> marker-wrapped lifecycle hook (gateway/run.py)
+  -> exact final-delivery hooks (gateway/platforms/base.py, Hermes 0.19+)
   -> hermes_feishu_card.hook_runtime
-  -> authenticated/fail-open HTTP POST /events
+     -> signed POST /delivery/policy (before native suppression)
+     -> authenticated/fail-open POST /events
+     -> signed POST /runtime/events (hello/heartbeat)
   -> hermes_feishu_card.server
-  -> session + render + Feishu CardKit send/update
+  -> policy + readiness + session + render + Feishu CardKit send/update
 ```
+
+V4.1 domain-separates the event data plane from four control actions: `hfc-policy-v1` per-chat policy, `hfc-runtime-v1` runtime readiness, `hfc-native-handoff-recovery-v2` pending-descriptor recovery, and `hfc-native-handoff-ack-v1` post-delivery confirmation. Policy is enforced in both hook and sidecar. Runtime events prove liveness only and cannot authorize a file write. Recovery submits only one-way obligation, exact-content, delivery-plan, and target-scope hashes plus a canonical-route enum, never answer text or raw routing identifiers. ACK can run only after the Hermes ledger durably marks `delivered`. A control-plane failure must not stop Hermes Agent work, while install/recovery mutations remain fail closed.
 
 The Hermes hook-to-sidecar `/events` path is fail-open. Sidecar unavailability or event rejection must not bring down Hermes; a message not confirmed as accepted by the card path continues through Hermes' native fallback. Once the card path accepts delivery, the hook suppresses duplicate gray native text.
 
@@ -19,7 +24,7 @@ The Hermes hook-to-sidecar `/events` path is fail-open. Sidecar unavailability o
 
 ### Minimal Hermes hook
 
-The installer modifies Hermes `gateway/run.py` only through `hermes_feishu_card.install.patcher`, inserting marker blocks that can be detected, removed, and restored. Event extraction, delta coalescing, command cards, and Feishu adapter compatibility live in `hermes_feishu_card.hook_runtime`. The hook stores no Feishu credentials and does not rewrite Hermes session ownership, resume, or group-admission rules.
+The installer modifies Hermes only through `hermes_feishu_card.install.patcher`. Lifecycle hooks live in `gateway/run.py`; Hermes 0.19+ with a delivery ledger also receives two minimal exact hooks in `gateway/platforms/base.py`: one closes media/TTS paths with no independent text, and one submits Base-produced `text_content` after `record_obligation` / `mark_attempting` but before the native send. Both sources and the optional cron target use detectable, removable, restorable marker blocks under one manifest/backup transaction. Event extraction, delta coalescing, command cards, and Feishu adapter compatibility live in `hermes_feishu_card.hook_runtime`. HFC does not copy Hermes' media-cleaning pipeline, store Feishu credentials, or rewrite Hermes session ownership, resume, or group-admission rules.
 
 ### HTTP sidecar
 
@@ -41,11 +46,17 @@ The default `server.host: 127.0.0.1` uses **local-process trust**. For upgrade c
 
 A non-loopback listener is rejected by default. Binding is allowed only with explicit `server.allow_non_loopback: true`, and the sidecar then requires a domain-separated HMAC event authentication proof over the raw request body, timestamp, and nonce. Missing, incorrect, expired, or replayed proofs are rejected before event parsing or card delivery. The root secret never enters YAML, environment files, cards, logs, or health output.
 
+Windows non-loopback startup fails closed when state-directory ACL privacy cannot be verified. Windows loopback continues under local-process trust without claiming that ACL privacy has been verified.
+
 Event authentication provides source authentication and integrity, not HTTP encryption. Non-loopback mode is only for trusted containers or private networks that share the private state directory. Do not expose the sidecar directly to the public internet; public deployment requires an additional TLS/mTLS or controlled reverse-proxy boundary.
 
 | Endpoint | Default boundary |
 |---|---|
 | `POST /events` | loopback local-process trust; explicit non-loopback requires event authentication |
+| `POST /delivery/policy` | state-directory transport root, short timestamp window, and nonce replay protection; responses do not echo ids |
+| `POST /runtime/events` | authenticated hello/heartbeat in a separate runtime domain; updates sanitized readiness only |
+| `POST /native-handoff/recover` | separate recovery domain; exactly matches obligation/content/plan/target hashes and a `create`/`thread-create` route within the one-hour window, without answer text or raw routing identifiers |
+| `POST /native-handoff/ack` | separate ACK domain; confirms a handoff only after the Hermes ledger durably records `delivered` |
 | `POST /commands` | state-directory command transport proof |
 | `POST /card/actions` | interaction token or operations transport proof |
 | `GET /health` | unauthenticated but strictly sanitized; local liveness only |

@@ -445,3 +445,23 @@ def test_safe_diagnostics_hides_non_string_card_title():
 
     assert diagnostics["bots"][0]["card_title"] == ""
     assert "do-not-leak" not in str(diagnostics)
+
+
+def test_route_metadata_carries_exact_delivery_policy_without_raw_chat_diagnostics():
+    native_chat = "oc_private_native"
+    registry = BotRegistry.from_config(
+        {
+            "feishu": {"app_id": "cli", "app_secret": "secret"},
+            "bindings": {"native_chats": [native_chat]},
+        }
+    )
+
+    route = registry.resolve(RoutingContext(chat_id=native_chat))
+    diagnostics = registry.safe_diagnostics()
+
+    assert route.metadata["delivery"] == {
+        "disposition": "native",
+        "reason": "bindings.native_chats",
+    }
+    assert diagnostics["delivery_policy"]["native_chat_count"] == 1
+    assert native_chat not in str(diagnostics)
