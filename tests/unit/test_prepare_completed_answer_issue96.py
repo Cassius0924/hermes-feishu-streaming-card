@@ -25,11 +25,11 @@ def _event(name, sequence, data):
 
 
 def _session_with_tool_and_answer(answer_text: str) -> CardSession:
-    """Create a session that has seen a tool event and streamed answer_text."""
+    """Create a session with streamed text before a later tool event."""
     session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
     # Stream some answer text
     session.apply(_event("answer.delta", 1, {"text": answer_text}))
-    # Fire a tool event so _has_seen_tool_event is True
+    # A later tool event establishes the archival boundary.
     session.apply(_event("tool.updated", 2, {"tool_id": "t1", "name": "search", "status": "completed"}))
     return session
 

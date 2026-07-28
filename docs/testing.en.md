@@ -28,6 +28,17 @@ python3 -m pytest tests/unit/test_hook_runtime.py tests/integration/test_hook_ru
 
 These tests verify that the installed Hermes hook can send `SidecarEvent` data to a mock sidecar and remains fail-open when sending fails. They use fixtures and a mock sidecar only; they do not access real Feishu.
 
+## V4.0.21 content-integrity regressions
+
+```bash
+python3 -m pytest \
+  tests/unit/test_prepare_completed_answer_issue96.py \
+  tests/unit/test_prepare_completed_answer_issue155.py \
+  tests/unit/test_hook_runtime.py -q
+```
+
+`test_prepare_completed_answer_issue155.py` locks Issue #155: only an explicit `answer -> tool` boundary can archive an answer, while `tool -> answer -> completed` retains the full user-visible answer. `test_v4021_hook_runtime_keeps_image_delivery_and_accepted_notice_in_same_turn` locks Issue #147: matching media text is suppressed once, the native image still delivers, and an accepted notice does not emit an uncertain-delivery warning. Real Feishu acceptance on 2026-07-28 observed a completion card plus native image, two answer segments retained in one completion card, no matching native duplicate or uncertain-delivery warning, and the candidate runtime in Hermes venv site-packages 4.0.21; it does not claim screenshot or desktop/mobile visual QA. Public tagged-installer and Release-asset verification remain pending post-tag.
+
 ## Sidecar Process Tests
 
 ```bash

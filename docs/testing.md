@@ -28,6 +28,17 @@ python3 -m pytest tests/unit/test_hook_runtime.py tests/integration/test_hook_ru
 
 这些测试会验证安装后的 Hermes hook 能把 `SidecarEvent` 发送到 mock sidecar，并在发送失败时保持 fail-open。它们只使用 fixture 和 mock sidecar，不访问真实飞书。
 
+## V4.0.21 内容完整性回归
+
+```bash
+python3 -m pytest \
+  tests/unit/test_prepare_completed_answer_issue96.py \
+  tests/unit/test_prepare_completed_answer_issue155.py \
+  tests/unit/test_hook_runtime.py -q
+```
+
+`test_prepare_completed_answer_issue155.py` 锁定 Issue #155：只有显式 `answer -> tool` 边界可以归档答案；`tool -> answer -> completed` 的完成态必须保留完整用户可见答案。`test_v4021_hook_runtime_keeps_image_delivery_and_accepted_notice_in_same_turn` 锁定 Issue #147：匹配媒体文本只抑制一次、原生图片仍投递、accepted notice 不出现 uncertain-delivery warning。2026-07-28 的真实飞书验收已观测到 completion card + native image、两段答案保留在同一完成卡、无匹配原生重复或 uncertain-delivery warning，且候选 runtime 已进入 Hermes venv site-packages 4.0.21；这不宣称截图或桌面/移动端视觉 QA。公开 tagged installer 与 Release assets 仍待 post-tag 验证。
+
 ## Sidecar process tests
 
 ```bash

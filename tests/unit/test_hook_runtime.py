@@ -1454,6 +1454,92 @@ async def test_v400_hook_runtime_suppresses_matching_native_media_text_after_car
 
 
 @pytest.mark.asyncio
+async def test_v4021_hook_runtime_keeps_image_delivery_and_accepted_notice_in_same_turn(
+    monkeypatch,
+):
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        def __init__(self):
+            self._client = object()
+            self.text_sent = []
+            self.media_sent = []
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            self.text_sent.append((chat_id, content, reply_to, metadata))
+            return SimpleNamespace(success=True, message_id="om_native_text")
+
+        async def send_multiple_images(self, chat_id, images, metadata=None):
+            self.media_sent.append((chat_id, images, metadata))
+            return SimpleNamespace(success=True, message_id="om_native_image")
+
+    async def fake_post_json_ordered_response(_url, payload, _timeout):
+        if payload["event"] == "message.completed":
+            return {"ok": True, "applied": True}
+        if payload["event"] == "system.notice":
+            return {
+                "ok": True,
+                "applied": True,
+                "delivery": {"outcome": "accepted"},
+            }
+        raise AssertionError(f"unexpected event: {payload['event']}")
+
+    monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
+    monkeypatch.setattr(
+        hook_runtime,
+        "_post_json_ordered_response",
+        fake_post_json_ordered_response,
+    )
+    adapter = DummyFeishuAdapter()
+    hook_runtime.install_feishu_command_card_adapter_methods(
+        SimpleNamespace(adapters={"feishu": adapter})
+    )
+
+    delivered = await hook_runtime.emit_from_hermes_locals_async(
+        {
+            "source": SourceObject(),
+            "message_id": "om_media_turn",
+            "answer": "已生成图片\nMEDIA:/tmp/result.png",
+        },
+        event_name="message.completed",
+    )
+    duplicate = await adapter.send("oc_source", "已生成图片")
+    media = await adapter.send_multiple_images(
+        "oc_source", [("file:///tmp/result.png", "")]
+    )
+
+    token = hook_runtime._HFC_FEISHU_NOTICE_CONTEXT.set(
+        {
+            "chat_id": "oc_source",
+            "message_id": "om_media_turn",
+            "conversation_id": "oc_source",
+            "thread_id": "",
+        }
+    )
+    try:
+        notice_result = await adapter.send(
+            "oc_source",
+            '✅ Background task complete\nPrompt: "Generate image"\n\nImage ready.',
+        )
+    finally:
+        hook_runtime._HFC_FEISHU_NOTICE_CONTEXT.reset(token)
+
+    assert delivered is True
+    assert duplicate.message_id == "media_text_suppressed"
+    assert media.message_id == "om_native_image"
+    assert notice_result.message_id == "om_media_turn"
+    assert len(adapter.media_sent) == 1
+    assert adapter.media_sent == [
+        ("oc_source", [("file:///tmp/result.png", "")], None)
+    ]
+    assert all(
+        content != hook_runtime._NOTICE_UNCERTAIN_WARNING
+        for _chat_id, content, _reply_to, _metadata in adapter.text_sent
+    )
+    assert adapter.text_sent == []
+
+
+@pytest.mark.asyncio
 async def test_v400_hook_runtime_keeps_native_media_text_when_card_delivery_fails(
     monkeypatch,
 ):

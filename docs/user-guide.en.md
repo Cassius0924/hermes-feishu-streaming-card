@@ -454,12 +454,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
+The Compose example defaults `HFC_VERSION` to `v4.0.21`.
+
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.0.20
+export HFC_VERSION=v4.0.21
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -702,6 +704,7 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.0.21](release-notes-v4.0.21.en.md) | 2026-07-28 | Issue #155 archives only at an explicit `answer -> tool` boundary so post-tool final answers stay visible; Issue #147 real Feishu acceptance observed a completion card plus native image and two answer segments in one card with no matching native duplicate or uncertain-delivery warning; it does not claim screenshot or desktop/mobile visual QA |
 | [v4.0.20](release-notes-v4.0.20.en.md) | 2026-07-22 | Issue #153: queued notice ACKs use `accepted`, with redacted metrics and codes for real PATCH failures |
 | [v4.0.19](release-notes-v4.0.19.en.md) | 2026-07-22 | Avoids `pip --user` inside the Hermes venv and stops immediately with the real pip failure |
 | [v4.0.18](release-notes-v4.0.18.en.md) | 2026-07-22 | Checks the Hermes Feishu SDK constructor capability, repairs stale `lark-oapi`, and exposes operations guidance |

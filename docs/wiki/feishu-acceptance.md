@@ -2,6 +2,19 @@
 
 自动化测试不能完全证明 Feishu/Lark 客户端体验。涉及卡片 UX、topic、系统提示、命令卡片的版本，发布前需要真实飞书 smoke。
 
+## V4.0.21 内容完整性与媒体/notice 组合验收
+
+- Issue #155：按 `tool -> answer -> completed` 走一轮，完成卡必须保留完整用户可见答案；只有在明确 `answer -> tool` 边界后，前一段答案才能进入时间线。
+- Issue #147：同一图片回合须有一张完成卡和一条 native image；匹配的原生媒体文本只能抑制一次，后续无关原生文本不得被抑制。
+- 让已接管卡片的 `system.notice` 返回 accepted，确认不出现 uncertain-delivery warning；保留既有 `MEDIA:` 清理、附件和 fail-open 分支。
+- 不改变卡片 UI 或配置；不要在验收记录中写入真实 chat/message/user 标识符、凭据、token、图片内容或本机路径。
+
+2026-07-28 真实验收结果：图片回合产生 1 条带标记、非“生成中”的 interactive completion card 与 1 条 native image，没有 uncertain-delivery warning。正常工具回合的两段答案保留在同一张卡，bot 原生标记重复为 0。
+
+sidecar 最终 metrics：`events_received/events_applied=23/23`，1 次发送成功、16 次更新成功；event rejected、auth rejection、send/update failures、notice uncertain warnings、notice update failures 均为 0。Gateway 日志确认 Feishu WebSocket 已连接，Hermes venv site-packages 中的候选 runtime 为 4.0.21。
+
+本记录不宣称截图或桌面/移动端视觉 QA，也不宣称真实故障注入。公开 tagged installer 与 Release assets 仍待 post-tag 验证；验收记录不包含真实标识符、marker 文本、本机路径、凭据或测试图片内容。
+
 ## V4.0.20 notice 异步 ACK 语义
 
 - 已有卡片收到 `system.notice` 时，`/events` 只在事件已应用且 PATCH 任务已排队后返回 `delivery.outcome=accepted`；hook 不再发送“投递结果无法确认”的灰色误报。

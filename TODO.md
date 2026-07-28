@@ -2,9 +2,19 @@
 
 当前 active runtime 是 `hermes_feishu_card/`。legacy adapter、dual mode、旧 `sidecar/`、旧 `patch/` 和 `installer_v2.py` 不是 active runtime，仅保留作历史参考。
 
-## V3.8 / V3.9 / V3.10 / V4.0 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20
+## V3.8 / V3.9 / V3.10 / V4.0 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21
 
 详细路线见 [docs/superpowers/specs/2026-06-30-v3-8-design.md](docs/superpowers/specs/2026-06-30-v3-8-design.md) 和 [docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md](docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md)。
+
+### V4.0.21：内容完整性与图片/notice 组合热修（发布候选）
+
+- [x] Issue #155：仅显式 `answer -> tool` 边界归档答案，`tool -> answer -> completed` 保留完整用户可见终态答案。
+- [x] Issue #147：图片/notice 自动化组合回归覆盖原生图片投递、一次性媒体文本抑制和 accepted notice 无 uncertain-delivery warning。
+- [x] 包元数据、当前安装入口、Docker Compose 默认、双语用户指南和发布门禁统一到 `v4.0.21`，不改变 UI 或配置。
+- [x] 真实飞书图片验收已通过（2026-07-28）：图片回合观测到 1 条带标记、非“生成中”的 completion card + 1 条 native image，无 uncertain-delivery warning；正常工具回合两段答案保留在同一卡，bot 原生标记重复为 0。
+- [x] sidecar `events_received/events_applied=23/23`、1 次发送成功、16 次更新成功；event/auth rejection、send/update failures、notice uncertain warnings、notice update failures 均为 0，Gateway Feishu WebSocket 已连接，Hermes venv site-packages 为 4.0.21。
+- [x] 最终本地发布门禁已通过：完整 pytest `1526 passed, 4 skipped in 53.56s`；`uv build` 生成 `hermes_feishu_streaming_card-4.0.21.tar.gz` 与 `hermes_feishu_streaming_card-4.0.21-py3-none-any.whl`；干净 Python 3.12 venv wheel 安装后的 import 位于 `site-packages`，package/distribution version 为 `4.0.21`，`hermes-feishu-card = hermes_feishu_card.cli:main` 存在，CLI `--help` exit 0。
+- [ ] 公开 tagged installer 与 Release assets 的 post-tag 验证仍待完成；验收不宣称截图或桌面/移动端视觉 QA。
 
 ### V4.0.20：notice 异步 ACK 语义热修（发布候选）
 

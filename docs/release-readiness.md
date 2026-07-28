@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.0.20`。它修复 Issue #153 中已有卡片 notice 的异步 ACK 语义，并为真实 PATCH 失败补充脱敏可观测性；V3.9.1 已于 2026-07-11 发布，V4.0.19 及更早版本也已发布。
+当前发布候选为 `4.0.21`。它修复 Issue #155 的 answer/tool 归档边界，并锁定 Issue #147 图片/notice 组合回归；不改变卡片 UI 或配置。V3.9.1 已于 2026-07-11 发布，V4.0.20 及更早版本为历史发布记录；2026-07-28 真实飞书图片验收已通过。
 
 ## 已具备
 
@@ -144,6 +144,16 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.0.21 发布门禁
+
+- Issue #155：只有明确 `answer -> tool` 边界才能归档答案；`tool -> answer -> completed` 必须保留完整的用户可见终态答案：**已通过聚焦顺序回归（`74 passed`）**。
+- Issue #147：完成卡接管后，匹配原生媒体文本只抑制一次、native image 继续投递，accepted queued notice 不出现 uncertain-delivery warning：**已通过 hook runtime 组合回归（`277 passed`）**。
+- 当前 README、安装说明、Docker Compose 和双语用户指南均 pin 到 `v4.0.21`；UI 与配置保持不变：**已通过文档门禁**。
+- 真实飞书图片验收：**已通过（2026-07-28）**。观测到 1 条带标记、非“生成中”的 completion card + 1 条 native image，无 uncertain-delivery warning；正常工具回合的两段答案保留在同一卡，bot 原生标记重复为 0。
+- sidecar 最终 metrics 为 `events_received/events_applied=23/23`、1 次发送成功、16 次更新成功，event/auth rejection、send/update failures、notice uncertain warnings、notice update failures 均为 0；Gateway Feishu WebSocket 已连接，Hermes venv site-packages 为 4.0.21。
+- 最终本地发布门禁：完整 pytest 为 `1526 passed, 4 skipped in 53.56s`；`uv build` 生成 `hermes_feishu_streaming_card-4.0.21.tar.gz` 与 `hermes_feishu_streaming_card-4.0.21-py3-none-any.whl`。干净 Python 3.12 venv 从 wheel 安装后，import 位于 `site-packages`，package/distribution version 均为 `4.0.21`，`hermes-feishu-card = hermes_feishu_card.cli:main` 存在，CLI --help exit 0。
+- 上述验收不宣称截图或桌面/移动端视觉 QA，也不替代真实故障注入。公开 tagged installer 与 Release assets 的 post-tag 验证仍待完成。
 
 ## V4.0.20 发布门禁
 

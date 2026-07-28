@@ -482,7 +482,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.0.0`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.0.21`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -490,7 +490,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.0.20
+export HFC_VERSION=v4.0.21
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -775,6 +775,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
+| [v4.0.21](release-notes-v4.0.21.md) | 2026-07-28 | Issue #155：仅显式 `answer -> tool` 边界归档答案，避免 post-tool 最终答案进入 timeline；Issue #147 真实飞书验收已观测 completion card + native image、两段答案留在同一卡、无匹配原生重复或 uncertain-delivery warning；不宣称截图或桌面/移动端视觉 QA |
 | [v4.0.20](release-notes-v4.0.20.md) | 2026-07-22 | Issue #153：notice 异步 ACK 使用 `accepted`，真实 PATCH 失败增加脱敏指标和错误码 |
 | [v4.0.19](release-notes-v4.0.19.md) | 2026-07-22 | Hermes venv 安装不再误用 `pip --user`，pip 失败会立即中止并保留真实错误 |
 | [v4.0.18](release-notes-v4.0.18.md) | 2026-07-22 | Hermes Feishu SDK 构造能力诊断、旧版 `lark-oapi` 自动修复与运维卡提示 |

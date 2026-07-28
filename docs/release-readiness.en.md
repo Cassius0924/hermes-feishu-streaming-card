@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.0.20`. It fixes Issue #153's asynchronous acknowledgement semantics for notices on existing cards and adds redacted observability for real PATCH failures. V3.9.1 was released on 2026-07-11, and V4.0.19 and earlier releases are public.
+Current release candidate: `4.0.21`. It fixes Issue #155's answer/tool archive boundary and locks the Issue #147 image/notice combined regression without changing the card UI or configuration. V3.9.1 was released on 2026-07-11; V4.0.20 and earlier releases remain historical release records; real Feishu image acceptance passed on 2026-07-28.
 
 ## Ready
 
@@ -144,6 +144,16 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.0.21 Release Gates
+
+- Issue #155: only an explicit `answer -> tool` boundary can archive an answer; `tool -> answer -> completed` must retain the full user-visible terminal answer: **passed focused ordering coverage (`74 passed`)**.
+- Issue #147: after the completed card accepts the event, matching native media text is suppressed once, the native image still delivers, and an accepted queued notice emits no uncertain-delivery warning: **passed hook-runtime combination coverage (`277 passed`)**.
+- Current README, install guidance, Docker Compose, and bilingual user guides pin `v4.0.21`; UI and configuration remain unchanged: **passed documentation gate**.
+- Real Feishu image acceptance: **passed (2026-07-28)**. Observed one marker-bearing, non-running completion card plus one native image with no uncertain-delivery warning; a normal tool turn retained two answer segments in one card, with zero bot native marker duplicates.
+- Final sidecar metrics were `events_received/events_applied=23/23`, 1 send success and 16 update successes; event/auth rejection, send/update failures, notice uncertain warnings, and notice update failures were all zero. Gateway Feishu WebSocket was connected, and Hermes venv site-packages was 4.0.21.
+- Final local release gate: full pytest reported `1526 passed, 4 skipped in 53.56s`; `uv build` produced `hermes_feishu_streaming_card-4.0.21.tar.gz` and `hermes_feishu_streaming_card-4.0.21-py3-none-any.whl`. A clean Python 3.12 venv installed from the wheel with imports in `site-packages`, package/distribution versions both `4.0.21`, `hermes-feishu-card = hermes_feishu_card.cli:main` present, and CLI --help exit 0.
+- This acceptance does not claim screenshot or desktop/mobile visual QA and does not replace real fault injection; public tagged installer and Release-asset post-tag verification remain pending.
 
 ## V4.0.20 Release Gates
 
