@@ -54,6 +54,8 @@ Event authentication provides source authentication and integrity, not HTTP encr
 | `POST /events` | loopback local-process trust; explicit non-loopback requires event authentication |
 | `POST /delivery/policy` | state-directory transport root, short timestamp window, and nonce replay protection; responses do not echo ids |
 | `POST /runtime/events` | authenticated hello/heartbeat in a separate runtime domain; updates sanitized readiness only |
+| `POST /native-handoff/recover` | separate recovery domain; looks up a pending descriptor within the one-hour window by obligation hash only |
+| `POST /native-handoff/ack` | separate ACK domain; confirms a handoff only after the Hermes ledger durably records `delivered` |
 | `POST /commands` | state-directory command transport proof |
 | `POST /card/actions` | interaction token or operations transport proof |
 | `GET /health` | unauthenticated but strictly sanitized; local liveness only |

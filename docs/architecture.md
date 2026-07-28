@@ -54,6 +54,8 @@ Windows non-loopback 在无法验证 state directory 的 ACL 私有性时 fail-c
 | `POST /events` | loopback 本机互信；显式非 loopback 强制事件鉴权 |
 | `POST /delivery/policy` | state-directory transport root、短 timestamp window 与 nonce replay protection；响应不回显 id |
 | `POST /runtime/events` | 独立 runtime domain 的认证 hello/heartbeat；只更新脱敏 readiness |
+| `POST /native-handoff/recover` | 独立 recovery domain；只用 obligation hash 查询一小时窗口内的 pending descriptor |
+| `POST /native-handoff/ack` | 独立 ACK domain；仅在 Hermes ledger 已持久化 `delivered` 后确认 handoff |
 | `POST /commands` | state-dir command transport proof |
 | `POST /card/actions` | interaction token 或 operations transport proof |
 | `GET /health` | 无鉴权但严格脱敏；仅供本机探活 |

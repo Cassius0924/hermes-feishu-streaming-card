@@ -10,7 +10,7 @@ V4.1.0 adds per-chat Hermes native delivery, lossless handling for excess tables
 - Use `chats use-native`, `chats use-card`, and `chats list` for atomic policy changes. Output shows masked summaries only. A change affects the chat's next new message and never flips an active turn.
 - Before suppressing Hermes native output, the hook queries `POST /delivery/policy` with the domain-separated `hfc-policy-v1` proof. The sidecar checks again before creating a session or card. Timeout, authentication failure, broken configuration, or an unknown profile all fail open to Hermes native delivery.
 - Answers, tools, approval/clarify, cron, system notices, command feedback, and pickers share the decision. `/hfc help/status/doctor/monitor` and the explicit smoke card remain card-based management surfaces.
-- Multi-bot groups from Issue #162 are an explicit exception: an `@bot` added by a later streaming-card PATCH does not create a new `im.message.receive_v1` event. Put groups that require bot-to-bot triggering in `bindings.native_chats`, so the complete post carries the mention when it is created; the mentioned app also needs `im:message.group_at_msg.include_bot:readonly`. HFC never switches a live turn based on generated-answer content.
+- Multi-bot groups from Issue #162 are an explicit exception: an `@bot` added by a later streaming-card PATCH does not create a new `im.message.receive_v1` event. Put groups that require bot-to-bot triggering in `bindings.native_chats`, so the complete post carries the mention when it is created; the mentioned app also needs `im:message.group_at_msg.include_bot:readonly`, must keep its `im.message.receive_v1` subscription, and must publish a new app version after adding the permission so it takes effect. HFC never switches a live turn based on generated-answer content.
 
 ## Tables and card limits no longer silently lose content
 
@@ -44,7 +44,7 @@ V4.1.0 adds per-chat Hermes native delivery, lossless handling for excess tables
 - `detached`: uses the existing owned detached process on macOS, Windows, containers, or when explicitly selected.
 - `systemd-system`: an explicit Linux-only opt-in using transient `systemd-run --system`; it writes nothing under `/etc/systemd/system`, never invokes `sudo`, and fails when the caller lacks permission.
 
-Docker Compose remains an ordinary setup, sidecar, and Gateway container stack. It pins `detached`, runs no systemd inside the image, and requests no privileged host integration. The CI release-topology smoke runs `install-docker.sh` as non-root, patches a fixture Hermes, starts the sidecar and patched Gateway, waits for signed `runtime.hello` readiness, and sends a real signed `POST /events` through the hook path; it is not a YAML-only check.
+Docker Compose remains an ordinary setup, sidecar, and Gateway container stack. It pins `detached`, runs no systemd inside the image, and requests no privileged host integration. The CI setup container actually runs `install-docker.sh`, patches a fixture Hermes, and prepares shared-volume ownership; the sidecar, patched Gateway, and probe then run as non-root, wait for signed `runtime.hello` readiness, and send a real signed `POST /events` through the hook path. This is not a YAML-only check.
 
 ## Hermes compatibility boundary
 

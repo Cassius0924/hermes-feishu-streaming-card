@@ -19,7 +19,7 @@ See also: [docs/release-notes-v4.1.0.md](docs/release-notes-v4.1.0.md)
 - The shared card serializer enforces five tables, 200 tagged elements, and a 28,000-byte JSON budget. Terminal overflow hands the complete answer back to Hermes native delivery instead of sending a partial card.
 - Terminal overflow now returns a stable descriptor: per-chunk Feishu UUIDs, Hermes-ledger-first `delivered`, signed ACK, and hash-only crash recovery keep retries bounded without claiming forever exactly-once semantics.
 - Multi-bot groups that depend on bot-to-bot mentions can opt into native creation through `native_chats`; the target app still needs Feishu's include-bot mention permission.
-- Docker Compose remains an ordinary unprivileged container flow and explicitly selects `detached` rather than systemd. CI executes the published installer, patched Gateway, signed readiness, and signed event path as non-root.
+- Docker Compose remains an ordinary unprivileged runtime flow and explicitly selects `detached` rather than systemd. The setup container runs `install-docker.sh` as root to prepare the shared volumes; the sidecar, Gateway, and probe run as non-root while CI exercises the patched Gateway, signed readiness, and signed event path.
 
 ### Compatibility and safety
 - Hermes 0.19.0 / `v2026.7.20` remains compatible with the existing AST-owned `gateway/run.py` hook. Runtime monitoring and strict repair replace broader import-time patching.

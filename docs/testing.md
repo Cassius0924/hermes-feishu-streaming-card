@@ -102,7 +102,7 @@ python3 -m hermes_feishu_card.cli smoke-feishu-card --config config.yaml.example
 python3 -m pytest tests/unit/test_docs.py -q
 ```
 
-文档测试只做低脆弱度守卫：确认 README 保留 sidecar-only、`v2026.4.23` 旧版本支持范围和 Hermes `0.13.0+` / `0.14.0` / `0.15.x` / `0.17.x` / `0.18.x` / `v2026.5.16+` / `v2026.6.19+` / `v2026.7.1+` 兼容说明，确认主线文档仍明确 legacy/dual 代码不是 active runtime，并确保事件协议持续声明卡片状态。它不替代人工文档 review。
+文档测试只做低脆弱度守卫：确认 README 保留 sidecar-only、`v2026.4.23` 旧版本支持范围和 Hermes `0.13.0+` / `0.14.0` / `0.15.x` / `0.17.x` / `0.18.x` / `0.19.0` / `v2026.5.16+` / `v2026.6.19+` / `v2026.7.1+` / `v2026.7.20` 兼容说明，确认主线文档仍明确 legacy/dual 代码不是 active runtime，并确保事件协议持续声明卡片状态。它不替代人工文档 review。
 
 ## E2E visual preview
 
@@ -135,7 +135,7 @@ python3 -m hermes_feishu_card.cli doctor --config config.yaml.example --hermes-d
 
 当前 CLI 的 `doctor` 需要显式传入 `--config`。`--skip-hermes` 适合仓库内 dry-run；真实安装前应使用 `--hermes-dir` 做只读 Hermes 检测。输出包含 `version_source`、`version`、`minimum_supported_version`、`run_py_exists`、`hook_strategy`、`compatibility`、anchors、`reason` 和 `runtime_import`，不写入 Hermes 文件、备份或 manifest。`--json` 用于 issue/自动化，`--explain` 用于人工排障并会提示是否可运行 `repair --hermes-dir ... --yes`。
 
-自动化矩阵显式覆盖 Hermes `v2026.4.23`、`v2026.5.7`、`v2026.5.16`、`v2026.5.29`、`v2026.6.19+`、`v2026.7.1`、`v2026.7.7.2`、`0.13.0`、`v0.13.0`、`0.14.0`、`v0.14.0`、`0.15.1`、`v0.15.1`、`0.17.x`、`0.18.0`、`v0.18.0`、`0.18.2`、`v0.18.2` 和描述型 `Hermes Agent v0.18.2 (...)` 的 hook strategy。Hermes `0.13.0+`、`0.14.0`、`0.15.x`、`0.17.x`、`0.18.x` / `v2026.5.16+` / `v2026.6.19+` / `v2026.7.1+` 应显示 `gateway_run_013_plus`，旧版本 Hermes `v2026.4.23` 到 `v2026.4.x` 应显示 `legacy_gateway_run`。缺少 `VERSION` 和 `.git` 元数据但存在可验证 `gateway/run.py` anchor 时，应显示 `version_source: gateway anchors`；`VERSION` 存在但不可解析且 anchors 可验证时，应显示 `version_source: VERSION + gateway anchors`。
+自动化矩阵显式覆盖 Hermes `v2026.4.23`、`v2026.5.7`、`v2026.5.16`、`v2026.5.29`、`v2026.6.19+`、`v2026.7.1`、`v2026.7.7.2`、`v2026.7.20`、`0.13.0`、`v0.13.0`、`0.14.0`、`v0.14.0`、`0.15.1`、`v0.15.1`、`0.17.x`、`0.18.0`、`v0.18.0`、`0.18.2`、`v0.18.2`、Hermes 0.19.0 和描述型 `Hermes Agent v0.18.2 (...)` 的 hook strategy。Hermes `0.13.0+`、`0.14.0`、`0.15.x`、`0.17.x`、`0.18.x`、`0.19.0` / `v2026.5.16+` / `v2026.6.19+` / `v2026.7.1+` / `v2026.7.20` 的自动化 strategy detection 应显示 `gateway_run_013_plus`，旧版本 Hermes `v2026.4.23` 到 `v2026.4.x` 应显示 `legacy_gateway_run`。此外，本机真实源码只读验证已在 `v2026.7.20` 上确认 V4.1 patcher 的启动/恢复插入顺序、幂等性与 restore；这不是实际启动 Gateway 或真实飞书 E2E 的通过声明。缺少 `VERSION` 和 `.git` 元数据但存在可验证 `gateway/run.py` anchor 时，应显示 `version_source: gateway anchors`；`VERSION` 存在但不可解析且 anchors 可验证时，应显示 `version_source: VERSION + gateway anchors`。
 
 ## 真实飞书联调
 

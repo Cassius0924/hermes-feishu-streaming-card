@@ -72,7 +72,7 @@ delivery. Real file/media paths still keep Hermes' native attachment delivery
 path available.
 
 From V3.8.13, Hermes upgrades are more resilient: version metadata accepts
-`v2026.7.7.2`, `0.18.2`, and descriptive strings such as
+`v2026.7.7.2`, `0.18.2`, `v2026.7.20`, `0.19.0`, and descriptive strings such as
 `Hermes Agent v0.18.2 (...)`; if readable version metadata is unparseable,
 verified `gateway/run.py` anchors can still decide support. `repair` also
 clears stale backup/manifest state left after an upstream Hermes upgrade
@@ -140,6 +140,15 @@ safe mode, run `hermes-feishu-card integrity migrate-safe --config CONFIG
 `sidecar.restart_required: true`. The migration itself reports
 `gateway.restart_required: false`; a later strict repair may require an
 operator-chosen Gateway restart, but HFC never performs it automatically.
+
+Hermes compatibility evidence is reported at two different levels:
+
+| Hermes release | Automated strategy detection | Real-source validation |
+|---|---|---|
+| Hermes 0.19.0 / `v2026.7.20` | Selects `gateway_run_013_plus` from version metadata and verified anchors | A read-only check against real local source confirmed V4.1 startup-before-redelivery, recovery-before-send, idempotency, and restore behavior |
+
+The real local source check does not claim that a real Gateway process or a
+real Feishu conversation passed E2E. Those remain separate release gates.
 
 `card.text_sizes` can configure the `body`, `reasoning`, `tool`, `notice`, and
 `footer` roles, with optional `default` / `pc` / `mobile` mappings. Physical
@@ -210,10 +219,11 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-Compose runs setup, sidecar, and Gateway as ordinary container processes with
-`HERMES_FEISHU_CARD_SERVICE_MANAGER=detached`. It does not start systemd,
-invoke `sudo`, request a privileged container, or mount host system-service
-directories.
+Compose uses `HERMES_FEISHU_CARD_SERVICE_MANAGER=detached`. The setup container
+runs the published `install-docker.sh` as root so it can prepare shared-volume
+ownership. The sidecar, patched Gateway, and probe then run as non-root ordinary
+container processes. The topology does not start systemd, invoke `sudo`, request
+a privileged container, or mount host system-service directories.
 
 ```
 export FEISHU_APP_ID=cli_xxx
@@ -227,9 +237,13 @@ V3.8.6 also supports Docker/source-stripped Hermes roots that contain
 case `doctor --explain` reports `version_source: gateway anchors` and uses the
 verified Gateway code anchors to choose the hook strategy.
 
-Existing-container Docker smoke for V3.9.0 (fresh/pinned install, safe repair,
-user-edit refusal, main/child profile routing, and final `doctor`) is pending
-acceptance; this document does not claim it has been run.
+The V4.1.0 automated Compose gate runs the published installer against a fixture
+Hermes tree, imports the patched Gateway, waits for signed `runtime.hello`
+readiness, sends a signed `POST /events`, and checks the resulting receipt and
+sanitized health metrics. A passing automated gate is required before release,
+but it does not replace acceptance on a real Docker deployment or in real
+Feishu. Real Docker and real Feishu scenarios remain pending acceptance until
+their respective release evidence is recorded.
 
 ## One-Line Install
 

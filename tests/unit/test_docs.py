@@ -2399,6 +2399,62 @@ def test_v410_release_docs_define_ack_multibot_and_compose_boundaries():
             assert marker in text
 
 
+def test_v410_docs_close_release_ux_review_drift():
+    changelog = read_doc("CHANGELOG.md")
+    readme = read_doc("README.md")
+    readme_en = read_doc("README.en.md")
+    install_doc = read_doc("README-install.md")
+    testing = read_doc("docs/testing.md")
+    testing_en = read_doc("docs/testing.en.md")
+    architecture = read_doc("docs/architecture.md")
+    architecture_en = read_doc("docs/architecture.en.md")
+    notes = read_doc("docs/release-notes-v4.1.0.md")
+    notes_en = read_doc("docs/release-notes-v4.1.0.en.md")
+    guide = read_doc("docs/user-guide.md")
+    guide_en = read_doc("docs/user-guide.en.md")
+    controls = read_doc("docs/wiki/v4.1-safety-controls.md")
+
+    assert "setup container runs `install-docker.sh` as root" in changelog
+    assert "sidecar, Gateway, and probe run as non-root" in changelog
+
+    assert "一小时幂等窗口" in controls
+    assert "窗口外" in controls
+    assert "人工复核" in controls
+    assert "保证" not in controls.split("## integrity 模式与升级迁移", 1)[0]
+
+    for text in (readme, testing):
+        assert "Hermes 0.19.0" in text
+        assert "v2026.7.20" in text
+        assert "自动化 strategy detection" in text
+        assert "本机真实源码" in text
+    assert "`0.18.x` / `0.19.0` / `v2026.5.16+`" in testing
+    for text in (readme_en, testing_en, install_doc):
+        assert "Hermes 0.19.0" in text
+        assert "v2026.7.20" in text
+        assert "automated strategy detection" in text.lower()
+        assert "real local source" in text
+    assert "`0.18.x` / `0.19.0` / `v2026.5.16+`" in testing_en
+    assert "`v2026.7.20`, `0.19.0`" in install_doc
+
+    for text in (architecture, architecture_en):
+        assert "`POST /native-handoff/recover`" in text
+        assert "`POST /native-handoff/ack`" in text
+
+    for text in (notes, notes_en, guide, guide_en, controls):
+        assert "im:message.group_at_msg.include_bot:readonly" in text
+        assert "im.message.receive_v1" in text
+    for text in (notes, guide, controls):
+        assert "发布新版本" in text
+    for text in (notes_en, guide_en):
+        assert "publish a new app version" in text
+
+    assert "Existing-container Docker smoke for V3.9.0" not in install_doc
+    assert "V4.1.0 automated Compose gate" in install_doc
+    assert "real Docker" in install_doc
+    assert "real Feishu" in install_doc
+    assert "pending acceptance" in install_doc
+
+
 def test_feishu_cli_playbook_is_linked_and_keeps_cli_optional():
     wiki = read_doc("docs/wiki/README.md")
     playbook = read_doc("docs/wiki/feishu-cli-playbook.md")
