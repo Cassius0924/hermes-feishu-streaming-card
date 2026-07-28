@@ -342,6 +342,7 @@ def _run_setup(args: argparse.Namespace) -> int:
         return 1
     print("status: running")
     print(f"pid: {status['pid'] or 'unknown'}")
+    print(f"manager: {status.get('manager', 'unknown')}")
     print("setup ok")
     return 0
 
@@ -378,6 +379,9 @@ server:
 # Existing configs without this section remain notification-only after upgrade.
 integrity:
   mode: safe
+
+service:
+  manager: auto
 
 feishu:
   app_id: ""
@@ -2006,6 +2010,7 @@ def _run_status(args: argparse.Namespace) -> int:
     if status["running"]:
         print("status: running")
         print(f"pid: {status['pid'] or 'unknown'}")
+        print(f"manager: {status.get('manager', 'unknown')}")
         health_status = status["health"].get("status")
         if health_status == "degraded":
             print("health: degraded")

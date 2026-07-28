@@ -26,6 +26,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
     # Missing values stay notification-only for upgraded existing configs.
     # New setup templates explicitly write ``safe`` after validation.
     "integrity": {"mode": "notify"},
+    "service": {"manager": "auto"},
     "card": {
         "max_wait_ms": 800,
         "max_chars": 240,
@@ -78,6 +79,9 @@ CARD_TEXT_SIZE_DEFAULTS = {
 }
 CARD_TEXT_SIZE_DEVICE_KEYS = frozenset({"default", "pc", "mobile"})
 CARD_TABLE_OVERFLOW_MODES = frozenset({"compact", "truncate"})
+SERVICE_MANAGER_VALUES = frozenset(
+    {"auto", "systemd-user", "systemd-system", "detached"}
+)
 
 
 def normalize_text_sizes(
@@ -235,6 +239,7 @@ def load_config(
     _normalize_config_card_options(config)
     _normalize_integrity_mode(config)
     config["server"]["port"] = _normalize_port(config["server"]["port"], "server.port")
+    _validate_service_manager(config)
     return config
 
 
@@ -253,6 +258,14 @@ def _normalize_integrity_mode(config: dict[str, Any]) -> None:
     if mode not in {"safe", "notify", "off"}:
         raise ValueError("integrity.mode must be safe, notify, or off")
     integrity["mode"] = mode
+
+
+def _validate_service_manager(config: dict[str, Any]) -> None:
+    service = config.get("service")
+    manager = service.get("manager") if isinstance(service, Mapping) else None
+    if not isinstance(manager, str) or manager not in SERVICE_MANAGER_VALUES:
+        values = ", ".join(sorted(SERVICE_MANAGER_VALUES))
+        raise ValueError(f"service.manager must be one of: {values}")
 
 
 def _normalize_config_card_options(config: dict[str, Any]) -> None:
@@ -336,6 +349,17 @@ def _apply_env_mapping_overrides(
         port = _normalize_port(raw_port, "HERMES_FEISHU_CARD_PORT")
         config.setdefault("server", {})["port"] = port
 
+    if "HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK" in values:
+        config.setdefault("server", {})["allow_non_loopback"] = _normalize_boolean(
+            values["HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK"],
+            "HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK",
+        )
+
+    if "HERMES_FEISHU_CARD_SERVICE_MANAGER" in values:
+        config.setdefault("service", {})["manager"] = values[
+            "HERMES_FEISHU_CARD_SERVICE_MANAGER"
+        ]
+
     if "HERMES_FEISHU_CARD_INTEGRITY_MODE" in values:
         config.setdefault("integrity", {})["mode"] = values[
             "HERMES_FEISHU_CARD_INTEGRITY_MODE"
@@ -415,3 +439,15 @@ def _normalize_port(value: Any, name: str) -> int:
     if not 1 <= port <= 65535:
         raise ValueError(f"{name} must be in range 1..65535")
     return port
+
+
+def _normalize_boolean(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"{name} must be a boolean")

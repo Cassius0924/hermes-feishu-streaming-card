@@ -13,6 +13,9 @@ from hermes_feishu_card.config import (
 CONFIG_ENV_VARS = (
     "HERMES_FEISHU_CARD_HOST",
     "HERMES_FEISHU_CARD_PORT",
+    "HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK",
+    "HERMES_FEISHU_CARD_SERVICE_MANAGER",
+    "HERMES_FEISHU_CARD_INTEGRITY_MODE",
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
     "HERMES_DIR",
@@ -44,6 +47,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path):
             "group_rules": {"enabled": False},
         },
         "integrity": {"mode": "notify"},
+        "service": {"manager": "auto"},
         "card": {
             "max_wait_ms": 800,
             "max_chars": 240,
@@ -66,6 +70,63 @@ def test_load_config_missing_file_returns_defaults(tmp_path):
             ],
         },
     }
+
+
+@pytest.mark.parametrize(
+    "manager", ["auto", "systemd-user", "systemd-system", "detached"]
+)
+def test_load_config_accepts_exact_service_managers(tmp_path, manager):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"service:\n  manager: {manager}\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config["service"] == {"manager": manager}
+
+
+@pytest.mark.parametrize(
+    "manager", ["", "systemd", "SYSTEMD-USER", "auto ", 1, True, None]
+)
+def test_load_config_rejects_invalid_service_manager(tmp_path, manager):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump({"service": {"manager": manager}}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="service.manager"):
+        load_config(path)
+
+
+def test_load_config_applies_container_service_and_listener_overrides(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_FEISHU_CARD_HOST", "0.0.0.0")
+    monkeypatch.setenv("HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK", "true")
+    monkeypatch.setenv("HERMES_FEISHU_CARD_SERVICE_MANAGER", "detached")
+
+    config = load_config(tmp_path / "missing.yaml")
+
+    assert config["server"]["host"] == "0.0.0.0"
+    assert config["server"]["allow_non_loopback"] is True
+    assert config["service"]["manager"] == "detached"
+
+
+@pytest.mark.parametrize("value", ["", "2", "sometimes"])
+def test_load_config_rejects_invalid_non_loopback_environment_boolean(
+    tmp_path, monkeypatch, value
+):
+    monkeypatch.setenv("HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK", value)
+
+    with pytest.raises(ValueError, match="HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK"):
+        load_config(tmp_path / "missing.yaml")
+
+
+def test_setup_template_writes_explicit_auto_service_manager():
+    from hermes_feishu_card.cli import _default_setup_config_text
+
+    config = yaml.safe_load(_default_setup_config_text())
+
+    assert config["service"] == {"manager": "auto"}
 
 
 def test_operations_hermes_root_uses_process_hint_without_user_config(

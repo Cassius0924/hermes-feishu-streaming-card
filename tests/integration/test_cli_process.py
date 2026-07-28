@@ -12,6 +12,8 @@ from pathlib import Path
 CONFIG_ENV_VARS = {
     "HERMES_FEISHU_CARD_HOST",
     "HERMES_FEISHU_CARD_PORT",
+    "HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK",
+    "HERMES_FEISHU_CARD_SERVICE_MANAGER",
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
 }
@@ -205,6 +207,7 @@ def test_start_status_and_stop_manage_sidecar_process(tmp_path):
 
         assert status.returncode == 0
         assert "status: running" in status.stdout
+        assert "manager: detached" in status.stdout
         assert "health: degraded" in status.stdout
         assert "delivery.mode: noop" in status.stdout
         assert "readiness: starting" in status.stdout

@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -473,6 +474,113 @@ def test_install_docker_sh_declares_container_defaults():
     assert 'ENV_FILE="${ENV_FILE:-/opt/data/.env}"' in script
     assert 'NO_PROMPT="${HFC_NO_PROMPT:-1}"' in script
     assert 'SKIP_START="${HFC_SKIP_START:-0}"' in script
+    assert 'SERVICE_MANAGER="${HERMES_FEISHU_CARD_SERVICE_MANAGER:-detached}"' in script
+    assert 'STATE_DIR="${HERMES_FEISHU_CARD_STATE_DIR:-}"' in script
+    assert 'STATE_DIR="${STATE_DIR:-$(dirname "$CONFIG_PATH")/state}"' in script
+
+
+def test_install_docker_sh_makes_shared_state_private(tmp_path):
+    hermes_dir = tmp_path / "opt" / "hermes"
+    data_dir = tmp_path / "opt" / "data"
+    state_dir = tmp_path / "opt" / "hfc-state"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text(
+        "# gateway\n", encoding="utf-8"
+    )
+    data_dir.mkdir(parents=True)
+    state_dir.mkdir(parents=True, mode=0o755)
+    state_dir.chmod(0o755)
+    env_file = data_dir / ".env"
+    env_file.write_text(
+        "FEISHU_APP_ID=cli_docker\nFEISHU_APP_SECRET=docker_secret\n",
+        encoding="utf-8",
+    )
+    make_fake_docker_python(hermes_dir / "venv" / "bin" / "python")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(data_dir / "config.yaml"),
+            "HFC_ENV_FILE": str(env_file),
+            "HERMES_FEISHU_CARD_STATE_DIR": str(state_dir),
+            "HFC_SKIP_START": "1",
+            "HFC_VERSION": "main",
+        }
+    )
+    env.pop("HFC_PYTHON", None)
+    env.pop("FEISHU_APP_ID", None)
+    env.pop("FEISHU_APP_SECRET", None)
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert stat.S_IMODE(state_dir.stat().st_mode) == 0o700
+
+
+def test_docker_compose_uses_ordinary_setup_gateway_and_sidecar_processes():
+    compose_path = ROOT / "docker-compose.example.yml"
+    source = compose_path.read_text(encoding="utf-8")
+    compose = yaml.safe_load(source)
+    services = compose["services"]
+
+    assert set(services) == {"setup", "gateway", "sidecar"}
+    setup = services["setup"]
+    gateway = services["gateway"]
+    sidecar = services["sidecar"]
+
+    assert setup["command"] == ["bash", "/tmp/install-docker.sh"]
+    assert setup["environment"]["HFC_SKIP_START"] == "1"
+    assert sidecar["depends_on"]["setup"]["condition"] == "service_completed_successfully"
+    assert gateway["depends_on"]["sidecar"]["condition"] == "service_healthy"
+    assert sidecar["command"][:4] == [
+        "/opt/hermes/venv/bin/python",
+        "-m",
+        "hermes_feishu_card.runner",
+        "--config",
+    ]
+    assert "healthcheck" in sidecar
+
+    for service in services.values():
+        assert service.get("privileged") is not True
+        assert service.get("network_mode") != "host"
+        assert service.get("pid") != "host"
+        assert "hfc-state:/opt/hfc-state" in service["volumes"]
+
+    for service in (setup, sidecar):
+        environment = service["environment"]
+        assert environment["HERMES_FEISHU_CARD_STATE_DIR"] == "/opt/hfc-state"
+        assert environment["HERMES_FEISHU_CARD_SERVICE_MANAGER"] == "detached"
+        assert environment["HERMES_FEISHU_CARD_HOST"] == "0.0.0.0"
+        assert environment["HERMES_FEISHU_CARD_ALLOW_NON_LOOPBACK"] == "true"
+
+    assert gateway["environment"]["HERMES_FEISHU_CARD_STATE_DIR"] == "/opt/hfc-state"
+    assert (
+        gateway["environment"]["HERMES_FEISHU_CARD_EVENT_URL"]
+        == "http://sidecar:8765/events"
+    )
+    assert "hfc-state" in compose["volumes"]
+
+    lowered = source.lower()
+    for forbidden in (
+        "privileged:",
+        "network_mode: host",
+        "pid: host",
+        "systemd-run",
+        "systemctl",
+        "/etc/systemd",
+        "/run/systemd",
+        "/var/run/docker.sock",
+    ):
+        assert forbidden not in lowered
 
 
 def test_install_docker_sh_uses_container_defaults_and_hermes_venv(tmp_path):
