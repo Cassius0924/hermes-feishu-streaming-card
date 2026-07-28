@@ -47,10 +47,16 @@ Docker Compose 示例默认使用 `v4.1.1`。升级前请备份本机配置与 `
 
 ## 发布验收状态
 
-以下项目必须在候选提交冻结后完成，本文不提前声称通过：
+候选提交 `20b7b06` 已完成以下门禁：
 
-- Python 3.9 / 3.12 全量自动化与 `git diff --check`；
-- wheel/sdist、公开 tag 安装、版本与 import provenance；
+- 完整 pytest：`2194 passed, 4 skipped`；`git diff --check` 通过；
+- wheel/sdist 构建、隔离 `site-packages` import/version provenance 通过；
+- wheel 安装后的真实进程测试：`8 passed`；独立代码审查无 P0–P2。
+
+以下 post-candidate / post-tag 项目仍需在发布流程中完成，本文不提前声称通过：
+
+- Python 3.9 / 3.12 CI、exact merge SHA 回归；
+- 公开 tag 安装与 Release assets；
 - Linux 四种 manager、Docker 普通非 privileged topology；
 - 本机与远端 upgrade/restart、真实 Hermes model 与真实飞书 card/native/card smoke；
 - heartbeat 等待不写 fence、empty/non-empty hash acknowledge 分支、legacy `0644` 与 pidfile-less 拒绝路径。

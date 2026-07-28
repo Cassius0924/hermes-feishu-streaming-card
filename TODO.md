@@ -13,7 +13,8 @@
 - [x] legacy `0644` pidfile 仅在 owned `0700` state dir 内收紧；pidfile-less 进程不自动接管或 kill。
 - [x] detached sidecar 改为 token 认证的本机自停路径，停止流程不再向可复用数字 PID/PGID 强制发信号。
 - [x] `integrity acknowledge-review` 受 installed plan、stopped sidecar、无 pidfile、target binding 与 fence CAS 约束。
-- [ ] 独立审查、全量自动化、Linux/Docker CI、exact merge SHA、public tag/install、本机与远端升级、真实飞书 smoke 和 Release assets。
+- [x] 独立审查通过；候选提交 `20b7b06` 完整 pytest `2194 passed, 4 skipped`，`git diff --check`、wheel/sdist 构建、隔离 `site-packages` provenance 与真实进程测试均通过。
+- [ ] CI、exact merge SHA、public tag/install、Linux/Docker、本机与远端升级、真实飞书 smoke 和 Release assets。
 
 ### V4.1.0：投递策略与运行安全（已发布）
 

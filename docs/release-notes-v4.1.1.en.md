@@ -47,10 +47,16 @@ The Docker Compose example defaults to `v4.1.1`. Back up local configuration and
 
 ## Release Acceptance Status
 
-The following gates remain pending until the release candidate is frozen; this document does not pre-declare them as passed:
+Candidate `20b7b06` completed these gates:
 
-- Python 3.9 / 3.12 full automation and `git diff --check`;
-- wheel/sdist, public tagged installation, version, and import provenance;
+- full pytest: `2194 passed, 4 skipped`; `git diff --check` passed;
+- wheel/sdist build and isolated `site-packages` import/version provenance passed;
+- real-process tests from the installed wheel: `8 passed`; independent review found no P0-P2 issue.
+
+The following post-candidate / post-tag gates remain part of the release workflow and are not pre-declared as passed:
+
+- Python 3.9 / 3.12 CI and exact-merge-SHA regression;
+- public tagged installation and Release assets;
 - all four Linux managers and the ordinary non-privileged Docker topology;
 - local and remote upgrade/restart plus real Hermes-model and real Feishu card/native/card smoke;
 - heartbeat waiting without a fence, empty/non-empty hash acknowledgement branches, legacy `0644`, and pidfile-less refusal paths.

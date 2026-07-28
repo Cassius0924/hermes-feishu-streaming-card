@@ -147,11 +147,11 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 
 ## V4.1.1 Release Gates
 
-- A verified `installed` plan neither repairs nor writes a restart/manual-review fence while the first heartbeat is waiting/missing, and resumes normal evaluation after a matching `runtime.hello`: **focused and full regressions pending**.
-- `integrity acknowledge-review` requires installed + unreachable sidecar health + no pidfile; empty hash can clear an unresolvable fence while a non-empty hash keeps the restart fence until a different-runtime-id matching hello: **CLI, persistence, and restart simulation pending**.
-- A legacy `0644` pidfile is tightened only inside a private owned `0700` state directory through fd identity binding; a pidfile-less process is never silently adopted/killed and requires the operator to stop the old service before rerunning: **macOS/Linux process migration acceptance pending**.
+- A verified `installed` plan neither repairs nor writes a restart/manual-review fence while the first heartbeat is waiting/missing, and resumes normal evaluation after a matching `runtime.hello`: **candidate focused and full regressions passed**.
+- `integrity acknowledge-review` requires installed + unreachable sidecar health + no pidfile; empty hash can clear an unresolvable fence while a non-empty hash keeps the restart fence until a different-runtime-id matching hello: **CLI, persistence, and restart simulation passed**.
+- A legacy `0644` pidfile is tightened only inside a private owned `0700` state directory through fd identity binding; a pidfile-less process is never silently adopted/killed and requires the operator to stop the old service before rerunning: **real macOS process tests passed; Linux CI remains pending**.
 - Setup installs/rechecks through the Hermes runtime venv and uses `/health` package version plus Python identity to decide whether to restart sidecar; sidecar and Gateway are then restarted manually: **local and remote upgrade acceptance pending**.
-- Full pytest, `git diff --check`, build/isolated `site-packages`, exact merge SHA, public tagged install, Release assets, Linux/Docker, and real Feishu: **release workflow pending and not pre-declared as passed**.
+- Candidate `20b7b06`: full pytest **`2194 passed, 4 skipped`**, `git diff --check`, wheel/sdist build, isolated `site-packages` provenance, and wheel real-process tests **`8 passed`**; **CI, exact merge SHA, public tagged install, Release assets, Linux/Docker, and real Feishu remain pending release gates**.
 
 ## V4.1.0 Release Gates
 

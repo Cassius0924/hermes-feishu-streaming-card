@@ -147,11 +147,11 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 
 ## V4.1.1 发布门禁
 
-- 已验证 `installed` plan 在首次 heartbeat 等待/缺失时不执行 repair、不写 restart/manual-review fence；收到 matching `runtime.hello` 后恢复正常评估：**待完成聚焦与全量回归**。
-- `integrity acknowledge-review` 只接受 installed + sidecar health 不可达 + 无 pidfile；empty hash 可解除不可自清 fence，non-empty hash 保留 restart fence 直到不同 runtime id 的 matching hello：**待完成 CLI、持久化与重启模拟**。
-- legacy `0644` pidfile 只在私有 owned `0700` state dir 中通过 fd identity 绑定收紧；pidfile-less 进程不自动接管/kill，要求人工停旧服务后重跑：**待 macOS/Linux 进程迁移验收**。
+- 已验证 `installed` plan 在首次 heartbeat 等待/缺失时不执行 repair、不写 restart/manual-review fence；收到 matching `runtime.hello` 后恢复正常评估：**候选提交聚焦与全量回归通过**。
+- `integrity acknowledge-review` 只接受 installed + sidecar health 不可达 + 无 pidfile；empty hash 可解除不可自清 fence，non-empty hash 保留 restart fence 直到不同 runtime id 的 matching hello：**CLI、持久化与重启模拟通过**。
+- legacy `0644` pidfile 只在私有 owned `0700` state dir 中通过 fd identity 绑定收紧；pidfile-less 进程不自动接管/kill，要求人工停旧服务后重跑：**macOS 真实进程测试通过，Linux CI 待完成**。
 - setup 通过 Hermes runtime venv 安装/复检，并按 `/health` package version 与 Python identity 决定是否重启 sidecar；随后人工重启 sidecar 与 Gateway：**待本机、远端升级验收**。
-- 完整 pytest、`git diff --check`、build/isolated `site-packages`、exact merge SHA、public tagged install、Release assets、Linux/Docker 与真实飞书：**发布流程待完成，不提前宣称通过**。
+- 候选提交 `20b7b06`：完整 pytest **`2194 passed, 4 skipped`**，`git diff --check`、wheel/sdist 构建、隔离 `site-packages` provenance 与 wheel 真实进程测试 **`8 passed`**；**CI、exact merge SHA、public tagged install、Release assets、Linux/Docker 与真实飞书仍待发布流程完成**。
 
 ## V4.1.0 发布门禁
 
