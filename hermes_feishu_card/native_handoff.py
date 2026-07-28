@@ -34,6 +34,7 @@ NATIVE_HANDOFF_TTL_SECONDS = 60 * 60
 LIFECYCLE_FENCE_TTL_SECONDS = 60 * 60
 NATIVE_HANDOFF_UUID_SEED_DOMAIN = b"hfc-native-handoff-uuid-seed-v1\0"
 NATIVE_HANDOFF_TARGET_HASH_DOMAIN = b"hfc-native-handoff-target-v1\0"
+NATIVE_HANDOFF_CONTENT_HASH_DOMAIN = b"hfc-native-content-v1\0"
 NATIVE_HANDOFF_MANUAL_REVIEW_ACTION = (
     "review_native_delivery_before_manual_retry"
 )
@@ -103,8 +104,15 @@ class NativeHandoffRecord:
     def bot_id(self) -> str:
         return ""
 
+    @property
+    def has_exact_delivery_binding(self) -> bool:
+        return _record_has_exact_delivery_binding(self)
+
     def descriptor(self, *, now: float | None = None) -> dict[str, Any] | None:
-        if self.delivery_state != "pending":
+        if (
+            self.delivery_state != "pending"
+            or not _record_has_exact_delivery_binding(self)
+        ):
             return None
         if now is not None and _finite_timestamp(now) > self.expires_at:
             return None
@@ -137,6 +145,30 @@ def handoff_identity_key(
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(b"hfc-native-handoff-v1\0" + identity).hexdigest()
+
+
+def derive_native_handoff_content_hash(content: Any) -> str:
+    """Bind an exact handoff descriptor to the terminal text bytes."""
+
+    return hashlib.sha256(
+        NATIVE_HANDOFF_CONTENT_HASH_DOMAIN
+        + str(content or "").encode("utf-8")
+    ).hexdigest()
+
+
+def is_exact_native_text_scope(data: Any) -> bool:
+    """Return whether event data is the canonical ordinary-text ACK scope."""
+
+    if not isinstance(data, dict):
+        return False
+    if not isinstance(data.get("answer"), str) or not data["answer"]:
+        return False
+    if "delivery_kind" in data and data["delivery_kind"] != "":
+        return False
+    attachments = data.get("attachments")
+    if not isinstance(attachments, list) or attachments:
+        return False
+    return data.get("native_delivery") == "allowed"
 
 
 def derive_native_handoff_uuid_seed(
@@ -289,26 +321,33 @@ class NativeHandoffStore:
             max_chars=_MAX_BOT_ID_CHARS,
             required=False,
         )
-        exact_binding = _validated_exact_binding(
-            content_hash,
-            plan_fingerprint,
-            route,
-            target_hash,
-            required=bool(ack_capable),
-        )
-        normalized_obligation = _validated_obligation_key(
-            obligation_key,
-            required=bool(ack_capable),
-        )
-        uuid_seed = _validated_provisional_uuid_seed(
-            provisional_uuid_seed,
-            obligation_key=normalized_obligation,
-            content_hash=exact_binding[0],
-            plan_fingerprint=exact_binding[1],
-            route=exact_binding[2],
-            target_hash=exact_binding[3],
-            required=bool(ack_capable),
-        )
+        if ack_capable:
+            exact_binding = _validated_exact_binding(
+                content_hash,
+                plan_fingerprint,
+                route,
+                target_hash,
+                required=True,
+            )
+            normalized_obligation = _validated_obligation_key(
+                obligation_key,
+                required=True,
+            )
+            uuid_seed = _validated_provisional_uuid_seed(
+                provisional_uuid_seed,
+                obligation_key=normalized_obligation,
+                content_hash=exact_binding[0],
+                plan_fingerprint=exact_binding[1],
+                route=exact_binding[2],
+                target_hash=exact_binding[3],
+                required=True,
+            )
+        else:
+            # Rolling or legacy payloads are fail-open native delivery only.
+            # Never persist attacker-controlled pseudo-exact bindings for them.
+            exact_binding = ("", "", "", "")
+            normalized_obligation = ""
+            uuid_seed = ""
         return self._begin(
             identity_key,
             card_state="pending",
@@ -342,26 +381,31 @@ class NativeHandoffStore:
         provisional_uuid_seed: str = "",
     ) -> tuple[NativeHandoffRecord, bool]:
         _validate_identity_key(identity_key)
-        exact_binding = _validated_exact_binding(
-            content_hash,
-            plan_fingerprint,
-            route,
-            target_hash,
-            required=bool(ack_capable),
-        )
-        normalized_obligation = _validated_obligation_key(
-            obligation_key,
-            required=bool(ack_capable),
-        )
-        uuid_seed = _validated_provisional_uuid_seed(
-            provisional_uuid_seed,
-            obligation_key=normalized_obligation,
-            content_hash=exact_binding[0],
-            plan_fingerprint=exact_binding[1],
-            route=exact_binding[2],
-            target_hash=exact_binding[3],
-            required=bool(ack_capable),
-        )
+        if ack_capable:
+            exact_binding = _validated_exact_binding(
+                content_hash,
+                plan_fingerprint,
+                route,
+                target_hash,
+                required=True,
+            )
+            normalized_obligation = _validated_obligation_key(
+                obligation_key,
+                required=True,
+            )
+            uuid_seed = _validated_provisional_uuid_seed(
+                provisional_uuid_seed,
+                obligation_key=normalized_obligation,
+                content_hash=exact_binding[0],
+                plan_fingerprint=exact_binding[1],
+                route=exact_binding[2],
+                target_hash=exact_binding[3],
+                required=True,
+            )
+        else:
+            exact_binding = ("", "", "", "")
+            normalized_obligation = ""
+            uuid_seed = ""
         return self._begin(
             identity_key,
             card_state="none",
@@ -436,6 +480,8 @@ class NativeHandoffStore:
                 if match is None:
                     raise ValueError("native handoff not found")
                 identity_key, current = match
+                if not _record_has_exact_delivery_binding(current):
+                    raise ValueError("native handoff is not exact")
                 if not _descriptor_matches(current, normalized):
                     raise ValueError("native handoff descriptor mismatch")
                 if current.delivery_state == "acked":
@@ -930,6 +976,8 @@ def _validate_restorable_delivery_fence(
         raise ValueError("native handoff fence identity mismatch")
     if _UUID_SEED_RE.fullmatch(record.uuid_seed) is None:
         raise ValueError("native handoff fence UUID is invalid")
+    if not record.has_exact_delivery_binding:
+        raise ValueError("native handoff fence binding is invalid")
     _validated_obligation_key(record.obligation_key, required=True)
     _validated_exact_binding(
         record.content_hash,
@@ -982,13 +1030,30 @@ def _same_delivery_fence(
 
 
 def _record_has_exact_delivery_binding(record: NativeHandoffRecord) -> bool:
-    return bool(
-        record.obligation_key
-        and record.content_hash
-        and record.plan_fingerprint
-        and record.route
-        and record.target_hash
-    )
+    try:
+        obligation_key = _validated_obligation_key(
+            record.obligation_key,
+            required=True,
+        )
+        content_hash, plan_fingerprint, route, target_hash = (
+            _validated_exact_binding(
+                record.content_hash,
+                record.plan_fingerprint,
+                record.route,
+                record.target_hash,
+                required=True,
+            )
+        )
+        expected_seed = derive_native_handoff_uuid_seed(
+            obligation_key=obligation_key,
+            content_hash=content_hash,
+            plan_fingerprint=plan_fingerprint,
+            route=route,
+            target_hash=target_hash,
+        )
+    except ValueError:
+        return False
+    return record.uuid_seed == expected_seed
 
 
 def _decode_record(
@@ -1058,9 +1123,18 @@ def _decode_record(
         or delivery_state not in _VALID_DELIVERY_STATES
     ):
         raise ValueError("invalid record state")
+    if version < 4 and delivery_state == "pending":
+        # A pre-V4 pending ACK lacks the target-bound contract. Keep a durable
+        # manual-review fence, but never rewrite it as a current exact pending.
+        delivery_state = "uncertain"
+    exact_delivery_state = delivery_state in {
+        "pending",
+        "acked",
+        "uncertain",
+    }
     generation = _validated_generation(
         value.get("generation", ""),
-        required=delivery_state == "pending",
+        required=delivery_state == "pending" or exact_delivery_state,
     )
     handoff_id = _validated_hash(value.get("handoff_id"), "handoff_id")
     uuid_seed = str(value.get("uuid_seed") or "")
@@ -1073,8 +1147,10 @@ def _decode_record(
         value.get("card_message_hash", ""), "card_message_hash"
     )
     bot_hash = _validated_optional_hash(value.get("bot_hash", ""), "bot_hash")
-    obligation_key = _validated_obligation_key(value.get("obligation_key", ""))
     if version >= 4:
+        obligation_key = _validated_obligation_key(
+            value.get("obligation_key", "")
+        )
         content_hash, plan_fingerprint, route, target_hash = _validated_exact_binding(
             value.get("content_hash", ""),
             value.get("plan_fingerprint", ""),
@@ -1082,11 +1158,49 @@ def _decode_record(
             value.get("target_hash", ""),
             required=False,
         )
+        has_exact_fields = bool(
+            obligation_key
+            or content_hash
+            or plan_fingerprint
+            or route
+            or target_hash
+        )
     else:
-        # Pre-V4 records predate the target-bound exact delivery contract.
-        # Preserve them as legacy fences, but never infer exact recovery.
+        obligation_key = ""
+        content_hash, plan_fingerprint, route, target_hash = "", "", "", ""
+        has_exact_fields = False
+    valid_exact_record = exact_delivery_state and has_exact_fields
+    if valid_exact_record:
+        obligation_key = _validated_obligation_key(
+            obligation_key,
+            required=True,
+        )
+        content_hash, plan_fingerprint, route, target_hash = _validated_exact_binding(
+            content_hash,
+            plan_fingerprint,
+            route,
+            target_hash,
+            required=True,
+        )
+        if handoff_id != _handoff_id(identity_key, generation):
+            raise ValueError("invalid exact handoff id")
+        expected_uuid_seed = derive_native_handoff_uuid_seed(
+            obligation_key=obligation_key,
+            content_hash=content_hash,
+            plan_fingerprint=plan_fingerprint,
+            route=route,
+            target_hash=target_hash,
+        )
+        if uuid_seed != expected_uuid_seed:
+            raise ValueError("invalid exact handoff uuid seed")
+    elif not exact_delivery_state:
+        # Non-exact V4 records are legacy fences. Never promote pseudo fields
+        # from rolling payloads into exact authority.
+        obligation_key = ""
         content_hash, plan_fingerprint, route, target_hash = "", "", "", ""
     expires_at = _finite_timestamp(value.get("expires_at", updated_at))
+    if valid_exact_record and expires_at != created_at + NATIVE_HANDOFF_TTL_SECONDS:
+        raise ValueError("invalid exact handoff expiry")
     if card_state == "none" and (card_message_hash or bot_hash):
         raise ValueError("card-free record contains routing hashes")
     return NativeHandoffRecord(

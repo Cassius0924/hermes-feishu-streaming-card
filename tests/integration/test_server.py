@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -476,6 +477,8 @@ def event_payload(
     ):
         data.setdefault("profile_id", "default")
         data.setdefault("profile_source", "fallback_default")
+        data.setdefault("attachments", [])
+        data.setdefault("native_delivery", "allowed")
     payload = {
         "schema_version": "1",
         "event": event,
@@ -498,13 +501,16 @@ def exact_handoff_metadata(
     generation: str,
     obligation_key: str,
     *,
-    content_hash: str = "c" * 64,
+    answer: str = "",
+    content_hash: str | None = None,
     plan_fingerprint: str = "d" * 64,
     route: str = "create",
     profile_id: str = "default",
     chat_id: str = "oc_abc",
     thread_id: str = "",
 ):
+    if content_hash is None:
+        content_hash = exact_content_hash(answer) if answer else "c" * 64
     target_hash = derive_native_handoff_target_hash(
         profile_id=profile_id,
         chat_id=chat_id,
@@ -532,6 +538,118 @@ def exact_handoff_metadata(
         "target_hash": target_hash,
         "provisional_uuid_seed": provisional_uuid_seed,
     }
+
+
+def exact_content_hash(answer: str) -> str:
+    return hashlib.sha256(
+        b"hfc-native-content-v1\0" + answer.encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "scope_mutation",
+    [
+        {"delivery_kind": "cron"},
+        {"delivery_kind": "command"},
+        {"attachments": [{"kind": "file", "name": "report.pdf"}]},
+        {"native_delivery": "required"},
+        {"attachments": None},
+        {"native_delivery": None},
+    ],
+)
+def test_sidecar_exact_ack_requires_content_bound_ordinary_text_scope(
+    scope_mutation,
+):
+    answer = "exact ordinary text"
+    metadata = exact_handoff_metadata(
+        "1" * 32,
+        "2" * 64,
+        content_hash=exact_content_hash(answer),
+    )
+    data = {
+        "answer": answer,
+        "attachments": [],
+        "native_delivery": "allowed",
+        "profile_id": "default",
+        "profile_source": "fallback_default",
+        "native_handoff": metadata,
+    }
+    for field, value in scope_mutation.items():
+        if value is None:
+            data.pop(field, None)
+        else:
+            data[field] = value
+    raw_event = event_payload("message.completed", 1, data)
+    for field, value in scope_mutation.items():
+        if value is None:
+            raw_event["data"].pop(field, None)
+    event = SidecarEvent.from_dict(raw_event)
+
+    assert sidecar_server._native_handoff_ack_capable(
+        {sidecar_server.NATIVE_HANDOFF_ACK_AUTH_VERIFIER_KEY: object()},
+        metadata,
+        event,
+    ) is False
+
+
+def test_sidecar_exact_ack_recomputes_content_hash_from_answer():
+    answer = "exact ordinary text"
+    metadata = exact_handoff_metadata(
+        "1" * 32,
+        "2" * 64,
+        content_hash="e" * 64,
+    )
+    event = SidecarEvent.from_dict(
+        event_payload(
+            "message.completed",
+            1,
+            {
+                "answer": answer,
+                "attachments": [],
+                "native_delivery": "allowed",
+                "native_handoff": metadata,
+            },
+        )
+    )
+
+    assert sidecar_server._native_handoff_ack_capable(
+        {sidecar_server.NATIVE_HANDOFF_ACK_AUTH_VERIFIER_KEY: object()},
+        metadata,
+        event,
+    ) is False
+
+
+def test_sidecar_exact_ack_accepts_only_completed_canonical_text_event():
+    answer = "exact ordinary text"
+    metadata = exact_handoff_metadata(
+        "1" * 32,
+        "2" * 64,
+        answer=answer,
+    )
+    data = {
+        "answer": answer,
+        "attachments": [],
+        "native_delivery": "allowed",
+        "profile_id": "default",
+        "profile_source": "fallback_default",
+        "native_handoff": metadata,
+    }
+    app = {sidecar_server.NATIVE_HANDOFF_ACK_AUTH_VERIFIER_KEY: object()}
+    completed = SidecarEvent.from_dict(
+        event_payload("message.completed", 1, data)
+    )
+    failed = SidecarEvent.from_dict(event_payload("message.failed", 1, data))
+
+    assert sidecar_server._native_handoff_ack_capable(
+        app,
+        metadata,
+        completed,
+    ) is True
+    assert sidecar_server._native_handoff_ack_capable(
+        app,
+        metadata,
+        failed,
+    ) is False
 
 
 @pytest.fixture
@@ -4708,7 +4826,12 @@ async def test_ack_capable_terminal_repeats_descriptor_until_signed_ack(tmp_path
     await test_client.start_server()
     generation = "1" * 32
     obligation_key = "2" * 64
-    handoff_meta = exact_handoff_metadata(generation, obligation_key)
+    answer = "ACK-NATIVE-" + ("密" * 40_000)
+    handoff_meta = exact_handoff_metadata(
+        generation,
+        obligation_key,
+        answer=answer,
+    )
     try:
         started = event_payload(
             "message.started",
@@ -4720,7 +4843,7 @@ async def test_ack_capable_terminal_repeats_descriptor_until_signed_ack(tmp_path
             "message.completed",
             1,
             {
-                "answer": "ACK-NATIVE-" + ("密" * 40_000),
+                "answer": answer,
                 "native_handoff": handoff_meta,
             },
         )
@@ -5024,12 +5147,17 @@ async def test_durable_native_terminal_refuses_delivery_binding_drift(
     first_client = TestClient(TestServer(app))
     await first_client.start_server()
     generation = "4" * 32
+    answer = "DURABLE-MISMATCH-NATIVE-" + ("密" * 40_000)
     completed_payload = event_payload(
         "message.completed",
         1,
         {
-            "answer": "DURABLE-MISMATCH-NATIVE-" + ("密" * 40_000),
-            "native_handoff": exact_handoff_metadata(generation, "5" * 64),
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                "5" * 64,
+                answer=answer,
+            ),
         },
         message_id="message-durable-mismatch",
     )
@@ -5084,12 +5212,17 @@ async def test_exact_terminal_refuses_legacy_v2_pending_descriptor_after_restart
     first_client = TestClient(TestServer(app))
     await first_client.start_server()
     generation = "6" * 32
+    answer = "LEGACY-FENCE-NATIVE-" + ("密" * 40_000)
     completed_payload = event_payload(
         "message.completed",
         1,
         {
-            "answer": "LEGACY-FENCE-NATIVE-" + ("密" * 40_000),
-            "native_handoff": exact_handoff_metadata(generation, "7" * 64),
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                "7" * 64,
+                answer=answer,
+            ),
         },
         message_id="message-legacy-fence",
     )
@@ -5140,12 +5273,17 @@ async def test_in_memory_native_terminal_restores_missing_handoff_fence(tmp_path
     generation = "4" * 32
     obligation_key = "5" * 64
     message_id = "message-state-loss"
+    answer = "STATE-LOSS-NATIVE-" + ("密" * 40_000)
     completed_payload = event_payload(
         "message.completed",
         1,
         {
-            "answer": "STATE-LOSS-NATIVE-" + ("密" * 40_000),
-            "native_handoff": exact_handoff_metadata(generation, obligation_key),
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                obligation_key,
+                answer=answer,
+            ),
         },
         message_id=message_id,
     )
@@ -5201,12 +5339,17 @@ async def test_in_memory_acked_native_terminal_restores_fence_without_resend(
     await test_client.start_server()
     generation = "8" * 32
     message_id = "message-acked-state-loss"
+    answer = "ACKED-STATE-LOSS-" + ("密" * 40_000)
     completed_payload = event_payload(
         "message.completed",
         1,
         {
-            "answer": "ACKED-STATE-LOSS-" + ("密" * 40_000),
-            "native_handoff": exact_handoff_metadata(generation, "9" * 64),
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                "9" * 64,
+                answer=answer,
+            ),
         },
         message_id=message_id,
     )
@@ -5266,12 +5409,17 @@ async def test_in_memory_native_terminal_fails_open_when_handoff_state_is_corrup
     await test_client.start_server()
     generation = "6" * 32
     message_id = "message-state-corrupt"
+    answer = "STATE-CORRUPT-NATIVE-" + ("密" * 40_000)
     completed_payload = event_payload(
         "message.completed",
         1,
         {
-            "answer": "STATE-CORRUPT-NATIVE-" + ("密" * 40_000),
-            "native_handoff": exact_handoff_metadata(generation, "7" * 64),
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                "7" * 64,
+                answer=answer,
+            ),
         },
         message_id=message_id,
     )
@@ -5303,6 +5451,81 @@ async def test_in_memory_native_terminal_fails_open_when_handoff_state_is_corrup
         await test_client.close()
 
 
+async def test_restarted_native_terminal_fails_open_for_wrong_durable_uuid_seed(
+    tmp_path,
+):
+    state_root = tmp_path / "handoff-state"
+    store = NativeHandoffStore(state_root, now=lambda: 100.0)
+    first_app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    first_client = TestClient(TestServer(first_app))
+    await first_client.start_server()
+    generation = "6" * 32
+    message_id = "message-corrupt-seed"
+    answer = "CORRUPT-SEED-NATIVE-" + ("密" * 40_000)
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                "7" * 64,
+                answer=answer,
+            ),
+        },
+        message_id=message_id,
+    )
+    try:
+        await first_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": generation}},
+                message_id=message_id,
+            ),
+        )
+        first = await first_client.post("/events", json=completed_payload)
+        assert (await first.json())["native_handoff"]["protocol"] == (
+            "hfc-native-handoff-v2"
+        )
+    finally:
+        await first_client.close()
+
+    identity = handoff_identity_key(
+        profile_id="default",
+        chat_id="oc_abc",
+        conversation_id="conversation-1",
+        message_id=message_id,
+    )
+    state_payload = json.loads(store.path.read_text(encoding="utf-8"))
+    state_payload["records"][identity]["uuid_seed"] = "f" * 32
+    store.path.write_text(json.dumps(state_payload), encoding="utf-8")
+    store.path.chmod(0o600)
+
+    second_app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=NativeHandoffStore(
+            state_root,
+            now=lambda: 101.0,
+        ),
+    )
+    second_client = TestClient(TestServer(second_app))
+    await second_client.start_server()
+    try:
+        repeated = await second_client.post("/events", json=completed_payload)
+
+        assert repeated.status == 503
+        assert await repeated.json() == {
+            "ok": False,
+            "error": "native handoff state unavailable",
+        }
+        metrics = (await (await second_client.get("/health")).json())["metrics"]
+        assert metrics["native_handoff_fence_restore_refusals"] == 1
+    finally:
+        await second_client.close()
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [
@@ -5324,12 +5547,17 @@ async def test_in_memory_native_terminal_refuses_mismatched_fence_restore(
     await test_client.start_server()
     generation = "a" * 32
     message_id = "message-state-mismatch"
+    answer = "STATE-MISMATCH-NATIVE-" + ("密" * 40_000)
     completed_payload = event_payload(
         "message.completed",
         1,
         {
-            "answer": "STATE-MISMATCH-NATIVE-" + ("密" * 40_000),
-            "native_handoff": exact_handoff_metadata(generation, "b" * 64),
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                generation,
+                "b" * 64,
+                answer=answer,
+            ),
         },
         message_id=message_id,
     )
@@ -5380,6 +5608,7 @@ async def test_native_descriptor_returns_before_slow_notice_and_survives_notice_
     await first_client.start_server()
     generation = "7" * 32
     obligation_key = "8" * 64
+    answer = "SLOW-NATIVE-" + ("密" * 40_000)
     try:
         await first_client.post(
             "/events",
@@ -5397,9 +5626,11 @@ async def test_native_descriptor_returns_before_slow_notice_and_survives_notice_
                 "message.completed",
                 1,
                 {
-                    "answer": "SLOW-NATIVE-" + ("密" * 40_000),
+                    "answer": answer,
                     "native_handoff": exact_handoff_metadata(
-                        generation, obligation_key
+                        generation,
+                        obligation_key,
+                        answer=answer,
                     ),
                 },
                 message_id="message-slow-native-notice",
@@ -5430,7 +5661,7 @@ async def test_native_descriptor_returns_before_slow_notice_and_survives_notice_
         {
             "protocol": "hfc-native-handoff-recovery-v2",
             "obligation_key": obligation_key,
-            "content_hash": "c" * 64,
+            "content_hash": exact_content_hash(answer),
             "plan_fingerprint": "d" * 64,
             "route": "create",
             "target_hash": derive_native_handoff_target_hash(
@@ -5749,12 +5980,17 @@ async def test_completed_first_new_generation_rechecks_card_policy(tmp_path):
     app = create_app(FakeFeishuClient(), native_handoff_store=store)
     test_client = TestClient(TestServer(app))
     await test_client.start_server()
+    answer = "NEW-COMPLETED-FIRST-" + ("密" * 40_000)
     payload = event_payload(
         "message.completed",
         0,
         {
-            "answer": "NEW-COMPLETED-FIRST-" + ("密" * 40_000),
-            "native_handoff": exact_handoff_metadata("2" * 32, "3" * 64),
+            "answer": answer,
+            "native_handoff": exact_handoff_metadata(
+                "2" * 32,
+                "3" * 64,
+                answer=answer,
+            ),
         },
         message_id=message_id,
         created_at=201.0,

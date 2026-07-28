@@ -51,9 +51,11 @@ from .native_handoff import (
     NativeHandoffRecord,
     NativeHandoffStore,
     NativeHandoffStoreError,
+    derive_native_handoff_content_hash,
     derive_native_handoff_target_hash,
     derive_native_handoff_uuid_seed,
     handoff_identity_key,
+    is_exact_native_text_scope,
 )
 from .operations import (
     OperationRecord,
@@ -2576,6 +2578,8 @@ def _native_handoff_ack_capable(
     if not complete:
         return False
     data = event.data if isinstance(event.data, dict) else {}
+    if event.event != "message.completed" or not is_exact_native_text_scope(data):
+        return False
     profile_id = str(data.get("profile_id") or "").strip()
     profile_source = str(data.get("profile_source") or "")
     if profile_id != "default" or profile_source.startswith("sanitized_"):
@@ -2598,7 +2602,9 @@ def _native_handoff_ack_capable(
     except ValueError:
         return False
     return (
-        metadata.get("target_hash") == expected_target
+        metadata.get("content_hash")
+        == derive_native_handoff_content_hash(data["answer"])
+        and metadata.get("target_hash") == expected_target
         and metadata.get("provisional_uuid_seed") == expected_seed
     )
 
@@ -3022,8 +3028,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             prior_handoff = _get_native_handoff(request.app, handoff_identity)
         except (NativeHandoffStoreError, OSError, ValueError):
             logger.warning("native handoff state could not be read safely")
-            if has_native_terminal_session:
-                metrics.native_handoff_fence_restore_refusals += 1
+            metrics.native_handoff_fence_restore_refusals += 1
             metrics.events_rejected += 1
             return web.json_response(
                 {"ok": False, "error": "native handoff state unavailable"},
@@ -3102,13 +3107,28 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                     handoff_metadata,
                     incoming_event,
                 )
-                durable_exact = bool(
-                    prior_handoff.obligation_key
-                    and prior_handoff.content_hash
-                    and prior_handoff.plan_fingerprint
-                    and prior_handoff.route
-                    and prior_handoff.target_hash
+                durable_claimed = bool(
+                    prior_handoff.delivery_state
+                    in {"pending", "acked", "uncertain"}
+                    or any(
+                        (
+                            prior_handoff.uuid_seed,
+                            prior_handoff.obligation_key,
+                            prior_handoff.content_hash,
+                            prior_handoff.plan_fingerprint,
+                            prior_handoff.route,
+                            prior_handoff.target_hash,
+                        )
+                    )
                 )
+                durable_exact = prior_handoff.has_exact_delivery_binding
+                if durable_claimed and not durable_exact:
+                    metrics.native_handoff_fence_restore_refusals += 1
+                    metrics.events_rejected += 1
+                    return web.json_response(
+                        {"ok": False, "error": "native handoff state unavailable"},
+                        status=503,
+                    ), None
                 if (incoming_exact or durable_exact) and (
                     not incoming_exact
                     or not durable_exact

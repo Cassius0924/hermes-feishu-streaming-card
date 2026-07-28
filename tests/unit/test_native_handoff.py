@@ -199,6 +199,33 @@ def test_ack_capable_begin_requires_complete_exact_delivery_binding(tmp_path):
         )
 
 
+def test_legacy_begin_discards_all_pseudo_exact_fields(tmp_path):
+    store = NativeHandoffStore(tmp_path / "state", now=lambda: 100.0)
+
+    record, created = store.begin_no_card(
+        _identity(),
+        event_created_at=90.0,
+        generation=_generation(),
+        ack_capable=False,
+        obligation_key=_obligation(),
+        content_hash="not-a-hash",
+        plan_fingerprint=_plan_fingerprint(),
+        route="thread-create",
+        target_hash=_target_hash(route="thread-create"),
+        provisional_uuid_seed="f" * 32,
+    )
+
+    assert created is True
+    assert record.delivery_state == "legacy_consumed"
+    assert record.descriptor(now=100.0) is None
+    assert record.obligation_key == ""
+    assert record.content_hash == ""
+    assert record.plan_fingerprint == ""
+    assert record.route == ""
+    assert record.target_hash == ""
+    assert record.uuid_seed == ""
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [
@@ -423,12 +450,12 @@ def test_restore_delivery_fence_rejects_identity_conflicts_and_ack_rollback(
         **_exact_binding(),
     )
 
-    with pytest.raises(ValueError, match="conflicts"):
+    with pytest.raises(ValueError, match="binding is invalid"):
         store.restore_delivery_fence_if_missing(
             identity,
             replace(pending, uuid_seed="f" * 32),
         )
-    with pytest.raises(ValueError, match="conflicts"):
+    with pytest.raises(ValueError, match="binding is invalid"):
         store.restore_delivery_fence_if_missing(
             identity,
             replace(pending, plan_fingerprint="f" * 64),
@@ -607,11 +634,22 @@ def test_store_reads_v2_ack_record_as_legacy_without_exact_binding(tmp_path):
 
     record = NativeHandoffStore(root, now=lambda: 101.0).get(identity)
 
-    assert record.delivery_state == "pending"
+    assert record.delivery_state == "uncertain"
     assert record.content_hash == ""
     assert record.plan_fingerprint == ""
     assert record.route == ""
-    with pytest.raises(ValueError, match="binding is required"):
+    assert record.descriptor(now=101.0) is None
+    forged_descriptor = {
+        "protocol": "hfc-native-handoff-v2",
+        "id": record.handoff_id,
+        "uuid_seed": record.uuid_seed,
+        "expires_at": record.expires_at,
+    }
+    with pytest.raises(ValueError, match="not exact"):
+        NativeHandoffStore(root, now=lambda: 101.0).acknowledge(
+            forged_descriptor
+        )
+    with pytest.raises(ValueError, match="not restorable"):
         NativeHandoffStore(root, now=lambda: 101.0).restore_delivery_fence_if_missing(
             identity,
             record,
@@ -625,6 +663,63 @@ def test_store_reads_v2_ack_record_as_legacy_without_exact_binding(tmp_path):
             obligation_key=_obligation(),
             **_exact_binding(),
         )
+
+
+def test_v2_pending_survives_unrelated_v4_write_as_legacy_uncertain(tmp_path):
+    root = tmp_path / "state"
+    legacy_identity = _identity()
+    writer = NativeHandoffStore(root, now=lambda: 100.0)
+    writer.begin_no_card(
+        legacy_identity,
+        event_created_at=90.0,
+        generation=_generation(),
+        ack_capable=True,
+        obligation_key=_obligation(),
+        **_exact_binding(),
+    )
+    path = root / "native-handoffs.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["version"] = 2
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+
+    migrated = NativeHandoffStore(root, now=lambda: 101.0)
+    legacy = migrated.get(legacy_identity)
+    assert legacy.delivery_state == "uncertain"
+    assert legacy.descriptor(now=101.0) is None
+    migrated.begin_no_card(
+        _identity(2),
+        event_created_at=100.0,
+        generation=_generation(2),
+        ack_capable=False,
+    )
+
+    reloaded = NativeHandoffStore(root, now=lambda: 102.0)
+    assert reloaded.get(legacy_identity).delivery_state == "uncertain"
+    assert reloaded.get(legacy_identity).descriptor(now=102.0) is None
+    assert reloaded.get(_identity(2)).delivery_state == "legacy_consumed"
+
+
+def test_store_rejects_v4_exact_record_with_wrong_derived_uuid_seed(tmp_path):
+    root = tmp_path / "state"
+    identity = _identity()
+    writer = NativeHandoffStore(root, now=lambda: 100.0)
+    writer.begin_no_card(
+        identity,
+        event_created_at=90.0,
+        generation=_generation(),
+        ack_capable=True,
+        obligation_key=_obligation(),
+        **_exact_binding(),
+    )
+    path = root / "native-handoffs.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["records"][identity]["uuid_seed"] = "f" * 32
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+
+    with pytest.raises(NativeHandoffStoreError, match="invalid"):
+        NativeHandoffStore(root, now=lambda: 101.0).get(identity)
 
 
 def test_store_rejects_partial_exact_binding_in_v3_state(tmp_path):

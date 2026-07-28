@@ -6731,17 +6731,19 @@ async def test_exact_base_attachments_never_advertise_ack_capability(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("profile_id", "profile_source", "expected_ack"),
+    ("profile_id", "profile_source", "delivery_kind", "expected_ack"),
     [
-        ("default", None, True),
-        ("work", None, False),
-        ("default", "sanitized_locals", False),
+        ("default", None, "", True),
+        ("default", None, "cron", False),
+        ("work", None, "", False),
+        ("default", "sanitized_locals", "", False),
     ],
 )
 async def test_exact_base_ack_is_limited_to_verified_default_profile(
     monkeypatch,
     profile_id,
     profile_source,
+    delivery_kind,
     expected_ack,
 ):
     async def no_pending(_local_vars):
@@ -6769,6 +6771,7 @@ async def test_exact_base_ack_is_limited_to_verified_default_profile(
             "profile_id": profile_id,
             "answer": "profile-scoped final",
             "created_at": 1777017600.0,
+            "delivery_kind": delivery_kind,
         }
     )
     if profile_source is not None:
@@ -6808,6 +6811,7 @@ async def test_exact_base_ack_is_limited_to_verified_default_profile(
             "images": [],
             "local_files": [],
             "media_files": [],
+            "delivery_kind": delivery_kind,
         }
     )
 
@@ -6816,6 +6820,77 @@ async def test_exact_base_ack_is_limited_to_verified_default_profile(
     assert len(registrations) == int(expected_ack)
     if not expected_ack:
         assert set(handoff) == {"generation"}
+
+
+@pytest.mark.parametrize(
+    "scope_mutation",
+    [
+        {"event": "message.failed"},
+        {"delivery_kind": "cron"},
+        {"delivery_kind": "command"},
+        {"attachments": [{"kind": "image", "name": "private.png"}]},
+        {"native_delivery": "required"},
+        {"attachments": None},
+        {"native_delivery": None},
+    ],
+)
+def test_gateway_rejects_exact_binding_outside_ordinary_text_scope(
+    scope_mutation,
+):
+    answer = "ordinary exact final"
+    obligation_key = "a" * 64
+    content_hash = hook_runtime._native_handoff_content_hash(answer)
+    plan_fingerprint = "b" * 64
+    route = "create"
+    target_hash = hook_runtime.derive_native_handoff_target_hash(
+        profile_id="default",
+        chat_id="oc_exact",
+        thread_id="",
+        route=route,
+    )
+    metadata = {
+        "generation": "c" * 32,
+        "capabilities": [
+            "native-ack-v2",
+            "stable-feishu-uuid-v2",
+            "exact-base-delivery-v1",
+        ],
+        "obligation_key": obligation_key,
+        "content_hash": content_hash,
+        "plan_fingerprint": plan_fingerprint,
+        "route": route,
+        "target_hash": target_hash,
+        "provisional_uuid_seed": hook_runtime.derive_native_handoff_uuid_seed(
+            obligation_key=obligation_key,
+            content_hash=content_hash,
+            plan_fingerprint=plan_fingerprint,
+            route=route,
+            target_hash=target_hash,
+        ),
+    }
+    data = {
+        "answer": answer,
+        "attachments": [],
+        "native_delivery": "allowed",
+        "profile_id": "default",
+        "profile_source": "fallback_default",
+        "native_handoff": metadata,
+    }
+    for field, value in scope_mutation.items():
+        if field == "event":
+            continue
+        if value is None:
+            data.pop(field, None)
+        else:
+            data[field] = value
+    payload = {
+        "event": scope_mutation.get("event", "message.completed"),
+        "chat_id": "oc_exact",
+        "thread_id": "",
+        "data": data,
+    }
+
+    assert hook_runtime._native_handoff_binding_from_payload(payload) is None
 
 
 @pytest.mark.asyncio
@@ -7098,6 +7173,8 @@ def _install_native_ack_context(
         "thread_id": thread_id,
         "data": {
             "answer": content,
+            "attachments": [],
+            "native_delivery": "allowed",
             "profile_id": "default",
             "profile_source": "fallback_default",
             "native_handoff": {

@@ -42,8 +42,10 @@ from .operations_transport import (
     sign_command_transport_proof,
 )
 from .native_handoff import (
+    derive_native_handoff_content_hash,
     derive_native_handoff_target_hash,
     derive_native_handoff_uuid_seed,
+    is_exact_native_text_scope,
 )
 from .status import normalize_display_status
 from .runtime_control import reset_runtime_control_for_tests, start_runtime_control
@@ -1345,7 +1347,11 @@ def _exact_base_has_attachments(local_vars: dict[str, Any]) -> bool:
 def _exact_stage_allows_ack(stage: dict[str, Any]) -> bool:
     payload = stage.get("payload")
     data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, dict):
+    if (
+        not isinstance(data, dict)
+        or payload.get("event") != "message.completed"
+        or ("delivery_kind" in data and data["delivery_kind"] != "")
+    ):
         return False
     profile_id = str(data.get("profile_id") or "")
     profile_source = str(data.get("profile_source") or "")
@@ -1353,9 +1359,7 @@ def _exact_stage_allows_ack(stage: dict[str, Any]) -> bool:
 
 
 def _native_handoff_content_hash(content: Any) -> str:
-    return sha256(
-        b"hfc-native-content-v1\0" + str(content or "").encode("utf-8")
-    ).hexdigest()
+    return derive_native_handoff_content_hash(content)
 
 
 def _semantic_code_value(value: Any) -> Any:
@@ -1726,6 +1730,16 @@ async def prepare_exact_base_final_delivery(
             },
             ack_capable=ack_capable,
         )
+        if ack_capable and not is_exact_native_text_scope(payload.get("data")):
+            ack_capable = False
+            payload = _exact_terminal_payload(
+                stage,
+                {
+                    **local_vars,
+                    "plan_fingerprint": plan_fingerprint,
+                },
+                ack_capable=False,
+            )
         event_url = str(stage["event_url"])
         timeout = float(stage["timeout_seconds"])
         try:
@@ -4091,10 +4105,13 @@ def _validated_native_handoff_descriptor(value: Any) -> dict[str, Any] | None:
 
 
 def _native_handoff_binding_from_payload(payload: Any) -> dict[str, str] | None:
-    if not isinstance(payload, dict):
+    if (
+        not isinstance(payload, dict)
+        or payload.get("event") != "message.completed"
+    ):
         return None
     data = payload.get("data")
-    if not isinstance(data, dict):
+    if not is_exact_native_text_scope(data):
         return None
     chat_id = str(payload.get("chat_id") or "").strip()
     answer = str(data.get("answer") or "")
