@@ -53,10 +53,14 @@ jobs:
           FEISHU_APP_SECRET: test_only_not_a_real_secret
           HFC_VERSION: v4.1.0
         run: docker compose -f docker-compose.example.yml config --quiet
-      - name: Run unprivileged sidecar Compose smoke
+      - name: Start published Compose smoke topology
         run: >-
-          timeout 180 docker compose -f docker-compose.smoke.yml up
-          --abort-on-container-exit --exit-code-from probe --quiet-pull
+          docker compose -f docker-compose.smoke.yml up
+          --detach --wait --wait-timeout 180 --quiet-pull gateway
+      - name: Probe installed Gateway and sidecar
+        run: >-
+          timeout 30 docker compose -f docker-compose.smoke.yml run
+          --rm --no-deps probe
       - name: Clean Compose smoke resources
         if: always()
         run: docker compose -f docker-compose.smoke.yml down --volumes --remove-orphans

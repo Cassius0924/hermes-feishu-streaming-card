@@ -12,7 +12,7 @@ bindings:
     - smoke-native-chat
 
 integrity:
-  mode: off
+  mode: safe
 
 service:
   manager: detached

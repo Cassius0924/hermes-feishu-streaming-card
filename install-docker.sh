@@ -13,6 +13,12 @@ NO_PROMPT="${HFC_NO_PROMPT:-1}"
 SKIP_START="${HFC_SKIP_START:-0}"
 SERVICE_MANAGER="${HERMES_FEISHU_CARD_SERVICE_MANAGER:-detached}"
 STATE_DIR="${HERMES_FEISHU_CARD_STATE_DIR:-}"
+INSTALL_SOURCE="${HFC_INSTALL_SOURCE:-}"
+TEST_NOOP_DELIVERY="${HFC_TEST_NOOP_DELIVERY:-0}"
+
+# CI-only no-op mode is intentionally narrow: it cannot select the normal
+# remote package path, cannot start a service, and never changes credential
+# requirements unless an explicit absolute local source is also supplied.
 
 log() {
   printf '[hermes-feishu-card:docker] %s\n' "$*"
@@ -138,6 +144,25 @@ validate_paths() {
   [ -w "$(dirname "$CONFIG_PATH")" ] || fail "$(dirname "$CONFIG_PATH") is not writable. Check Docker volume ownership/root permissions for /opt/data."
 }
 
+validate_test_controls() {
+  case "$TEST_NOOP_DELIVERY" in
+    0|1) ;;
+    *) fail "HFC_TEST_NOOP_DELIVERY must be 0 or 1" ;;
+  esac
+  if [ -n "$INSTALL_SOURCE" ]; then
+    case "$INSTALL_SOURCE" in
+      /*) ;;
+      *) fail "HFC_INSTALL_SOURCE must be an absolute local directory: $INSTALL_SOURCE" ;;
+    esac
+    [ -d "$INSTALL_SOURCE" ] || fail "HFC_INSTALL_SOURCE must be a local directory: $INSTALL_SOURCE"
+    [ ! -L "$INSTALL_SOURCE" ] || fail "HFC_INSTALL_SOURCE must not be a symlink: $INSTALL_SOURCE"
+  fi
+  if [ "$TEST_NOOP_DELIVERY" = "1" ]; then
+    [ -n "$INSTALL_SOURCE" ] || fail "HFC_TEST_NOOP_DELIVERY requires HFC_INSTALL_SOURCE"
+    [ "$SKIP_START" = "1" ] || fail "HFC_TEST_NOOP_DELIVERY requires HFC_SKIP_START=1"
+  fi
+}
+
 prepare_private_state() {
   mkdir -p "$STATE_DIR"
   [ ! -L "$STATE_DIR" ] || fail "HFC state directory must not be a symlink: $STATE_DIR"
@@ -146,6 +171,10 @@ prepare_private_state() {
 }
 
 require_credentials() {
+  if [ "$TEST_NOOP_DELIVERY" = "1" ]; then
+    log "credential-free no-op delivery enabled for local-source smoke"
+    return 0
+  fi
   if [ -n "${FEISHU_APP_ID:-}" ] && [ -n "${FEISHU_APP_SECRET:-}" ]; then
     return 0
   fi
@@ -159,14 +188,21 @@ install_package() {
   local python_bin="$1"
   export PIP_ROOT_USER_ACTION="${PIP_ROOT_USER_ACTION:-ignore}"
   "$python_bin" -m pip --version >/dev/null 2>&1 || "$python_bin" -m ensurepip --upgrade >/dev/null
-  local tag
-  tag="$(resolve_version)"
-  local spec="git+https://github.com/$REPO.git"
-  if [ -n "$tag" ] && [ "$tag" != "latest" ]; then
-    spec="$spec@$tag"
+  local tag=""
+  local spec=""
+  if [ -n "$INSTALL_SOURCE" ]; then
+    spec="$INSTALL_SOURCE"
+  else
+    tag="$(resolve_version)"
+    spec="git+https://github.com/$REPO.git"
+    if [ -n "$tag" ] && [ "$tag" != "latest" ]; then
+      spec="$spec@$tag"
+    fi
   fi
   export HFC_INSTALL_SPEC="$spec"
-  if [ "$tag" = "latest" ]; then
+  if [ -n "$INSTALL_SOURCE" ]; then
+    log "installing local source $INSTALL_SOURCE into $python_bin"
+  elif [ "$tag" = "latest" ]; then
     log "installing $REPO (latest branch) into $python_bin"
   else
     log "installing $REPO@$tag into $python_bin"
@@ -210,6 +246,19 @@ run_doctor() {
 
 run_setup() {
   local python_bin="$1"
+  if [ "$TEST_NOOP_DELIVERY" = "1" ]; then
+    local install_args=(
+      -m hermes_feishu_card.cli install
+      --hermes-dir "$HERMES_DIR"
+      --yes
+    )
+    if [ "$NO_REPAIR" = "1" ]; then
+      install_args+=(--no-repair)
+    fi
+    log "running credential-free hook install smoke"
+    "$python_bin" "${install_args[@]}"
+    return
+  fi
   local setup_args=(
     -m hermes_feishu_card.cli setup
     --hermes-dir "$HERMES_DIR"
@@ -244,6 +293,9 @@ main() {
   CONFIG_PATH="$(expand_path "$CONFIG_PATH")"
   STATE_DIR="${STATE_DIR:-$(dirname "$CONFIG_PATH")/state}"
   STATE_DIR="$(expand_path "$STATE_DIR")"
+  if [ -n "$INSTALL_SOURCE" ]; then
+    INSTALL_SOURCE="$(expand_path "$INSTALL_SOURCE")"
+  fi
 
   export HFC_CONFIG="$CONFIG_PATH"
   export HFC_ENV_FILE="$ENV_FILE"
@@ -253,7 +305,10 @@ main() {
   export HERMES_FEISHU_CARD_SERVICE_MANAGER="$SERVICE_MANAGER"
   export HERMES_FEISHU_CARD_STATE_DIR="$STATE_DIR"
   export HFC_NO_REPAIR="$NO_REPAIR"
+  export HFC_INSTALL_SOURCE="$INSTALL_SOURCE"
+  export HFC_TEST_NOOP_DELIVERY="$TEST_NOOP_DELIVERY"
 
+  validate_test_controls
   validate_paths
   prepare_private_state
   require_credentials

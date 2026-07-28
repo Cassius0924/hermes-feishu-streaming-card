@@ -479,6 +479,224 @@ def test_install_docker_sh_declares_container_defaults():
     assert 'STATE_DIR="${STATE_DIR:-$(dirname "$CONFIG_PATH")/state}"' in script
 
 
+def test_install_docker_sh_explicit_local_source_allows_credential_free_smoke(tmp_path):
+    hermes_dir = tmp_path / "opt" / "hermes"
+    data_dir = tmp_path / "opt" / "data"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text(
+        "# gateway\n", encoding="utf-8"
+    )
+    data_dir.mkdir(parents=True)
+    (data_dir / "config.yaml").write_text(
+        "server:\n  host: 127.0.0.1\n  port: 8765\n",
+        encoding="utf-8",
+    )
+    runtime_python = make_argument_capture_python(
+        hermes_dir / "venv" / "bin" / "python"
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(data_dir / "config.yaml"),
+            "HFC_ENV_FILE": str(data_dir / ".env"),
+            "HFC_INSTALL_SOURCE": str(ROOT),
+            "HFC_TEST_NOOP_DELIVERY": "1",
+            "HFC_SKIP_START": "1",
+            "HFC_PYTHON": str(runtime_python),
+        }
+    )
+    env.pop("FEISHU_APP_ID", None)
+    env.pop("FEISHU_APP_SECRET", None)
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    log = (tmp_path / "python.log").read_text(encoding="utf-8")
+    assert f"-m pip install --upgrade {ROOT}" in log
+    assert "git+https://" not in log
+    assert "hermes_feishu_card.cli doctor" in log
+    assert f"hermes_feishu_card.cli install --hermes-dir {hermes_dir} --yes" in log
+    assert "hermes_feishu_card.cli setup" not in log
+
+
+def test_install_docker_sh_noop_smoke_refuses_remote_install_source(tmp_path):
+    hermes_dir = tmp_path / "opt" / "hermes"
+    data_dir = tmp_path / "opt" / "data"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text(
+        "# gateway\n", encoding="utf-8"
+    )
+    data_dir.mkdir(parents=True)
+    runtime_python = make_argument_capture_python(
+        hermes_dir / "venv" / "bin" / "python"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(data_dir / "config.yaml"),
+            "HFC_ENV_FILE": str(data_dir / ".env"),
+            "HFC_TEST_NOOP_DELIVERY": "1",
+            "HFC_SKIP_START": "1",
+            "HFC_PYTHON": str(runtime_python),
+        }
+    )
+    env.pop("HFC_INSTALL_SOURCE", None)
+    env.pop("FEISHU_APP_ID", None)
+    env.pop("FEISHU_APP_SECRET", None)
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "HFC_TEST_NOOP_DELIVERY requires HFC_INSTALL_SOURCE" in result.stderr
+
+
+def test_install_docker_sh_local_source_alone_does_not_bypass_credentials(tmp_path):
+    hermes_dir = tmp_path / "opt" / "hermes"
+    data_dir = tmp_path / "opt" / "data"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text(
+        "# gateway\n", encoding="utf-8"
+    )
+    data_dir.mkdir(parents=True)
+    runtime_python = make_argument_capture_python(
+        hermes_dir / "venv" / "bin" / "python"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(data_dir / "config.yaml"),
+            "HFC_ENV_FILE": str(data_dir / ".env"),
+            "HFC_INSTALL_SOURCE": str(ROOT),
+            "HFC_SKIP_START": "1",
+            "HFC_PYTHON": str(runtime_python),
+        }
+    )
+    env.pop("HFC_TEST_NOOP_DELIVERY", None)
+    env.pop("FEISHU_APP_ID", None)
+    env.pop("FEISHU_APP_SECRET", None)
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "FEISHU_APP_ID/FEISHU_APP_SECRET are missing" in result.stderr
+
+
+def test_install_docker_sh_noop_smoke_rejects_relative_source(tmp_path):
+    hermes_dir = tmp_path / "opt" / "hermes"
+    data_dir = tmp_path / "opt" / "data"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text(
+        "# gateway\n", encoding="utf-8"
+    )
+    data_dir.mkdir(parents=True)
+    runtime_python = make_argument_capture_python(
+        hermes_dir / "venv" / "bin" / "python"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(data_dir / "config.yaml"),
+            "HFC_ENV_FILE": str(data_dir / ".env"),
+            "HFC_INSTALL_SOURCE": ".",
+            "HFC_TEST_NOOP_DELIVERY": "1",
+            "HFC_SKIP_START": "1",
+            "HFC_PYTHON": str(runtime_python),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "HFC_INSTALL_SOURCE must be an absolute local directory" in result.stderr
+
+
+def test_install_docker_sh_noop_smoke_rejects_symlink_source(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    source_link = tmp_path / "source-link"
+    source_link.symlink_to(source, target_is_directory=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "HFC_INSTALL_SOURCE": str(source_link),
+            "HFC_TEST_NOOP_DELIVERY": "1",
+            "HFC_SKIP_START": "1",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "HFC_INSTALL_SOURCE must not be a symlink" in result.stderr
+
+
+def test_install_docker_sh_noop_smoke_requires_skip_start():
+    env = os.environ.copy()
+    env.update(
+        {
+            "HFC_INSTALL_SOURCE": str(ROOT),
+            "HFC_TEST_NOOP_DELIVERY": "1",
+            "HFC_SKIP_START": "0",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "HFC_TEST_NOOP_DELIVERY requires HFC_SKIP_START=1" in result.stderr
+
+
 def test_install_docker_sh_makes_shared_state_private(tmp_path):
     hermes_dir = tmp_path / "opt" / "hermes"
     data_dir = tmp_path / "opt" / "data"
