@@ -38,6 +38,7 @@ from .event_auth import (
     NativeHandoffRecoveryProofVerifier,
     PolicyAuthenticationError,
     PolicyProofVerifier,
+    is_loopback_host,
 )
 from .flush import FlushController
 from .feishu_client import FeishuAPIError, build_delivery_uuid
@@ -106,6 +107,9 @@ BOT_ROUTER_KEY = web.AppKey("bot_router", Any)
 ROUTING_DIAGNOSTICS_KEY = web.AppKey("routing_diagnostics", dict)
 PROFILE_DIAGNOSTICS_KEY = web.AppKey("profile_diagnostics", dict)
 PROCESS_TOKEN_KEY = web.AppKey("process_token", str)
+PACKAGE_VERSION_KEY = web.AppKey("package_version", str)
+PYTHON_IDENTITY_KEY = web.AppKey("python_identity", str)
+SHUTDOWN_CALLBACK_KEY = web.AppKey("shutdown_callback", Any)
 METRICS_KEY = web.AppKey("metrics", SidecarMetrics)
 NOOP_MODE_KEY = web.AppKey("noop_mode", bool)
 EVENT_AUTH_REQUIRED_KEY = web.AppKey("event_auth_required", bool)
@@ -212,12 +216,21 @@ class _OperationsDiagnosticCapacityError(RuntimeError):
 
 
 class _AfterEofJsonResponse(web.Response):
-    def __init__(self, data: dict[str, object], after_eof: Any):
+    def __init__(
+        self,
+        data: dict[str, object],
+        after_eof: Any,
+        *,
+        status: int = 200,
+        after_eof_on_error: bool = True,
+    ):
         super().__init__(
             body=json.dumps(data, ensure_ascii=False).encode("utf-8"),
             content_type="application/json",
+            status=status,
         )
         self._after_eof = after_eof
+        self._after_eof_on_error = after_eof_on_error
 
     async def write_eof(self, data: bytes = b"") -> None:
         after_eof = self._after_eof
@@ -225,7 +238,7 @@ class _AfterEofJsonResponse(web.Response):
         try:
             await super().write_eof(data)
         except BaseException:
-            if callable(after_eof):
+            if self._after_eof_on_error and callable(after_eof):
                 try:
                     after_eof()
                 except Exception:
@@ -241,6 +254,8 @@ class _AfterEofJsonResponse(web.Response):
 def create_app(
     feishu_client: Any,
     process_token: str = "",
+    package_version: str = "",
+    python_identity: str = "",
     card_config: dict[str, Any] | None = None,
     bot_router: Any = None,
     operations_config_path: str | Path | None = None,
@@ -254,6 +269,7 @@ def create_app(
     runtime_integrity_state_directory: str | Path | None = None,
     delivery_policy: Any = None,
     native_handoff_store: NativeHandoffStore | None = None,
+    shutdown_callback: Callable[[], None] | None = None,
 ) -> web.Application:
     valid_transport_root = (
         isinstance(operations_transport_root_secret, bytes)
@@ -276,6 +292,9 @@ def create_app(
     app[SESSION_CARD_CONFIGS_KEY] = {}
     app[BOT_ROUTER_KEY] = bot_router
     app[PROCESS_TOKEN_KEY] = process_token
+    app[PACKAGE_VERSION_KEY] = str(package_version)
+    app[PYTHON_IDENTITY_KEY] = str(python_identity)
+    app[SHUTDOWN_CALLBACK_KEY] = shutdown_callback
     app[METRICS_KEY] = SidecarMetrics()
     app[NOOP_MODE_KEY] = bool(noop_mode)
     app[EVENT_AUTH_REQUIRED_KEY] = bool(event_auth_required)
@@ -373,6 +392,7 @@ def create_app(
     title = card_config.get("title")
     app[CARD_TITLE_KEY] = title if isinstance(title, str) else "Hermes Agent"
     app.router.add_get("/health", _health)
+    app.router.add_post("/control/shutdown", _control_shutdown)
     app.router.add_get("/messages/{message_id}/summary", _message_summary)
     app.router.add_get("/interactions/{interaction_id}", _interaction_result)
     app.router.add_post("/card/actions", _card_actions)
@@ -521,6 +541,8 @@ async def _health(request: web.Request) -> web.Response:
         ),
         "active_sessions": len(sessions),
         "process_pid": os.getpid(),
+        "package_version": request.app[PACKAGE_VERSION_KEY],
+        "python_identity": request.app[PYTHON_IDENTITY_KEY],
         "metrics": metrics.snapshot(),
         "reply_index": {
             "entries": len(request.app[CARD_SUMMARIES_KEY]),
@@ -571,6 +593,30 @@ async def _health(request: web.Request) -> web.Response:
         response["profiles"] = profile_stats
 
     return web.json_response(response)
+
+
+async def _control_shutdown(request: web.Request) -> web.Response:
+    expected = request.app[PROCESS_TOKEN_KEY]
+    supplied = request.headers.get("X-HFC-Process-Token", "")
+    callback = request.app[SHUTDOWN_CALLBACK_KEY]
+    if (
+        not request.remote
+        or not is_loopback_host(request.remote)
+        or not expected
+        or not supplied
+        or not secrets.compare_digest(supplied, expected)
+        or not callable(callback)
+    ):
+        return web.json_response(
+            {"ok": False, "error": "forbidden"},
+            status=403,
+        )
+    return _AfterEofJsonResponse(
+        {"ok": True, "status": "stopping"},
+        callback,
+        status=202,
+        after_eof_on_error=False,
+    )
 
 
 def _safe_delivery_policy_diagnostics(app: web.Application) -> dict[str, Any]:
@@ -5024,6 +5070,20 @@ def _full_diagnostic_hash(value: str) -> str:
     if not value:
         return ""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def python_executable_identity(executable: str | os.PathLike[str]) -> str:
+    """Return a path-free, domain-separated identity for a Python runtime."""
+    path = Path(executable).expanduser()
+    try:
+        canonical_parent = path.parent.resolve(strict=False)
+    except (OSError, RuntimeError):
+        canonical_parent = path.parent.absolute()
+    canonical = os.path.normcase(str(canonical_parent / path.name))
+    material = b"hermes-feishu-streaming-card:python-executable:v1\0" + os.fsencode(
+        canonical
+    )
+    return f"python-sha256:{hashlib.sha256(material).hexdigest()}"
 
 
 def _would_apply(session: CardSession, event: SidecarEvent) -> bool:

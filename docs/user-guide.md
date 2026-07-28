@@ -66,6 +66,8 @@ V3.8.2 起，最终答案保留在主内容区，pre-tool answer 会按“正文
 
 ## V4.1.0 投递策略、内容保护与运行安全
 
+V4.1.1 在不改变下述投递体验的前提下修复升级恢复：首次 heartbeat 等待不写持久化 fence；`integrity acknowledge-review` 受双 plan 检查、stopped sidecar、无 pidfile、target binding 与 CAS snapshot 约束；setup 以隔离 Python 复检 Hermes venv，并按 `/health` 的 package/Python identity 决定是否重启。detached 进程通过 token 认证自停，不再按数字 PID/PGID 强制 kill。完整恢复顺序见 [V4.1 安全控制与排障](wiki/v4.1-safety-controls.md)。
+
 按会话切换只使用精确匹配：
 
 ```yaml
@@ -508,7 +510,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.1.0`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.1.1`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -516,7 +518,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.1.0
+export HFC_VERSION=v4.1.1
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -801,6 +803,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
+| [v4.1.1](release-notes-v4.1.1.md) | 2026-07-28 | 升级恢复热修：heartbeat 等待不写 fence、受约束的 review acknowledgement、legacy pidfile/process fail-closed、setup 对齐 Hermes venv 与运行 identity |
 | [v4.1.0](release-notes-v4.1.0.md) | 2026-07-28 | 精确 per-chat 原生策略、超量表格无损 compact、认证 runtime 完整性与 strict repair、四种显式 service manager |
 | [v4.0.21](release-notes-v4.0.21.md) | 2026-07-28 | Issue #155：仅显式 `answer -> tool` 边界归档答案，避免 post-tool 最终答案进入 timeline；Issue #147 真实飞书验收已观测 completion card + native image、两段答案留在同一卡、无匹配原生重复或 uncertain-delivery warning；不宣称截图或桌面/移动端视觉 QA |
 | [v4.0.20](release-notes-v4.0.20.md) | 2026-07-22 | Issue #153：notice 异步 ACK 使用 `accepted`，真实 PATCH 失败增加脱敏指标和错误码 |

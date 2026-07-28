@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from pathlib import Path
+import stat
 import threading
 from typing import Any, Callable
 
 from .install.detect import detect_hermes
 from .install.integrity import execute_integrity_repair, plan_integrity_repair
-from .runtime_control import RuntimeIntegritySupervisor
+from .runtime_control import RuntimeIntegrityFenceBinding, RuntimeIntegritySupervisor
 
 
 _OPERATOR_INTEGRITY_MODES = frozenset({"safe", "notify", "off"})
@@ -51,6 +55,55 @@ _OPERATOR_INTEGRITY_REASONS = frozenset(
         "integrity_repair_refused",
     }
 )
+_HERMES_TARGET_IDENTITY_DOMAIN = b"hfc-hermes-target-identity-v1\0"
+_INTEGRITY_PLAN_FINGERPRINT_DOMAIN = b"hfc-integrity-plan-fingerprint-v1\0"
+_UNAVAILABLE_PLAN_FINGERPRINT = "integrity-evidence-unavailable-v1"
+
+
+def build_runtime_integrity_fence_binding(
+    hermes_root: str | Path,
+    plan_fingerprint: str,
+) -> RuntimeIntegrityFenceBinding:
+    """Bind a fence to an exact Hermes root identity and integrity plan."""
+    fingerprint = str(plan_fingerprint or "")
+    if (
+        not fingerprint
+        or len(fingerprint) > 256
+        or any(
+            ord(character) < 0x20 or ord(character) == 0x7F
+            for character in fingerprint
+        )
+    ):
+        raise ValueError("integrity plan fingerprint is invalid")
+    try:
+        resolved = Path(hermes_root).expanduser().resolve(strict=True)
+        before = resolved.lstat()
+        after = resolved.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Hermes target identity is unavailable") from exc
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+    ):
+        raise ValueError("Hermes target identity is unavailable")
+    target_evidence = json.dumps(
+        {
+            "device": int(before.st_dev),
+            "inode": int(before.st_ino),
+            "path": os.path.normcase(str(resolved)),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return RuntimeIntegrityFenceBinding(
+        target_identity=hashlib.sha256(
+            _HERMES_TARGET_IDENTITY_DOMAIN + target_evidence
+        ).hexdigest(),
+        plan_fingerprint=hashlib.sha256(
+            _INTEGRITY_PLAN_FINGERPRINT_DOMAIN + fingerprint.encode("utf-8")
+        ).hexdigest(),
+    )
 
 
 def sanitize_integrity_snapshot(snapshot: Any) -> dict[str, Any]:
@@ -148,7 +201,9 @@ class RuntimeIntegrityCoordinator:
             plan = self._planner(detection)
         except Exception:
             self._repair_refusals += 1
-            self.supervisor.mark_manual_review_required()
+            self.supervisor.mark_manual_review_required(
+                binding=self._fence_binding(_UNAVAILABLE_PLAN_FINGERPRINT)
+            )
             return self._record(
                 "manual_review_required",
                 "integrity_evidence_unavailable",
@@ -156,7 +211,18 @@ class RuntimeIntegrityCoordinator:
             )
 
         if plan.state == "installed":
-            self.supervisor.mark_restart_required()
+            if readiness_reason in {
+                "runtime_heartbeat_waiting",
+                "runtime_heartbeat_missing",
+            }:
+                return self._record(
+                    "idle",
+                    "recovery_not_required",
+                    attempted=False,
+                )
+            self.supervisor.mark_restart_required(
+                binding=self._fence_binding(str(plan.fingerprint))
+            )
             return self._record(
                 "restart_required",
                 "gateway_restart_required",
@@ -172,7 +238,9 @@ class RuntimeIntegrityCoordinator:
                 )
             self._last_refusal_evidence = refusal_evidence
             self._repair_refusals += 1
-            self.supervisor.mark_manual_review_required()
+            self.supervisor.mark_manual_review_required(
+                binding=self._fence_binding(str(plan.fingerprint))
+            )
             return self._record(
                 "manual_review_required",
                 str(getattr(plan, "reason", "integrity_evidence_invalid")),
@@ -197,14 +265,18 @@ class RuntimeIntegrityCoordinator:
             )
         except Exception:
             self._repair_refusals += 1
-            self.supervisor.mark_manual_review_required()
+            self.supervisor.mark_manual_review_required(
+                binding=self._fence_binding(str(plan.fingerprint))
+            )
             return self._record(
                 "manual_review_required",
                 "integrity_repair_refused",
                 attempted=True,
             )
         if getattr(result, "restart_required", False):
-            self.supervisor.mark_restart_required()
+            self.supervisor.mark_restart_required(
+                binding=self._fence_binding(str(plan.fingerprint))
+            )
         self._repair_successes += 1
         return self._record("repaired", "gateway_restart_required", attempted=True)
 
@@ -218,6 +290,18 @@ class RuntimeIntegrityCoordinator:
                 "repair_successes": self._repair_successes,
                 "repair_refusals": self._repair_refusals,
             }
+
+    def _fence_binding(
+        self,
+        plan_fingerprint: str,
+    ) -> RuntimeIntegrityFenceBinding | None:
+        try:
+            return build_runtime_integrity_fence_binding(
+                self.hermes_root,
+                plan_fingerprint,
+            )
+        except (OSError, ValueError):
+            return None
 
     def _record(
         self,

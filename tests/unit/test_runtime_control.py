@@ -13,8 +13,10 @@ from hermes_feishu_card.runtime_control import (
     RuntimeControlEmitter,
     RuntimeControlEvent,
     RuntimeControlValidationError,
+    RuntimeIntegrityFenceBinding,
     RuntimeIntegritySupervisor,
     RuntimeProofVerifier,
+    inspect_runtime_integrity_review,
     runtime_events_url,
     sign_runtime_request,
 )
@@ -32,6 +34,13 @@ def _payload(**changes):
     }
     payload.update(changes)
     return payload
+
+
+def _fence_binding(seed: str = "a") -> RuntimeIntegrityFenceBinding:
+    return RuntimeIntegrityFenceBinding(
+        target_identity=seed * 64,
+        plan_fingerprint=("b" if seed != "b" else "c") * 64,
+    )
 
 
 def test_runtime_control_event_accepts_only_bounded_safe_fields():
@@ -306,7 +315,7 @@ def test_restart_fence_survives_sidecar_restart_until_different_matching_hello(
             _payload(runtime_id=old_runtime_id, created_at=99.0)
         )
     )
-    first.mark_restart_required()
+    first.mark_restart_required(binding=_fence_binding())
 
     persisted = (state_root / "runtime-integrity-fence.json").read_text()
     assert old_runtime_id not in persisted
@@ -322,6 +331,14 @@ def test_restart_fence_survives_sidecar_restart_until_different_matching_hello(
         state_directory=state_root,
     )
     assert restarted.snapshot()["reason"] == "gateway_restart_required"
+
+    current = inspect_runtime_integrity_review(state_root)
+    with pytest.raises(ValueError, match="could not be acknowledged safely"):
+        runtime_control.acknowledge_runtime_integrity_review(
+            state_root,
+            expected_state_token=current.state_token,
+            expected_binding=_fence_binding("d"),
+        )
 
     assert restarted.record(
         RuntimeControlEvent.from_dict(
@@ -389,7 +406,7 @@ def test_restart_fence_without_pre_repair_runtime_requires_manual_resolution(
         state_directory=state_root,
     )
 
-    first.mark_restart_required()
+    first.mark_restart_required(binding=_fence_binding())
 
     assert first.snapshot()["reason"] == "manual_review_required"
     restarted = RuntimeIntegritySupervisor(
@@ -420,7 +437,7 @@ def test_manual_review_fence_survives_restart_and_matching_new_runtime_hello(
         now=lambda: 100.0,
         state_directory=state_root,
     )
-    first.mark_manual_review_required()
+    first.mark_manual_review_required(binding=_fence_binding())
 
     restarted = RuntimeIntegritySupervisor(
         mode="safe",
@@ -436,6 +453,200 @@ def test_manual_review_fence_survives_restart_and_matching_new_runtime_hello(
         )
     )
     assert restarted.snapshot()["reason"] == "manual_review_required"
+
+
+def test_acknowledge_manual_review_preserves_independent_restart_fence(tmp_path):
+    state_root = tmp_path / "private-state"
+    binding = _fence_binding()
+    first = RuntimeIntegritySupervisor(
+        mode="safe",
+        expected_hook_generation=RUNTIME_HOOK_GENERATION,
+        expected_package_version="4.1.0",
+        now=lambda: 100.0,
+        state_directory=state_root,
+    )
+    assert first.record(
+        RuntimeControlEvent.from_dict(
+            _payload(runtime_id="runtime-before-review-123", created_at=100.0)
+        )
+    )
+    first.mark_restart_required(binding=binding)
+    first.mark_manual_review_required(binding=binding)
+    before = json.loads(
+        (state_root / "runtime-integrity-fence.json").read_text(encoding="utf-8")
+    )
+
+    review = inspect_runtime_integrity_review(state_root)
+    assert review.binding == binding
+    assert runtime_control.acknowledge_runtime_integrity_review(
+        state_root,
+        expected_state_token=review.state_token,
+        expected_binding=binding,
+    ) is True
+
+    after = json.loads(
+        (state_root / "runtime-integrity-fence.json").read_text(encoding="utf-8")
+    )
+    assert after["manual_review_required"] is False
+    assert after["restart_required"] is True
+    assert after["pre_repair_runtime_hash"] == before["pre_repair_runtime_hash"]
+    restarted = RuntimeIntegritySupervisor(
+        mode="safe",
+        expected_hook_generation=RUNTIME_HOOK_GENERATION,
+        expected_package_version="4.1.0",
+        now=lambda: 101.0,
+        state_directory=state_root,
+    )
+    assert restarted.snapshot()["reason"] == "gateway_restart_required"
+
+
+def test_acknowledge_manual_review_is_noop_when_no_review_is_pending(tmp_path):
+    state_root = tmp_path / "private-state"
+    RuntimeIntegritySupervisor(mode="safe", state_directory=state_root)
+    review = inspect_runtime_integrity_review(state_root)
+
+    assert runtime_control.acknowledge_runtime_integrity_review(
+        state_root,
+        expected_state_token=review.state_token,
+        expected_binding=_fence_binding(),
+    ) is False
+
+
+def test_acknowledge_manual_review_clears_unresolvable_empty_hash_restart_fence(
+    tmp_path,
+):
+    state_root = tmp_path / "private-state"
+    state_root.mkdir(mode=0o700)
+    fence = state_root / "runtime-integrity-fence.json"
+    fence.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "restart_required": True,
+                "manual_review_required": True,
+                "pre_repair_runtime_hash": "",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fence.chmod(0o600)
+
+    review = inspect_runtime_integrity_review(state_root)
+    assert review.legacy_unbound_empty_restart is True
+    binding = _fence_binding()
+    with pytest.raises(ValueError, match="could not be acknowledged safely"):
+        runtime_control.acknowledge_runtime_integrity_review(
+            state_root,
+            expected_state_token=review.state_token,
+            expected_binding=binding,
+        )
+    assert runtime_control.acknowledge_runtime_integrity_review(
+        state_root,
+        expected_state_token=review.state_token,
+        expected_binding=binding,
+        allow_legacy_unbound_empty_restart=True,
+    ) is True
+
+    payload = json.loads(fence.read_text(encoding="utf-8"))
+    assert payload == {
+        "schema_version": "2",
+        "restart_required": False,
+        "manual_review_required": False,
+        "pre_repair_runtime_hash": "",
+        "target_identity": binding.target_identity,
+        "plan_fingerprint": binding.plan_fingerprint,
+    }
+
+
+def test_acknowledge_manual_review_refuses_non_private_fence(tmp_path):
+    state_root = tmp_path / "private-state"
+    binding = _fence_binding()
+    supervisor = RuntimeIntegritySupervisor(mode="safe", state_directory=state_root)
+    supervisor.mark_manual_review_required(binding=binding)
+    fence = state_root / "runtime-integrity-fence.json"
+    fence.chmod(0o644)
+
+    with pytest.raises(ValueError, match="could not be inspected safely"):
+        inspect_runtime_integrity_review(state_root)
+
+    assert json.loads(fence.read_text(encoding="utf-8"))["manual_review_required"]
+
+
+def test_bound_fence_acknowledge_rejects_wrong_binding_and_stale_snapshot(tmp_path):
+    state_root = tmp_path / "private-state"
+    binding = _fence_binding("a")
+    supervisor = RuntimeIntegritySupervisor(mode="safe", state_directory=state_root)
+    supervisor.mark_manual_review_required(binding=binding)
+    review = inspect_runtime_integrity_review(state_root)
+    before = (state_root / "runtime-integrity-fence.json").read_bytes()
+
+    with pytest.raises(ValueError, match="could not be acknowledged safely"):
+        runtime_control.acknowledge_runtime_integrity_review(
+            state_root,
+            expected_state_token=review.state_token,
+            expected_binding=_fence_binding("d"),
+        )
+    assert (state_root / "runtime-integrity-fence.json").read_bytes() == before
+
+    supervisor.mark_restart_required(binding=binding)
+    with pytest.raises(ValueError, match="could not be acknowledged safely"):
+        runtime_control.acknowledge_runtime_integrity_review(
+            state_root,
+            expected_state_token=review.state_token,
+            expected_binding=binding,
+        )
+    assert inspect_runtime_integrity_review(state_root).manual_review_required
+
+
+def test_legacy_unbound_nonempty_restart_fence_is_never_acknowledged(tmp_path):
+    state_root = tmp_path / "private-state"
+    state_root.mkdir(mode=0o700)
+    fence = state_root / "runtime-integrity-fence.json"
+    fence.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "restart_required": True,
+                "manual_review_required": True,
+                "pre_repair_runtime_hash": "d" * 64,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fence.chmod(0o600)
+    review = inspect_runtime_integrity_review(state_root)
+
+    assert review.legacy_unbound_empty_restart is False
+    with pytest.raises(ValueError, match="could not be acknowledged safely"):
+        runtime_control.acknowledge_runtime_integrity_review(
+            state_root,
+            expected_state_token=review.state_token,
+            expected_binding=_fence_binding(),
+            allow_legacy_unbound_empty_restart=True,
+        )
+    assert fence.read_text(encoding="utf-8").find('"schema_version": "1"') >= 0
+
+
+def test_new_persisted_fence_requires_binding_and_does_not_leak_target_path(tmp_path):
+    state_root = tmp_path / "private-state"
+    supervisor = RuntimeIntegritySupervisor(mode="safe", state_directory=state_root)
+
+    supervisor.mark_manual_review_required()
+    assert supervisor.snapshot()["reason"] == "manual_review_required"
+    assert not (state_root / "runtime-integrity-fence.json").exists()
+
+    binding = _fence_binding()
+    supervisor.mark_manual_review_required(binding=binding)
+    payload = (state_root / "runtime-integrity-fence.json").read_text(
+        encoding="utf-8"
+    )
+    assert '"schema_version":"2"' in payload
+    assert str(tmp_path) not in payload
+    assert inspect_runtime_integrity_review(state_root).binding == binding
 
 
 def test_fence_state_lstat_permission_error_fails_closed(monkeypatch, tmp_path):
@@ -559,7 +770,7 @@ def test_atomic_fence_write_never_replaces_or_unlinks_through_swapped_root(
         state_directory=state_root,
     )
 
-    supervisor.mark_restart_required()
+    supervisor.mark_restart_required(binding=_fence_binding())
 
     assert supervisor.snapshot()["reason"] == "manual_review_required"
     assert len(decoys) == 1
@@ -586,7 +797,7 @@ def test_atomic_fence_write_fails_closed_if_root_loses_private_mode(
         state_directory=state_root,
     )
 
-    supervisor.mark_restart_required()
+    supervisor.mark_restart_required(binding=_fence_binding())
 
     assert supervisor.snapshot()["reason"] == "manual_review_required"
 

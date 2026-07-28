@@ -48,6 +48,7 @@ from hermes_feishu_card.install.manifest import (
 from hermes_feishu_card.install.integrity import (
     IntegrityRepairRefused,
     build_integrity_provenance,
+    plan_integrity_repair,
     render_integrity_manifest_migration,
 )
 from hermes_feishu_card.install.recovery import (
@@ -65,9 +66,23 @@ from hermes_feishu_card.install.patcher import (
     remove_cron_patch,
     remove_patch_lenient,
 )
-from hermes_feishu_card.integrity import sanitize_integrity_snapshot
-from hermes_feishu_card.process import start_sidecar, status_sidecar, stop_sidecar
+from hermes_feishu_card.integrity import (
+    build_runtime_integrity_fence_binding,
+    sanitize_integrity_snapshot,
+)
+from hermes_feishu_card.runtime_control import (
+    acknowledge_runtime_integrity_review,
+    inspect_runtime_integrity_review,
+)
+from hermes_feishu_card.process import (
+    PIDFILE_NAME,
+    fetch_health,
+    start_sidecar,
+    status_sidecar,
+    stop_sidecar,
+)
 from hermes_feishu_card.render import render_card
+from hermes_feishu_card.server import python_executable_identity
 from hermes_feishu_card.session import CardSession
 
 
@@ -84,6 +99,11 @@ FEISHU_SDK_REQUIRED_PARAMETER = "extra_ua_tags"
 _RestoreIdentity = tuple[int, int]
 _RestoreEvidenceSnapshot = tuple[int, int, str]
 _CLI_SNAPSHOT_UNSET = object()
+OFFICIAL_INSTALLER_COMMAND = (
+    "bash <(curl -fsSL "
+    "https://raw.githubusercontent.com/baileyh8/"
+    "hermes-feishu-streaming-card/main/install.sh)"
+)
 
 
 class _CliTargetBinding:
@@ -224,8 +244,8 @@ def _build_parser() -> argparse.ArgumentParser:
     for command in ("start", "stop", "status"):
         process_parser = subparsers.add_parser(command)
         process_parser.add_argument("--config", default="config.yaml.example")
+        process_parser.add_argument("--env-file")
         if command in {"start", "status"}:
-            process_parser.add_argument("--env-file")
             process_parser.add_argument("--hermes-dir")
 
     smoke = subparsers.add_parser("smoke-feishu-card")
@@ -272,6 +292,30 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         required=True,
         help="confirm provenance migration and safe-mode activation",
+    )
+    integrity_acknowledge = integrity_subparsers.add_parser("acknowledge-review")
+    integrity_acknowledge.add_argument("--config", required=True)
+    integrity_acknowledge.add_argument("--hermes-dir", required=True)
+    integrity_acknowledge.add_argument(
+        "--env-file",
+        help=(
+            "configuration loading only; the state directory must be provided "
+            "with --state-dir"
+        ),
+    )
+    integrity_acknowledge.add_argument(
+        "--state-dir",
+        required=True,
+        help=(
+            "explicit sidecar state directory; this is never inferred from "
+            "--env-file"
+        ),
+    )
+    integrity_acknowledge.add_argument(
+        "--yes",
+        action="store_true",
+        required=True,
+        help="confirm clearing only the verified manual-review fence",
     )
 
     chats = subparsers.add_parser("chats")
@@ -360,6 +404,14 @@ def _run_setup(args: argparse.Namespace) -> int:
     if not detection.supported:
         print(_format_hermes_detection(detection), file=sys.stderr)
         return 1
+    try:
+        verified_hermes_root = _verified_explicit_hermes_root(
+            args.hermes_dir,
+            detection=detection,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     print("doctor: ok")
     print(_format_hermes_detection(detection))
     _print_hermes_streaming_guidance(Path(args.hermes_dir))
@@ -386,6 +438,14 @@ def _run_setup(args: argparse.Namespace) -> int:
     if install_code != 0:
         return install_code
 
+    try:
+        runtime_python, runtime_identity = _resolve_start_runtime_identity(
+            verified_hermes_root
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     if args.skip_start:
         print("start: skipped")
         print("setup ok")
@@ -393,19 +453,20 @@ def _run_setup(args: argparse.Namespace) -> int:
 
     try:
         default_env_path = config_path.parent / ".env"
-        if route_settings["env_path"] == default_env_path:
-            start_result = start_sidecar(config_path, config)
-        else:
-            start_result = start_sidecar(
-                config_path,
-                config,
-                env_file=route_settings["env_path"],
-            )
+        start_kwargs: dict[str, Any] = {
+            "hermes_dir": verified_hermes_root,
+            "python_executable": runtime_python,
+            "expected_package_version": PACKAGE_VERSION,
+            "expected_python_identity": runtime_identity,
+        }
+        if route_settings["env_path"] != default_env_path:
+            start_kwargs["env_file"] = route_settings["env_path"]
+        start_result = start_sidecar(config_path, config, **start_kwargs)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if start_result.startswith("failed:"):
-        print(f"error: {start_result}", file=sys.stderr)
+        _print_sidecar_start_failure(start_result)
         return 1
     if start_result == "already running":
         print("start: already running")
@@ -1318,27 +1379,121 @@ def _detect_hermes_runtime_python(hermes_root: Path | str) -> Path | None:
         root / ".venv" / "bin" / "python3",
         root / "venv" / "Scripts" / "python.exe",
         root / ".venv" / "Scripts" / "python.exe",
+        root / "gateway" / "venv" / "bin" / "python",
+        root / "gateway" / "venv" / "bin" / "python3",
+        root / "gateway" / ".venv" / "bin" / "python",
+        root / "gateway" / ".venv" / "bin" / "python3",
+        root / "gateway" / "venv" / "Scripts" / "python.exe",
+        root / "gateway" / ".venv" / "Scripts" / "python.exe",
     )
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
-            return candidate
+            try:
+                return candidate.parent.resolve(strict=True) / candidate.name
+            except (OSError, RuntimeError):
+                continue
     return None
+
+
+def _resolve_start_runtime_identity(
+    hermes_root: Path | str | None = None,
+) -> tuple[Path, str]:
+    if hermes_root is None:
+        candidate = Path(sys.executable).expanduser()
+        try:
+            runtime_python = (
+                candidate.parent.resolve(strict=True) / candidate.name
+                if candidate.is_file()
+                else None
+            )
+        except (OSError, RuntimeError):
+            runtime_python = None
+    else:
+        runtime_python = _detect_hermes_runtime_python(hermes_root)
+    if runtime_python is None:
+        raise ValueError(
+            "Sidecar runtime Python could not be verified. Rerun the official "
+            f"installer: {OFFICIAL_INSTALLER_COMMAND}"
+        )
+    report = _check_runtime_hook_import(runtime_python)
+    if report.get("status") != "ok" or report.get("version") != PACKAGE_VERSION:
+        raise ValueError(
+            "Sidecar runtime package does not match this CLI release. Rerun the "
+            f"official installer: {OFFICIAL_INSTALLER_COMMAND}"
+        )
+    if hermes_root is not None and not _runtime_report_uses_installed_package(
+        report, runtime_python
+    ):
+        raise ValueError(
+            "Hermes runtime package is not an isolated site-packages install. "
+            f"Rerun the official installer: {OFFICIAL_INSTALLER_COMMAND}"
+        )
+    return runtime_python, python_executable_identity(runtime_python)
+
+
+def _verified_explicit_hermes_root(
+    hermes_root: Path | str,
+    *,
+    detection: HermesDetection | None = None,
+) -> Path:
+    verified = detection if detection is not None else detect_hermes(hermes_root)
+    if not verified.supported:
+        raise ValueError("Explicit Hermes root could not be verified")
+    try:
+        return Path(verified.root).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Explicit Hermes root could not be canonicalized") from exc
+
+
+def _runtime_report_uses_installed_package(
+    report: dict[str, Any], runtime_python: Path
+) -> bool:
+    raw_location = str(report.get("location") or "").strip()
+    raw_prefix = str(report.get("prefix") or "").strip()
+    raw_roots = {
+        str(report.get(name) or "").strip()
+        for name in ("purelib", "platlib")
+    }
+    if not raw_location or not raw_prefix:
+        return False
+    try:
+        location = Path(raw_location).resolve(strict=True)
+        prefix = Path(raw_prefix).resolve(strict=True)
+        expected_prefix = runtime_python.parent.parent.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    if prefix != expected_prefix:
+        return False
+    for raw_root in raw_roots:
+        if not raw_root:
+            continue
+        try:
+            root = Path(raw_root).resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        root_belongs_to_runtime = root == prefix or prefix in root.parents
+        if root_belongs_to_runtime and (location == root or root in location.parents):
+            return True
+    return False
 
 
 def _check_runtime_hook_import(runtime_python: Path) -> dict[str, Any]:
     code = (
-        "import json; "
+        "import json, sys, sysconfig; "
         "import hermes_feishu_card as package; "
         "import hermes_feishu_card.hook_runtime; "
         "print(json.dumps({"
         "'version': getattr(package, '__version__', ''), "
-        "'location': getattr(package, '__file__', '')"
+        "'location': getattr(package, '__file__', ''), "
+        "'prefix': sys.prefix, "
+        "'purelib': sysconfig.get_path('purelib') or '', "
+        "'platlib': sysconfig.get_path('platlib') or ''"
         "}))"
     )
     cwd = _hermes_runtime_cwd(runtime_python)
     try:
         result = subprocess.run(
-            [str(runtime_python), "-c", code],
+            [str(runtime_python), "-I", "-c", code],
             check=False,
             capture_output=True,
             text=True,
@@ -1374,6 +1529,9 @@ def _check_runtime_hook_import(runtime_python: Path) -> dict[str, Any]:
             }
         version = str(metadata.get("version", "")).strip()
         location = str(metadata.get("location", "")).strip()
+        prefix = str(metadata.get("prefix", "")).strip()
+        purelib = str(metadata.get("purelib", "")).strip()
+        platlib = str(metadata.get("platlib", "")).strip()
         suffix = f" from {location}" if location else ""
         return {
             "checked": True,
@@ -1381,6 +1539,9 @@ def _check_runtime_hook_import(runtime_python: Path) -> dict[str, Any]:
             "python": str(runtime_python),
             "version": version,
             "location": location,
+            "prefix": prefix,
+            "purelib": purelib,
+            "platlib": platlib,
             "message": f"Hermes runtime can import hook_runtime{suffix}.",
         }
     detail = _summarize_process_output(result)
@@ -1956,24 +2117,35 @@ def _lifecycle_hook_check(args: argparse.Namespace) -> dict[str, object] | None:
             "blocking": True,
             "root": hermes_root,
         }
+    try:
+        verified_root = _verified_explicit_hermes_root(
+            hermes_root,
+            detection=detection,
+        )
+    except ValueError:
+        return {
+            "status": "manual_review_required",
+            "blocking": True,
+            "root": hermes_root,
+        }
 
     plan = plan_recovery(detection)
     if plan.state == "installed" and not plan.actions:
-        return {"status": "installed", "blocking": False, "root": hermes_root}
+        return {"status": "installed", "blocking": False, "root": verified_root}
     if plan.state == "clean":
-        return {"status": "not_installed", "blocking": False, "root": hermes_root}
+        return {"status": "not_installed", "blocking": False, "root": verified_root}
     if plan.state == "stale_unpatched":
         accepted = plan_recovery(detection, accept_hermes_upgrade=True)
         if accepted.executable:
             return {
                 "status": "upgrade_repair_required",
                 "blocking": True,
-                "root": hermes_root,
+                "root": verified_root,
             }
     return {
         "status": "manual_review_required",
         "blocking": True,
-        "root": hermes_root,
+        "root": verified_root,
     }
 
 
@@ -2012,6 +2184,28 @@ def _print_lifecycle_hook_check(
         print(f"hook.next: {doctor_command}", file=output)
 
 
+def _print_sidecar_start_failure(result: str) -> None:
+    lowered = result.lower()
+    pidfileless = (
+        "no verified pidfile" in lowered
+        or "has no pidfile" in lowered
+        or "pidfile-less" in lowered
+    )
+    if pidfileless:
+        print(
+            "error: a running sidecar cannot be managed safely without a "
+            "verified pidfile",
+            file=sys.stderr,
+        )
+        print(
+            "next: stop the old sidecar service manually, then rerun the "
+            f"official installer: {OFFICIAL_INSTALLER_COMMAND}",
+            file=sys.stderr,
+        )
+        return
+    print(f"error: {result}", file=sys.stderr)
+
+
 def _run_start(args: argparse.Namespace) -> int:
     try:
         config = (
@@ -2029,16 +2223,48 @@ def _run_start(args: argparse.Namespace) -> int:
         _print_lifecycle_hook_check(hook_check, file=sys.stderr)
         return 1
 
+    start_kwargs: dict[str, Any] = {}
+    if args.env_file is not None:
+        start_kwargs["env_file"] = args.env_file
+    verified_hermes_root: Path | None = None
+    if args.hermes_dir is not None:
+        try:
+            verified_hermes_root = (
+                Path(hook_check["root"]).expanduser().resolve(strict=True)
+                if hook_check is not None
+                else _verified_explicit_hermes_root(args.hermes_dir)
+            )
+        except (OSError, RuntimeError, ValueError):
+            print(
+                "error: Explicit Hermes root could not be verified. Rerun the "
+                f"official installer: {OFFICIAL_INSTALLER_COMMAND}",
+                file=sys.stderr,
+            )
+            return 1
     try:
-        if args.env_file is None:
-            result = start_sidecar(args.config, config)
-        else:
-            result = start_sidecar(args.config, config, env_file=args.env_file)
+        runtime_python, runtime_identity = _resolve_start_runtime_identity(
+            verified_hermes_root
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    start_kwargs.update(
+        {
+            "python_executable": runtime_python,
+            "expected_package_version": PACKAGE_VERSION,
+            "expected_python_identity": runtime_identity,
+        }
+    )
+    if verified_hermes_root is not None:
+        start_kwargs["hermes_dir"] = verified_hermes_root
+
+    try:
+        result = start_sidecar(args.config, config, **start_kwargs)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if result.startswith("failed:"):
-        print(f"error: {result}", file=sys.stderr)
+        _print_sidecar_start_failure(result)
         return 1
     if result == "already running":
         print("start: already running")
@@ -2049,7 +2275,11 @@ def _run_start(args: argparse.Namespace) -> int:
 
 def _run_stop(args: argparse.Namespace) -> int:
     try:
-        config = load_config(args.config)
+        config = (
+            load_config(args.config, env_file=args.env_file)
+            if args.env_file is not None
+            else load_config(args.config)
+        )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -2070,6 +2300,8 @@ def _run_stop(args: argparse.Namespace) -> int:
 
 
 def _run_integrity(args: argparse.Namespace) -> int:
+    if getattr(args, "integrity_command", None) == "acknowledge-review":
+        return _run_integrity_acknowledge_review(args)
     if getattr(args, "integrity_command", None) != "migrate-safe":
         print("error: an integrity subcommand is required", file=sys.stderr)
         return 2
@@ -2137,9 +2369,108 @@ def _run_integrity(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_integrity_acknowledge_review(args: argparse.Namespace) -> int:
+    try:
+        first_binding = _verified_integrity_acknowledgement_binding(
+            args.hermes_dir
+        )
+        config = (
+            load_config(args.config, env_file=args.env_file)
+            if args.env_file is not None
+            else load_config(args.config)
+        )
+        target_state = _integrity_state_directory(args)
+        review = inspect_runtime_integrity_review(target_state)
+        if not _integrity_acknowledgement_process_stopped(target_state, config):
+            print(
+                "error: stop the sidecar before acknowledging manual review",
+                file=sys.stderr,
+            )
+            return 1
+        second_binding = _verified_integrity_acknowledgement_binding(
+            args.hermes_dir
+        )
+        if second_binding != first_binding:
+            raise ValueError("runtime integrity acknowledgement binding changed")
+        if not _integrity_acknowledgement_process_stopped(target_state, config):
+            print(
+                "error: stop the sidecar before acknowledging manual review",
+                file=sys.stderr,
+            )
+            return 1
+        changed = acknowledge_runtime_integrity_review(
+            target_state,
+            expected_state_token=review.state_token,
+            expected_binding=first_binding,
+            allow_legacy_unbound_empty_restart=bool(
+                args.yes is True and review.legacy_unbound_empty_restart
+            ),
+        )
+    except (OSError, RuntimeError, ValueError):
+        print(
+            "error: manual review fence could not be acknowledged safely",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "integrity manual review: acknowledged"
+        if changed
+        else "integrity manual review: no pending fence"
+    )
+    print("next: restart sidecar and Hermes Gateway")
+    return 0
+
+
+def _verified_integrity_acknowledgement_binding(
+    hermes_dir: str | Path,
+):
+    detection = detect_hermes(hermes_dir)
+    if not detection.supported:
+        raise ValueError("Hermes install could not be verified")
+    recovery_plan = plan_recovery(detection)
+    if recovery_plan.state != "installed" or recovery_plan.actions:
+        raise ValueError("Hermes installed plan could not be verified")
+    integrity_plan = plan_integrity_repair(detection)
+    if (
+        integrity_plan.state != "installed"
+        or integrity_plan.executable
+        or integrity_plan.reason != "recovery_not_required"
+    ):
+        raise ValueError("Hermes integrity plan could not be verified")
+    return build_runtime_integrity_fence_binding(
+        detection.root,
+        integrity_plan.fingerprint,
+    )
+
+
+def _integrity_acknowledgement_process_stopped(target_state: Path, config) -> bool:
+    return bool(
+        _integrity_pidfile_absent(target_state)
+        and fetch_health(config) is None
+    )
+
+
+def _integrity_state_directory(args: argparse.Namespace) -> Path:
+    return Path(args.state_dir).expanduser()
+
+
+def _integrity_pidfile_absent(target_state: Path) -> bool:
+    try:
+        os.lstat(target_state / PIDFILE_NAME)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _run_status(args: argparse.Namespace) -> int:
     try:
-        config = load_config(args.config)
+        config = (
+            load_config(args.config, env_file=args.env_file)
+            if args.env_file is not None
+            else load_config(args.config)
+        )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

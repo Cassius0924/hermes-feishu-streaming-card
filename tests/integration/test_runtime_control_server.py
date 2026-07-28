@@ -9,6 +9,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from hermes_feishu_card import server as sidecar_server
 from hermes_feishu_card.runtime_control import (
     RUNTIME_HOOK_GENERATION,
+    RuntimeIntegrityFenceBinding,
     sign_runtime_request,
 )
 from hermes_feishu_card.server import create_app
@@ -133,7 +134,12 @@ def test_create_app_recovers_persisted_gateway_restart_fence(
     assert first_supervisor.record(
         sidecar_server.RuntimeControlEvent.from_dict(_payload())
     )
-    first_supervisor.mark_restart_required()
+    first_supervisor.mark_restart_required(
+        binding=RuntimeIntegrityFenceBinding(
+            target_identity="a" * 64,
+            plan_fingerprint="b" * 64,
+        )
+    )
 
     restarted = create_app(
         NeverCalledFeishuClient(),

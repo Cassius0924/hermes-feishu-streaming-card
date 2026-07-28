@@ -57,6 +57,31 @@ python3 -m hermes_feishu_card.cli status --config config.yaml.example
 
 `status` 应显示 `status: running`、`active_sessions` 和 metrics。未配置飞书凭据时会使用 no-op client；配置真实凭据时只从本机配置或环境变量读取。
 
+## 从 V4.1.0 升级到 V4.1.1
+
+V4.1.1 修复升级后“磁盘已是新版本、运行 sidecar 仍是旧解释器/旧包”以及首次 heartbeat 等待误写 fence 的边界。升级必须继续走官方 setup/install，不要手工修改 Hermes 源码：
+
+```bash
+hermes-feishu-card doctor --config CONFIG --hermes-dir HERMES_DIR --explain
+hermes-feishu-card stop --config CONFIG
+hermes-feishu-card setup --config CONFIG --hermes-dir HERMES_DIR --yes
+```
+
+setup 会使用检测到的 Hermes runtime venv 安装并复检 V4.1.1，并依据 `/health` 的 package version 与 Python identity 判断旧 sidecar 是否需要重启。若运行中的旧 sidecar 已无 pidfile，默认不会自动接管或 kill；先人工停止旧服务，再重跑 setup。不要用猜测的 PID 或宽泛 `pkill` 绕过该边界。
+
+仅当 `doctor --explain` 确认 on-disk plan 为 `installed`、sidecar health 已不可达且 state dir 内无 pidfile，但状态仍为 `manual_review_required` 时，才可执行：
+
+```bash
+hermes-feishu-card integrity acknowledge-review \
+  --config CONFIG \
+  --hermes-dir HERMES_DIR \
+  --yes
+```
+
+空 `pre_repair_runtime_hash` 表示 runtime 无法自行证明新旧进程，人工确认可解除该不可自清 fence；非空 hash 只解除 manual-review 位，Gateway restart fence 必须保留，直到不同 runtime id 且 generation/package 匹配的新 `runtime.hello` 到达。随后人工重启 sidecar 与 Hermes Gateway，再用 `doctor` / `/health` 确认 ready。任何 dirty target、未知 manifest/backup、非私有 state/fence 或残留 pidfile 都必须先人工处理，不能把 `acknowledge-review` 当强制清除。
+
+旧版 `0644` pidfile 只有位于当前用户拥有的私有 `0700` state dir、形状与 identity 均严格匹配时才能原 inode 收紧为 `0600`；其他情况 fail-closed。
+
 ## 升级到 V4.1.0
 
 V4.1.0 保持旧会话的卡片默认与旧配置的非自动变更边界。建议先升级包并重新运行 setup/install，再按需加入：

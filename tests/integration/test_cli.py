@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -233,6 +234,15 @@ def test_start_passes_explicit_env_file_to_sidecar(tmp_path, monkeypatch, capsys
     config_path.write_text("server: {}\n", encoding="utf-8")
     env_path.write_text("FEISHU_APP_ID=test-app\n", encoding="utf-8")
     started = {}
+    resolved = []
+    runtime_python = Path(sys.executable)
+    runtime_identity = "python-sha256:current-runtime"
+    monkeypatch.setattr(
+        cli_module,
+        "_resolve_start_runtime_identity",
+        lambda hermes_root=None: resolved.append(hermes_root)
+        or (runtime_python, runtime_identity),
+    )
     monkeypatch.setattr(
         cli_module,
         "start_sidecar",
@@ -245,13 +255,30 @@ def test_start_passes_explicit_env_file_to_sidecar(tmp_path, monkeypatch, capsys
     assert main(["start", "--config", str(config_path), "--env-file", str(env_path)]) == 0
     assert capsys.readouterr().err == ""
     assert started["path"] == config_path
-    assert started["kwargs"] == {"env_file": str(env_path)}
+    assert resolved == [None]
+    assert started["kwargs"] == {
+        "env_file": str(env_path),
+        "python_executable": runtime_python,
+        "expected_package_version": PACKAGE_VERSION,
+        "expected_python_identity": runtime_identity,
+    }
 
 
-def test_start_keeps_default_sidecar_arguments(tmp_path, monkeypatch, capsys):
+def test_start_without_hermes_dir_still_uses_verified_current_python_identity(
+    tmp_path, monkeypatch, capsys
+):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("server: {}\n", encoding="utf-8")
     started = {}
+    resolved = []
+    runtime_python = Path(sys.executable)
+    runtime_identity = "python-sha256:current-runtime"
+    monkeypatch.setattr(
+        cli_module,
+        "_resolve_start_runtime_identity",
+        lambda hermes_root=None: resolved.append(hermes_root)
+        or (runtime_python, runtime_identity),
+    )
     monkeypatch.setattr(
         cli_module,
         "start_sidecar",
@@ -260,7 +287,280 @@ def test_start_keeps_default_sidecar_arguments(tmp_path, monkeypatch, capsys):
 
     assert main(["start", "--config", str(config_path)]) == 0
     assert capsys.readouterr().err == ""
-    assert started == {"kwargs": {}}
+    assert resolved == [None]
+    assert started == {
+        "kwargs": {
+            "python_executable": runtime_python,
+            "expected_package_version": PACKAGE_VERSION,
+            "expected_python_identity": runtime_identity,
+        }
+    }
+
+
+def test_start_uses_verified_canonical_hermes_python_identity(
+    tmp_path, monkeypatch, capsys
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    hermes_root = tmp_path / "hermes"
+    runtime_bin = hermes_root / ".venv" / "bin"
+    runtime_bin.mkdir(parents=True)
+    runtime_python = runtime_bin / "python"
+    runtime_python.symlink_to(sys.executable)
+    runtime_site = hermes_root / ".venv" / "lib" / "python3.12" / "site-packages"
+    package_init = runtime_site / "hermes_feishu_card" / "__init__.py"
+    package_init.parent.mkdir(parents=True)
+    package_init.write_text("", encoding="utf-8")
+    started = {}
+    canonical_root = hermes_root.resolve()
+    monkeypatch.setattr(
+        cli_module,
+        "_lifecycle_hook_check",
+        lambda _args: {
+            "status": "installed",
+            "blocking": False,
+            "root": canonical_root,
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_check_runtime_hook_import",
+        lambda _python: {
+            "status": "ok",
+            "version": PACKAGE_VERSION,
+            "location": str(package_init),
+            "prefix": str(hermes_root / ".venv"),
+            "purelib": str(runtime_site),
+            "platlib": str(runtime_site),
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "start_sidecar",
+        lambda path, config, **kwargs: started.update(kwargs) or "started",
+    )
+
+    exit_code = main(
+        [
+            "start",
+            "--config",
+            str(config_path),
+            "--hermes-dir",
+            str(hermes_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0, captured.err
+    assert started["python_executable"] == runtime_python
+    assert started["hermes_dir"] == canonical_root
+    assert started["expected_package_version"] == PACKAGE_VERSION
+    assert started["expected_python_identity"].startswith("python-sha256:")
+    assert str(runtime_python) not in started["expected_python_identity"]
+
+
+def test_verified_explicit_hermes_root_uses_detection_root_not_raw_symlink(
+    tmp_path, monkeypatch
+):
+    canonical_root = tmp_path / "canonical-hermes"
+    canonical_root.mkdir()
+    linked_root = tmp_path / "linked-hermes"
+    linked_root.symlink_to(canonical_root, target_is_directory=True)
+    monkeypatch.setattr(
+        cli_module,
+        "detect_hermes",
+        lambda _raw: SimpleNamespace(supported=True, root=canonical_root),
+    )
+
+    assert cli_module._verified_explicit_hermes_root(linked_root) == canonical_root
+
+
+@pytest.mark.parametrize(
+    "runtime_report",
+    [
+        {"status": "failed"},
+        {"status": "ok", "version": "4.0.21"},
+        {
+            "status": "ok",
+            "version": PACKAGE_VERSION,
+            "location": "/private/source/hermes_feishu_card/__init__.py",
+            "purelib": "/private/venv/site-packages",
+            "platlib": "/private/venv/site-packages",
+        },
+    ],
+)
+def test_start_refuses_unverified_runtime_and_prints_official_installer_only(
+    runtime_report, tmp_path, monkeypatch, capsys
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    hermes_root = tmp_path / "private-hermes-root"
+    runtime_bin = hermes_root / "venv" / "bin"
+    runtime_bin.mkdir(parents=True)
+    (runtime_bin / "python").symlink_to(sys.executable)
+    monkeypatch.setattr(cli_module, "_lifecycle_hook_check", lambda _args: None)
+    monkeypatch.setattr(
+        cli_module,
+        "_verified_explicit_hermes_root",
+        lambda _root: hermes_root.resolve(),
+    )
+    monkeypatch.setattr(
+        cli_module, "_check_runtime_hook_import", lambda _python: runtime_report
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "start_sidecar",
+        lambda *_args, **_kwargs: pytest.fail("unverified runtime must not start"),
+    )
+
+    exit_code = main(
+        [
+            "start",
+            "--config",
+            str(config_path),
+            "--hermes-dir",
+            str(hermes_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "official installer" in captured.err.lower()
+    assert "https://raw.githubusercontent.com/baileyh8/hermes-feishu-streaming-card/main/install.sh" in captured.err
+    assert str(hermes_root) not in captured.out + captured.err
+
+
+def test_start_pidfileless_failure_gives_safe_manual_stop_next_step(
+    tmp_path, monkeypatch, capsys
+):
+    config_path = tmp_path / "config-with-private-name.yaml"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    monkeypatch.setattr(cli_module, "_lifecycle_hook_check", lambda _args: None)
+    monkeypatch.setattr(
+        cli_module,
+        "_resolve_start_runtime_identity",
+        lambda hermes_root=None: (Path(sys.executable), "python-sha256:test"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "start_sidecar",
+        lambda *_args, **_kwargs: (
+            "failed: running sidecar has no verified pidfile; manager transition refused"
+        ),
+    )
+
+    exit_code = main(["start", "--config", str(config_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "stop the old sidecar service manually" in captured.err
+    assert "official installer" in captured.err.lower()
+    assert str(config_path) not in captured.out + captured.err
+    assert "manager transition refused" not in captured.err
+
+
+def test_runtime_hook_import_probe_uses_isolated_python_and_reports_library_roots(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "version": PACKAGE_VERSION,
+                    "location": "/verified/site-packages/hermes_feishu_card/__init__.py",
+                    "prefix": "/verified",
+                    "purelib": "/verified/site-packages",
+                    "platlib": "/verified/site-packages",
+                }
+            )
+            + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli_module.subprocess, "run", fake_run)
+
+    report = cli_module._check_runtime_hook_import(Path(sys.executable))
+
+    assert report["status"] == "ok"
+    assert report["prefix"] == "/verified"
+    assert report["purelib"] == "/verified/site-packages"
+    assert report["platlib"] == "/verified/site-packages"
+    assert calls[0][0][:2] == [sys.executable, "-I"]
+    assert calls[0][0][2] == "-c"
+
+
+def test_current_python_identity_preserves_venv_entry_for_isolated_import(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        cli_module,
+        "_check_runtime_hook_import",
+        lambda runtime_python: {
+            "status": "ok",
+            "version": PACKAGE_VERSION,
+            "location": "/checkout/hermes_feishu_card/__init__.py",
+            "purelib": "/runtime/site-packages",
+            "platlib": "/runtime/site-packages",
+        },
+    )
+
+    runtime_python, runtime_identity = cli_module._resolve_start_runtime_identity()
+
+    executable = Path(sys.executable)
+    assert runtime_python == executable.parent.resolve(strict=True) / executable.name
+    assert runtime_identity.startswith("python-sha256:")
+
+
+@pytest.mark.parametrize("command", ["status", "stop"])
+def test_lifecycle_commands_use_explicit_env_file(
+    command, tmp_path, monkeypatch, capsys
+):
+    config_path = tmp_path / "config.yaml"
+    env_path = tmp_path / "selected.env"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    env_path.write_text("FEISHU_APP_ID=selected-app\n", encoding="utf-8")
+    loaded = []
+    config = {"server": {"host": "127.0.0.1", "port": 8765}}
+
+    def fake_load(path, *, env_file=None):
+        loaded.append((path, env_file))
+        return config
+
+    monkeypatch.setattr(cli_module, "load_config", fake_load)
+    if command == "status":
+        monkeypatch.setattr(
+            cli_module,
+            "status_sidecar",
+            lambda _config: {
+                "running": False,
+                "pid": None,
+                "health": None,
+                "manager": "detached",
+            },
+        )
+        monkeypatch.setattr(cli_module, "_lifecycle_hook_check", lambda _args: None)
+    else:
+        monkeypatch.setattr(cli_module, "stop_sidecar", lambda _config: "not running")
+
+    assert main(
+        [command, "--config", str(config_path), "--env-file", str(env_path)]
+    ) == 0
+
+    assert capsys.readouterr().err == ""
+    assert loaded == [(str(config_path), str(env_path))]
+
+
+def test_runtime_python_detection_includes_gateway_windows_candidate(tmp_path):
+    candidate = tmp_path / "gateway" / ".venv" / "Scripts" / "python.exe"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"python")
+
+    assert cli_module._detect_hermes_runtime_python(tmp_path) == candidate
 
 
 def test_status_reports_cron_metrics_when_sidecar_is_running(monkeypatch, capsys):
@@ -650,6 +950,9 @@ def test_module_doctor_json_reports_runtime_import_failure(tmp_path):
     runtime_python = venv_bin / "python"
     runtime_python.write_text(
         """#!/usr/bin/env bash
+if [ "$1" = "-I" ]; then
+  shift
+fi
 if [ "$1" = "-c" ]; then
   echo "No module named hermes_feishu_card" >&2
   exit 1
@@ -696,6 +999,9 @@ def test_module_doctor_json_reports_incompatible_hermes_feishu_sdk(tmp_path):
     runtime_python = venv_bin / "python"
     runtime_python.write_text(
         f"""#!/usr/bin/env bash
+if [ "$1" = "-I" ]; then
+  shift
+fi
 if [ "$1" = "-c" ]; then
   if [[ "$2" == *"lark_oapi.ws"* ]]; then
     printf '%s\\n' '{{"version":"1.5.3","supports_extra_ua_tags":false}}'

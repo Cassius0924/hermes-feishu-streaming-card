@@ -45,6 +45,17 @@ def copy_hermes(tmp_path):
     return hermes_dir
 
 
+def stub_setup_runtime(monkeypatch, hermes_dir):
+    runtime_python = hermes_dir / ".venv" / "bin" / "python"
+    identity = "python-sha256:" + "1" * 64
+    monkeypatch.setattr(
+        cli,
+        "_resolve_start_runtime_identity",
+        lambda _root: (runtime_python, identity),
+    )
+    return runtime_python, identity
+
+
 def initialize_git_fixture(hermes_dir):
     subprocess.run(["git", "-C", str(hermes_dir), "init", "-q"], check=True)
     subprocess.run(
@@ -516,6 +527,9 @@ def test_install_bootstraps_package_into_hermes_runtime_venv(tmp_path, monkeypat
         f"""#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$*" >> {str(runtime_log)!r}
+if [ "$1" = "-I" ]; then
+  shift
+fi
 if [ "$1" = "-c" ]; then
   if [ -f {str(marker)!r} ]; then
     printf '%s\\n' '{{"version":"{PACKAGE_VERSION}","location":"/runtime/hermes_feishu_card/__init__.py"}}'
@@ -558,6 +572,9 @@ def test_install_upgrades_importable_outdated_runtime_package(tmp_path, monkeypa
         f"""#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$*" >> {str(runtime_log)!r}
+if [ "$1" = "-I" ]; then
+  shift
+fi
 if [ "$1" = "-c" ]; then
   if [ -f {str(upgraded)!r} ]; then
     printf '%s\\n' '{{"version":"{PACKAGE_VERSION}","location":"/runtime/hermes_feishu_card/__init__.py"}}'
@@ -603,6 +620,9 @@ def test_install_skips_matching_runtime_package(tmp_path, monkeypatch):
         f"""#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$*" >> {str(runtime_log)!r}
+if [ "$1" = "-I" ]; then
+  shift
+fi
 if [ "$1" = "-c" ]; then
   printf '%s\\n' '{{"version":"{PACKAGE_VERSION}","location":"/runtime/hermes_feishu_card/__init__.py"}}'
   exit 0
@@ -642,6 +662,9 @@ def test_install_upgrades_incompatible_hermes_feishu_sdk(tmp_path, monkeypatch):
         f"""#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$*" >> {str(runtime_log)!r}
+if [ "$1" = "-I" ]; then
+  shift
+fi
 if [ "$1" = "-c" ]; then
   if [[ "$2" == *"lark_oapi.ws"* ]]; then
     if [ -f {str(upgraded)!r} ]; then
@@ -693,6 +716,9 @@ def test_install_does_not_accept_project_cwd_runtime_import_false_positive(
         f"""#!/usr/bin/env bash
 set -euo pipefail
 printf 'cwd=%s args=%s\\n' "$PWD" "$*" >> {str(runtime_log)!r}
+if [ "$1" = "-I" ]; then
+  shift
+fi
 if [ "$1" = "-c" ]; then
   if [ -f {str(marker)!r} ]; then
     printf '%s\\n' '{{"version":"{PACKAGE_VERSION}","location":"/runtime/hermes_feishu_card/__init__.py"}}'
@@ -730,14 +756,16 @@ exit 0
 
 def test_setup_creates_config_installs_hook_and_starts_sidecar(tmp_path, monkeypatch, capsys):
     hermes_dir = copy_hermes(tmp_path)
+    runtime_python, runtime_identity = stub_setup_runtime(monkeypatch, hermes_dir)
     config_path = tmp_path / "generated" / "feishu-card.yaml"
     started = {}
     monkeypatch.setenv("FEISHU_APP_ID", "cli_setup_test")
     monkeypatch.setenv("FEISHU_APP_SECRET", "setup-secret")
 
-    def fake_start_sidecar(path, config):
+    def fake_start_sidecar(path, config, **kwargs):
         started["path"] = Path(path)
         started["config"] = config
+        started["kwargs"] = kwargs
         return "started"
 
     def fake_status_sidecar(config):
@@ -774,6 +802,12 @@ def test_setup_creates_config_installs_hook_and_starts_sidecar(tmp_path, monkeyp
     assert started["config"]["feishu"]["app_id"] == "cli_setup_test"
     assert started["config"]["feishu"]["app_secret"] == "setup-secret"
     assert started["config"]["server"]["port"] == 8765
+    assert started["kwargs"] == {
+        "hermes_dir": hermes_dir.resolve(),
+        "python_executable": runtime_python,
+        "expected_package_version": PACKAGE_VERSION,
+        "expected_python_identity": runtime_identity,
+    }
     assert f"HERMES_DIR={hermes_dir}" in (config_path.parent / ".env").read_text(
         encoding="utf-8"
     )
@@ -786,6 +820,7 @@ def test_setup_updates_selected_profile_env_and_reports_route_chain(
     tmp_path, monkeypatch, capsys
 ):
     hermes_dir = copy_hermes(tmp_path)
+    stub_setup_runtime(monkeypatch, hermes_dir)
     config_path = tmp_path / "config.yaml"
     env_path = tmp_path / "selected.env"
     config_path.write_text(
@@ -862,6 +897,7 @@ profiles:
 
 def test_setup_starts_sidecar_with_selected_env_file(tmp_path, monkeypatch, capsys):
     hermes_dir = copy_hermes(tmp_path)
+    runtime_python, runtime_identity = stub_setup_runtime(monkeypatch, hermes_dir)
     config_path = tmp_path / "config.yaml"
     env_path = tmp_path / "selected.env"
     config_path.write_text("", encoding="utf-8")
@@ -890,7 +926,16 @@ def test_setup_starts_sidecar_with_selected_env_file(tmp_path, monkeypatch, caps
     )
 
     assert exit_code == 0, capsys.readouterr().err
-    assert started == {"path": config_path, "kwargs": {"env_file": env_path}}
+    assert started == {
+        "path": config_path,
+        "kwargs": {
+            "env_file": env_path,
+            "hermes_dir": hermes_dir.resolve(),
+            "python_executable": runtime_python,
+            "expected_package_version": PACKAGE_VERSION,
+            "expected_python_identity": runtime_identity,
+        },
+    }
     assert f"HERMES_DIR={hermes_dir}" in env_path.read_text(encoding="utf-8")
 
 
@@ -955,13 +1000,14 @@ def test_setup_warns_when_hermes_streaming_appears_disabled(
     tmp_path, monkeypatch, capsys
 ):
     hermes_dir = copy_hermes(tmp_path)
+    stub_setup_runtime(monkeypatch, hermes_dir)
     (hermes_dir / "config.yaml").write_text(
         "streaming:\n  enabled: false\n  transport: edit\n", encoding="utf-8"
     )
     config_path = tmp_path / "generated" / "feishu-card.yaml"
     monkeypatch.setenv("FEISHU_APP_ID", "cli_setup_test")
     monkeypatch.setenv("FEISHU_APP_SECRET", "setup-secret")
-    monkeypatch.setattr(cli, "start_sidecar", lambda *_args: "started")
+    monkeypatch.setattr(cli, "start_sidecar", lambda *_args, **_kwargs: "started")
     monkeypatch.setattr(
         cli,
         "status_sidecar",
@@ -998,6 +1044,7 @@ def test_setup_warns_when_feishu_streaming_override_is_disabled(
     tmp_path, monkeypatch, capsys
 ):
     hermes_dir = copy_hermes(tmp_path)
+    stub_setup_runtime(monkeypatch, hermes_dir)
     (hermes_dir / "config.yaml").write_text(
         (
             "streaming:\n"
@@ -1013,7 +1060,7 @@ def test_setup_warns_when_feishu_streaming_override_is_disabled(
     config_path = tmp_path / "generated" / "feishu-card.yaml"
     monkeypatch.setenv("FEISHU_APP_ID", "cli_setup_test")
     monkeypatch.setenv("FEISHU_APP_SECRET", "setup-secret")
-    monkeypatch.setattr(cli, "start_sidecar", lambda *_args: "started")
+    monkeypatch.setattr(cli, "start_sidecar", lambda *_args, **_kwargs: "started")
     monkeypatch.setattr(
         cli,
         "status_sidecar",
@@ -1046,6 +1093,7 @@ def test_setup_accepts_minimal_streaming_config_without_reasoning_display_warnin
     tmp_path, monkeypatch, capsys
 ):
     hermes_dir = copy_hermes(tmp_path)
+    stub_setup_runtime(monkeypatch, hermes_dir)
     (hermes_dir / "config.yaml").write_text(
         "streaming:\n  enabled: true\n  transport: edit\n",
         encoding="utf-8",
@@ -1053,7 +1101,7 @@ def test_setup_accepts_minimal_streaming_config_without_reasoning_display_warnin
     config_path = tmp_path / "generated" / "feishu-card.yaml"
     monkeypatch.setenv("FEISHU_APP_ID", "cli_setup_test")
     monkeypatch.setenv("FEISHU_APP_SECRET", "setup-secret")
-    monkeypatch.setattr(cli, "start_sidecar", lambda *_args: "started")
+    monkeypatch.setattr(cli, "start_sidecar", lambda *_args, **_kwargs: "started")
     monkeypatch.setattr(
         cli,
         "status_sidecar",
@@ -3397,10 +3445,11 @@ def test_setup_repair_rebuilds_missing_manifest_before_install(
     tmp_path, monkeypatch, capsys
 ):
     hermes_dir = copy_hermes(tmp_path)
+    stub_setup_runtime(monkeypatch, hermes_dir)
     config_path = tmp_path / "generated" / "feishu-card.yaml"
     monkeypatch.setenv("FEISHU_APP_ID", "cli_setup_repair")
     monkeypatch.setenv("FEISHU_APP_SECRET", "setup-repair-secret")
-    monkeypatch.setattr(cli, "start_sidecar", lambda *_args: "started")
+    monkeypatch.setattr(cli, "start_sidecar", lambda *_args, **_kwargs: "started")
     monkeypatch.setattr(
         cli,
         "status_sidecar",
@@ -3438,6 +3487,7 @@ def test_setup_auto_repairs_issue_82_corrupt_completion_marker(
     tmp_path, monkeypatch, capsys
 ):
     hermes_dir = copy_hermes(tmp_path)
+    stub_setup_runtime(monkeypatch, hermes_dir)
     config_path = tmp_path / "generated" / "feishu-card.yaml"
     monkeypatch.setenv("FEISHU_APP_ID", "cli_setup_auto_repair")
     monkeypatch.setenv("FEISHU_APP_SECRET", "setup-auto-repair-secret")
@@ -3445,7 +3495,7 @@ def test_setup_auto_repairs_issue_82_corrupt_completion_marker(
     monkeypatch.setattr(
         cli,
         "start_sidecar",
-        lambda *_args: started.append(True) or "started",
+        lambda *_args, **_kwargs: started.append(True) or "started",
     )
     monkeypatch.setattr(
         cli,

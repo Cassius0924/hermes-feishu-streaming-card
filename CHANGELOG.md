@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.1.1 — 2026-07-28
+
+See also: [docs/release-notes-v4.1.1.md](docs/release-notes-v4.1.1.md)
+
+### Fixed
+- `setup/install` now probes the detected Hermes runtime venv with isolated Python, verifies that the package comes from that venv's `site-packages`, and compares the package/Python identity reported by `/health`. Plain `start` also requires an isolated matching import; `start/status/stop` now share the selected env source.
+- Waiting for the first authenticated runtime heartbeat no longer creates a persistent restart/manual-review fence when the on-disk install is already verified.
+- Added `integrity acknowledge-review`, which works only with a twice-verified `installed` plan, a stopped sidecar, no pidfile, a matching target-bound fence, and an unchanged CAS snapshot. The known V4.1.0 unbound fence migrates only in its exact empty-hash form; non-empty legacy fences stay fail-closed.
+- A legacy `0644` pidfile is accepted only inside a private, owned `0700` state directory and is tightened through an open-file identity binding. A running pidfile-less sidecar is never silently adopted or killed.
+- Detached sidecars stop through a loopback-only, process-token-authenticated self-shutdown request. HFC no longer sends TERM/KILL to a numeric detached PID/PGID; unsupported legacy processes and shutdown timeouts remain running for manual handling.
+- Recovery instructions now require an operator to stop and review first, acknowledge only when eligible, then manually restart sidecar and Hermes Gateway. Automated, package, Linux/Docker, and real Feishu acceptance remain release gates rather than pre-declared results.
+
 ## V4.1.0 — 2026-07-28
 
 See also: [docs/release-notes-v4.1.0.md](docs/release-notes-v4.1.0.md)

@@ -123,6 +123,99 @@ def test_pid_record_read_refuses_non_private_file(monkeypatch, tmp_path):
     assert process.read_pid_record() is None
 
 
+def test_migrate_legacy_detached_pidfile_tightens_same_inode_only(
+    monkeypatch, tmp_path
+):
+    state_root = tmp_path / "legacy-state"
+    state_root.mkdir(mode=0o700)
+    record_path = state_root / "sidecar.pid"
+    original = b'{"pid":4321,"token":"legacy-token"}\n'
+    record_path.write_bytes(original)
+    record_path.chmod(0o644)
+    inode = record_path.stat().st_ino
+    monkeypatch.setattr(process, "state_dir", lambda: state_root)
+
+    assert process.migrate_legacy_pidfile_permissions() == "migrated"
+
+    assert record_path.stat().st_ino == inode
+    assert stat.S_IMODE(record_path.stat().st_mode) == 0o600
+    assert record_path.read_bytes() == original
+    assert process.read_pid_record() == {
+        "pid": 4321,
+        "token": "legacy-token",
+        "manager": "detached",
+    }
+
+
+@pytest.mark.parametrize("manager", ["systemd-user", "systemd-system"])
+def test_migrate_legacy_systemd_pidfile_accepts_only_fixed_unit_shape(
+    monkeypatch, tmp_path, manager
+):
+    state_root = tmp_path / "legacy-state"
+    state_root.mkdir(mode=0o700)
+    monkeypatch.setattr(process, "state_dir", lambda: state_root)
+    owner_uid = state_root.stat().st_uid
+    monkeypatch.setattr(process.os, "getuid", lambda: owner_uid)
+    unit = (
+        process.SYSTEMD_UNIT_NAME
+        if manager == "systemd-user"
+        else process._systemd_system_unit_name()
+    )
+    record_path = state_root / "sidecar.pid"
+    record_path.write_text(
+        '{"manager":'
+        + repr(manager).replace("'", '"')
+        + ',"pid":4321,"token":"legacy-token","unit":'
+        + repr(unit).replace("'", '"')
+        + "}\n",
+        encoding="utf-8",
+    )
+    record_path.chmod(0o644)
+
+    assert process.migrate_legacy_pidfile_permissions() == "migrated"
+    assert process.read_pid_record() == {
+        "pid": 4321,
+        "token": "legacy-token",
+        "manager": manager,
+        "unit": unit,
+    }
+
+
+def test_migrate_legacy_pidfile_refuses_non_private_state_root(
+    monkeypatch, tmp_path
+):
+    state_root = tmp_path / "legacy-state"
+    state_root.mkdir(mode=0o755)
+    state_root.chmod(0o755)
+    record_path = state_root / "sidecar.pid"
+    record_path.write_text(
+        '{"pid":4321,"token":"legacy-token"}\n', encoding="utf-8"
+    )
+    record_path.chmod(0o644)
+    monkeypatch.setattr(process, "state_dir", lambda: state_root)
+
+    assert process.migrate_legacy_pidfile_permissions().startswith("failed:")
+    assert stat.S_IMODE(record_path.stat().st_mode) == 0o644
+
+
+def test_migrate_legacy_pidfile_refuses_unknown_record_shape(
+    monkeypatch, tmp_path
+):
+    state_root = tmp_path / "legacy-state"
+    state_root.mkdir(mode=0o700)
+    record_path = state_root / "sidecar.pid"
+    original = (
+        b'{"pid":4321,"token":"legacy-token","unexpected":"value"}\n'
+    )
+    record_path.write_bytes(original)
+    record_path.chmod(0o644)
+    monkeypatch.setattr(process, "state_dir", lambda: state_root)
+
+    assert process.migrate_legacy_pidfile_permissions().startswith("failed:")
+    assert stat.S_IMODE(record_path.stat().st_mode) == 0o644
+    assert record_path.read_bytes() == original
+
+
 def test_pid_record_read_refuses_foreign_owned_file(monkeypatch, tmp_path):
     record_path = tmp_path / "sidecar.pid"
     record_path.write_text(
@@ -214,16 +307,67 @@ def test_start_sidecar_passes_selected_env_file_to_runner(monkeypatch, tmp_path)
     assert commands == [
         [
             process.sys.executable,
+            "-I",
             "-m",
             "hermes_feishu_card.runner",
             "--config",
             str(config_path),
-            "--env-file",
-            str(env_path),
-            "--token",
+                "--env-file",
+                str(env_path),
+                "--managed-pidfile",
+                "--token",
             commands[0][-1],
         ]
     ]
+
+
+def test_detached_start_uses_private_state_cwd_not_shadowing_caller(
+    monkeypatch, tmp_path
+):
+    state_root = tmp_path / "private-state"
+    shadow_root = tmp_path / "shadow-cwd"
+    (shadow_root / "hermes_feishu_card").mkdir(parents=True)
+    (shadow_root / "hermes_feishu_card" / "__init__.py").write_text(
+        "raise RuntimeError('shadow import used')\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(shadow_root)
+    monkeypatch.setattr(process, "fetch_health", lambda _config: None)
+    monkeypatch.setattr(process, "_systemd_user_available", lambda: False)
+    monkeypatch.setattr(process, "state_dir", lambda: state_root)
+    monkeypatch.setattr(process, "log_path", lambda: state_root / "sidecar.log")
+    monkeypatch.setattr(process, "write_pid_record", lambda *_args: None)
+    monkeypatch.setattr(process, "clear_pid", lambda: None)
+    monkeypatch.setattr(process, "stop_pid", lambda _pid: None)
+    monkeypatch.setattr(process.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(process.time, "monotonic", iter((0, 6)).__next__)
+    popen_kwargs = {}
+
+    def fake_popen(_command, **kwargs):
+        popen_kwargs.update(kwargs)
+        return SimpleNamespace(pid=123, poll=lambda: None)
+
+    monkeypatch.setattr(process.subprocess, "Popen", fake_popen)
+
+    result = process.start_sidecar(
+        tmp_path / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+
+    assert result == "failed: health check timed out"
+    assert popen_kwargs["cwd"] == str(state_root.resolve())
+    assert popen_kwargs["cwd"] != str(shadow_root)
+
+
+def test_systemd_working_directory_argument_escapes_specifiers(
+    monkeypatch, tmp_path
+):
+    state_root = tmp_path / "private state % tenant"
+    state_root.mkdir()
+    monkeypatch.setattr(process, "state_dir", lambda: state_root)
+
+    assert process._systemd_working_directory_arg() == (
+        f"--property=WorkingDirectory={str(state_root.resolve()).replace('%', '%%')}"
+    )
 
 
 def test_start_sidecar_auto_never_probes_system_manager(monkeypatch, tmp_path):
@@ -416,10 +560,22 @@ def test_sidecar_command_uses_absolute_config_and_env_paths(monkeypatch, tmp_pat
         "config.yaml",
         env_file="CUSTOM.env",
         token="sidecar-token",
+        hermes_dir="verified-hermes",
+        managed_pidfile=True,
     )
 
     assert command[command.index("--config") + 1] == str(tmp_path / "config.yaml")
     assert command[command.index("--env-file") + 1] == str(tmp_path / "CUSTOM.env")
+    assert command[command.index("--hermes-dir") + 1] == str(
+        tmp_path / "verified-hermes"
+    )
+    assert "--managed-pidfile" in command
+    assert command[:4] == [
+        process.sys.executable,
+        "-I",
+        "-m",
+        "hermes_feishu_card.runner",
+    ]
 
 
 def test_start_sidecar_explicit_detached_skips_all_systemd_detection(
@@ -598,6 +754,7 @@ def test_start_sidecar_uses_restartable_systemd_user_unit(monkeypatch, tmp_path)
             f"--unit={process.SYSTEMD_UNIT_NAME}",
             "--collect",
             f"--setenv=HERMES_FEISHU_CARD_STATE_DIR={tmp_path}",
+            f"--property=WorkingDirectory={tmp_path.resolve()}",
             "--property=Type=exec",
             "--property=Restart=on-failure",
             "--property=RestartSec=2s",
@@ -605,6 +762,7 @@ def test_start_sidecar_uses_restartable_systemd_user_unit(monkeypatch, tmp_path)
             f"--property=StandardError=append:{log_file}",
             "--",
             process.sys.executable,
+            "-I",
             "-m",
             "hermes_feishu_card.runner",
             "--config",
@@ -665,7 +823,9 @@ def test_systemd_start_rejects_boolean_health_pid(monkeypatch, tmp_path):
     assert stopped == [process.SYSTEMD_UNIT_NAME]
 
 
-def test_detached_start_requires_matching_health_pid(monkeypatch, tmp_path):
+def test_detached_start_timeout_never_signals_unmatched_health_pid(
+    monkeypatch, tmp_path
+):
     token = "fixed-sidecar-token"
     health_responses = iter(
         (
@@ -700,7 +860,7 @@ def test_detached_start_requires_matching_health_pid(monkeypatch, tmp_path):
     )
 
     assert result == "failed: health check timed out"
-    assert stopped == [123]
+    assert stopped == []
 
 
 def test_start_sidecar_uses_explicit_transient_system_unit(monkeypatch, tmp_path):
@@ -776,6 +936,7 @@ def test_start_sidecar_uses_explicit_transient_system_unit(monkeypatch, tmp_path
             f"--unit={unit}",
             "--collect",
             f"--setenv=HERMES_FEISHU_CARD_STATE_DIR={state_root}",
+            f"--property=WorkingDirectory={state_root.resolve()}",
             f"--uid={owner_uid}",
             "--gid=20",
             "--property=Type=exec",
@@ -787,6 +948,7 @@ def test_start_sidecar_uses_explicit_transient_system_unit(monkeypatch, tmp_path
             f"--property=StandardError=append:{log_file}",
             "--",
             process.sys.executable,
+            "-I",
             "-m",
             "hermes_feishu_card.runner",
             "--config",
@@ -866,8 +1028,9 @@ def test_start_sidecar_migrates_owned_process_into_systemd_unit(monkeypatch, tmp
         "process_pid": 4321,
         "process_token_hash": process.process_token_hash(new_token),
     }
-    health_responses = iter((old_health, new_health))
+    health_responses = iter((old_health, old_health, None, new_health))
     stopped: list[int] = []
+    shutdowns: list[str] = []
     cleared: list[bool] = []
     launched: list[list[str]] = []
 
@@ -879,12 +1042,17 @@ def test_start_sidecar_migrates_owned_process_into_systemd_unit(monkeypatch, tmp
         lambda: {"pid": 1234, "token": old_token},
     )
     monkeypatch.setattr(process, "stop_pid", lambda pid: stopped.append(pid))
+    monkeypatch.setattr(
+        process,
+        "_request_authenticated_shutdown",
+        lambda _config, token: shutdowns.append(token) or True,
+    )
     monkeypatch.setattr(process, "pid_is_running", lambda _pid: False)
     monkeypatch.setattr(process, "clear_pid", lambda: cleared.append(True))
     monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
     monkeypatch.setattr(process.secrets, "token_hex", lambda _length: new_token)
     monkeypatch.setattr(process, "_start_systemd_user_sidecar", lambda command: launched.append(command) or True)
-    monkeypatch.setattr(process.time, "monotonic", iter((0, 0)).__next__)
+    monkeypatch.setattr(process.time, "monotonic", iter((0, 0, 0, 0)).__next__)
     monkeypatch.setattr(process.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(process, "write_pid_record", lambda *_args, **_kwargs: None)
 
@@ -894,7 +1062,8 @@ def test_start_sidecar_migrates_owned_process_into_systemd_unit(monkeypatch, tmp
     )
 
     assert result == "started"
-    assert stopped == [1234]
+    assert stopped == []
+    assert shutdowns == [old_token]
     assert cleared == [True]
     assert launched
 
@@ -934,6 +1103,241 @@ def test_start_sidecar_refuses_unverified_manager_migration(monkeypatch, tmp_pat
     assert result == "failed: running sidecar identity mismatch; migration refused"
     assert stopped == []
     assert launched == []
+
+
+def test_start_sidecar_keeps_matching_owned_process_with_expected_identity(
+    monkeypatch, tmp_path
+):
+    token = "owned-token"
+    health = {
+        "status": "healthy",
+        "process_pid": 1234,
+        "process_token_hash": process.process_token_hash(token),
+        "package_version": "4.1.1",
+        "python_identity": "python-sha256:matching",
+    }
+    monkeypatch.setattr(process, "fetch_health", lambda _config: health)
+    monkeypatch.setattr(process, "_systemd_user_available", lambda: False)
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        process,
+        "read_pid_record",
+        lambda: {"pid": 1234, "token": token, "manager": "detached"},
+    )
+    monkeypatch.setattr(
+        process,
+        "stop_pid",
+        lambda _pid: (_ for _ in ()).throw(
+            AssertionError("matching process must not be stopped")
+        ),
+    )
+    monkeypatch.setattr(
+        process.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("matching process must not be relaunched")
+        ),
+    )
+
+    result = process.start_sidecar(
+        tmp_path / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+        python_executable="/verified/python",
+        expected_package_version="4.1.1",
+        expected_python_identity="python-sha256:matching",
+    )
+
+    assert result == "already running"
+
+
+@pytest.mark.parametrize(
+    "old_identity",
+    [
+        {},
+        {
+            "package_version": "4.1.0",
+            "python_identity": "python-sha256:different",
+        },
+    ],
+)
+def test_start_sidecar_restarts_owned_process_when_expected_identity_is_missing_or_mismatched(
+    monkeypatch, tmp_path, old_identity
+):
+    old_token = "old-token"
+    new_token = "new-token"
+    old_health = {
+        "status": "healthy",
+        "process_pid": 1234,
+        "process_token_hash": process.process_token_hash(old_token),
+        **old_identity,
+    }
+    new_health = {
+        "status": "healthy",
+        "process_pid": 4321,
+        "process_token_hash": process.process_token_hash(new_token),
+        "package_version": "4.1.1",
+        "python_identity": "python-sha256:target",
+    }
+    health_responses = iter((old_health, old_health, None, new_health))
+    stopped: list[int] = []
+    shutdowns: list[str] = []
+    cleared: list[bool] = []
+    commands: list[list[str]] = []
+    monkeypatch.setattr(process, "fetch_health", lambda _config: next(health_responses))
+    monkeypatch.setattr(process, "_systemd_user_available", lambda: False)
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(process, "log_path", lambda: tmp_path / "sidecar.log")
+    monkeypatch.setattr(
+        process,
+        "read_pid_record",
+        lambda: {"pid": 1234, "token": old_token, "manager": "detached"},
+    )
+    monkeypatch.setattr(process, "stop_pid", lambda pid: stopped.append(pid))
+    monkeypatch.setattr(
+        process,
+        "_request_authenticated_shutdown",
+        lambda _config, token: shutdowns.append(token) or True,
+    )
+    monkeypatch.setattr(process, "clear_pid", lambda: cleared.append(True))
+    monkeypatch.setattr(process.secrets, "token_hex", lambda _length: new_token)
+    monkeypatch.setattr(
+        process.subprocess,
+        "Popen",
+        lambda command, **_kwargs: commands.append(command)
+        or SimpleNamespace(pid=4321, poll=lambda: None),
+    )
+    monkeypatch.setattr(process, "write_pid_record", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(process.time, "monotonic", iter((0, 0, 0, 0)).__next__)
+
+    result = process.start_sidecar(
+        tmp_path / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+        python_executable="/verified/python",
+        expected_package_version="4.1.1",
+        expected_python_identity="python-sha256:target",
+    )
+
+    assert result == "started"
+    assert stopped == []
+    assert shutdowns == [old_token]
+    assert cleared == [True]
+    assert commands[0][0] == "/verified/python"
+
+
+def test_start_sidecar_refuses_identity_restart_when_health_changes_before_stop(
+    monkeypatch, tmp_path
+):
+    token = "owned-token"
+    initial = {
+        "status": "healthy",
+        "process_pid": 1234,
+        "process_token_hash": process.process_token_hash(token),
+        "package_version": "4.1.0",
+        "python_identity": "python-sha256:old",
+    }
+    changed = {
+        "status": "healthy",
+        "process_pid": 4321,
+        "process_token_hash": process.process_token_hash("replacement-token"),
+        "package_version": "4.1.0",
+        "python_identity": "python-sha256:old",
+    }
+    health_responses = iter((initial, changed))
+    stopped: list[int] = []
+    monkeypatch.setattr(process, "fetch_health", lambda _config: next(health_responses))
+    monkeypatch.setattr(process, "_systemd_user_available", lambda: False)
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        process,
+        "read_pid_record",
+        lambda: {"pid": 1234, "token": token, "manager": "detached"},
+    )
+    monkeypatch.setattr(process, "stop_pid", lambda pid: stopped.append(pid))
+    monkeypatch.setattr(
+        process.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("changed process must not be relaunched")
+        ),
+    )
+
+    result = process.start_sidecar(
+        tmp_path / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+        expected_package_version="4.1.1",
+        expected_python_identity="python-sha256:new",
+    )
+
+    assert result == "failed: running sidecar changed before stop"
+    assert stopped == []
+
+
+def test_stop_sidecar_refuses_when_health_changes_before_signal(
+    monkeypatch, tmp_path
+):
+    token = "owned-token"
+    initial = {
+        "status": "healthy",
+        "process_pid": 1234,
+        "process_token_hash": process.process_token_hash(token),
+    }
+    changed = {
+        "status": "healthy",
+        "process_pid": 4321,
+        "process_token_hash": process.process_token_hash("replacement-token"),
+    }
+    health_responses = iter((initial, changed))
+    stopped: list[int] = []
+    monkeypatch.setattr(process, "fetch_health", lambda _config: next(health_responses))
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        process,
+        "read_pid_record",
+        lambda: {"pid": 1234, "token": token, "manager": "detached"},
+    )
+    monkeypatch.setattr(process, "pid_is_running", lambda _pid: True)
+    monkeypatch.setattr(process, "stop_pid", lambda pid: stopped.append(pid))
+
+    result = process.stop_sidecar(
+        {"server": {"host": "127.0.0.1", "port": 8765}}
+    )
+
+    assert result == "failed: pidfile identity changed before stop"
+    assert stopped == []
+
+
+def test_start_sidecar_migrates_stale_dead_legacy_pidfile_before_cleanup(
+    monkeypatch, tmp_path
+):
+    record_path = tmp_path / process.PIDFILE_NAME
+    record_path.write_text(
+        '{"pid":4321,"token":"legacy-token"}\n', encoding="utf-8"
+    )
+    record_path.chmod(0o644)
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(process, "log_path", lambda: tmp_path / "sidecar.log")
+    monkeypatch.setattr(process, "fetch_health", lambda _config: None)
+    monkeypatch.setattr(process, "_systemd_user_available", lambda: False)
+    monkeypatch.setattr(process, "pid_is_running", lambda _pid: False)
+    cleared: list[bool] = []
+    monkeypatch.setattr(process, "clear_pid", lambda: cleared.append(True))
+    monkeypatch.setattr(
+        process.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            pid=9999, poll=lambda: 1, returncode=1
+        ),
+    )
+    monkeypatch.setattr(process, "write_pid_record", lambda *_args, **_kwargs: None)
+
+    result = process.start_sidecar(
+        tmp_path / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+
+    assert result == "failed: process exited with 1"
+    assert stat.S_IMODE(record_path.stat().st_mode) == 0o600
+    assert cleared == [True, True]
 
 
 def test_start_sidecar_recovers_explicit_systemd_user_when_health_is_unavailable(
@@ -1840,6 +2244,24 @@ def test_fetch_health_bypasses_proxy_for_loopback(monkeypatch):
     assert calls == [("http://127.0.0.1:8765/health", 0.4)]
 
 
+def test_fetch_health_for_specific_non_loopback_listener_uses_local_control_host(
+    monkeypatch,
+):
+    calls: list[tuple[str, float]] = []
+
+    class _NoProxyOpener:
+        def open(self, request, timeout):
+            calls.append((request.full_url, timeout))
+            return _HealthResponse()
+
+    monkeypatch.setattr(process, "_NO_PROXY_OPENER", _NoProxyOpener())
+
+    assert process.fetch_health(
+        {"server": {"host": "192.0.2.10", "port": 8765}}
+    ) == {"status": "healthy"}
+    assert calls == [("http://127.0.0.1:8765/health", 0.4)]
+
+
 def test_fetch_health_recognizes_degraded_sidecar_as_running(monkeypatch):
     class _NoProxyOpener:
         def open(self, _request, timeout):
@@ -1853,6 +2275,246 @@ def test_fetch_health_recognizes_degraded_sidecar_as_running(monkeypatch):
     )
 
     assert health == {"status": "degraded", "noop_mode": True}
+
+
+def test_authenticated_shutdown_posts_token_only_in_header_over_loopback(monkeypatch):
+    requests = []
+
+    class _ShutdownResponse:
+        status = 202
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self) -> bytes:
+            return b'{"ok":true,"status":"stopping"}'
+
+    class _NoProxyOpener:
+        def open(self, request, timeout):
+            requests.append((request, timeout))
+            return _ShutdownResponse()
+
+    monkeypatch.setattr(process, "_NO_PROXY_OPENER", _NoProxyOpener())
+    token = "private-process-token"
+
+    accepted = process._request_authenticated_shutdown(
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+        token,
+    )
+
+    assert accepted is True
+    request, timeout = requests[0]
+    assert request.full_url == "http://127.0.0.1:8765/control/shutdown"
+    assert request.method == "POST"
+    assert request.get_header("X-hfc-process-token") == token
+    assert token not in request.full_url
+    assert token not in (request.data or b"").decode("utf-8")
+    assert timeout == 0.8
+
+
+def test_authenticated_shutdown_for_specific_ipv6_listener_uses_ipv6_loopback(
+    monkeypatch,
+):
+    urls: list[str] = []
+
+    class _ShutdownResponse:
+        status = 202
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self) -> bytes:
+            return b'{"ok":true,"status":"stopping"}'
+
+    class _NoProxyOpener:
+        def open(self, request, timeout):
+            urls.append(request.full_url)
+            return _ShutdownResponse()
+
+    monkeypatch.setattr(process, "_NO_PROXY_OPENER", _NoProxyOpener())
+
+    assert process._request_authenticated_shutdown(
+        {"server": {"host": "2001:db8::10", "port": 8765}}, "owned-token"
+    ) is True
+    assert urls == ["http://[::1]:8765/control/shutdown"]
+
+
+def test_managed_pidfile_handshake_requires_exact_detached_pid_and_token(
+    monkeypatch,
+):
+    responses = iter(
+        (
+            None,
+            {"pid": 4444, "token": "wrong", "manager": "detached"},
+            {"pid": 4444, "token": "owned", "manager": "detached"},
+        )
+    )
+    monkeypatch.setattr(process, "read_pid_record", lambda: next(responses))
+    monkeypatch.setattr(process.time, "monotonic", iter((0, 0, 0, 0)).__next__)
+    monkeypatch.setattr(process.time, "sleep", lambda _seconds: None)
+
+    assert process.wait_for_managed_pidfile(4444, "owned", timeout=5) is True
+
+
+def test_detached_pidfile_write_failure_waits_for_managed_child_self_exit(
+    monkeypatch, tmp_path
+):
+    poll_results = iter((None, 1))
+    child = SimpleNamespace(pid=4444, poll=lambda: next(poll_results), returncode=1)
+    monkeypatch.setattr(process, "fetch_health", lambda _config: None)
+    monkeypatch.setattr(process, "_systemd_user_available", lambda: False)
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(process, "log_path", lambda: tmp_path / "sidecar.log")
+    monkeypatch.setattr(process.subprocess, "Popen", lambda *_args, **_kwargs: child)
+    monkeypatch.setattr(
+        process,
+        "write_pid_record",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
+    )
+    monkeypatch.setattr(process.time, "monotonic", iter((0, 0, 0)).__next__)
+    monkeypatch.setattr(process.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        process.os,
+        "kill",
+        lambda *_args: pytest.fail("pidfile failure must not signal child PID"),
+    )
+
+    result = process.start_sidecar(
+        tmp_path / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+
+    assert result == "failed: pidfile could not be written: OSError"
+
+
+def test_detached_health_timeout_keeps_valid_pidfile_without_unmanaged_orphan(
+    monkeypatch, tmp_path
+):
+    written = []
+    cleared = []
+    monkeypatch.setattr(process, "fetch_health", lambda _config: None)
+    monkeypatch.setattr(process, "_systemd_user_available", lambda: False)
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(process, "log_path", lambda: tmp_path / "sidecar.log")
+    monkeypatch.setattr(
+        process.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: SimpleNamespace(pid=4444, poll=lambda: None),
+    )
+    monkeypatch.setattr(
+        process,
+        "write_pid_record",
+        lambda pid, token, **kwargs: written.append((pid, token, kwargs)),
+    )
+    monkeypatch.setattr(process, "clear_pid", lambda: cleared.append(True))
+    monkeypatch.setattr(process.time, "monotonic", iter((0, 6)).__next__)
+
+    result = process.start_sidecar(
+        tmp_path / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+
+    assert result == "failed: health check timed out"
+    assert len(written) == 1
+    assert written[0][0] == 4444
+    assert written[0][2] == {}
+    assert cleared == []
+
+
+def test_stop_sidecar_uses_authenticated_self_shutdown_without_pid_signal(
+    monkeypatch, tmp_path
+):
+    token = "owned-token"
+    health = {
+        "status": "healthy",
+        "process_pid": 1234,
+        "process_token_hash": process.process_token_hash(token),
+    }
+    health_responses = iter((health, health, None))
+    shutdowns: list[tuple[dict, str]] = []
+    cleared: list[bool] = []
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        process,
+        "read_pid_record",
+        lambda: {"pid": 1234, "token": token, "manager": "detached"},
+    )
+    monkeypatch.setattr(process, "fetch_health", lambda config: next(health_responses))
+    monkeypatch.setattr(
+        process,
+        "_request_authenticated_shutdown",
+        lambda config, supplied: shutdowns.append((config, supplied)) or True,
+    )
+    monkeypatch.setattr(process, "clear_pid", lambda: cleared.append(True))
+    monkeypatch.setattr(
+        process.os,
+        "killpg",
+        lambda *_args: pytest.fail("detached shutdown must not signal a PGID"),
+    )
+    monkeypatch.setattr(
+        process.os,
+        "kill",
+        lambda *_args: pytest.fail("detached shutdown must not signal a PID"),
+    )
+    config = {"server": {"host": "127.0.0.1", "port": 8765}}
+
+    result = process.stop_sidecar(config)
+
+    assert result == "stopped"
+    assert shutdowns == [(config, token)]
+    assert cleared == [True]
+
+
+def test_stop_sidecar_pid_reuse_race_times_out_without_killing_replacement(
+    monkeypatch, tmp_path
+):
+    token = "owned-token"
+    initial = {
+        "status": "healthy",
+        "process_pid": 1234,
+        "process_token_hash": process.process_token_hash(token),
+    }
+    replacement = {
+        "status": "healthy",
+        "process_pid": 1234,
+        "process_token_hash": process.process_token_hash("replacement-token"),
+    }
+    health_responses = iter((initial, initial, replacement))
+    cleared: list[bool] = []
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        process,
+        "read_pid_record",
+        lambda: {"pid": 1234, "token": token, "manager": "detached"},
+    )
+    monkeypatch.setattr(process, "fetch_health", lambda _config: next(health_responses))
+    monkeypatch.setattr(process, "_request_authenticated_shutdown", lambda *_args: True)
+    monkeypatch.setattr(process, "clear_pid", lambda: cleared.append(True))
+    monkeypatch.setattr(process.time, "monotonic", iter((0, 0, 6)).__next__)
+    monkeypatch.setattr(process.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        process.os,
+        "killpg",
+        lambda *_args: pytest.fail("replacement PGID must never be signalled"),
+    )
+    monkeypatch.setattr(
+        process.os,
+        "kill",
+        lambda *_args: pytest.fail("replacement PID must never be signalled"),
+    )
+
+    result = process.stop_sidecar(
+        {"server": {"host": "127.0.0.1", "port": 8765}}
+    )
+
+    assert result == "failed: authenticated sidecar shutdown timed out"
+    assert cleared == []
 
 
 def test_pid_is_running_uses_windows_process_probe(monkeypatch):
@@ -1870,36 +2532,17 @@ def test_pid_is_running_uses_windows_process_probe(monkeypatch):
     assert calls == [1234]
 
 
-def test_stop_pid_uses_windows_taskkill(monkeypatch):
-    calls: list[list[str]] = []
-
-    def fake_run(args, **kwargs):
-        calls.append(list(args))
-        assert kwargs["stdout"] is subprocess.DEVNULL
-        assert kwargs["stderr"] is subprocess.DEVNULL
-        assert kwargs["timeout"] == 5
-        assert kwargs["check"] is False
-        return subprocess.CompletedProcess(args, 0)
-
-    monkeypatch.setattr(process.subprocess, "run", fake_run)
-    monkeypatch.setattr(process, "pid_is_running", lambda _pid: False)
-
-    process._stop_pid_windows(4321)
-
-    assert calls == [["taskkill", "/PID", "4321", "/T", "/F"]]
-
-
-def test_stop_pid_dispatches_to_windows_helper(monkeypatch):
-    calls: list[int] = []
-
-    monkeypatch.setattr(process.sys, "platform", "win32")
-    monkeypatch.setattr(process, "_stop_pid_windows", lambda pid: calls.append(pid))
+def test_numeric_pid_termination_is_disabled_on_all_platforms(monkeypatch):
     monkeypatch.setattr(
         process.os,
         "killpg",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("os.killpg should not be used")),
+        lambda *_args, **_kwargs: pytest.fail("numeric PGID termination is forbidden"),
+    )
+    monkeypatch.setattr(
+        process.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("taskkill is forbidden"),
     )
 
-    process.stop_pid(5678)
-
-    assert calls == [5678]
+    with pytest.raises(RuntimeError, match="disabled"):
+        process.stop_pid(5678)

@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.1.0`。它增加 per-chat native policy、无损表格 compact、认证 runtime integrity 与显式 sidecar service manager。V3.9.1 已于 2026-07-11 发布，V4.0.21 及更早版本保留为历史发布记录；V4.1.0 的真实飞书、Linux/Docker、public tag/install 和 exact merge SHA 门禁只有完成后才会标记通过。
+当前发布候选为 `4.1.1`。它在 V4.1.0 的 per-chat native policy、无损表格 compact、认证 runtime integrity 与显式 sidecar service manager 之上，修复升级恢复、heartbeat fence、人工 review acknowledgement、legacy pidfile/process 与 setup runtime identity。V3.9.1 已于 2026-07-11 发布；V4.1.0 及更早版本保留为历史发布记录。V4.1.1 的自动化、真实飞书、Linux/Docker、public tag/install 和 exact merge SHA 门禁只有完成后才会标记通过。
 
 ## 已具备
 
@@ -144,6 +144,14 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.1.1 发布门禁
+
+- 已验证 `installed` plan 在首次 heartbeat 等待/缺失时不执行 repair、不写 restart/manual-review fence；收到 matching `runtime.hello` 后恢复正常评估：**候选提交聚焦与全量回归通过**。
+- `integrity acknowledge-review` 只接受 installed + sidecar health 不可达 + 无 pidfile；empty hash 可解除不可自清 fence，non-empty hash 保留 restart fence 直到不同 runtime id 的 matching hello：**CLI、持久化与重启模拟通过**。
+- legacy `0644` pidfile 只在私有 owned `0700` state dir 中通过 fd identity 绑定收紧；pidfile-less 进程不自动接管/kill，要求人工停旧服务后重跑：**macOS 真实进程测试通过，Linux CI 待完成**。
+- setup 通过 Hermes runtime venv 安装/复检，并按 `/health` package version 与 Python identity 决定是否重启 sidecar；随后人工重启 sidecar 与 Gateway：**待本机、远端升级验收**。
+- 候选提交 `20b7b06`：完整 pytest **`2194 passed, 4 skipped`**，`git diff --check`、wheel/sdist 构建、隔离 `site-packages` provenance 与 wheel 真实进程测试 **`8 passed`**；**CI、exact merge SHA、public tagged install、Release assets、Linux/Docker 与真实飞书仍待发布流程完成**。
 
 ## V4.1.0 发布门禁
 

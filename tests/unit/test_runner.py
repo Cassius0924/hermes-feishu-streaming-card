@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 from pathlib import Path
 
@@ -128,7 +130,12 @@ def test_main_passes_boundary_to_create_app_when_bot_credentials_exist(
     assert captured["kwargs"]["operations_config_path"] == "config.yaml"
     assert captured["kwargs"]["integrity_mode"] == "notify"
     assert captured["kwargs"]["expected_runtime_package_version"] == runner.__version__
+    assert captured["kwargs"]["package_version"] == runner.__version__
+    assert captured["kwargs"]["python_identity"].startswith("python-sha256:")
+    assert sys.executable not in captured["kwargs"]["python_identity"]
     assert captured["kwargs"]["runtime_integrity_state_directory"] == private_state
+    with pytest.raises(runner.web.GracefulExit):
+        captured["kwargs"]["shutdown_callback"]()
     assert isinstance(
         captured["kwargs"]["delivery_policy"],
         ReloadingDeliveryPolicyProvider,
@@ -337,7 +344,9 @@ def test_main_passes_config_scoped_hermes_root_to_operations(monkeypatch, tmp_pa
     captured = {}
     monkeypatch.setattr(runner, "load_config", lambda path: config)
     monkeypatch.setattr(
-        runner, "resolve_operations_hermes_root", lambda **kwargs: hermes_root
+        runner,
+        "resolve_operations_hermes_root",
+        lambda _explicit=None, **_kwargs: hermes_root,
     )
     monkeypatch.setattr(
         runner, "create_app", lambda _client, **kwargs: captured.update(kwargs) or object()
@@ -346,6 +355,114 @@ def test_main_passes_config_scoped_hermes_root_to_operations(monkeypatch, tmp_pa
 
     assert main(["--config", str(config_path)]) == 0
     assert captured["operations_hermes_root"] == hermes_root
+
+
+def test_main_explicit_hermes_root_wins_over_conflicting_selected_env(
+    monkeypatch, tmp_path
+):
+    config = {"server": {"host": "127.0.0.1", "port": 0}, "feishu": {}, "card": {}}
+    config_path = tmp_path / "config.yaml"
+    env_path = tmp_path / "selected.env"
+    explicit_root = tmp_path / "verified-hermes"
+    conflicting_root = tmp_path / "wrong-hermes"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    env_path.write_text(f"HERMES_DIR={conflicting_root}\n", encoding="utf-8")
+    captured = {}
+    resolutions = []
+    monkeypatch.setattr(runner, "load_config", lambda path, **_kwargs: config)
+    monkeypatch.setattr(
+        runner,
+        "resolve_operations_hermes_root",
+        lambda explicit=None, **kwargs: resolutions.append((explicit, kwargs))
+        or Path(explicit),
+    )
+    monkeypatch.setattr(
+        runner, "create_app", lambda _client, **kwargs: captured.update(kwargs) or object()
+    )
+    monkeypatch.setattr(runner.web, "run_app", lambda *_args, **_kwargs: None)
+
+    assert main(
+        [
+            "--config",
+            str(config_path),
+            "--env-file",
+            str(env_path),
+            "--hermes-dir",
+            str(explicit_root),
+        ]
+    ) == 0
+    assert resolutions == [
+        (
+            str(explicit_root),
+            {"config_path": str(config_path), "env_file": str(env_path)},
+        )
+    ]
+    assert captured["operations_hermes_root"] == explicit_root
+
+
+@pytest.mark.parametrize(
+    ("configured_host", "expected_host"),
+    [
+        ("192.0.2.10", ["192.0.2.10", "127.0.0.1"]),
+        ("2001:db8::10", ["2001:db8::10", "::1"]),
+        ("0.0.0.0", "0.0.0.0"),
+        ("::", "::"),
+    ],
+)
+def test_main_adds_loopback_control_listener_only_for_specific_non_loopback_host(
+    configured_host, expected_host, monkeypatch
+):
+    config = {
+        "server": {
+            "host": configured_host,
+            "port": 8765,
+            "allow_non_loopback": True,
+        },
+        "feishu": {},
+        "card": {},
+    }
+    captured = {}
+    monkeypatch.setattr(runner, "load_config", lambda _path: config)
+    monkeypatch.setattr(runner, "ensure_transport_root_secret", lambda: b"r" * 32)
+    monkeypatch.setattr(runner, "transport_root_privacy_verified", lambda: True)
+    monkeypatch.setattr(runner, "create_app", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        runner.web,
+        "run_app",
+        lambda _app, **kwargs: captured.update(kwargs),
+    )
+
+    assert main(["--config", "config.yaml"]) == 0
+    assert captured["host"] == expected_host
+
+
+def test_managed_detached_runner_exits_before_listen_without_matching_pidfile(
+    monkeypatch,
+):
+    config = {"server": {"host": "127.0.0.1", "port": 8765}, "feishu": {}, "card": {}}
+    handshakes = []
+    monkeypatch.setattr(runner, "load_config", lambda _path: config)
+    monkeypatch.setattr(
+        runner,
+        "wait_for_managed_pidfile",
+        lambda pid, token: handshakes.append((pid, token)) or False,
+    )
+    monkeypatch.setattr(
+        runner.web,
+        "run_app",
+        lambda *_args, **_kwargs: pytest.fail("unmanaged runner must not listen"),
+    )
+
+    assert main(
+        [
+            "--config",
+            "config.yaml",
+            "--token",
+            "owned-token",
+            "--managed-pidfile",
+        ]
+    ) == 1
+    assert handshakes == [(runner.os.getpid(), "owned-token")]
 
 
 def test_main_passes_selected_env_file_to_operations_root_resolution(monkeypatch, tmp_path):

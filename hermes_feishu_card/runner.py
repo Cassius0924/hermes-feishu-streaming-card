@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import logging
+import os
+import sys
 from typing import Any
 
 from aiohttp import web
@@ -14,15 +16,26 @@ from .config import load_config, resolve_operations_hermes_root
 from .delivery_policy import ReloadingDeliveryPolicyProvider
 from .event_auth import is_loopback_host
 from .feishu_client import FeishuAPIError, FeishuClient, FeishuClientConfig
-from .server import create_app
+from .server import create_app, python_executable_identity
 from .operations_transport import (
     ensure_transport_root_secret,
     transport_root_privacy_verified,
 )
-from .process import state_dir
+from .process import local_control_host, state_dir, wait_for_managed_pidfile
 
 
 logger = logging.getLogger(__name__)
+
+
+def _request_process_shutdown() -> None:
+    raise web.GracefulExit()
+
+
+def _listener_hosts(configured_host: str) -> str | list[str]:
+    normalized = configured_host.strip().lower().strip("[]")
+    if normalized in {"", "0.0.0.0", "::"} or is_loopback_host(normalized):
+        return configured_host
+    return [configured_host, local_control_host(configured_host)]
 
 
 class NoopFeishuClient:
@@ -198,8 +211,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="hermes-feishu-card-sidecar")
     parser.add_argument("--config", default="config.yaml.example")
     parser.add_argument("--env-file")
+    parser.add_argument("--hermes-dir")
     parser.add_argument("--token", default="")
+    parser.add_argument("--managed-pidfile", action="store_true")
     args = parser.parse_args(argv)
+
+    if args.managed_pidfile and not wait_for_managed_pidfile(
+        os.getpid(), args.token
+    ):
+        logger.error("Managed detached sidecar pidfile handshake failed.")
+        return 1
 
     config = (
         load_config(args.config, env_file=args.env_file)
@@ -254,12 +275,16 @@ def main(argv: list[str] | None = None) -> int:
         create_app(
             boundary.client,
             process_token=args.token,
+            package_version=__version__,
+            python_identity=python_executable_identity(sys.executable),
+            shutdown_callback=_request_process_shutdown,
             card_config=_card_config_for_server(config),
             bot_router=boundary.router,
             noop_mode=noop_mode,
             operations_config_path=args.config,
             operations_env_file=args.env_file,
             operations_hermes_root=resolve_operations_hermes_root(
+                args.hermes_dir,
                 config_path=args.config,
                 env_file=args.env_file,
             ),
@@ -272,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime_integrity_state_directory=state_dir(),
             delivery_policy=delivery_policy,
         ),
-        host=server["host"],
+        host=_listener_hosts(str(server["host"])),
         port=server["port"],
         print=None,
         access_log=None,
