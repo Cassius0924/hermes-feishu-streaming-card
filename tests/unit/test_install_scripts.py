@@ -1031,6 +1031,100 @@ exit 0
     )
 
 
+def run_install_docker_with_failing_pip(tmp_path, *, failure_mode):
+    hermes_dir = tmp_path / "opt" / "hermes"
+    data_dir = tmp_path / "opt" / "data"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text("# gateway\n", encoding="utf-8")
+    data_dir.mkdir(parents=True)
+    env_file = data_dir / ".env"
+    env_file.write_text(
+        "FEISHU_APP_ID=cli_docker\nFEISHU_APP_SECRET=docker_secret\n",
+        encoding="utf-8",
+    )
+    fake_python = hermes_dir / "venv" / "bin" / "python"
+    fake_python.parent.mkdir(parents=True, exist_ok=True)
+    fake_python.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$FAKE_PYTHON_LOG"
+if [ "$1" = "-m" ] && [ "$2" = "pip" ] && [ "$3" = "--version" ]; then
+  exit 0
+fi
+if [ "$1" = "-m" ] && [ "$2" = "pip" ] && [ "$3" = "install" ]; then
+  case "$FAKE_PIP_FAILURE_MODE:$*" in
+    ordinary:*) echo "fatal package install failure" >&2; exit 9 ;;
+    externally:*--break-system-packages*)
+      echo "externally managed retry still failed" >&2
+      exit 13
+      ;;
+    externally:*) echo "error: externally-managed-environment" >&2; exit 1 ;;
+  esac
+fi
+if [ "$1" = "-m" ] && [ "$2" = "hermes_feishu_card.cli" ] && [ "$3" = "setup" ]; then
+  touch "$SETUP_MARKER"
+  exit 0
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+
+    setup_marker = tmp_path / "setup-ran"
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_PIP_FAILURE_MODE": failure_mode,
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "SETUP_MARKER": str(setup_marker),
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(data_dir / "config.yaml"),
+            "HFC_ENV_FILE": str(env_file),
+            "HFC_VERSION": "main",
+            "HFC_SKIP_START": "1",
+        }
+    )
+    env.pop("HFC_PYTHON", None)
+    env.pop("FEISHU_APP_ID", None)
+    env.pop("FEISHU_APP_SECRET", None)
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result, setup_marker, tmp_path / "python.log"
+
+
+def test_install_docker_sh_stops_when_pip_install_fails(tmp_path):
+    result, setup_marker, python_log = run_install_docker_with_failing_pip(
+        tmp_path, failure_mode="ordinary"
+    )
+
+    assert result.returncode == 9
+    assert "fatal package install failure" in result.stderr
+    assert not setup_marker.exists()
+    assert "hermes_feishu_card.cli" not in python_log.read_text(encoding="utf-8")
+
+
+def test_install_docker_sh_stops_when_externally_managed_retry_fails(tmp_path):
+    result, setup_marker, python_log = run_install_docker_with_failing_pip(
+        tmp_path, failure_mode="externally"
+    )
+
+    assert result.returncode == 13
+    assert "retrying with --break-system-packages" in result.stdout
+    assert "externally managed retry still failed" in result.stderr
+    assert not setup_marker.exists()
+    log = python_log.read_text(encoding="utf-8")
+    assert "--break-system-packages" in log
+    assert "hermes_feishu_card.cli" not in log
+
+
 def test_install_docker_sh_fails_without_hermes_venv_python(tmp_path):
     hermes_dir = tmp_path / "opt" / "hermes"
     data_dir = tmp_path / "opt" / "data"

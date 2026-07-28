@@ -209,13 +209,14 @@ install_package() {
   fi
   local pip_log
   pip_log="$(mktemp)"
+  local pip_status
   if "$python_bin" -m pip install --upgrade "$spec" >"$pip_log" 2>&1; then
     cat "$pip_log"
     rm -f "$pip_log"
     return
+  else
+    pip_status=$?
   fi
-  local pip_status
-  pip_status=$?
   if grep -q "externally-managed-environment" "$pip_log"; then
     log "Python environment is externally managed; retrying with --break-system-packages"
     if "$python_bin" -m pip install --upgrade --break-system-packages "$spec" >"$pip_log" 2>&1; then
@@ -223,8 +224,9 @@ install_package() {
       log "pip warning handled safely; package install completed"
       rm -f "$pip_log"
       return
+    else
+      pip_status=$?
     fi
-    pip_status=$?
     cat "$pip_log" >&2
     rm -f "$pip_log"
     return "$pip_status"
