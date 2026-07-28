@@ -170,6 +170,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ![Feishu topic reply card continuity and reasoning/tool timeline showcase](docs/assets/feishu-topic-card-showcase-v389.png)
 | Version | Highlights |
 |---|---|
+| [v4.0.21](docs/release-notes-v4.0.21.en.md) | Issue #155 archives answers only at an explicit `answer -> tool` boundary so post-tool final answers stay visible; locks the Issue #147 image/notice regression without changing UI or configuration; real Feishu image smoke remains pending |
 | [v4.0.20](docs/release-notes-v4.0.20.en.md) | Fixes Issue #153: queued notice updates return `accepted` without false unknown-delivery warnings, while real PATCH failures retain redacted metrics and error codes |
 | [v4.0.19](docs/release-notes-v4.0.19.en.md) | Prevents the one-line installer from using `pip --user` inside the Hermes venv and stops immediately on pip failures, avoiding false upgrade success |
 | [v4.0.18](docs/release-notes-v4.0.18.en.md) | Checks the real Hermes Feishu SDK constructor capability, diagnoses stale `lark-oapi`, and repairs it during setup/install |

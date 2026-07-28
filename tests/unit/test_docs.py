@@ -2070,6 +2070,49 @@ def test_v4020_release_docs_cover_notice_accepted_ack_and_observability():
     assert "V4.0.20 notice 异步 ACK 语义" in acceptance
 
 
+def test_v4021_release_docs_preserve_content_integrity_and_pending_feishu_smoke():
+    changelog = read_doc("CHANGELOG.md")
+    notes = read_doc("docs/release-notes-v4.0.21.md")
+    notes_en = read_doc("docs/release-notes-v4.0.21.en.md")
+    readme = read_doc("README.md")
+    readme_en = read_doc("README.en.md")
+    testing = read_doc("docs/testing.md")
+    testing_en = read_doc("docs/testing.en.md")
+    acceptance = read_doc("docs/wiki/feishu-acceptance.md")
+
+    assert "## V4.0.21 — 2026-07-28" in changelog
+    assert "[docs/release-notes-v4.0.21.md](docs/release-notes-v4.0.21.md)" in changelog
+    for text in (notes, notes_en):
+        for marker in (
+            "Issue #155",
+            "answer -> tool",
+            "tool -> answer -> completed",
+            "Issue #147",
+            "native image",
+            "accepted",
+            "uncertain-delivery warning",
+        ):
+            assert marker in text
+    assert "不改变卡片 UI 或配置" in notes
+    assert "does not change the card UI or configuration" in notes_en
+    assert "真实飞书图片 smoke 尚未完成" in notes
+    assert "real Feishu image smoke remains pending" in notes_en
+    assert "docs/release-notes-v4.0.21.md" in readme
+    assert "docs/release-notes-v4.0.21.en.md" in readme_en
+    assert "test_prepare_completed_answer_issue155.py" in testing
+    assert "test_prepare_completed_answer_issue155.py" in testing_en
+    assert "test_v4021_hook_runtime_keeps_image_delivery_and_accepted_notice_in_same_turn" in testing
+    assert "test_v4021_hook_runtime_keeps_image_delivery_and_accepted_notice_in_same_turn" in testing_en
+    assert "V4.0.21 内容完整性与媒体/notice 组合验收" in acceptance
+    assert "真实飞书图片 smoke 尚未完成" in acceptance
+
+    public_v4021_docs = "\n".join((notes, notes_en, testing, testing_en, acceptance))
+    assert re.search(r"\b(?:oc|om|ou)_[0-9a-f]{16,}\b", public_v4021_docs) is None
+    assert re.search(
+        r"FEISHU_APP_SECRET=(?!xxx\b)[^\s]+", public_v4021_docs
+    ) is None
+
+
 def test_feishu_cli_playbook_is_linked_and_keeps_cli_optional():
     wiki = read_doc("docs/wiki/README.md")
     playbook = read_doc("docs/wiki/feishu-cli-playbook.md")

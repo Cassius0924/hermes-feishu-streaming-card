@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.0.21 — 2026-07-28
+
+See also: [docs/release-notes-v4.0.21.md](docs/release-notes-v4.0.21.md)
+
+### Fixed
+- Fixed Issue #155: completion reconciliation archives streamed text only after an explicit `answer -> tool` boundary. A prior tool no longer causes a later `tool -> answer -> completed` final answer to move into the reasoning timeline.
+- Locked the Issue #147 image/notice combination with an automated regression: an accepted completed card suppresses matching native media text once, retains the native image delivery, and an accepted queued notice does not produce an uncertain-delivery warning.
+
+### Compatibility
+- This narrow hotfix does not change the card UI or configuration. Existing media handoff, notice acknowledgement, fail-open behavior, and Issue #96 completion-suffix compatibility remain in place.
+
+### Verification
+- Task 1 focused ordering coverage passed `74 passed`; Task 2 image/notice combination coverage passed `277 passed` without requiring a production runtime change.
+- The real Feishu image smoke and release-install verification remain pending; automated regression evidence is not presented as client visual acceptance.
+
 ## V4.0.20 — 2026-07-22
 
 See also: [docs/release-notes-v4.0.20.md](docs/release-notes-v4.0.20.md)

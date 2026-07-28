@@ -2,6 +2,15 @@
 
 自动化测试不能完全证明 Feishu/Lark 客户端体验。涉及卡片 UX、topic、系统提示、命令卡片的版本，发布前需要真实飞书 smoke。
 
+## V4.0.21 内容完整性与媒体/notice 组合验收
+
+- Issue #155：按 `tool -> answer -> completed` 走一轮，完成卡必须保留完整用户可见答案；只有在明确 `answer -> tool` 边界后，前一段答案才能进入时间线。
+- Issue #147：同一图片回合须有一张完成卡和一条 native image；匹配的原生媒体文本只能抑制一次，后续无关原生文本不得被抑制。
+- 让已接管卡片的 `system.notice` 返回 accepted，确认不出现 uncertain-delivery warning；保留既有 `MEDIA:` 清理、附件和 fail-open 分支。
+- 不改变卡片 UI 或配置；不要在验收记录中写入真实 chat/message/user 标识符、凭据、token、图片内容或本机路径。
+
+真实飞书图片 smoke 尚未完成：以上为发布前验收清单和自动化组合回归边界，不得写成已完成的飞书客户端视觉验收。完成后才可记录“一张完成卡 + 一条 native image、无灰色重复答案、无 uncertain-delivery warning”的真实观察。
+
 ## V4.0.20 notice 异步 ACK 语义
 
 - 已有卡片收到 `system.notice` 时，`/events` 只在事件已应用且 PATCH 任务已排队后返回 `delivery.outcome=accepted`；hook 不再发送“投递结果无法确认”的灰色误报。
