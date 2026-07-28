@@ -77,6 +77,8 @@ PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 COMPOSE_HOST_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")
 FEISHU_SDK_INSTALL_SPEC = "lark-oapi==1.6.8"
 FEISHU_SDK_REQUIRED_PARAMETER = "extra_ua_tags"
+_RestoreIdentity = tuple[int, int]
+_RestoreEvidenceSnapshot = tuple[int, int, str]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2858,7 +2860,18 @@ def _repair_install_state(
         accept_hermes_upgrade=accept_hermes_upgrade,
     )
     if not plan.actions:
-        return []
+        healthy_noop = bool(
+            plan.state in {"clean", "installed"}
+            and not any(finding.severity == "error" for finding in plan.findings)
+        )
+        if healthy_noop:
+            return []
+        raise RecoveryRefused(
+            _recovery_refusal_message(
+                plan,
+                accept_hermes_upgrade=accept_hermes_upgrade,
+            )
+        )
     if not plan.executable:
         raise RecoveryRefused(
             _recovery_refusal_message(
@@ -2916,7 +2929,7 @@ def _restore(hermes_root: Path) -> None:
     cron_backup_path = _backup_path(cron_py)
     base_backup_path = _backup_path(base_py)
     manifest_path = _manifest_path(hermes_root)
-    restore_identities = _snapshot_restore_evidence(
+    restore_identities, restore_directory_identities = _snapshot_restore_evidence(
         hermes_root,
         {
             "gateway/run.py": run_py,
@@ -2935,15 +2948,33 @@ def _restore(hermes_root: Path) -> None:
         read_restore_text(path).encode("utf-8")
     ).hexdigest()
     manifest = _read_restore_manifest(manifest_path, read_restore_text)
-    if manifest is not None and not _manifest_has_base(
-        manifest
-    ) and _has_strict_owned_base_patch_pair(
-        base_py, base_backup_path, read_text=read_restore_text
-    ):
-        raise ValueError(
-            "install state incomplete; exact Base evidence exists but manifest "
-            "ownership is missing; refusing to restore"
-        )
+    if manifest is not None:
+        if not _manifest_has_cron(
+            manifest
+        ) and _legacy_managed_evidence_requires_refusal(
+            cron_py,
+            cron_backup_path,
+            remove_owned_patch=remove_cron_patch,
+            apply_owned_patch=apply_cron_patch,
+            read_text=read_restore_text,
+        ):
+            raise ValueError(
+                "install state incomplete; cron evidence exists but manifest "
+                "ownership is missing; refusing to restore"
+            )
+        if not _manifest_has_base(
+            manifest
+        ) and _legacy_managed_evidence_requires_refusal(
+            base_py,
+            base_backup_path,
+            remove_owned_patch=remove_base_patch,
+            apply_owned_patch=apply_base_patch,
+            read_text=read_restore_text,
+        ):
+            raise ValueError(
+                "install state incomplete; exact Base evidence exists but manifest "
+                "ownership is missing; refusing to restore"
+            )
     if backup_path.exists():
         if manifest is None:
             if _managed_restore_evidence_exists(
@@ -2975,6 +3006,7 @@ def _restore(hermes_root: Path) -> None:
                     manifest_path,
                     manifest=None,
                     restore_identities=restore_identities,
+                    restore_directory_identities=restore_directory_identities,
                 )
                 return
 
@@ -2982,12 +3014,17 @@ def _restore(hermes_root: Path) -> None:
             try:
                 if run_py.exists() and remove_patch(current) == backup_text:
                     _assert_restore_evidence_set_unchanged(restore_identities)
-                    _atomic_write_text(run_py, backup_text)
+                    _write_targets_transactionally(
+                        [(run_py, backup_text)],
+                        expected_identities=restore_identities,
+                        expected_directories=restore_directory_identities,
+                    )
                     _clear_install_state(
                         backup_path,
                         manifest_path,
                         manifest=None,
                         restore_identities=restore_identities,
+                        restore_directory_identities=restore_directory_identities,
                     )
                     return
             except ValueError:
@@ -2998,12 +3035,17 @@ def _restore(hermes_root: Path) -> None:
                 raise ValueError("run.py changed since install; refusing to restore")
 
             _assert_restore_evidence_set_unchanged(restore_identities)
-            _atomic_write_text(run_py, backup_text)
+            _write_targets_transactionally(
+                [(run_py, backup_text)],
+                expected_identities=restore_identities,
+                expected_directories=restore_directory_identities,
+            )
             _clear_install_state(
                 backup_path,
                 manifest_path,
                 manifest=None,
                 restore_identities=restore_identities,
+                restore_directory_identities=restore_directory_identities,
             )
             return
 
@@ -3036,12 +3078,17 @@ def _restore(hermes_root: Path) -> None:
         if cron_backup_text is not None:
             target_changes.append((cron_py, cron_backup_text))
         _assert_restore_evidence_set_unchanged(restore_identities)
-        _write_targets_transactionally(target_changes)
+        _write_targets_transactionally(
+            target_changes,
+            expected_identities=restore_identities,
+            expected_directories=restore_directory_identities,
+        )
         _clear_install_state(
             backup_path,
             manifest_path,
             manifest=manifest,
             restore_identities=restore_identities,
+            restore_directory_identities=restore_directory_identities,
         )
         return
 
@@ -3090,6 +3137,7 @@ def _restore(hermes_root: Path) -> None:
             manifest_path,
             manifest=manifest,
             restore_identities=restore_identities,
+            restore_directory_identities=restore_directory_identities,
         )
         return
 
@@ -3101,14 +3149,22 @@ def _restore(hermes_root: Path) -> None:
         elif restore_file_hash(run_py) != patched_sha256:
             raise ValueError("run.py changed since install; refusing to restore")
 
-    _assert_restore_evidence_set_unchanged(restore_identities)
-    restored = _restore_by_removing_owned_patch(run_py, current)
+    restored_contents = remove_patch(current)
+    restored = restored_contents != current
+    if restored:
+        _assert_restore_evidence_set_unchanged(restore_identities)
+        _write_targets_transactionally(
+            [(run_py, restored_contents)],
+            expected_identities=restore_identities,
+            expected_directories=restore_directory_identities,
+        )
     if restored or backup_path.exists() or manifest_path.exists():
         _clear_install_state(
             backup_path,
             manifest_path,
             manifest=manifest,
             restore_identities=restore_identities,
+            restore_directory_identities=restore_directory_identities,
         )
 
 
@@ -3118,7 +3174,11 @@ def _backup_path(run_py: Path) -> Path:
 
 def _snapshot_restore_evidence(
     hermes_root: Path, evidence: dict[str, Path]
-) -> dict[Path, tuple[int, int] | None]:
+) -> tuple[
+    dict[Path, _RestoreEvidenceSnapshot | None],
+    dict[Path, _RestoreIdentity | None],
+]:
+    directory_identities: dict[Path, _RestoreIdentity | None] = {}
     for label, path in (
         ("Hermes directory", hermes_root),
         ("gateway directory", hermes_root / "gateway"),
@@ -3126,15 +3186,17 @@ def _snapshot_restore_evidence(
         ("gateway/platforms directory", hermes_root / "gateway" / "platforms"),
     ):
         try:
-            mode = path.lstat().st_mode
+            snapshot = path.lstat()
         except FileNotFoundError:
+            directory_identities[path] = None
             continue
-        if stat.S_ISLNK(mode):
+        if stat.S_ISLNK(snapshot.st_mode):
             raise ValueError(f"{label} must not be a symlink")
-        if not stat.S_ISDIR(mode):
+        if not stat.S_ISDIR(snapshot.st_mode):
             raise ValueError(f"{label} must be a directory")
+        directory_identities[path] = (snapshot.st_dev, snapshot.st_ino)
 
-    identities: dict[Path, tuple[int, int] | None] = {}
+    identities: dict[Path, _RestoreEvidenceSnapshot | None] = {}
     for label, path in evidence.items():
         try:
             snapshot = path.lstat()
@@ -3145,13 +3207,28 @@ def _snapshot_restore_evidence(
             raise ValueError(f"{label} must not be a symlink")
         if not stat.S_ISREG(snapshot.st_mode):
             raise ValueError(f"{label} must be a regular file")
-        identities[path] = (snapshot.st_dev, snapshot.st_ino)
-    return identities
+        identity = (snapshot.st_dev, snapshot.st_ino)
+        contents = _read_restore_text(path, identity)
+        identities[path] = (
+            snapshot.st_dev,
+            snapshot.st_ino,
+            _restore_text_sha256(contents),
+        )
+    return identities, directory_identities
 
 
-def _read_restore_text(path: Path, expected_identity: tuple[int, int] | None) -> str:
-    if expected_identity is None:
+def _restore_text_sha256(contents: str) -> str:
+    return hashlib.sha256(contents.encode("utf-8")).hexdigest()
+
+
+def _read_restore_text(
+    path: Path,
+    expected_snapshot: _RestoreIdentity | _RestoreEvidenceSnapshot | None,
+) -> str:
+    if expected_snapshot is None:
         raise ValueError(f"{path.name} is missing; refusing to restore")
+    expected_identity = expected_snapshot[:2]
+    expected_digest = expected_snapshot[2] if len(expected_snapshot) == 3 else None
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     fd: int | None = None
     try:
@@ -3183,6 +3260,11 @@ def _read_restore_text(path: Path, expected_identity: tuple[int, int] | None) ->
                 raise ValueError(
                     f"{path.name} changed during restore; refusing to restore"
                 )
+        if (
+            expected_digest is not None
+            and _restore_text_sha256(contents) != expected_digest
+        ):
+            raise ValueError(f"{path.name} changed during restore; refusing to restore")
         return contents
     finally:
         if fd is not None:
@@ -3204,27 +3286,38 @@ def _read_restore_manifest(
     return manifest
 
 
-def _has_strict_owned_base_patch_pair(
-    base_py: Path,
-    base_backup_path: Path,
+def _legacy_managed_evidence_requires_refusal(
+    target_py: Path,
+    target_backup_path: Path,
     *,
+    remove_owned_patch: Callable[[str], str],
+    apply_owned_patch: Callable[[str], str],
     read_text: Callable[[Path], str] | None = None,
 ) -> bool:
     if read_text is None:
         read_text = _read_text_preserve_newlines
-    if not base_py.exists() or not base_backup_path.exists():
-        return False
+    target_exists = target_py.exists()
+    backup_exists = target_backup_path.exists()
     try:
-        base_backup = read_text(base_backup_path)
-        if remove_base_patch(base_backup) != base_backup:
+        if target_exists:
+            current = read_text(target_py)
+            if remove_owned_patch(current) != current:
+                return True
+        if not backup_exists:
             return False
-        current_base = read_text(base_py)
+        backup = read_text(target_backup_path)
+        if remove_owned_patch(backup) != backup:
+            return True
+        try:
+            patched_backup = apply_owned_patch(backup)
+        except ValueError:
+            return False
         return (
-            remove_base_patch(current_base) == base_backup
-            and apply_base_patch(base_backup) == current_base
+            patched_backup != backup
+            and remove_owned_patch(patched_backup) == backup
         )
     except (OSError, UnicodeError, ValueError):
-        return False
+        return True
 
 
 def _managed_restore_evidence_exists(
@@ -3258,7 +3351,8 @@ def _clear_install_state(
     manifest_path: Path,
     *,
     manifest: dict[str, object] | None,
-    restore_identities: dict[Path, tuple[int, int] | None] | None = None,
+    restore_identities: dict[Path, _RestoreEvidenceSnapshot | None] | None = None,
+    restore_directory_identities: dict[Path, _RestoreIdentity | None] | None = None,
 ) -> None:
     paths_to_remove = [backup_path]
     if manifest is not None and _manifest_has_cron(manifest):
@@ -3277,52 +3371,125 @@ def _clear_install_state(
             path.unlink(missing_ok=True)
         return
     for path in paths_to_remove:
+        if restore_directory_identities is not None:
+            _assert_restore_directory_ancestry_unchanged(
+                path, restore_directory_identities
+            )
         _assert_restore_evidence_unchanged(path, restore_identities.get(path))
     for path in paths_to_remove:
-        _safe_unlink_restore_evidence(path, restore_identities.get(path))
+        _safe_unlink_restore_evidence(
+            path,
+            restore_identities.get(path),
+            expected_directories=restore_directory_identities,
+        )
 
 
 def _assert_restore_evidence_unchanged(
-    path: Path, expected_identity: tuple[int, int] | None
+    path: Path, expected_snapshot: _RestoreEvidenceSnapshot | None
 ) -> None:
+    if expected_snapshot is not None:
+        try:
+            _read_restore_text(path, expected_snapshot)
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise ValueError(
+                f"{path.name} changed during restore; refusing to clean up"
+            ) from exc
+        return
     try:
         current = path.lstat()
     except FileNotFoundError:
-        if expected_identity is None:
+        if expected_snapshot is None:
             return
         raise ValueError(f"{path.name} changed during restore; refusing to clean up")
     if (
-        expected_identity is None
+        expected_snapshot is None
         or stat.S_ISLNK(current.st_mode)
         or not stat.S_ISREG(current.st_mode)
-        or (current.st_dev, current.st_ino) != expected_identity
     ):
         raise ValueError(f"{path.name} changed during restore; refusing to clean up")
 
 
 def _assert_restore_evidence_set_unchanged(
-    restore_identities: dict[Path, tuple[int, int] | None]
+    restore_identities: dict[Path, _RestoreEvidenceSnapshot | None]
 ) -> None:
-    for path, expected_identity in restore_identities.items():
-        _assert_restore_evidence_unchanged(path, expected_identity)
+    for path, expected_snapshot in restore_identities.items():
+        _assert_restore_evidence_unchanged(path, expected_snapshot)
 
 
 def _safe_unlink_restore_evidence(
-    path: Path, expected_identity: tuple[int, int] | None
+    path: Path,
+    expected_snapshot: _RestoreEvidenceSnapshot | None,
+    *,
+    expected_directories: dict[Path, _RestoreIdentity | None] | None = None,
 ) -> None:
-    _assert_restore_evidence_unchanged(path, expected_identity)
-    if expected_identity is not None:
+    if expected_directories is not None:
+        _assert_restore_directory_ancestry_unchanged(path, expected_directories)
+    _assert_restore_evidence_unchanged(path, expected_snapshot)
+    if expected_snapshot is not None:
+        if expected_directories is not None:
+            _assert_restore_directory_ancestry_unchanged(path, expected_directories)
         path.unlink()
 
 
-def _write_targets_transactionally(changes: list[tuple[Path, str]]) -> None:
-    snapshots = [
-        (path, _read_text_preserve_newlines(path) if path.exists() else None)
-        for path, _contents in changes
-    ]
+def _assert_restore_directory_ancestry_unchanged(
+    path: Path,
+    expected_directories: dict[Path, _RestoreIdentity | None],
+) -> None:
+    for directory, expected_identity in expected_directories.items():
+        if directory != path and directory not in path.parents:
+            continue
+        try:
+            current = directory.lstat()
+        except FileNotFoundError:
+            if expected_identity is None:
+                continue
+            raise ValueError(
+                f"{directory.name} directory changed during restore; "
+                "refusing to restore"
+            )
+        if (
+            expected_identity is None
+            or not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != expected_identity
+        ):
+            raise ValueError(
+                f"{directory.name} directory changed during restore; "
+                "refusing to restore"
+            )
+
+
+def _write_targets_transactionally(
+    changes: list[tuple[Path, str]],
+    *,
+    expected_identities: dict[Path, _RestoreEvidenceSnapshot | None] | None = None,
+    expected_directories: dict[Path, _RestoreIdentity | None] | None = None,
+) -> None:
+    if expected_identities is None:
+        snapshots = [
+            (path, _read_text_preserve_newlines(path) if path.exists() else None)
+            for path, _contents in changes
+        ]
+    else:
+        snapshots = []
+        for path, _contents in changes:
+            if expected_directories is not None:
+                _assert_restore_directory_ancestry_unchanged(
+                    path, expected_directories
+                )
+            snapshots.append(
+                (path, _read_restore_text(path, expected_identities.get(path)))
+            )
     written: list[Path] = []
     try:
         for path, contents in changes:
+            if expected_directories is not None:
+                _assert_restore_directory_ancestry_unchanged(
+                    path, expected_directories
+                )
+            if expected_identities is not None:
+                _assert_restore_evidence_unchanged(
+                    path, expected_identities.get(path)
+                )
             _atomic_write_text(path, contents)
             written.append(path)
     except (OSError, UnicodeError, ValueError) as exc:
@@ -3331,6 +3498,10 @@ def _write_targets_transactionally(changes: list[tuple[Path, str]]) -> None:
         for path in reversed(written):
             previous = snapshot_by_path[path]
             try:
+                if expected_directories is not None:
+                    _assert_restore_directory_ancestry_unchanged(
+                        path, expected_directories
+                    )
                 if previous is None:
                     path.unlink(missing_ok=True)
                 else:
@@ -3941,19 +4112,6 @@ def _atomic_write_text(
             pass
         except OSError:
             pass
-
-
-def _restore_by_removing_owned_patch(run_py: Path, current: str | None = None) -> bool:
-    if not run_py.exists():
-        return False
-    if current is None:
-        current = _read_text_preserve_newlines(run_py)
-    restored = remove_patch(current)
-    if restored == current:
-        return False
-    _atomic_write_text(run_py, restored)
-    return True
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
