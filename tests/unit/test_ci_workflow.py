@@ -20,8 +20,11 @@ def test_github_actions_runs_full_pytest_matrix():
     assert "runs-on: windows-latest" in text
     assert "ParseFile" in text
     assert "install.ps1" in text
-    assert "docker-compose-smoke:" in text
+    assert "docker-compose-runtime-smoke:" in text
     assert "docker compose -f docker-compose.example.yml config --quiet" in text
+    assert "docker compose -f docker-compose.smoke.yml up" in text
+    assert "--abort-on-container-exit" in text
+    assert "--exit-code-from probe" in text
 
 
 def test_release_assets_workflow_supports_manual_package_dry_run():
@@ -47,3 +50,20 @@ def test_docker_compose_example_documents_container_paths():
     assert "FEISHU_APP_ID" in compose
     assert "FEISHU_APP_SECRET" in compose
     assert "install-docker.sh" in compose
+
+
+def test_docker_compose_runtime_smoke_is_unprivileged_and_health_checked():
+    compose = (ROOT / "docker-compose.smoke.yml").read_text(encoding="utf-8")
+    config = (
+        ROOT / "tests" / "fixtures" / "docker-smoke-config.yaml"
+    ).read_text(encoding="utf-8")
+
+    assert "python:3.12-slim" in compose
+    assert "sidecar:" in compose
+    assert "probe:" in compose
+    assert "condition: service_healthy" in compose
+    assert "HERMES_FEISHU_CARD_STATE_DIR" in compose
+    assert "privileged:" not in compose
+    assert "systemd" not in compose.lower()
+    assert "allow_non_loopback: true" in config
+    assert "manager: detached" in config
