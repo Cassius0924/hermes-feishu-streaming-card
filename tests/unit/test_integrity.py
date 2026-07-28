@@ -40,6 +40,43 @@ EXACT_BASE_FIXTURE = (
 )
 
 
+def test_integrity_mutations_fail_closed_without_dirfd_support(monkeypatch):
+    monkeypatch.setattr(
+        integrity_module, "_secure_dirfd_transactions_supported", lambda: False
+    )
+
+    with pytest.raises(IntegrityRepairRefused, match="requires directory-relative"):
+        execute_integrity_repair(object(), expected_fingerprint="unused")
+    with pytest.raises(IntegrityRepairRefused, match="requires directory-relative"):
+        migrate_integrity_manifest(object())
+
+
+def test_integrity_bound_rollback_read_ignores_parent_path_aba(tmp_path):
+    parent = tmp_path / "managed"
+    parent.mkdir()
+    target = parent / "run.py"
+    target.write_text("ORIGINAL\n", encoding="utf-8")
+    binding = integrity_module._bind_target(target)
+    original_parent = tmp_path / "managed-original"
+    try:
+        parent.rename(original_parent)
+        parent.mkdir()
+        (parent / target.name).write_text(
+            "ATTACKER-ROLLBACK\n", encoding="utf-8"
+        )
+
+        snapshot, contents = integrity_module._read_bound_target_text(
+            binding,
+            "bound rollback read failed",
+        )
+
+        assert contents == "ORIGINAL\n"
+        assert snapshot is not None
+        assert snapshot[2] == sha256(b"ORIGINAL\n").hexdigest()
+    finally:
+        binding.release()
+
+
 def _git(root: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(root), *args],
@@ -324,6 +361,232 @@ def test_integrity_transaction_rolls_back_when_post_commit_validation_fails(tmp_
 
     assert existing.read_text(encoding="utf-8") == "before\n"
     assert not created.exists()
+
+
+def test_integrity_rollback_preserves_concurrent_same_inode_edit_and_continues(
+    tmp_path, monkeypatch
+):
+    raced = tmp_path / "raced.txt"
+    owned = tmp_path / "owned.txt"
+    failing = tmp_path / "failing.txt"
+    raced.write_text("raced-before\n", encoding="utf-8")
+    owned.write_text("owned-before\n", encoding="utf-8")
+    failing.write_text("failing-before\n", encoding="utf-8")
+    original_replace = integrity_module.os.replace
+    replacements = 0
+    raced_post_write_inode = None
+
+    def fail_after_concurrent_edit(source, target, *args, **kwargs):
+        nonlocal replacements, raced_post_write_inode
+        replacements += 1
+        if replacements == 3:
+            raced_post_write_inode = raced.stat().st_ino
+            raced.write_text("user-concurrent-edit\n", encoding="utf-8")
+            raise OSError("third target unavailable")
+        return original_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(integrity_module.os, "replace", fail_after_concurrent_edit)
+
+    with pytest.raises(IntegrityRepairRefused, match="manual review required"):
+        _atomic_replace_many(
+            [
+                (raced, "raced-after\n"),
+                (owned, "owned-after\n"),
+                (failing, "failing-after\n"),
+            ]
+        )
+
+    assert raced.stat().st_ino == raced_post_write_inode
+    assert raced.read_text(encoding="utf-8") == "user-concurrent-edit\n"
+    assert owned.read_text(encoding="utf-8") == "owned-before\n"
+    assert failing.read_text(encoding="utf-8") == "failing-before\n"
+
+
+@pytest.mark.parametrize("drift", ["leaf", "parent"])
+def test_integrity_transaction_refuses_prewrite_target_drift_and_rolls_back(
+    tmp_path, monkeypatch, drift
+):
+    root = tmp_path / "hermes"
+    first_parent = root / "gateway"
+    second_parent = root / "cron"
+    first_parent.mkdir(parents=True)
+    second_parent.mkdir()
+    first = first_parent / "run.py"
+    second = second_parent / "scheduler.py"
+    first.write_text("first-before\n", encoding="utf-8")
+    second.write_text("second-before\n", encoding="utf-8")
+    original_snapshot = integrity_module._snapshot_owned_write
+    injected = False
+
+    def drift_second_after_first_write(target, contents):
+        nonlocal injected
+        result = original_snapshot(target, contents)
+        if target == first and not injected:
+            if drift == "leaf":
+                second.write_text("user-second-edit\n", encoding="utf-8")
+            else:
+                real_parent = root / "cron-real"
+                second_parent.rename(real_parent)
+                second_parent.symlink_to(real_parent, target_is_directory=True)
+                second.write_text("user-second-edit\n", encoding="utf-8")
+            injected = True
+        return result
+
+    monkeypatch.setattr(
+        integrity_module,
+        "_snapshot_owned_write",
+        drift_second_after_first_write,
+    )
+
+    with pytest.raises(IntegrityRepairRefused, match="changed before write"):
+        _atomic_replace_many(
+            [(first, "first-after\n"), (second, "second-after\n")]
+        )
+
+    assert injected
+    assert first.read_text(encoding="utf-8") == "first-before\n"
+    assert second.read_text(encoding="utf-8") == "user-second-edit\n"
+    assert second_parent.is_symlink() is (drift == "parent")
+
+
+def test_integrity_temp_cleanup_stays_bound_to_staging_parent(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "hermes"
+    parent = root / "gateway"
+    parent.mkdir(parents=True)
+    target = parent / "run.py"
+    target.write_text("before\n", encoding="utf-8")
+    real_parent = root / "gateway-real"
+    decoys = []
+
+    def replace_parent_after_staging():
+        parent.rename(real_parent)
+        parent.mkdir()
+        real_temps = sorted(real_parent.glob(".run.py.*.tmp"))
+        assert len(real_temps) == 2
+        for real_temp in real_temps:
+            decoy = parent / real_temp.name
+            decoy.write_text("USER-DECOY\n", encoding="utf-8")
+            decoys.append(decoy)
+        raise IntegrityRepairRefused("injected parent replacement")
+
+    with pytest.raises(IntegrityRepairRefused, match="injected parent replacement"):
+        _atomic_replace_many(
+            [(target, "after\n")],
+            controlled_root=root,
+            pre_commit_validate=replace_parent_after_staging,
+        )
+
+    assert len(decoys) == 2
+    assert all(decoy.read_text(encoding="utf-8") == "USER-DECOY\n" for decoy in decoys)
+    assert not list(real_parent.glob(".run.py.*.tmp"))
+
+
+def test_integrity_commit_replace_uses_bound_target_parent(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    parent = root / "gateway"
+    parent.mkdir(parents=True)
+    target = parent / "run.py"
+    target.write_text("before\n", encoding="utf-8")
+    real_parent = root / "gateway-real"
+    original_replace = integrity_module.os.replace
+    injected = False
+
+    def swap_parent_at_replace(source, destination, *args, **kwargs):
+        nonlocal injected
+        if not injected:
+            source_name = Path(source).name
+            parent.rename(real_parent)
+            parent.mkdir()
+            (parent / source_name).write_text("after\n", encoding="utf-8")
+            (parent / target.name).write_text("USER-TARGET\n", encoding="utf-8")
+            injected = True
+        return original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(integrity_module.os, "replace", swap_parent_at_replace)
+
+    try:
+        _atomic_replace_many(
+            [(target, "after\n")], controlled_root=root
+        )
+    except IntegrityRepairRefused:
+        pass
+
+    assert injected
+    assert (parent / target.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert (real_parent / target.name).read_text(encoding="utf-8") == "before\n"
+
+
+def test_integrity_rollback_replace_uses_bound_target_parent(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    parent = root / "gateway"
+    parent.mkdir(parents=True)
+    target = parent / "run.py"
+    target.write_text("before\n", encoding="utf-8")
+    real_parent = root / "gateway-real"
+    original_replace = integrity_module.os.replace
+    replacements = 0
+
+    def swap_parent_at_rollback(source, destination, *args, **kwargs):
+        nonlocal replacements
+        replacements += 1
+        if replacements == 2:
+            source_name = Path(source).name
+            parent.rename(real_parent)
+            parent.mkdir()
+            (parent / source_name).write_text("before\n", encoding="utf-8")
+            (parent / target.name).write_text("USER-TARGET\n", encoding="utf-8")
+        return original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(integrity_module.os, "replace", swap_parent_at_rollback)
+
+    with pytest.raises(IntegrityRepairRefused, match="validation failed"):
+        _atomic_replace_many(
+            [(target, "after\n")],
+            controlled_root=root,
+            validate=lambda: (_ for _ in ()).throw(
+                IntegrityRepairRefused("validation failed")
+            ),
+        )
+
+    assert replacements == 2
+    assert (parent / target.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert (real_parent / target.name).read_text(encoding="utf-8") == "before\n"
+
+
+def test_integrity_rollback_unlink_uses_bound_target_parent(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    parent = root / "gateway"
+    parent.mkdir(parents=True)
+    target = parent / "new.py"
+    real_parent = root / "gateway-real"
+    original_unlink = integrity_module.os.unlink
+    injected = False
+
+    def swap_parent_at_rollback_unlink(path, *args, **kwargs):
+        nonlocal injected
+        if Path(path).name == target.name and not injected:
+            parent.rename(real_parent)
+            parent.mkdir()
+            (parent / target.name).write_text("USER-TARGET\n", encoding="utf-8")
+            injected = True
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(integrity_module.os, "unlink", swap_parent_at_rollback_unlink)
+
+    with pytest.raises(IntegrityRepairRefused, match="validation failed"):
+        _atomic_replace_many(
+            [(target, "created\n")],
+            controlled_root=root,
+            validate=lambda: (_ for _ in ()).throw(
+                IntegrityRepairRefused("validation failed")
+            ),
+        )
+
+    assert injected
+    assert (parent / target.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert not (real_parent / target.name).exists()
 
 
 def test_integrity_plan_refuses_non_descendant_history(git_installed_state):

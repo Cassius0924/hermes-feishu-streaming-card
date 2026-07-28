@@ -45,6 +45,30 @@ def copy_hermes(tmp_path):
     return hermes_dir
 
 
+def initialize_git_fixture(hermes_dir):
+    subprocess.run(["git", "-C", str(hermes_dir), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(hermes_dir), "config", "user.name", "HFC Test"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(hermes_dir),
+            "config",
+            "user.email",
+            "hfc@example.invalid",
+        ],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(hermes_dir), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(hermes_dir), "commit", "-qm", "initial"],
+        check=True,
+    )
+
+
 def run_py(hermes_dir):
     return hermes_dir / "gateway" / "run.py"
 
@@ -108,6 +132,340 @@ def phase_one_placeholder(content):
         ),
         "        pass\n",
     )
+
+
+def test_restore_transaction_rollback_preserves_concurrent_replacement_and_continues(
+    tmp_path, monkeypatch
+):
+    raced = tmp_path / "raced.txt"
+    owned = tmp_path / "owned.txt"
+    failing = tmp_path / "failing.txt"
+    raced.write_text("raced-before\n", encoding="utf-8")
+    owned.write_text("owned-before\n", encoding="utf-8")
+    failing.write_text("failing-before\n", encoding="utf-8")
+    original_atomic_write = cli._atomic_write_text
+    writes = 0
+
+    def fail_after_concurrent_replacement(path, contents, **kwargs):
+        nonlocal writes
+        writes += 1
+        if writes == 3:
+            raced.unlink()
+            raced.write_text("user-concurrent-replacement\n", encoding="utf-8")
+            raise OSError("third target unavailable")
+        return original_atomic_write(path, contents, **kwargs)
+
+    monkeypatch.setattr(cli, "_atomic_write_text", fail_after_concurrent_replacement)
+
+    with pytest.raises(ValueError, match="manual review required"):
+        cli._write_targets_transactionally(
+            [
+                (raced, "raced-after\n"),
+                (owned, "owned-after\n"),
+                (failing, "failing-after\n"),
+            ]
+        )
+
+    assert raced.read_text(encoding="utf-8") == "user-concurrent-replacement\n"
+    assert owned.read_text(encoding="utf-8") == "owned-before\n"
+    assert failing.read_text(encoding="utf-8") == "failing-before\n"
+
+
+def test_atomic_write_temp_cleanup_stays_bound_to_staging_parent(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path / "managed"
+    parent.mkdir()
+    target = parent / "target.txt"
+    target.write_text("before\n", encoding="utf-8")
+    real_parent = tmp_path / "managed-real"
+    original_replace = cli.os.replace
+    decoy = None
+
+    def replace_parent_before_temp_replace(source, destination, *args, **kwargs):
+        nonlocal decoy
+        source_name = Path(source).name
+        if (
+            decoy is None
+            and source_name.startswith(".target.txt.")
+            and source_name.endswith(".tmp")
+        ):
+            parent.rename(real_parent)
+            parent.mkdir()
+            decoy = parent / source_name
+            decoy.write_text("after\n", encoding="utf-8")
+            (parent / target.name).write_text("USER-TARGET\n", encoding="utf-8")
+        return original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(cli.os, "replace", replace_parent_before_temp_replace)
+
+    with pytest.raises(ValueError, match="directory changed during write"):
+        cli._atomic_write_text(target, "after\n")
+
+    assert decoy is not None
+    assert decoy.read_text(encoding="utf-8") == "after\n"
+    assert (parent / target.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert not list(real_parent.glob(".target.txt.*.tmp"))
+    assert (real_parent / "target.txt").read_text(encoding="utf-8") == "before\n"
+
+
+def test_restore_transaction_prebinds_parent_across_atomic_write_entry_gap(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path / "managed"
+    parent.mkdir()
+    target = parent / "target.txt"
+    target.write_text("before\n", encoding="utf-8")
+    real_parent = tmp_path / "managed-real"
+    original_atomic_write = cli._atomic_write_text
+    injected = False
+
+    def swap_parent_before_atomic_open(path, contents, **kwargs):
+        nonlocal injected
+        if not injected:
+            parent.rename(real_parent)
+            parent.mkdir()
+            (parent / target.name).write_text("USER-TARGET\n", encoding="utf-8")
+            injected = True
+        return original_atomic_write(path, contents, **kwargs)
+
+    monkeypatch.setattr(cli, "_atomic_write_text", swap_parent_before_atomic_open)
+
+    with pytest.raises(ValueError, match="directory changed during write"):
+        cli._write_targets_transactionally([(target, "after\n")])
+
+    assert injected
+    assert (parent / target.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert (real_parent / target.name).read_text(encoding="utf-8") == "before\n"
+
+
+def test_restore_transaction_absent_rollback_unlink_stays_bound_to_parent(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path / "managed"
+    parent.mkdir()
+    created = parent / "created.txt"
+    failing = parent / "failing.txt"
+    failing.write_text("before\n", encoding="utf-8")
+    real_parent = tmp_path / "managed-real"
+    original_atomic_write = cli._atomic_write_text
+    original_unlink = cli.os.unlink
+    injected = False
+
+    def fail_second_write(path, contents, **kwargs):
+        if path == failing:
+            raise OSError("second target unavailable")
+        return original_atomic_write(path, contents, **kwargs)
+
+    def swap_parent_at_rollback_unlink(path, *args, **kwargs):
+        nonlocal injected
+        candidate = os.fspath(path)
+        if not injected and candidate in {os.fspath(created), created.name}:
+            parent.rename(real_parent)
+            parent.mkdir()
+            (parent / created.name).write_text("USER-TARGET\n", encoding="utf-8")
+            injected = True
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli, "_atomic_write_text", fail_second_write)
+    monkeypatch.setattr(cli.os, "unlink", swap_parent_at_rollback_unlink)
+
+    with pytest.raises(OSError, match="second target unavailable"):
+        cli._write_targets_transactionally(
+            [(created, "created\n"), (failing, "after\n")]
+        )
+
+    assert injected
+    assert (parent / created.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert not (real_parent / created.name).exists()
+
+
+def test_restore_transaction_final_sweep_rolls_back_prior_parent_swap(
+    tmp_path, monkeypatch
+):
+    first_parent = tmp_path / "first"
+    second_parent = tmp_path / "second"
+    first_parent.mkdir()
+    second_parent.mkdir()
+    first = first_parent / "first.txt"
+    second = second_parent / "second.txt"
+    first.write_text("first-before\n", encoding="utf-8")
+    second.write_text("second-before\n", encoding="utf-8")
+    real_parent = tmp_path / "first-real"
+    original_atomic_write = cli._atomic_write_text
+    injected = False
+
+    def swap_first_parent_after_second_commit(path, contents, **kwargs):
+        nonlocal injected
+        result = original_atomic_write(path, contents, **kwargs)
+        if path == second and not injected:
+            first_parent.rename(real_parent)
+            first_parent.mkdir()
+            (first_parent / first.name).write_text("USER-TARGET\n", encoding="utf-8")
+            injected = True
+        return result
+
+    monkeypatch.setattr(
+        cli, "_atomic_write_text", swap_first_parent_after_second_commit
+    )
+
+    with pytest.raises(ValueError, match="directory changed"):
+        cli._write_targets_transactionally(
+            [(first, "first-after\n"), (second, "second-after\n")]
+        )
+
+    assert injected
+    assert (first_parent / first.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert (real_parent / first.name).read_text(encoding="utf-8") == "first-before\n"
+    assert second.read_text(encoding="utf-8") == "second-before\n"
+
+
+def test_atomic_write_uses_portable_fallback_without_dirfd_support(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "config.yaml"
+    target.write_text("before\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "_cli_dirfd_binding_supported", lambda: False)
+
+    cli._atomic_write_text(target, "after\n")
+
+    assert target.read_text(encoding="utf-8") == "after\n"
+    assert not list(tmp_path.glob(".config.yaml.*.tmp"))
+
+
+def test_restore_transaction_fails_closed_without_dirfd_support(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "run.py"
+    target.write_text("before\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "_cli_dirfd_binding_supported", lambda: False)
+
+    with pytest.raises(ValueError, match="secure restore transaction requires"):
+        cli._write_targets_transactionally([(target, "after\n")])
+
+    assert target.read_text(encoding="utf-8") == "before\n"
+
+
+def test_integrity_migration_commits_manifest_and_env_in_one_transaction(
+    tmp_path, monkeypatch
+):
+    hermes_dir = copy_hermes(tmp_path)
+    initialize_git_fixture(hermes_dir)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    config_parent = tmp_path / "hfc-config"
+    config_parent.mkdir()
+    config_path = config_parent / "config.yaml"
+    env_path = config_parent / ".env"
+    original_transaction = cli._write_targets_transactionally
+    calls = []
+
+    def record_transaction(changes, **kwargs):
+        calls.append(([path for path, _contents in changes], kwargs))
+        return original_transaction(changes, **kwargs)
+
+    monkeypatch.setattr(cli, "_write_targets_transactionally", record_transaction)
+
+    result = cli._run_integrity(
+        Namespace(
+            integrity_command="migrate-safe",
+            hermes_dir=str(hermes_dir),
+            config=str(config_path),
+            env_file=None,
+        )
+    )
+
+    assert result == 0
+    assert len(calls) == 1
+    assert calls[0][0] == [manifest_path(hermes_dir), env_path]
+    assert calls[0][1]["expected_identities"]
+    assert calls[0][1]["expected_directories"]
+    assert "HERMES_FEISHU_CARD_INTEGRITY_MODE=safe" in env_path.read_text(
+        encoding="utf-8"
+    )
+    assert "integrity" in json.loads(
+        manifest_path(hermes_dir).read_text(encoding="utf-8")
+    )
+
+
+def test_integrity_migration_refuses_env_parent_swap_before_transaction(
+    tmp_path, monkeypatch
+):
+    hermes_dir = copy_hermes(tmp_path)
+    initialize_git_fixture(hermes_dir)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    config_parent = tmp_path / "hfc-config"
+    config_parent.mkdir()
+    env_path = config_parent / ".env"
+    env_path.write_text("UNKNOWN=keep\n", encoding="utf-8")
+    env_before = env_path.read_bytes()
+    real_parent = tmp_path / "hfc-config-real"
+    manifest_before = manifest_path(hermes_dir).read_bytes()
+    original_transaction = cli._write_targets_transactionally
+
+    def swap_before_transaction(changes, **kwargs):
+        config_parent.rename(real_parent)
+        config_parent.mkdir()
+        (config_parent / env_path.name).write_text(
+            "USER-TARGET\n", encoding="utf-8"
+        )
+        return original_transaction(changes, **kwargs)
+
+    monkeypatch.setattr(
+        cli, "_write_targets_transactionally", swap_before_transaction
+    )
+
+    result = cli._run_integrity(
+        Namespace(
+            integrity_command="migrate-safe",
+            hermes_dir=str(hermes_dir),
+            config=str(config_parent / "config.yaml"),
+            env_file=None,
+        )
+    )
+
+    assert result != 0
+    assert (config_parent / env_path.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert (real_parent / env_path.name).read_bytes() == env_before
+    assert manifest_path(hermes_dir).read_bytes() == manifest_before
+
+
+def test_integrity_migration_refuses_manifest_parent_swap_before_transaction(
+    tmp_path, monkeypatch
+):
+    hermes_dir = copy_hermes(tmp_path)
+    initialize_git_fixture(hermes_dir)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = manifest_path(hermes_dir)
+    manifest_before = manifest.read_bytes()
+    real_root = hermes_dir.with_name("hermes-real")
+    config_parent = tmp_path / "hfc-config"
+    config_parent.mkdir()
+    original_transaction = cli._write_targets_transactionally
+
+    def swap_before_transaction(changes, **kwargs):
+        hermes_dir.rename(real_root)
+        hermes_dir.mkdir()
+        (hermes_dir / MANIFEST_NAME).write_text(
+            "USER-TARGET\n", encoding="utf-8"
+        )
+        return original_transaction(changes, **kwargs)
+
+    monkeypatch.setattr(
+        cli, "_write_targets_transactionally", swap_before_transaction
+    )
+
+    result = cli._run_integrity(
+        Namespace(
+            integrity_command="migrate-safe",
+            hermes_dir=str(hermes_dir),
+            config=str(config_parent / "config.yaml"),
+            env_file=None,
+        )
+    )
+
+    assert result != 0
+    assert (hermes_dir / MANIFEST_NAME).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert (real_root / MANIFEST_NAME).read_bytes() == manifest_before
 
 
 def write_manifest(hermes_dir):
@@ -1541,6 +1899,39 @@ def test_restore_cleanup_refuses_managed_parent_swap_before_unlink(
 
 
 @pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_cleanup_unlink_stays_bound_when_parent_swaps_at_syscall(
+    tmp_path, monkeypatch, command
+):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    evidence = backup_path(hermes_dir)
+    parent = evidence.parent
+    real_parent = parent.with_name("gateway-real")
+    original_unlink = cli.os.unlink
+    injected = False
+
+    def swap_parent_at_evidence_unlink(path, *args, **kwargs):
+        nonlocal injected
+        candidate = os.fspath(path)
+        if not injected and candidate in {os.fspath(evidence), evidence.name}:
+            parent.rename(real_parent)
+            parent.mkdir()
+            (parent / evidence.name).write_text("USER-TARGET\n", encoding="utf-8")
+            injected = True
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli.os, "unlink", swap_parent_at_evidence_unlink)
+
+    runner = cli._run_restore if command == "restore" else cli._run_uninstall
+    result = runner(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result == 0
+    assert injected
+    assert (parent / evidence.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert not (real_parent / evidence.name).exists()
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
 def test_restore_commands_refuse_symlinked_exact_base_target(tmp_path, command):
     hermes_dir = make_exact_019_hermes(tmp_path)
     assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
@@ -2194,11 +2585,14 @@ def test_install_failure_restores_run_py_and_removes_manifest_and_backup(
 ):
     hermes_dir = copy_hermes(tmp_path)
     original = run_py(hermes_dir).read_text(encoding="utf-8")
+    original_atomic_write = cli._atomic_write_text
 
-    def fail_manifest(*_args):
-        raise OSError("manifest unavailable")
+    def fail_manifest(path, contents, **kwargs):
+        if Path(path) == manifest_path(hermes_dir):
+            raise OSError("manifest unavailable")
+        return original_atomic_write(path, contents, **kwargs)
 
-    monkeypatch.setattr(cli, "_write_manifest", fail_manifest)
+    monkeypatch.setattr(cli, "_atomic_write_text", fail_manifest)
 
     result = cli._run_install(Namespace(hermes_dir=str(hermes_dir), yes=True))
 
@@ -2208,6 +2602,135 @@ def test_install_failure_restores_run_py_and_removes_manifest_and_backup(
     assert "HERMES_FEISHU_CARD_PATCH_BEGIN" not in current
     assert not manifest_path(hermes_dir).exists()
     assert not backup_path(hermes_dir).exists()
+
+
+def test_install_posix_commits_all_mutations_in_one_transaction(
+    tmp_path, monkeypatch
+):
+    if not cli._cli_dirfd_binding_supported():
+        pytest.skip("requires POSIX dirfd transaction support")
+    hermes_dir = copy_hermes(tmp_path)
+    original_writer = cli._write_targets_transactionally
+    calls = []
+
+    def record_transaction(changes, **kwargs):
+        calls.append(([path for path, _contents in changes], kwargs))
+        return original_writer(changes, **kwargs)
+
+    monkeypatch.setattr(cli, "_write_targets_transactionally", record_transaction)
+
+    result = cli._run_install(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result == 0
+    assert len(calls) == 1
+    assert calls[0][0] == [
+        backup_path(hermes_dir),
+        run_py(hermes_dir),
+        manifest_path(hermes_dir),
+    ]
+    assert calls[0][1]["expected_identities"]
+    assert calls[0][1]["expected_directories"]
+
+
+def test_install_transaction_refuses_parent_swap_at_entry(tmp_path, monkeypatch):
+    if not cli._cli_dirfd_binding_supported():
+        pytest.skip("requires POSIX dirfd transaction support")
+    hermes_dir = copy_hermes(tmp_path)
+    parent = run_py(hermes_dir).parent
+    real_parent = parent.with_name("gateway-real")
+    original_writer = cli._write_targets_transactionally
+    injected = False
+
+    def swap_parent_before_transaction(changes, **kwargs):
+        nonlocal injected
+        parent.rename(real_parent)
+        parent.mkdir()
+        (parent / "run.py").write_text("USER-TARGET\n", encoding="utf-8")
+        injected = True
+        return original_writer(changes, **kwargs)
+
+    monkeypatch.setattr(
+        cli, "_write_targets_transactionally", swap_parent_before_transaction
+    )
+
+    result = cli._run_install(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert injected
+    assert (parent / "run.py").read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert not (parent / BACKUP_NAME).exists()
+    assert not manifest_path(hermes_dir).exists()
+    assert (real_parent / "run.py").exists()
+
+
+def test_install_snapshot_precedes_original_read_parent_swap(tmp_path, monkeypatch):
+    if not cli._cli_dirfd_binding_supported():
+        pytest.skip("requires POSIX dirfd transaction support")
+    hermes_dir = copy_hermes(tmp_path)
+    target = run_py(hermes_dir)
+    parent = target.parent
+    real_parent = parent.with_name("gateway-real")
+    original_read = cli._read_restore_text
+    injected = False
+
+    def swap_parent_after_original_read(path, expected_snapshot):
+        nonlocal injected
+        contents = original_read(path, expected_snapshot)
+        if path == target and not injected:
+            parent.rename(real_parent)
+            parent.mkdir()
+            (parent / target.name).write_text(contents, encoding="utf-8")
+            injected = True
+        return contents
+
+    monkeypatch.setattr(cli, "_read_restore_text", swap_parent_after_original_read)
+
+    result = cli._run_install(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert injected
+    assert (parent / target.name).read_text(encoding="utf-8") == (
+        real_parent / target.name
+    ).read_text(encoding="utf-8")
+    assert not (parent / BACKUP_NAME).exists()
+    assert not manifest_path(hermes_dir).exists()
+
+
+def test_install_rollback_unlink_stays_bound_when_parent_swaps_at_syscall(
+    tmp_path, monkeypatch
+):
+    hermes_dir = copy_hermes(tmp_path)
+    evidence = backup_path(hermes_dir)
+    parent = evidence.parent
+    real_parent = parent.with_name("gateway-real")
+    original_atomic_write = cli._atomic_write_text
+    original_unlink = cli.os.unlink
+    injected = False
+
+    def fail_run_write(path, contents, **kwargs):
+        if path == run_py(hermes_dir):
+            raise OSError("run.py write failed")
+        return original_atomic_write(path, contents, **kwargs)
+
+    def swap_parent_at_evidence_unlink(path, *args, **kwargs):
+        nonlocal injected
+        candidate = os.fspath(path)
+        if not injected and candidate in {os.fspath(evidence), evidence.name}:
+            parent.rename(real_parent)
+            parent.mkdir()
+            (parent / evidence.name).write_text("USER-TARGET\n", encoding="utf-8")
+            injected = True
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli, "_atomic_write_text", fail_run_write)
+    monkeypatch.setattr(cli.os, "unlink", swap_parent_at_evidence_unlink)
+
+    result = cli._run_install(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert injected
+    assert (parent / evidence.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert not (real_parent / evidence.name).exists()
 
 
 def test_restore_refuses_to_overwrite_user_edited_run_py(tmp_path):
@@ -3100,8 +3623,12 @@ def test_existing_manifest_survives_manifest_rewrite_failure(tmp_path, monkeypat
     assert install_result.returncode == 0, install_result.stderr
     old_manifest = manifest_path(hermes_dir).read_text(encoding="utf-8")
 
-    def fail_atomic_write(*_args):
-        raise OSError("atomic manifest write failed")
+    original_atomic_write = cli._atomic_write_text
+
+    def fail_atomic_write(path, contents, **kwargs):
+        if Path(path) == manifest_path(hermes_dir):
+            raise OSError("atomic manifest write failed")
+        return original_atomic_write(path, contents, **kwargs)
 
     monkeypatch.setattr(cli, "_atomic_write_text", fail_atomic_write, raising=False)
 

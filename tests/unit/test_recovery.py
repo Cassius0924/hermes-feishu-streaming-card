@@ -47,6 +47,41 @@ EXACT_BASE_FIXTURE = (
 )
 
 
+def test_execute_recovery_fails_closed_without_dirfd_support(monkeypatch):
+    monkeypatch.setattr(
+        recovery, "_secure_dirfd_transactions_supported", lambda: False
+    )
+
+    with pytest.raises(RecoveryRefused, match="requires directory-relative"):
+        execute_recovery(object())
+
+
+def test_recovery_bound_rollback_read_ignores_parent_path_aba(tmp_path):
+    parent = tmp_path / "managed"
+    parent.mkdir()
+    target = parent / "run.py"
+    target.write_text("ORIGINAL\n", encoding="utf-8")
+    binding = recovery._bind_target(target)
+    original_parent = tmp_path / "managed-original"
+    try:
+        parent.rename(original_parent)
+        parent.mkdir()
+        (parent / target.name).write_text(
+            "ATTACKER-ROLLBACK\n", encoding="utf-8"
+        )
+
+        snapshot, contents = recovery._read_bound_target_text(
+            binding,
+            "bound rollback read failed",
+        )
+
+        assert contents == "ORIGINAL\n"
+        assert snapshot is not None
+        assert snapshot[2] == sha256(b"ORIGINAL\n").hexdigest()
+    finally:
+        binding.release()
+
+
 @pytest.fixture
 def installed_state(tmp_path):
     root = tmp_path / "hermes"
@@ -111,6 +146,307 @@ def _wait_for_path(path, timeout=5.0):
             return
         time.sleep(0.01)
     raise AssertionError(f"timed out waiting for {path}")
+
+
+def test_recovery_rollback_preserves_concurrent_inode_replacement_and_continues(
+    tmp_path, monkeypatch
+):
+    raced = tmp_path / "raced.txt"
+    owned = tmp_path / "owned.txt"
+    failing = tmp_path / "failing.txt"
+    raced.write_text("raced-before\n", encoding="utf-8")
+    owned.write_text("owned-before\n", encoding="utf-8")
+    failing.write_text("failing-before\n", encoding="utf-8")
+    original_atomic_replace = recovery._atomic_replace
+    replacements = 0
+
+    def fail_after_concurrent_replacement(staged, target):
+        nonlocal replacements
+        replacements += 1
+        if replacements == 3:
+            raced.unlink()
+            raced.write_text("user-concurrent-replacement\n", encoding="utf-8")
+            raise OSError("third target unavailable")
+        return original_atomic_replace(staged, target)
+
+    monkeypatch.setattr(recovery, "_atomic_replace", fail_after_concurrent_replacement)
+    plan = SimpleNamespace(fingerprint="stable")
+    monkeypatch.setattr(recovery, "plan_recovery", lambda *_args, **_kwargs: plan)
+
+    with pytest.raises(RecoveryRefused, match="requires manual review"):
+        recovery._commit_recovery_changes(
+            SimpleNamespace(root=tmp_path),
+            plan,
+            [
+                (raced, "raced-after\n"),
+                (owned, "owned-after\n"),
+                (failing, "failing-after\n"),
+            ],
+        )
+
+    assert raced.read_text(encoding="utf-8") == "user-concurrent-replacement\n"
+    assert owned.read_text(encoding="utf-8") == "owned-before\n"
+    assert failing.read_text(encoding="utf-8") == "failing-before\n"
+
+
+@pytest.mark.parametrize("drift", ["leaf", "parent"])
+@pytest.mark.parametrize("second_contents", ["second-after\n", None], ids=["replace", "unlink"])
+def test_recovery_transaction_refuses_prewrite_target_drift_and_rolls_back(
+    tmp_path, monkeypatch, drift, second_contents
+):
+    root = tmp_path / "hermes"
+    first_parent = root / "gateway"
+    second_parent = root / "cron"
+    first_parent.mkdir(parents=True)
+    second_parent.mkdir()
+    first = first_parent / "run.py"
+    second = second_parent / "scheduler.py"
+    first.write_text("first-before\n", encoding="utf-8")
+    second.write_text("second-before\n", encoding="utf-8")
+    original_snapshot = recovery._snapshot_owned_write
+    injected = False
+
+    def drift_second_after_first_write(target, contents):
+        nonlocal injected
+        result = original_snapshot(target, contents)
+        if target == first and not injected:
+            if drift == "leaf":
+                second.write_text("user-second-edit\n", encoding="utf-8")
+            else:
+                real_parent = root / "cron-real"
+                second_parent.rename(real_parent)
+                second_parent.symlink_to(real_parent, target_is_directory=True)
+                second.write_text("user-second-edit\n", encoding="utf-8")
+            injected = True
+        return result
+
+    monkeypatch.setattr(
+        recovery,
+        "_snapshot_owned_write",
+        drift_second_after_first_write,
+    )
+    plan = SimpleNamespace(fingerprint="stable")
+    monkeypatch.setattr(recovery, "plan_recovery", lambda *_args, **_kwargs: plan)
+
+    with pytest.raises(RecoveryRefused, match="changed before write"):
+        recovery._commit_recovery_changes(
+            SimpleNamespace(root=root),
+            plan,
+            [(first, "first-after\n"), (second, second_contents)],
+        )
+
+    assert injected
+    assert first.read_text(encoding="utf-8") == "first-before\n"
+    assert second.read_text(encoding="utf-8") == "user-second-edit\n"
+    assert second_parent.is_symlink() is (drift == "parent")
+
+
+def test_recovery_temp_cleanup_stays_bound_to_staging_parent(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "hermes"
+    parent = root / "gateway"
+    parent.mkdir(parents=True)
+    target = parent / "run.py"
+    target.write_text("before\n", encoding="utf-8")
+    real_parent = root / "gateway-real"
+    decoys = []
+
+    def replace_parent_after_staging(*_args, **_kwargs):
+        parent.rename(real_parent)
+        parent.mkdir()
+        real_temps = sorted(real_parent.glob(".run.py.*.tmp"))
+        assert len(real_temps) == 2
+        for real_temp in real_temps:
+            decoy = parent / real_temp.name
+            decoy.write_text("USER-DECOY\n", encoding="utf-8")
+            decoys.append(decoy)
+        raise RecoveryRefused("injected parent replacement")
+
+    monkeypatch.setattr(recovery, "plan_recovery", replace_parent_after_staging)
+
+    with pytest.raises(RecoveryRefused, match="injected parent replacement"):
+        recovery._commit_recovery_changes(
+            SimpleNamespace(root=root),
+            SimpleNamespace(fingerprint="stable"),
+            [(target, "after\n")],
+        )
+
+    assert len(decoys) == 2
+    assert all(decoy.read_text(encoding="utf-8") == "USER-DECOY\n" for decoy in decoys)
+    assert not list(real_parent.glob(".run.py.*.tmp"))
+
+
+@pytest.mark.parametrize("contents", ["after\n", None], ids=["replace", "unlink"])
+def test_recovery_commit_mutation_uses_bound_target_parent(
+    tmp_path, monkeypatch, contents
+):
+    root = tmp_path / "hermes"
+    parent = root / "gateway"
+    parent.mkdir(parents=True)
+    target = parent / "run.py"
+    target.write_text("before\n", encoding="utf-8")
+    real_parent = root / "gateway-real"
+    plan = SimpleNamespace(fingerprint="stable")
+    monkeypatch.setattr(recovery, "plan_recovery", lambda *_args, **_kwargs: plan)
+    injected = False
+
+    def swap_parent():
+        nonlocal injected
+        parent.rename(real_parent)
+        parent.mkdir()
+        (parent / target.name).write_text("USER-TARGET\n", encoding="utf-8")
+        injected = True
+
+    if contents is None:
+        original_unlink = recovery.os.unlink
+
+        def interposed_unlink(path, *args, **kwargs):
+            if Path(path).name == target.name and not injected:
+                swap_parent()
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(recovery.os, "unlink", interposed_unlink)
+    else:
+        original_replace = recovery.os.replace
+
+        def interposed_replace(source, destination, *args, **kwargs):
+            if not injected:
+                source_name = Path(source).name
+                swap_parent()
+                (parent / source_name).write_text(contents, encoding="utf-8")
+            return original_replace(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(recovery.os, "replace", interposed_replace)
+
+    try:
+        recovery._commit_recovery_changes(
+            SimpleNamespace(root=root), plan, [(target, contents)]
+        )
+    except RecoveryRefused:
+        pass
+
+    assert injected
+    assert (parent / target.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert (real_parent / target.name).read_text(encoding="utf-8") == "before\n"
+
+
+@pytest.mark.parametrize("first_existed", [True, False], ids=["replace", "unlink"])
+def test_recovery_rollback_mutation_uses_bound_target_parent(
+    tmp_path, monkeypatch, first_existed
+):
+    root = tmp_path / "hermes"
+    first_parent = root / "gateway"
+    second_parent = root / "cron"
+    first_parent.mkdir(parents=True)
+    second_parent.mkdir()
+    first = first_parent / "run.py"
+    if first_existed:
+        first.write_text("first-before\n", encoding="utf-8")
+    second = second_parent / "scheduler.py"
+    second.write_text("second-before\n", encoding="utf-8")
+    real_parent = root / "gateway-real"
+    plan = SimpleNamespace(fingerprint="stable")
+    monkeypatch.setattr(recovery, "plan_recovery", lambda *_args, **_kwargs: plan)
+    real_atomic_replace = recovery._atomic_replace
+
+    def fail_second(staged, target):
+        if target == second:
+            raise OSError("second target unavailable")
+        return real_atomic_replace(staged, target)
+
+    monkeypatch.setattr(recovery, "_atomic_replace", fail_second)
+    injected = False
+
+    def swap_parent():
+        nonlocal injected
+        first_parent.rename(real_parent)
+        first_parent.mkdir()
+        (first_parent / first.name).write_text("USER-TARGET\n", encoding="utf-8")
+        injected = True
+
+    if first_existed:
+        original_replace = recovery.os.replace
+        replacements = 0
+
+        def interposed_replace(source, destination, *args, **kwargs):
+            nonlocal replacements
+            replacements += 1
+            if replacements == 2:
+                source_name = Path(source).name
+                swap_parent()
+                (first_parent / source_name).write_text(
+                    "first-before\n", encoding="utf-8"
+                )
+            return original_replace(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(recovery.os, "replace", interposed_replace)
+    else:
+        original_unlink = recovery.os.unlink
+
+        def interposed_unlink(path, *args, **kwargs):
+            if Path(path).name == first.name and not injected:
+                swap_parent()
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(recovery.os, "unlink", interposed_unlink)
+
+    with pytest.raises(OSError, match="second target unavailable"):
+        recovery._commit_recovery_changes(
+            SimpleNamespace(root=root),
+            plan,
+            [(first, "first-after\n"), (second, "second-after\n")],
+        )
+
+    assert injected
+    assert (first_parent / first.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    if first_existed:
+        assert (real_parent / first.name).read_text(encoding="utf-8") == "first-before\n"
+    else:
+        assert not (real_parent / first.name).exists()
+
+
+def test_recovery_final_sweep_rolls_back_prior_parent_swap(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    first_parent = root / "gateway"
+    second_parent = root / "cron"
+    first_parent.mkdir(parents=True)
+    second_parent.mkdir()
+    first = first_parent / "run.py"
+    second = second_parent / "scheduler.py"
+    first.write_text("first-before\n", encoding="utf-8")
+    second.write_text("second-before\n", encoding="utf-8")
+    real_parent = root / "gateway-real"
+    plan = SimpleNamespace(fingerprint="stable")
+    monkeypatch.setattr(recovery, "plan_recovery", lambda *_args, **_kwargs: plan)
+    original_atomic_replace = recovery._atomic_replace
+    injected = False
+
+    def swap_first_parent_after_second_commit(staged, target):
+        nonlocal injected
+        result = original_atomic_replace(staged, target)
+        if target == second and not injected:
+            first_parent.rename(real_parent)
+            first_parent.mkdir()
+            (first_parent / first.name).write_text("USER-TARGET\n", encoding="utf-8")
+            injected = True
+        return result
+
+    monkeypatch.setattr(
+        recovery, "_atomic_replace", swap_first_parent_after_second_commit
+    )
+
+    with pytest.raises(RecoveryRefused, match="ancestry changed"):
+        recovery._commit_recovery_changes(
+            SimpleNamespace(root=root),
+            plan,
+            [(first, "first-after\n"), (second, "second-after\n")],
+        )
+
+    assert injected
+    assert (first_parent / first.name).read_text(encoding="utf-8") == "USER-TARGET\n"
+    assert (real_parent / first.name).read_text(encoding="utf-8") == "first-before\n"
+    assert second.read_text(encoding="utf-8") == "second-before\n"
 
 
 def test_execute_recovery_replans_and_refuses_stale_fingerprint(installed_state):
@@ -433,10 +769,10 @@ def test_execute_recovery_does_not_mutate_when_staging_manifest_fails(
     original_manifest = manifest_path.read_text(encoding="utf-8")
     real_stage = recovery._stage_text
 
-    def fail_manifest_stage(target, contents):
+    def fail_manifest_stage(target, contents, **kwargs):
         if target == manifest_path:
             raise OSError("injected manifest stage failure")
-        return real_stage(target, contents)
+        return real_stage(target, contents, **kwargs)
 
     monkeypatch.setattr(recovery, "_stage_text", fail_manifest_stage)
 
@@ -541,8 +877,9 @@ def test_execute_recovery_commits_cron_restore_before_deleting_evidence_and_roll
     detection.run_py.write_text(original, encoding="utf-8")
     operations = []
     tracked_deletions = {gateway_backup, cron_backup, manifest_path}
+    tracked_deletions_by_name = {path.name: path for path in tracked_deletions}
     real_atomic_replace = recovery._atomic_replace
-    real_unlink = Path.unlink
+    real_unlink = recovery.os.unlink
 
     def record_replace(staged, target):
         if target == detection.cron_py:
@@ -550,14 +887,15 @@ def test_execute_recovery_commits_cron_restore_before_deleting_evidence_and_roll
         return real_atomic_replace(staged, target)
 
     def record_unlink(path, *args, **kwargs):
-        if path in tracked_deletions:
-            operations.append(("unlink", path.name))
-            if path == manifest_path:
+        tracked_path = tracked_deletions_by_name.get(Path(path).name)
+        if tracked_path is not None:
+            operations.append(("unlink", tracked_path.name))
+            if tracked_path == manifest_path:
                 raise OSError("injected evidence deletion failure")
         return real_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(recovery, "_atomic_replace", record_replace)
-    monkeypatch.setattr(Path, "unlink", record_unlink)
+    monkeypatch.setattr(recovery.os, "unlink", record_unlink)
 
     with pytest.raises(OSError, match="injected evidence deletion failure"):
         execute_recovery(detection)

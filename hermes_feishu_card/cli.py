@@ -33,7 +33,11 @@ from hermes_feishu_card.diagnostics import (
 from hermes_feishu_card.events import SidecarEvent
 from hermes_feishu_card.feishu_client import FeishuAPIError, FeishuClient, FeishuClientConfig
 from hermes_feishu_card.install.detect import HermesDetection, detect_hermes
-from hermes_feishu_card.install.envfile import read_hfc_env, update_hfc_env
+from hermes_feishu_card.install.envfile import (
+    read_hfc_env,
+    render_hfc_env,
+    update_hfc_env,
+)
 from hermes_feishu_card.install.manifest import (
     BASE_INSTALL_MANIFEST_FIELDS,
     CRON_INSTALL_MANIFEST_FIELDS,
@@ -44,7 +48,7 @@ from hermes_feishu_card.install.manifest import (
 from hermes_feishu_card.install.integrity import (
     IntegrityRepairRefused,
     build_integrity_provenance,
-    migrate_integrity_manifest,
+    render_integrity_manifest_migration,
 )
 from hermes_feishu_card.install.recovery import (
     RecoveryRefused,
@@ -79,6 +83,49 @@ FEISHU_SDK_INSTALL_SPEC = "lark-oapi==1.6.8"
 FEISHU_SDK_REQUIRED_PARAMETER = "extra_ua_tags"
 _RestoreIdentity = tuple[int, int]
 _RestoreEvidenceSnapshot = tuple[int, int, str]
+_CLI_SNAPSHOT_UNSET = object()
+
+
+class _CliTargetBinding:
+    def __init__(
+        self,
+        path: Path,
+        parent_fd: int,
+        parent_identity: _RestoreIdentity,
+        initial_snapshot: _RestoreEvidenceSnapshot | None,
+        initial_bytes: bytes | None,
+        initial_mode: int | None,
+    ) -> None:
+        self.path = path
+        self.parent_fd = parent_fd
+        self.parent_identity = parent_identity
+        self.initial_snapshot = initial_snapshot
+        self.initial_bytes = initial_bytes
+        self.initial_mode = initial_mode
+
+    @property
+    def basename(self) -> str:
+        return self.path.name
+
+    def close(self) -> None:
+        if self.parent_fd >= 0:
+            os.close(self.parent_fd)
+            self.parent_fd = -1
+
+
+class _CliStagedText:
+    def __init__(
+        self,
+        basename: str,
+        identity: _RestoreIdentity,
+        digest: str,
+        mode: int,
+    ) -> None:
+        self.basename = basename
+        self.identity = identity
+        self.digest = digest
+        self.mode = mode
+        self.consumed = False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2037,62 +2084,52 @@ def _run_integrity(args: argparse.Namespace) -> int:
         else config_path.parent / ".env"
     )
     manifest_path = detection.root / MANIFEST_NAME
+    bindings: list[_CliTargetBinding] = []
     try:
-        if manifest_path.is_symlink():
-            raise ValueError("integrity manifest must not be a symbolic link")
-        manifest_before = _read_text_preserve_newlines(manifest_path)
-        manifest_mode = stat.S_IMODE(manifest_path.stat().st_mode)
-        if env_path.is_symlink():
-            raise ValueError("HFC env file must not be a symbolic link")
-        env_existed = env_path.exists()
-        env_before = (
-            _read_text_preserve_newlines(env_path) if env_existed else ""
+        if not _cli_dirfd_binding_supported():
+            raise ValueError(
+                "secure integrity migration requires directory-relative "
+                "filesystem operations on this platform"
+            )
+        manifest_binding = _bind_cli_target(manifest_path)
+        bindings.append(manifest_binding)
+        if manifest_binding.initial_snapshot is None:
+            raise ValueError("integrity migration requires a manifest")
+        env_binding = _bind_cli_target(env_path)
+        bindings.append(env_binding)
+        manifest_text = (manifest_binding.initial_bytes or b"").decode("utf-8")
+        _provenance, manifest_contents = render_integrity_manifest_migration(
+            detection,
+            manifest_text,
         )
-        env_mode = (
-            stat.S_IMODE(env_path.stat().st_mode) if env_existed else 0o600
-        )
-        migrate_integrity_manifest(detection)
-        update_hfc_env(
-            env_path,
+        env_text = (env_binding.initial_bytes or b"").decode("utf-8")
+        env_contents = render_hfc_env(
+            env_text,
             {"HERMES_FEISHU_CARD_INTEGRITY_MODE": "safe"},
         )
+        _write_targets_transactionally(
+            [
+                (manifest_path, manifest_contents),
+                (env_path, env_contents),
+            ],
+            expected_identities={
+                manifest_path: manifest_binding.initial_snapshot,
+                env_path: env_binding.initial_snapshot,
+            },
+            expected_directories={
+                manifest_path.parent: manifest_binding.parent_identity,
+                env_path.parent: env_binding.parent_identity,
+            },
+        )
     except (OSError, UnicodeError, ValueError) as exc:
-        try:
-            if (
-                "manifest_before" in locals()
-                and "manifest_mode" in locals()
-                and _file_state_differs(
-                    manifest_path,
-                    manifest_before,
-                    manifest_mode,
-                )
-            ):
-                _atomic_write_text(
-                    manifest_path,
-                    manifest_before,
-                    mode=manifest_mode,
-                )
-            if (
-                "env_existed" in locals()
-                and env_existed
-                and "env_mode" in locals()
-                and _file_state_differs(env_path, env_before, env_mode)
-            ):
-                _atomic_write_text(env_path, env_before, mode=env_mode)
-            elif (
-                "env_existed" in locals()
-                and not env_existed
-                and (env_path.exists() or env_path.is_symlink())
-            ):
-                env_path.unlink(missing_ok=True)
-        except (OSError, ValueError):
-            print(
-                "error: integrity migration rollback failed; manual review required",
-                file=sys.stderr,
-            )
-            return 1
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        for binding in bindings:
+            try:
+                binding.close()
+            except OSError:
+                pass
     print("integrity migration: verified")
     print("integrity mode: safe")
     print("sidecar.restart_required: true")
@@ -2687,19 +2724,44 @@ def _run_install(args: argparse.Namespace) -> int:
     cron_backup_existed = False
     base_backup_existed = False
     gateway_restart_required = False
+    transactional_install = _cli_dirfd_binding_supported()
 
     try:
-        original = _read_text_preserve_newlines(run_py)
+        install_paths = {
+            "run.py": run_py,
+            "run.py backup": backup_path,
+            "install manifest": manifest_path,
+        }
+        if cron_py is not None and cron_backup_path is not None:
+            install_paths["cron scheduler"] = cron_py
+            install_paths["cron backup"] = cron_backup_path
+        if base_py is not None and base_backup_path is not None:
+            install_paths["exact Base"] = base_py
+            install_paths["exact Base backup"] = base_backup_path
+        install_identities, install_directory_identities = _snapshot_restore_evidence(
+            detection.root, install_paths
+        )
+        original = _read_restore_text(run_py, install_identities.get(run_py))
         cron_original = (
-            _read_text_preserve_newlines(cron_py) if cron_py is not None else None
+            _read_restore_text(cron_py, install_identities.get(cron_py))
+            if cron_py is not None
+            else None
         )
         base_original = (
-            _read_text_preserve_newlines(base_py) if base_py is not None else None
+            _read_restore_text(base_py, install_identities.get(base_py))
+            if base_py is not None
+            else None
         )
-        manifest_existed = manifest_path.exists()
-        backup_existed = backup_path.exists()
-        cron_backup_existed = bool(cron_backup_path and cron_backup_path.exists())
-        base_backup_existed = bool(base_backup_path and base_backup_path.exists())
+        manifest_existed = install_identities.get(manifest_path) is not None
+        backup_existed = install_identities.get(backup_path) is not None
+        cron_backup_existed = bool(
+            cron_backup_path is not None
+            and install_identities.get(cron_backup_path) is not None
+        )
+        base_backup_existed = bool(
+            base_backup_path is not None
+            and install_identities.get(base_backup_path) is not None
+        )
         _validate_existing_install_state(
             run_py,
             backup_path,
@@ -2708,6 +2770,27 @@ def _run_install(args: argparse.Namespace) -> int:
             cron_backup_path=cron_backup_path,
             base_py=base_py,
             base_backup_path=base_backup_path,
+        )
+        run_backup_source = (
+            _read_restore_text(
+                backup_path, install_identities.get(backup_path)
+            )
+            if backup_existed
+            else original
+        )
+        cron_backup_source = (
+            _read_restore_text(
+                cron_backup_path, install_identities.get(cron_backup_path)
+            )
+            if cron_backup_path is not None and cron_backup_existed
+            else cron_original
+        )
+        base_backup_source = (
+            _read_restore_text(
+                base_backup_path, install_identities.get(base_backup_path)
+            )
+            if base_backup_path is not None and base_backup_existed
+            else base_original
         )
         patched = apply_patch(
             original, strategy=detection.hook_strategy or "legacy_gateway_run"
@@ -2735,60 +2818,117 @@ def _run_install(args: argparse.Namespace) -> int:
                 and base_patched != base_original
             )
         )
-        if base_py is not None and base_backup_path is not None and not base_backup_existed:
-            _atomic_write_text(base_backup_path, base_original or "")
-        if not backup_existed:
-            _atomic_write_text(backup_path, original)
-        if cron_py is not None and cron_backup_path is not None and not cron_backup_existed:
-            _atomic_write_text(cron_backup_path, cron_original or "")
-        # The Base contract must exist before run.py can stage exact completion.
-        if (
-            base_py is not None
-            and base_patched is not None
-            and base_original is not None
-            and base_patched != base_original
-        ):
-            _atomic_write_text(base_py, base_patched)
-        if patched != original:
-            _atomic_write_text(run_py, patched)
-        if (
-            cron_py is not None
-            and cron_patched is not None
-            and cron_original is not None
-            and cron_patched != cron_original
-        ):
-            _atomic_write_text(cron_py, cron_patched)
-        _write_manifest(
+        manifest_contents = _render_install_manifest(
             manifest_path,
-            run_py,
-            backup_path,
-            cron_py,
-            cron_backup_path,
-            base_py,
-            base_backup_path,
+            run_py=run_py,
+            run_contents=patched,
+            backup_path=backup_path,
+            run_source=run_backup_source,
+            cron_py=cron_py,
+            cron_contents=cron_patched,
+            cron_backup_path=cron_backup_path,
+            cron_source=cron_backup_source,
+            base_py=base_py,
+            base_contents=base_patched,
+            base_backup_path=base_backup_path,
+            base_source=base_backup_source,
         )
-    except (OSError, UnicodeError, ValueError) as exc:
-        try:
-            _rollback_install(
-                run_py,
-                original,
-                backup_path,
-                backup_existed,
-                manifest_path,
-                manifest_existed,
-                cron_py=cron_py,
-                cron_original=cron_original,
-                cron_backup_path=cron_backup_path,
-                cron_backup_existed=cron_backup_existed,
-                base_py=base_py,
-                base_original=base_original,
-                base_backup_path=base_backup_path,
-                base_backup_existed=base_backup_existed,
+        if transactional_install:
+            changes: list[tuple[Path, str]] = []
+            if (
+                base_py is not None
+                and base_backup_path is not None
+                and not base_backup_existed
+            ):
+                changes.append((base_backup_path, base_backup_source or ""))
+            if not backup_existed:
+                changes.append((backup_path, run_backup_source))
+            if (
+                cron_py is not None
+                and cron_backup_path is not None
+                and not cron_backup_existed
+            ):
+                changes.append((cron_backup_path, cron_backup_source or ""))
+            # The Base contract must exist before run.py can stage exact completion.
+            if (
+                base_py is not None
+                and base_patched is not None
+                and base_original is not None
+                and base_patched != base_original
+            ):
+                changes.append((base_py, base_patched))
+            if patched != original:
+                changes.append((run_py, patched))
+            if (
+                cron_py is not None
+                and cron_patched is not None
+                and cron_original is not None
+                and cron_patched != cron_original
+            ):
+                changes.append((cron_py, cron_patched))
+            changes.append((manifest_path, manifest_contents))
+            _write_targets_transactionally(
+                changes,
+                expected_identities=install_identities,
+                expected_directories=install_directory_identities,
+                preserve_earlier_writes_on_rollback_failure=True,
             )
-        except (OSError, UnicodeError, ValueError) as rollback_exc:
-            print(f"error: {exc}; {rollback_exc}", file=sys.stderr)
-            return 1
-        print(f"error: {exc}", file=sys.stderr)
+        else:
+            if base_py is not None and base_backup_path is not None and not base_backup_existed:
+                _atomic_write_text(base_backup_path, base_backup_source or "")
+            if not backup_existed:
+                _atomic_write_text(backup_path, run_backup_source)
+            if cron_py is not None and cron_backup_path is not None and not cron_backup_existed:
+                _atomic_write_text(cron_backup_path, cron_backup_source or "")
+            if (
+                base_py is not None
+                and base_patched is not None
+                and base_original is not None
+                and base_patched != base_original
+            ):
+                _atomic_write_text(base_py, base_patched)
+            if patched != original:
+                _atomic_write_text(run_py, patched)
+            if (
+                cron_py is not None
+                and cron_patched is not None
+                and cron_original is not None
+                and cron_patched != cron_original
+            ):
+                _atomic_write_text(cron_py, cron_patched)
+            _atomic_write_text(manifest_path, manifest_contents)
+    except (OSError, UnicodeError, ValueError) as exc:
+        if not transactional_install:
+            try:
+                _rollback_install(
+                    run_py,
+                    original,
+                    backup_path,
+                    backup_existed,
+                    manifest_path,
+                    manifest_existed,
+                    cron_py=cron_py,
+                    cron_original=cron_original,
+                    cron_backup_path=cron_backup_path,
+                    cron_backup_existed=cron_backup_existed,
+                    base_py=base_py,
+                    base_original=base_original,
+                    base_backup_path=base_backup_path,
+                    base_backup_existed=base_backup_existed,
+                )
+            except (OSError, UnicodeError, ValueError) as rollback_exc:
+                print(f"error: {exc}; {rollback_exc}", file=sys.stderr)
+                return 1
+        message = str(exc)
+        if transactional_install and message.startswith(
+            "restore transaction rollback failed"
+        ):
+            message = message.replace(
+                "restore transaction rollback failed",
+                "install rollback failed",
+                1,
+            )
+        print(f"error: {message}", file=sys.stderr)
         return 1
 
     print("install ok")
@@ -3370,18 +3510,48 @@ def _clear_install_state(
         for path in paths_to_remove:
             path.unlink(missing_ok=True)
         return
-    for path in paths_to_remove:
-        if restore_directory_identities is not None:
-            _assert_restore_directory_ancestry_unchanged(
-                path, restore_directory_identities
-            )
-        _assert_restore_evidence_unchanged(path, restore_identities.get(path))
-    for path in paths_to_remove:
-        _safe_unlink_restore_evidence(
-            path,
-            restore_identities.get(path),
-            expected_directories=restore_directory_identities,
+    if not _cli_dirfd_binding_supported():
+        raise ValueError(
+            "secure restore cleanup requires directory-relative filesystem "
+            "operations on this platform"
         )
+    bindings: dict[Path, _CliTargetBinding] = {}
+    try:
+        for path in paths_to_remove:
+            if restore_directory_identities is not None:
+                _assert_restore_directory_ancestry_unchanged(
+                    path, restore_directory_identities
+                )
+            binding = _bind_cli_target(path)
+            bindings[path] = binding
+            expected_snapshot = restore_identities.get(path)
+            if binding.initial_snapshot != expected_snapshot:
+                raise ValueError(
+                    f"{path.name} changed during restore; refusing to clean up"
+                )
+            if restore_directory_identities is not None:
+                _assert_restore_directory_ancestry_unchanged(
+                    path, restore_directory_identities
+                )
+                expected_parent = restore_directory_identities.get(path.parent)
+                if (
+                    expected_parent is not None
+                    and binding.parent_identity != expected_parent
+                ):
+                    raise ValueError(
+                        f"{path.parent.name} directory changed during restore; "
+                        "refusing to restore"
+                    )
+        for path in paths_to_remove:
+            _safe_unlink_restore_evidence(
+                bindings[path], restore_identities.get(path)
+            )
+    finally:
+        for binding in bindings.values():
+            try:
+                binding.close()
+            except OSError:
+                pass
 
 
 def _assert_restore_evidence_unchanged(
@@ -3417,18 +3587,15 @@ def _assert_restore_evidence_set_unchanged(
 
 
 def _safe_unlink_restore_evidence(
-    path: Path,
+    binding: _CliTargetBinding,
     expected_snapshot: _RestoreEvidenceSnapshot | None,
-    *,
-    expected_directories: dict[Path, _RestoreIdentity | None] | None = None,
 ) -> None:
-    if expected_directories is not None:
-        _assert_restore_directory_ancestry_unchanged(path, expected_directories)
-    _assert_restore_evidence_unchanged(path, expected_snapshot)
     if expected_snapshot is not None:
-        if expected_directories is not None:
-            _assert_restore_directory_ancestry_unchanged(path, expected_directories)
-        path.unlink()
+        _unlink_bound_cli_target(binding, expected_snapshot)
+    elif _read_bound_cli_target(binding.parent_fd, binding.basename) is not None:
+        raise ValueError(
+            f"{binding.basename} changed during restore; refusing to clean up"
+        )
 
 
 def _assert_restore_directory_ancestry_unchanged(
@@ -3463,56 +3630,127 @@ def _write_targets_transactionally(
     *,
     expected_identities: dict[Path, _RestoreEvidenceSnapshot | None] | None = None,
     expected_directories: dict[Path, _RestoreIdentity | None] | None = None,
+    preserve_earlier_writes_on_rollback_failure: bool = False,
 ) -> None:
-    if expected_identities is None:
-        snapshots = [
-            (path, _read_text_preserve_newlines(path) if path.exists() else None)
-            for path, _contents in changes
-        ]
-    else:
-        snapshots = []
+    if not _cli_dirfd_binding_supported():
+        raise ValueError(
+            "secure restore transaction requires directory-relative "
+            "filesystem operations on this platform"
+        )
+    bindings: dict[Path, _CliTargetBinding] = {}
+    snapshots: list[tuple[Path, str | None]] = []
+    try:
         for path, _contents in changes:
             if expected_directories is not None:
                 _assert_restore_directory_ancestry_unchanged(
                     path, expected_directories
                 )
-            snapshots.append(
-                (path, _read_restore_text(path, expected_identities.get(path)))
-            )
-    written: list[Path] = []
-    try:
-        for path, contents in changes:
+            binding = _bind_cli_target(path)
+            bindings[path] = binding
             if expected_directories is not None:
                 _assert_restore_directory_ancestry_unchanged(
                     path, expected_directories
                 )
+                expected_parent = expected_directories.get(path.parent)
+                if (
+                    expected_parent is not None
+                    and binding.parent_identity != expected_parent
+                ):
+                    raise ValueError(
+                        f"{path.parent.name} directory changed during restore; "
+                        "refusing to restore"
+                    )
             if expected_identities is not None:
-                _assert_restore_evidence_unchanged(
-                    path, expected_identities.get(path)
+                expected_snapshot = expected_identities.get(path)
+                if binding.initial_snapshot != expected_snapshot:
+                    raise ValueError(
+                        f"{path.name} changed during restore; refusing to clean up"
+                    )
+            snapshots.append(
+                (
+                    path,
+                    binding.initial_bytes.decode("utf-8")
+                    if binding.initial_bytes is not None
+                    else None,
                 )
-            _atomic_write_text(path, contents)
-            written.append(path)
-    except (OSError, UnicodeError, ValueError) as exc:
-        rollback_failed = False
-        snapshot_by_path = dict(snapshots)
-        for path in reversed(written):
-            previous = snapshot_by_path[path]
-            try:
+            )
+
+        written: list[Path] = []
+        post_write_snapshots: dict[Path, _RestoreEvidenceSnapshot] = {}
+        try:
+            for path, contents in changes:
+                binding = bindings[path]
+                post_write_snapshots[path] = _atomic_write_text(
+                    path,
+                    contents,
+                    _binding=binding,
+                    _expected_before=binding.initial_snapshot,
+                )
+                written.append(path)
+            for path in written:
                 if expected_directories is not None:
                     _assert_restore_directory_ancestry_unchanged(
                         path, expected_directories
                     )
-                if previous is None:
-                    path.unlink(missing_ok=True)
-                else:
-                    _atomic_write_text(path, previous)
-            except (OSError, UnicodeError, ValueError):
-                rollback_failed = True
-        if rollback_failed:
-            raise ValueError(
-                "restore transaction rollback failed; manual review required"
-            ) from exc
-        raise
+                binding = bindings[path]
+                _assert_cli_path_parent_bound(binding)
+                if (
+                    _read_bound_cli_target(binding.parent_fd, binding.basename)
+                    != post_write_snapshots[path]
+                ):
+                    raise ValueError("restore transaction lost write ownership")
+        except (OSError, UnicodeError, ValueError) as exc:
+            rollback_failed = False
+            snapshot_by_path = dict(snapshots)
+            for path in reversed(written):
+                previous = snapshot_by_path[path]
+                try:
+                    post_write_snapshot = post_write_snapshots.get(path)
+                    if post_write_snapshot is None:
+                        raise ValueError("restore transaction lost write ownership")
+                    binding = bindings[path]
+                    if previous is None:
+                        _unlink_bound_cli_target(binding, post_write_snapshot)
+                    else:
+                        _atomic_write_text(
+                            path,
+                            previous,
+                            _binding=binding,
+                            _expected_before=post_write_snapshot,
+                            _enforce_path_parent=False,
+                        )
+                except (OSError, UnicodeError, ValueError):
+                    rollback_failed = True
+                    if preserve_earlier_writes_on_rollback_failure:
+                        break
+            if rollback_failed:
+                raise ValueError(
+                    "restore transaction rollback failed; manual review required"
+                ) from exc
+            raise
+    finally:
+        for binding in bindings.values():
+            try:
+                binding.close()
+            except OSError:
+                pass
+
+
+def _snapshot_transaction_write(
+    path: Path, expected_contents: str
+) -> _RestoreEvidenceSnapshot:
+    try:
+        snapshot = path.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError("restore transaction lost write ownership") from exc
+    if not stat.S_ISREG(snapshot.st_mode):
+        raise ValueError("restore transaction lost write ownership")
+    identity = (snapshot.st_dev, snapshot.st_ino)
+    contents = _read_restore_text(path, identity)
+    digest = _restore_text_sha256(contents)
+    if digest != _restore_text_sha256(expected_contents):
+        raise ValueError("restore transaction could not verify committed write")
+    return snapshot.st_dev, snapshot.st_ino, digest
 
 
 def _write_manifest(
@@ -3524,58 +3762,120 @@ def _write_manifest(
     base_py: Path | None = None,
     base_backup_path: Path | None = None,
 ) -> None:
+    run_contents = _read_text_preserve_newlines(run_py)
+    run_source = _read_text_preserve_newlines(backup_path)
+    cron_contents = (
+        _read_text_preserve_newlines(cron_py)
+        if cron_py is not None and cron_backup_path is not None and cron_py.exists()
+        else None
+    )
+    cron_source = (
+        _read_text_preserve_newlines(cron_backup_path)
+        if cron_contents is not None
+        and cron_backup_path is not None
+        and cron_backup_path.exists()
+        else None
+    )
+    base_contents = (
+        _read_text_preserve_newlines(base_py)
+        if base_py is not None and base_backup_path is not None and base_py.exists()
+        else None
+    )
+    if base_contents is not None and (
+        base_backup_path is None or not base_backup_path.exists()
+    ):
+        raise ValueError("exact Base backup missing; refusing to write manifest")
+    base_source = (
+        _read_text_preserve_newlines(base_backup_path)
+        if base_contents is not None and base_backup_path is not None
+        else None
+    )
+    rendered = _render_install_manifest(
+        manifest_path,
+        run_py=run_py,
+        run_contents=run_contents,
+        backup_path=backup_path,
+        run_source=run_source,
+        cron_py=cron_py,
+        cron_contents=cron_contents,
+        cron_backup_path=cron_backup_path,
+        cron_source=cron_source,
+        base_py=base_py,
+        base_contents=base_contents,
+        base_backup_path=base_backup_path,
+        base_source=base_source,
+    )
+    _atomic_write_text(manifest_path, rendered)
+
+
+def _render_install_manifest(
+    manifest_path: Path,
+    *,
+    run_py: Path,
+    run_contents: str,
+    backup_path: Path,
+    run_source: str,
+    cron_py: Path | None = None,
+    cron_contents: str | None = None,
+    cron_backup_path: Path | None = None,
+    cron_source: str | None = None,
+    base_py: Path | None = None,
+    base_contents: str | None = None,
+    base_backup_path: Path | None = None,
+    base_source: str | None = None,
+) -> str:
     manifest = {
         "manifest_version": INSTALL_MANIFEST_VERSION,
         "run_py": str(run_py.relative_to(manifest_path.parent)),
-        "patched_sha256": file_sha256(run_py),
+        "patched_sha256": _restore_text_sha256(run_contents),
         "backup": str(backup_path.relative_to(manifest_path.parent)),
-        "backup_sha256": file_sha256(backup_path),
+        "backup_sha256": _restore_text_sha256(run_source),
     }
-    if cron_py is not None and cron_backup_path is not None and cron_py.exists():
+    if (
+        cron_py is not None
+        and cron_contents is not None
+        and cron_backup_path is not None
+        and cron_source is not None
+    ):
         manifest.update(
             {
                 "cron_py": str(cron_py.relative_to(manifest_path.parent)),
-                "cron_patched_sha256": file_sha256(cron_py),
+                "cron_patched_sha256": _restore_text_sha256(cron_contents),
                 "cron_backup": str(cron_backup_path.relative_to(manifest_path.parent)),
-                "cron_backup_sha256": file_sha256(cron_backup_path),
+                "cron_backup_sha256": _restore_text_sha256(cron_source),
             }
         )
-    if base_py is not None and base_backup_path is not None and base_py.exists():
-        if not base_backup_path.exists():
-            raise ValueError("exact Base backup missing; refusing to write manifest")
+    if (
+        base_py is not None
+        and base_contents is not None
+        and base_backup_path is not None
+        and base_source is not None
+    ):
         manifest.update(
             {
                 "base_py": str(base_py.relative_to(manifest_path.parent)),
-                "base_patched_sha256": file_sha256(base_py),
+                "base_patched_sha256": _restore_text_sha256(base_contents),
                 "base_backup": str(
                     base_backup_path.relative_to(manifest_path.parent)
                 ),
-                "base_backup_sha256": file_sha256(base_backup_path),
+                "base_backup_sha256": _restore_text_sha256(base_source),
             }
         )
     try:
         manifest["integrity"] = build_integrity_provenance(
             manifest_path.parent,
             run_py=run_py,
-            run_source=_read_text_preserve_newlines(backup_path),
-            cron_py=(cron_py if cron_backup_path is not None else None),
-            cron_source=(
-                _read_text_preserve_newlines(cron_backup_path)
-                if cron_backup_path is not None and cron_backup_path.exists()
-                else None
-            ),
-            base_py=(base_py if base_backup_path is not None else None),
-            base_source=(
-                _read_text_preserve_newlines(base_backup_path)
-                if base_backup_path is not None and base_backup_path.exists()
-                else None
-            ),
+            run_source=run_source,
+            cron_py=(cron_py if cron_source is not None else None),
+            cron_source=cron_source,
+            base_py=(base_py if base_source is not None else None),
+            base_source=base_source,
         )
     except IntegrityRepairRefused:
         # Source-stripped/container installs remain supported, but cannot use
         # automatic safe repair until provenance is explicitly available.
         pass
-    _atomic_write_text(manifest_path, json.dumps(manifest, sort_keys=True) + "\n")
+    return json.dumps(manifest, sort_keys=True) + "\n"
 
 
 def _rollback_install(
@@ -3594,6 +3894,8 @@ def _rollback_install(
     base_original: str | None = None,
     base_backup_path: Path | None = None,
     base_backup_existed: bool = False,
+    created_evidence_bindings: dict[Path, _CliTargetBinding] | None = None,
+    created_evidence_snapshots: dict[Path, _RestoreEvidenceSnapshot] | None = None,
 ) -> None:
     rollback_failures: list[tuple[str, Exception]] = []
 
@@ -3627,12 +3929,33 @@ def _rollback_install(
         ) from rollback_failures[0][1]
 
     cleanup_failures: list[tuple[str, Exception]] = []
+    owned_bindings = created_evidence_bindings or {}
+    owned_snapshots = created_evidence_snapshots or {}
 
     def remove_created_evidence(label: str, path: Path | None, existed: bool) -> None:
         if path is None or existed:
             return
+        if not _cli_dirfd_binding_supported():
+            try:
+                path.unlink(missing_ok=True)
+            except (OSError, UnicodeError, ValueError) as exc:
+                cleanup_failures.append((label, exc))
+            return
+        expected_snapshot = owned_snapshots.get(path)
+        binding = owned_bindings.get(path)
+        if expected_snapshot is None or binding is None:
+            if path.exists() or path.is_symlink():
+                cleanup_failures.append(
+                    (
+                        label,
+                        ValueError(
+                            "created ownership evidence lacks a bound write snapshot"
+                        ),
+                    )
+                )
+            return
         try:
-            path.unlink(missing_ok=True)
+            _unlink_bound_cli_target(binding, expected_snapshot)
         except (OSError, UnicodeError, ValueError) as exc:
             cleanup_failures.append((label, exc))
 
@@ -4085,33 +4408,348 @@ def _file_state_differs(path: Path, contents: str, mode: int) -> bool:
         return True
 
 
+_CLI_DIRFD_BINDING_SUPPORTED = (
+    os.name != "nt"
+    and hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "fchmod")
+    and all(
+        operation in getattr(os, "supports_dir_fd", set())
+        for operation in (os.open, os.stat, os.unlink, os.rename)
+    )
+)
+
+
+def _cli_dirfd_binding_supported() -> bool:
+    return _CLI_DIRFD_BINDING_SUPPORTED
+
+
 def _atomic_write_text(
     path: Path,
     contents: str,
     *,
     mode: int | None = None,
-) -> None:
+    _binding: _CliTargetBinding | None = None,
+    _expected_before: _RestoreEvidenceSnapshot | None | object = _CLI_SNAPSHOT_UNSET,
+    _enforce_path_parent: bool = True,
+) -> _RestoreEvidenceSnapshot:
+    if not _cli_dirfd_binding_supported():
+        if _binding is not None:
+            raise ValueError(
+                "secure bound write requires directory-relative filesystem "
+                "operations on this platform"
+            )
+        return _atomic_write_text_portable(path, contents, mode=mode)
+    owns_binding = _binding is None
+    binding = _binding if _binding is not None else _bind_cli_target(path)
+    if binding.path != path:
+        if owns_binding:
+            binding.close()
+        raise ValueError("atomic write binding does not match target")
+    expected_before = (
+        binding.initial_snapshot
+        if _expected_before is _CLI_SNAPSHOT_UNSET
+        else _expected_before
+    )
+    rollback_stage: _CliStagedText | None = None
+    write_stage: _CliStagedText | None = None
+    try:
+        _assert_bound_cli_parent(binding)
+        current_snapshot, current_bytes, current_mode = _read_bound_cli_target_state(
+            binding.parent_fd, binding.basename
+        )
+        if current_snapshot != expected_before:
+            raise ValueError("refusing to replace a changed target")
+        if current_bytes is not None:
+            rollback_stage = _stage_bound_cli_bytes(
+                binding,
+                current_bytes,
+                current_mode if current_mode is not None else 0o600,
+            )
+        selected_mode = mode if mode is not None else current_mode
+        write_stage = _stage_bound_cli_bytes(
+            binding,
+            contents.encode("utf-8"),
+            selected_mode if selected_mode is not None else 0o600,
+        )
+        committed = _replace_bound_cli_stage(
+            binding,
+            write_stage,
+            expected_before=current_snapshot,
+        )
+        if _enforce_path_parent:
+            try:
+                _assert_cli_path_parent_bound(binding)
+            except (OSError, ValueError) as exc:
+                try:
+                    if current_snapshot is None:
+                        _unlink_bound_cli_target(binding, committed)
+                    else:
+                        if rollback_stage is None:
+                            raise ValueError("atomic write lost rollback stage")
+                        restored = _replace_bound_cli_stage(
+                            binding,
+                            rollback_stage,
+                            expected_before=committed,
+                        )
+                        if restored[2] != current_snapshot[2]:
+                            raise ValueError("atomic write rollback verification failed")
+                except (OSError, ValueError) as rollback_exc:
+                    raise ValueError(
+                        "atomic write rollback failed; manual review required"
+                    ) from rollback_exc
+                raise ValueError("directory changed during write") from exc
+        return committed
+    finally:
+        for staged in (write_stage, rollback_stage):
+            if staged is not None:
+                _cleanup_bound_cli_stage(binding, staged)
+        if owns_binding:
+            binding.close()
+
+
+def _atomic_write_text_portable(
+    path: Path,
+    contents: str,
+    *,
+    mode: int | None = None,
+) -> _RestoreEvidenceSnapshot:
     if path.is_symlink():
         raise ValueError("refusing to replace a symbolic link")
-    preserved_mode = (
-        stat.S_IMODE(path.stat().st_mode) if path.exists() else None
-    )
+    preserved_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
     temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
-        with temp_path.open("w", encoding="utf-8", newline="") as handle:
+        with temp_path.open("x", encoding="utf-8", newline="") as handle:
             handle.write(contents)
         selected_mode = mode if mode is not None else preserved_mode
-        temp_path.chmod(selected_mode if selected_mode is not None else 0o600)
+        os.chmod(temp_path, selected_mode if selected_mode is not None else 0o600)
         if path.is_symlink():
             raise ValueError("refusing to replace a symbolic link")
-        temp_path.replace(path)
+        os.replace(temp_path, path)
+        return _snapshot_transaction_write(path, contents)
     finally:
         try:
-            temp_path.unlink()
-        except FileNotFoundError:
-            pass
+            temp_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _bind_cli_target(path: Path) -> _CliTargetBinding:
+    parent_fd = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        parent_fd = os.open(path.parent, flags)
+        opened_parent = os.fstat(parent_fd)
+        current_parent = path.parent.lstat()
+        if (
+            not stat.S_ISDIR(opened_parent.st_mode)
+            or not stat.S_ISDIR(current_parent.st_mode)
+            or (opened_parent.st_dev, opened_parent.st_ino)
+            != (current_parent.st_dev, current_parent.st_ino)
+        ):
+            raise ValueError("refusing to stage through a changed directory")
+        snapshot, payload, file_mode = _read_bound_cli_target_state(
+            parent_fd, path.name
+        )
+        binding = _CliTargetBinding(
+            path,
+            parent_fd,
+            (opened_parent.st_dev, opened_parent.st_ino),
+            snapshot,
+            payload,
+            file_mode,
+        )
+        parent_fd = -1
+        return binding
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _assert_bound_cli_parent(binding: _CliTargetBinding) -> None:
+    current = os.fstat(binding.parent_fd)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or (current.st_dev, current.st_ino) != binding.parent_identity
+    ):
+        raise ValueError("bound target directory changed during write")
+
+
+def _assert_cli_path_parent_bound(binding: _CliTargetBinding) -> None:
+    try:
+        current = binding.path.parent.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError("directory changed during write") from exc
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or (current.st_dev, current.st_ino) != binding.parent_identity
+    ):
+        raise ValueError("directory changed during write")
+
+
+def _stage_bound_cli_bytes(
+    binding: _CliTargetBinding,
+    payload: bytes,
+    mode: int,
+) -> _CliStagedText:
+    _assert_bound_cli_parent(binding)
+    basename = f".{binding.basename}.{uuid4().hex}.tmp"
+    descriptor = -1
+    staged: _CliStagedText | None = None
+    try:
+        descriptor = os.open(
+            basename,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=binding.parent_fd,
+        )
+        snapshot = os.fstat(descriptor)
+        staged = _CliStagedText(
+            basename,
+            (snapshot.st_dev, snapshot.st_ino),
+            hashlib.sha256(payload).hexdigest(),
+            mode,
+        )
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fchmod(descriptor, mode)
+        os.close(descriptor)
+        descriptor = -1
+        return staged
+    except Exception:
+        if staged is not None:
+            _cleanup_bound_cli_stage(binding, staged)
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _replace_bound_cli_stage(
+    binding: _CliTargetBinding,
+    staged: _CliStagedText,
+    *,
+    expected_before: _RestoreEvidenceSnapshot | None,
+) -> _RestoreEvidenceSnapshot:
+    _assert_bound_cli_parent(binding)
+    if _read_bound_cli_target(binding.parent_fd, binding.basename) != expected_before:
+        raise ValueError("refusing to replace a changed target")
+    current_stage = os.stat(
+        staged.basename,
+        dir_fd=binding.parent_fd,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(current_stage.st_mode)
+        or (current_stage.st_dev, current_stage.st_ino) != staged.identity
+    ):
+        raise ValueError("refusing to replace a changed staged file")
+    os.replace(
+        staged.basename,
+        binding.basename,
+        src_dir_fd=binding.parent_fd,
+        dst_dir_fd=binding.parent_fd,
+    )
+    staged.consumed = True
+    committed = _read_bound_cli_target(binding.parent_fd, binding.basename)
+    expected_committed = (*staged.identity, staged.digest)
+    if committed != expected_committed:
+        raise ValueError("could not verify committed target")
+    return expected_committed
+
+
+def _unlink_bound_cli_target(
+    binding: _CliTargetBinding,
+    expected_snapshot: _RestoreEvidenceSnapshot,
+) -> None:
+    _assert_bound_cli_parent(binding)
+    if _read_bound_cli_target(binding.parent_fd, binding.basename) != expected_snapshot:
+        raise ValueError("refusing to unlink a changed target")
+    os.unlink(binding.basename, dir_fd=binding.parent_fd)
+    if _read_bound_cli_target(binding.parent_fd, binding.basename) is not None:
+        raise ValueError("could not verify removed target")
+
+
+def _cleanup_bound_cli_stage(
+    binding: _CliTargetBinding,
+    staged: _CliStagedText,
+) -> None:
+    if staged.consumed or binding.parent_fd < 0:
+        return
+    try:
+        current = os.stat(
+            staged.basename,
+            dir_fd=binding.parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            stat.S_ISREG(current.st_mode)
+            and (current.st_dev, current.st_ino) == staged.identity
+        ):
+            os.unlink(staged.basename, dir_fd=binding.parent_fd)
+            staged.consumed = True
+    except OSError:
+        pass
+
+
+def _read_bound_cli_target(
+    parent_fd: int, basename: str
+) -> tuple[int, int, str] | None:
+    snapshot, _payload, _mode = _read_bound_cli_target_state(parent_fd, basename)
+    return snapshot
+
+
+def _read_bound_cli_target_state(
+    parent_fd: int, basename: str
+) -> tuple[_RestoreEvidenceSnapshot | None, bytes | None, int | None]:
+    try:
+        before = os.stat(
+            basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None, None, None
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("refusing to use a non-regular target")
+    identity = (before.st_dev, before.st_ino)
+    descriptor = -1
+    chunks: list[bytes] = []
+    try:
+        descriptor = os.open(
+            basename,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != identity
+        ):
+            raise ValueError("target changed while being verified")
+        while chunk := os.read(descriptor, 64 * 1024):
+            chunks.append(chunk)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    after = os.stat(
+        basename,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or (after.st_dev, after.st_ino) != identity
+    ):
+        raise ValueError("target changed while being verified")
+    payload = b"".join(chunks)
+    return (
+        (before.st_dev, before.st_ino, hashlib.sha256(payload).hexdigest()),
+        payload,
+        stat.S_IMODE(before.st_mode),
+    )
 
 if __name__ == "__main__":
     raise SystemExit(main())
