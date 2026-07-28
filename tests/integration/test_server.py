@@ -732,6 +732,53 @@ async def test_native_event_bypasses_before_any_card_state_or_feishu_send():
         await test_client.close()
 
 
+async def test_native_new_turn_does_not_mutate_prior_card_handoff_state(tmp_path):
+    raw_chat_id = "oc_native_handoff_chat"
+    message_id = "message-native-handoff-reuse"
+    state_root = tmp_path / "handoff-state"
+    store = NativeHandoffStore(state_root)
+    identity = handoff_identity_key(
+        profile_id="",
+        chat_id=raw_chat_id,
+        conversation_id="conversation-1",
+        message_id=message_id,
+    )
+    prior, created = store.begin_no_card(
+        identity,
+        event_created_at=1777017600.0,
+    )
+    assert created is True
+
+    app = create_app(
+        FakeFeishuClient(),
+        delivery_policy=ChatDeliveryPolicy(native_chats=(raw_chat_id,)),
+        native_handoff_store=store,
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                chat_id=raw_chat_id,
+                message_id=message_id,
+                created_at=1777017700.0,
+            ),
+        )
+
+        assert await response.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert store.get(identity) == prior
+        assert app[SESSIONS_KEY] == {}
+    finally:
+        await test_client.close()
+
+
 async def test_existing_active_card_turn_stays_card_after_policy_changes_native():
     class MutablePolicy:
         def __init__(self):

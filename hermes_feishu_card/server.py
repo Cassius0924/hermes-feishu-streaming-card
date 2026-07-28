@@ -2625,6 +2625,79 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
     event_is_terminal = _event_is_terminal(event)
     handoff_identity = _native_handoff_identity(incoming_event)
     starts_new_lifecycle = _event_starts_new_lifecycle(incoming_event)
+    reopens_completed_session = bool(
+        session is not None
+        and session.status in {"completed", "failed"}
+        and (
+            starts_new_lifecycle
+            or (
+                event.event in TURN_REOPENING_EVENTS
+                and incoming_event.data.get("policy_new_turn") is True
+            )
+        )
+    )
+
+    # A duplicate terminal handoff belongs to the prior card turn even when
+    # policy has since changed. Suppress it before considering a new policy
+    # decision, but do not mutate handoff state for a genuinely native turn.
+    if event_is_terminal and not starts_new_lifecycle:
+        prior_handoff = _get_native_handoff(request.app, handoff_identity)
+        if prior_handoff is not None:
+            if prior_handoff.state == "lifecycle":
+                if incoming_event.created_at >= prior_handoff.event_created_at:
+                    prior_handoff = None
+                else:
+                    metrics.events_applied += 1
+                    request.app[DIAGNOSTICS_KEY]["last_terminal_event"] = {
+                        "message_id_hash": _diagnostic_id_hash(
+                            incoming_event.message_id
+                        ),
+                        "event": incoming_event.event,
+                        "sequence": incoming_event.sequence,
+                        "applied": True,
+                        "disposition": "native_stale_replay",
+                    }
+                    return web.json_response(
+                        {"ok": True, "applied": True}
+                    ), None
+            if prior_handoff is not None:
+                post_lock_task = _schedule_pending_native_handoff_repair(
+                    request.app,
+                    handoff_identity,
+                    prior_handoff,
+                )
+                metrics.events_applied += 1
+                request.app[DIAGNOSTICS_KEY]["last_terminal_event"] = {
+                    "message_id_hash": _diagnostic_id_hash(
+                        incoming_event.message_id
+                    ),
+                    "event": incoming_event.event,
+                    "sequence": incoming_event.sequence,
+                    "applied": True,
+                    "disposition": "native_deduplicated",
+                }
+                return web.json_response(
+                    {"ok": True, "applied": True}
+                ), post_lock_task
+
+    if session is None or reopens_completed_session:
+        metrics.policy_event_checks += 1
+        decision = _policy_decision(
+            request.app,
+            incoming_event.chat_id,
+            profile_id=policy_profile_id,
+        )
+        if decision.disposition == NATIVE_DISPOSITION:
+            if reopens_completed_session:
+                _reset_session_for_new_turn(request.app, session_key)
+            metrics.native_bypass_events += 1
+            return web.json_response(
+                {
+                    "ok": True,
+                    "applied": False,
+                    "disposition": NATIVE_DISPOSITION,
+                }
+            ), None
 
     if starts_new_lifecycle:
         lifecycle_state = _prepare_native_handoff_lifecycle(
@@ -2646,84 +2719,15 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 request.app,
                 handoff_identity,
             )
-        if (
-            incoming_event.event != "message.started"
-            and session is not None
-            and session.status in {"completed", "failed"}
-        ):
-            _reset_session_for_new_turn(request.app, session_key)
-            session = None
-    elif event_is_terminal:
-        prior_handoff = _get_native_handoff(request.app, handoff_identity)
-        if prior_handoff is not None:
-            if prior_handoff.state == "lifecycle":
-                if incoming_event.created_at >= prior_handoff.event_created_at:
-                    prior_handoff = None
-                else:
-                    metrics.events_applied += 1
-                    request.app[DIAGNOSTICS_KEY]["last_terminal_event"] = {
-                        "message_id_hash": _diagnostic_id_hash(
-                            incoming_event.message_id
-                        ),
-                        "event": incoming_event.event,
-                        "sequence": incoming_event.sequence,
-                        "applied": True,
-                        "disposition": "native_stale_replay",
-                    }
-                    return web.json_response(
-                        {"ok": True, "applied": True}
-                    ), None
-        if prior_handoff is not None:
-            post_lock_task = _schedule_pending_native_handoff_repair(
-                request.app,
-                handoff_identity,
-                prior_handoff,
-            )
-            metrics.events_applied += 1
-            request.app[DIAGNOSTICS_KEY]["last_terminal_event"] = {
-                "message_id_hash": _diagnostic_id_hash(incoming_event.message_id),
-                "event": incoming_event.event,
-                "sequence": incoming_event.sequence,
-                "applied": True,
-                "disposition": "native_deduplicated",
-            }
-            return web.json_response({"ok": True, "applied": True}), post_lock_task
-
-    if (
-        (
-            event.event == "message.started"
-            or (
-                event.event in TURN_REOPENING_EVENTS
-                and incoming_event.data.get("policy_new_turn") is True
-            )
-        )
-        and session is not None
-        and session.status in {"completed", "failed"}
-    ):
+    if reopens_completed_session:
         # A completed topic session can share the next turn's message id. A
         # stream event is also sufficient evidence of a new turn when Hermes
-        # omitted message.started. Re-read policy before allocating card state.
+        # omitted message.started. Policy was checked before mutating handoff
+        # state, so a native turn cannot leave an active lifecycle floor.
         _reset_session_for_new_turn(request.app, session_key)
         session = None
         event = incoming_event
         event_is_terminal = _event_is_terminal(event)
-
-    if session is None:
-        metrics.policy_event_checks += 1
-        decision = _policy_decision(
-            request.app,
-            incoming_event.chat_id,
-            profile_id=policy_profile_id,
-        )
-        if decision.disposition == NATIVE_DISPOSITION:
-            metrics.native_bypass_events += 1
-            return web.json_response(
-                {
-                    "ok": True,
-                    "applied": False,
-                    "disposition": NATIVE_DISPOSITION,
-                }
-            ), None
 
     if _skip_native_text_fallback_interaction(request.app, event):
         metrics.events_ignored += 1
