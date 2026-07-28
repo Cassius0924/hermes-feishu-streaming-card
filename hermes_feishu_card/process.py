@@ -385,6 +385,8 @@ def _state_dir_security_error(
     candidate = state_dir().expanduser()
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
+    if candidate == Path(candidate.anchor):
+        return "state directory must not be filesystem root"
     parts = candidate.parts
     current = Path(parts[0])
     for part in parts[1:]:

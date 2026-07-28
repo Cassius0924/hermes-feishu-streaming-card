@@ -1171,6 +1171,54 @@ def test_status_sidecar_refuses_symlinked_state_parent_before_pid_or_health(
     }
 
 
+@pytest.mark.parametrize(
+    ("mode", "uid_offset", "expected"),
+    [
+        (0o755, 0, "state directory permissions must be private"),
+        (0o700, 1, "state directory is not owned by the current user"),
+    ],
+)
+def test_status_sidecar_refuses_non_private_or_foreign_state_directory(
+    monkeypatch, tmp_path, mode, uid_offset, expected
+):
+    private_state = tmp_path / "state"
+    private_state.mkdir(mode=mode)
+    private_state.chmod(mode)
+    real_uid = private_state.stat().st_uid
+    monkeypatch.setattr(process, "state_dir", lambda: private_state)
+    monkeypatch.setattr(process.os, "getuid", lambda: real_uid + uid_offset)
+    monkeypatch.setattr(
+        process,
+        "read_pid_record",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("untrusted state reached pidfile parsing")
+        ),
+    )
+
+    status = process.status_sidecar(
+        {"server": {"host": "127.0.0.1", "port": 8765}}
+    )
+
+    assert status["error"] == expected
+
+
+def test_status_sidecar_refuses_filesystem_root_as_state_directory(monkeypatch):
+    monkeypatch.setattr(process, "state_dir", lambda: process.Path("/"))
+    monkeypatch.setattr(
+        process,
+        "read_pid_record",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("filesystem root reached pidfile parsing")
+        ),
+    )
+
+    status = process.status_sidecar(
+        {"server": {"host": "127.0.0.1", "port": 8765}}
+    )
+
+    assert status["error"] == "state directory must not be filesystem root"
+
+
 def test_fetch_health_bypasses_proxy_for_loopback(monkeypatch):
     calls: list[tuple[str, float]] = []
 
