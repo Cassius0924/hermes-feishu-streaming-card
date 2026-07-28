@@ -19,11 +19,11 @@ Hermes 进程内的 hook 只负责提取和转发。sidecar 负责会话状态�
 
 新 turn 在任何 sequence、pending delta、session 或原生抑制发生前，通过 `hfc-policy-v1` 查询 per-chat 决策。card decision 在 turn 内固定；native decision 让 original Hermes 路径继续。sidecar 收到 `/events` 后在创建 CardSession、reply alias、动画或 Feishu client state 前再查一次。未知 profile、配置 reload 失败、proof 无效/过期/重放、timeout 或 malformed response 全部走 native fail-open。
 
-normal answer/tool、approval/clarify、cron、system notice、command feedback 与 picker 使用同一决策；`/hfc help/status/doctor/monitor` 和 smoke card 是显式管理面，始终保持卡片。terminal 会清理本轮 policy cache、pending delta 和 native-media suppression；重复 terminal 只复用已记录 disposition，不能泄漏第二条原生答案。
+normal answer/tool、approval/clarify、cron、system notice、command feedback 与 picker 使用同一决策；`/hfc help/status/doctor/monitor` 和 smoke card 是显式管理面，始终保持卡片。terminal 会清理本轮 policy cache、pending delta 和 native-media suppression；durable record 可读时，重复 terminal 复用已记录 disposition。记录缺失时会重建有界 descriptor，记录损坏或不可读时返回 503 让 hook fail-open，不能只凭内存 session 声称已经投递。
 
 实际 card JSON 由共享 serializer 检查 5 table、200 tagged element 与 28,000 UTF-8 byte。非终态超限用小型 waiting card 继续收集；terminal 超限先持久化不含正文和原始路由标识的 handoff delivery record，再立即返回 `applied:false, disposition:native` 与短期 descriptor。有旧卡时，简短 handoff notice 只作为当前进程内 best-effort 异步 PATCH，不阻塞 descriptor；进程在 PATCH 中途退出时，旧卡可能停在 waiting 状态，但完整原答案仍由 Hermes 原生投递，无卡时不额外发卡。
 
-ACK-capable handoff 使用 generation fence、逐逻辑分片稳定且按 create/reply/thread 与 post/text 变体隔离的 Feishu UUID。Hermes delivery ledger 的 obligation id 只以单向 hash 关联 sidecar；重启恢复先用独立签名域查询仍 pending 的 descriptor，再复用相同 UUID 投递。只有全部 required chunks 成功且 Hermes ledger 已持久化 `delivered` 后才发送签名 ACK；ACK 失败不能回滚 ledger。若进程在平台成功与 ledger transition 之间退出，ledger 仍会恢复并以稳定 UUID 去重；反向窗口只会让 sidecar pending 最终进入 uncertain，不会触发第二次原生发送。任何空 body、非 object 或缺少显式 `ok:true, applied:true` 的 terminal/cron/command 响应都必须 fail-open，不能抑制 Hermes 原生答案。
+ACK-capable handoff 使用 generation fence、逐逻辑分片稳定且按 create/reply/thread 与 post/text 变体隔离的 Feishu UUID。Hermes delivery ledger 的 obligation id 只以单向 hash 关联 sidecar；重启恢复先用独立签名域查询仍 pending 的 descriptor，再复用相同 UUID 投递。只有全部 required chunks 成功且 Hermes ledger 已持久化 `delivered` 后才发送签名 ACK；ACK 失败不能回滚 ledger。若进程在平台成功与 ledger transition 之间退出，一小时窗口内由 ledger recovery 与稳定 UUID 提供 bounded idempotency；窗口外的未决状态进入 uncertain / 人工复核。状态丢失或损坏时优先避免丢失答案并 fail-open，因此不承诺永久 exactly-once。任何空 body、非 object 或缺少显式 `ok:true, applied:true` 的 terminal/cron/command 响应都必须 fail-open，不能抑制 Hermes 原生答案。
 
 Gateway runtime 以独立 `hfc-runtime-v1` 域发送 `runtime.hello` / `runtime.heartbeat`。sidecar readiness 根据本机 monotonic receipt、generation 和 strict integrity 状态计算；heartbeat 只证明 runtime 活性，不授权写源码。safe repair 仍需 Git/manifest/backup/blob/anchor/fingerprint 证据，成功后只设置 `gateway.restart_required`，不自动重启 Gateway。
 

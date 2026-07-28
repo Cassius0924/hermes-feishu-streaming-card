@@ -2261,6 +2261,7 @@ def test_v410_release_docs_cover_native_policy_limits_integrity_and_services():
     event_protocol_en = read_doc("docs/event-protocol.en.md")
     wiki = read_doc("docs/wiki/README.md")
     controls = read_doc("docs/wiki/v4.1-safety-controls.md")
+    event_flow = read_doc("docs/wiki/event-flow.md")
     acceptance = read_doc("docs/wiki/feishu-acceptance.md")
     config = read_doc("config.yaml.example")
     compose = read_doc("docker-compose.example.yml")
@@ -2413,6 +2414,7 @@ def test_v410_docs_close_release_ux_review_drift():
     guide = read_doc("docs/user-guide.md")
     guide_en = read_doc("docs/user-guide.en.md")
     controls = read_doc("docs/wiki/v4.1-safety-controls.md")
+    event_flow = read_doc("docs/wiki/event-flow.md")
 
     assert "setup container runs `install-docker.sh` as root" in changelog
     assert "sidecar, Gateway, and probe run as non-root" in changelog
@@ -2421,6 +2423,10 @@ def test_v410_docs_close_release_ux_review_drift():
     assert "窗口外" in controls
     assert "人工复核" in controls
     assert "保证" not in controls.split("## integrity 模式与升级迁移", 1)[0]
+    assert "durable record 可读" in event_flow
+    assert "状态丢失或损坏" in event_flow
+    assert "优先避免丢失答案" in event_flow
+    assert "不承诺永久 exactly-once" in event_flow
 
     for text in (readme, testing):
         assert "Hermes 0.19.0" in text
