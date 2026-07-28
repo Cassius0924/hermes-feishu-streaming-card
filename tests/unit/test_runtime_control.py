@@ -201,6 +201,26 @@ def test_supervisor_requires_matching_generation_and_can_mark_restart_required()
     assert supervisor.snapshot()["restart_required"] is False
 
 
+def test_matching_runtime_hello_does_not_clear_manual_review_requirement():
+    supervisor = RuntimeIntegritySupervisor(
+        mode="safe",
+        expected_hook_generation=RUNTIME_HOOK_GENERATION,
+        expected_package_version="4.1.0",
+        now=lambda: 100.0,
+    )
+    supervisor.mark_manual_review_required()
+
+    assert supervisor.record(
+        RuntimeControlEvent.from_dict(
+            _payload(runtime_id="runtime-reviewed-123", created_at=101.0)
+        )
+    )
+
+    snapshot = supervisor.snapshot()
+    assert snapshot["status"] == "degraded"
+    assert snapshot["reason"] == "manual_review_required"
+
+
 def test_supervisor_off_mode_is_disabled_even_without_runtime():
     supervisor = RuntimeIntegritySupervisor(mode="off")
 

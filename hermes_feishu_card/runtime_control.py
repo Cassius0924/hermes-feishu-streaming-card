@@ -345,7 +345,6 @@ class RuntimeIntegritySupervisor:
             )
             if event.event == "runtime.hello" and self._generation_match:
                 self._restart_required = False
-                self._manual_review_required = False
         return True
 
     def mark_restart_required(self) -> None:

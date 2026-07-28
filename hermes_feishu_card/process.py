@@ -312,7 +312,9 @@ def write_pid_record(
     temporary = Path(temporary_name)
     try:
         try:
-            os.fchmod(descriptor, 0o600)
+            fchmod = getattr(os, "fchmod", None)
+            if callable(fchmod):
+                fchmod(descriptor, 0o600)
             handle = os.fdopen(descriptor, "w", encoding="utf-8")
         except Exception:
             os.close(descriptor)
@@ -446,6 +448,8 @@ def _record_identity_valid(record: dict[str, Any]) -> bool:
         return unit in {"", None}
     if manager not in {"systemd-user", "systemd-system"}:
         return False
+    if sys.platform.startswith("win") or not callable(getattr(os, "getuid", None)):
+        return False
     return isinstance(unit, str) and unit == _expected_unit(manager)
 
 
@@ -491,9 +495,13 @@ def _stop_systemd_sidecar(manager: str, unit: str) -> bool:
 
 
 def _systemd_system_unit_name() -> str:
-    scope = f"{os.getuid()}:{state_dir().expanduser().resolve(strict=False)}"
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        raise RuntimeError("systemd system units require POSIX user identity")
+    uid = getuid()
+    scope = f"{uid}:{state_dir().expanduser().resolve(strict=False)}"
     digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:12]
-    return f"hermes-feishu-card-sidecar-{os.getuid()}-{digest}.service"
+    return f"hermes-feishu-card-sidecar-{uid}-{digest}.service"
 
 
 def _systemd_user_available() -> bool:

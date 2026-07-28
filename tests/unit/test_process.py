@@ -1238,6 +1238,52 @@ def test_status_sidecar_does_not_apply_posix_mode_bits_on_windows(
     assert "error" not in status
 
 
+def test_pid_record_write_does_not_require_posix_fchmod_on_windows(
+    monkeypatch, tmp_path
+):
+    record_path = tmp_path / "sidecar.pid"
+    monkeypatch.setattr(process, "pid_path", lambda: record_path)
+    monkeypatch.setattr(process.sys, "platform", "win32")
+    monkeypatch.delattr(process.os, "fchmod", raising=False)
+
+    process.write_pid_record(4321, "sidecar-token", manager="detached")
+
+    assert process.read_pid_record() == {
+        "pid": 4321,
+        "token": "sidecar-token",
+        "manager": "detached",
+    }
+
+
+def test_status_rejects_systemd_pid_record_on_windows_without_getuid(
+    monkeypatch, tmp_path
+):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    monkeypatch.setattr(process, "state_dir", lambda: state)
+    monkeypatch.setattr(process, "_supports_posix_state_permissions", lambda: False)
+    monkeypatch.setattr(process.sys, "platform", "win32")
+    monkeypatch.delattr(process.os, "getuid", raising=False)
+    monkeypatch.setattr(
+        process,
+        "read_pid_record",
+        lambda: {
+            "pid": 4321,
+            "token": "sidecar-token",
+            "manager": "systemd-system",
+            "unit": "forged.service",
+        },
+    )
+    monkeypatch.setattr(process, "fetch_health", lambda _config: None)
+
+    status = process.status_sidecar(
+        {"server": {"host": "127.0.0.1", "port": 8765}}
+    )
+
+    assert status["running"] is False
+    assert status["manager"] == "unknown"
+
+
 def test_fetch_health_bypasses_proxy_for_loopback(monkeypatch):
     calls: list[tuple[str, float]] = []
 
