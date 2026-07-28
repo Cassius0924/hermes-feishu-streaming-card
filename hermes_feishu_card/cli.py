@@ -21,6 +21,7 @@ import yaml
 
 from hermes_feishu_card import __version__ as PACKAGE_VERSION
 from hermes_feishu_card.config import load_config
+from hermes_feishu_card.delivery_policy import normalize_native_chats
 from hermes_feishu_card.bots import BotRegistry, RoutingContext
 from hermes_feishu_card.diagnostics import (
     DiagnosticReport,
@@ -86,6 +87,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_bots(args)
     if args.command == "integrity":
         return _run_integrity(args)
+    if args.command == "chats":
+        return _run_chats(args)
     if args.command == "install":
         return _run_install(args)
     if args.command == "repair":
@@ -209,6 +212,17 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="confirm provenance migration and safe-mode activation",
     )
+
+    chats = subparsers.add_parser("chats")
+    chat_subparsers = chats.add_subparsers(dest="chat_command")
+    for chat_command in ("use-native", "use-card"):
+        command_parser = chat_subparsers.add_parser(chat_command)
+        command_parser.add_argument("chat_id")
+        command_parser.add_argument("--config", required=True)
+        command_parser.add_argument("--profile-id")
+    chats_list = chat_subparsers.add_parser("list")
+    chats_list.add_argument("--config", required=True)
+    chats_list.add_argument("--profile-id")
 
     for command in ("install", "repair", "restore", "uninstall"):
         command_parser = subparsers.add_parser(command)
@@ -2172,6 +2186,80 @@ def _run_smoke_feishu_card(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_chats(args: argparse.Namespace) -> int:
+    if getattr(args, "chat_command", None) not in {
+        "list",
+        "use-native",
+        "use-card",
+    }:
+        print("error: chats command is required", file=sys.stderr)
+        return 2
+    try:
+        config = load_config(args.config)
+        data = _read_local_yaml(args.config)
+        bindings = _native_chat_bindings_scope(
+            config,
+            data,
+            profile_id=args.profile_id,
+        )
+        native_chats = normalize_native_chats(bindings.get("native_chats", []))
+        if args.chat_command == "list":
+            for chat_id in native_chats:
+                print(_masked_chat_id(chat_id))
+            return 0
+        chat_id = normalize_native_chats([args.chat_id])[0]
+        if args.chat_command == "use-native":
+            if chat_id not in native_chats:
+                native_chats.append(chat_id)
+            disposition = "native"
+        else:
+            native_chats = [item for item in native_chats if item != chat_id]
+            disposition = "card"
+        bindings["native_chats"] = native_chats
+        _write_local_yaml(args.config, data)
+        print(
+            f"{disposition}: {_masked_chat_id(chat_id)} "
+            "(applies to the next new message)"
+        )
+        return 0
+    except Exception as exc:
+        print(
+            f"error: {_sanitize_error(exc, locals().get('config'))}",
+            file=sys.stderr,
+        )
+        return 1
+
+
+def _native_chat_bindings_scope(
+    config: dict[str, Any],
+    data: dict[str, Any],
+    *,
+    profile_id: str | None,
+) -> dict[str, Any]:
+    profiles = config.get("profiles")
+    if isinstance(profiles, dict) and profiles:
+        if not profile_id:
+            raise ValueError("--profile-id is required in multi-profile mode")
+        if profile_id not in profiles:
+            raise KeyError("unknown profile")
+        raw_profiles = _ensure_mapping_path(data, "profiles")
+        raw_profile = raw_profiles.get(profile_id)
+        if raw_profile is None:
+            raw_profile = {}
+            raw_profiles[profile_id] = raw_profile
+        if not isinstance(raw_profile, dict):
+            raise ValueError("profile must be a mapping")
+        return _ensure_mapping_path(raw_profile, "bindings")
+    if profile_id:
+        raise KeyError("unknown profile")
+    return _ensure_mapping_path(data, "bindings")
+
+
+def _masked_chat_id(chat_id: str) -> str:
+    digest = hashlib.sha256(chat_id.encode("utf-8")).hexdigest()[:10]
+    return f"chat#{digest}"
+
+
 def _run_bots(args: argparse.Namespace) -> int:
     try:
         if args.bot_command == "list":
@@ -3092,8 +3180,7 @@ def _atomic_write_text(
         with temp_path.open("w", encoding="utf-8", newline="") as handle:
             handle.write(contents)
         selected_mode = mode if mode is not None else preserved_mode
-        if selected_mode is not None:
-            temp_path.chmod(selected_mode)
+        temp_path.chmod(selected_mode if selected_mode is not None else 0o600)
         if path.is_symlink():
             raise ValueError("refusing to replace a symbolic link")
         temp_path.replace(path)

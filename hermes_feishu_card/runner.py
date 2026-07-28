@@ -11,6 +11,7 @@ from . import __version__
 from .bots import BotRegistry, FeishuClientFactory, RoutingContext
 from .bots import resolve_card_config as _resolve_card_config
 from .config import load_config, resolve_operations_hermes_root
+from .delivery_policy import ReloadingDeliveryPolicyProvider
 from .event_auth import is_loopback_host
 from .feishu_client import FeishuAPIError, FeishuClient, FeishuClientConfig
 from .server import create_app
@@ -220,6 +221,11 @@ def main(argv: list[str] | None = None) -> int:
             "non-loopback sidecar binding requires event authentication"
         )
     noop_mode = not _has_any_feishu_credentials(config)
+    delivery_policy = ReloadingDeliveryPolicyProvider(
+        args.config,
+        initial_config=config,
+        env_file=args.env_file,
+    )
     if not noop_mode:
         boundary = build_feishu_boundary(config)
     else:
@@ -248,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
                 (config.get("integrity") or {}).get("mode") or "notify"
             ),
             expected_runtime_package_version=__version__,
+            delivery_policy=delivery_policy,
         ),
         host=server["host"],
         port=server["port"],

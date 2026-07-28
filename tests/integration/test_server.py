@@ -18,7 +18,8 @@ from hermes_feishu_card import server as sidecar_server
 from hermes_feishu_card.bots import RouteResult
 from hermes_feishu_card.card_limits import inspect_card_limits
 from hermes_feishu_card.events import SidecarEvent
-from hermes_feishu_card.event_auth import sign_event_request
+from hermes_feishu_card.delivery_policy import ChatDeliveryPolicy
+from hermes_feishu_card.event_auth import sign_event_request, sign_policy_request
 from hermes_feishu_card.feishu_client import FeishuAPIError
 from hermes_feishu_card.diagnostics import DiagnosticFinding, DiagnosticReport
 from hermes_feishu_card.flush import FlushController
@@ -76,6 +77,11 @@ def create_app(*args, **kwargs):
         TRANSPORT_ROOT_SECRET,
     )
     return _create_app(*args, **kwargs)
+
+
+def signed_policy_request(payload):
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return body, sign_policy_request(TRANSPORT_ROOT_SECRET, body)
 
 
 def signed_operations_command(payload):
@@ -567,6 +573,265 @@ def test_create_app_refuses_required_event_auth_without_private_root_secret():
         )
 
 
+async def test_delivery_policy_requires_signed_fresh_request_and_never_echoes_ids():
+    raw_chat_id = "oc_private_chat_123"
+    app = create_app(
+        FakeFeishuClient(),
+        delivery_policy=ChatDeliveryPolicy(native_chats=(raw_chat_id,)),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    payload = {
+        "schema_version": "1",
+        "chat_id": raw_chat_id,
+        "profile_id": "",
+        "message_id": "om_private_message_123",
+    }
+    body, headers = signed_policy_request(payload)
+    try:
+        unsigned = await test_client.post("/delivery/policy", data=body)
+        accepted = await test_client.post(
+            "/delivery/policy", data=body, headers=headers
+        )
+        replayed = await test_client.post(
+            "/delivery/policy", data=body, headers=headers
+        )
+        response_text = await accepted.text()
+        assert unsigned.status == 401
+        assert accepted.status == 200
+        assert json.loads(response_text) == {
+            "ok": True,
+            "disposition": "native",
+            "reason": "bindings.native_chats",
+            "ttl_ms": 1000,
+        }
+        assert replayed.status == 401
+        assert raw_chat_id not in response_text
+        assert payload["message_id"] not in response_text
+        assert app[METRICS_KEY].policy_queries == 1
+        assert app[METRICS_KEY].policy_auth_rejections == 2
+    finally:
+        await test_client.close()
+
+
+async def test_delivery_policy_rejects_malformed_payload_without_echoing_value():
+    app = create_app(FakeFeishuClient())
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    leaked = "oc_should_not_be_echoed"
+    body, headers = signed_policy_request(
+        {"schema_version": "2", "chat_id": leaked}
+    )
+    try:
+        response = await test_client.post(
+            "/delivery/policy", data=body, headers=headers
+        )
+        text = await response.text()
+        assert response.status == 400
+        assert leaked not in text
+    finally:
+        await test_client.close()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"schema_version": "1", "chat_id": "oc_bad\nchat"},
+        {
+            "schema_version": "1",
+            "chat_id": "oc_valid",
+            "profile_id": "../default",
+        },
+        {
+            "schema_version": "1",
+            "chat_id": "oc_valid",
+            "message_id": "om_bad\x7fmessage",
+        },
+    ],
+)
+async def test_delivery_policy_rejects_control_characters_and_invalid_profile(
+    payload,
+):
+    app = create_app(FakeFeishuClient())
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    body, headers = signed_policy_request(payload)
+    try:
+        response = await test_client.post(
+            "/delivery/policy", data=body, headers=headers
+        )
+        assert response.status == 400
+        response_text = await response.text()
+        assert str(next(reversed(payload.values()))) not in response_text
+    finally:
+        await test_client.close()
+
+
+async def test_delivery_policy_fails_closed_when_private_root_is_missing():
+    app = _create_app(FakeFeishuClient())
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/delivery/policy",
+            json={"schema_version": "1", "chat_id": "oc_private"},
+        )
+        assert response.status == 503
+        assert (await response.json())["ok"] is False
+    finally:
+        await test_client.close()
+
+
+async def test_native_event_bypasses_before_any_card_state_or_feishu_send():
+    raw_chat_id = "oc_native_chat"
+    client = FakeFeishuClient()
+    app = create_app(
+        client,
+        delivery_policy=ChatDeliveryPolicy(native_chats=(raw_chat_id,)),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    payload = event_payload("message.started", 0)
+    payload["chat_id"] = raw_chat_id
+    try:
+        response = await test_client.post("/events", json=payload)
+        assert response.status == 200
+        assert await response.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert app[SESSIONS_KEY] == {}
+        assert app[SESSION_ALIASES_KEY] == {}
+        assert app[FEISHU_MESSAGE_IDS_KEY] == {}
+        assert client.sent == []
+        assert app[METRICS_KEY].native_bypass_events == 1
+        assert app[METRICS_KEY].events_ignored == 0
+    finally:
+        await test_client.close()
+
+
+async def test_existing_active_card_turn_stays_card_after_policy_changes_native():
+    class MutablePolicy:
+        def __init__(self):
+            self.native = False
+
+        def decide(self, chat_id, *, profile_id=""):
+            return ChatDeliveryPolicy(
+                native_chats=(chat_id,) if self.native else ()
+            ).decide(chat_id, profile_id=profile_id)
+
+        def safe_diagnostics(self):
+            return {"status": "ready", "native_chat_count": int(self.native)}
+
+    policy = MutablePolicy()
+    client = FakeFeishuClient()
+    app = create_app(client, delivery_policy=policy, card_config={"flush_interval_ms": 0})
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        started = await test_client.post(
+            "/events", json=event_payload("message.started", 0)
+        )
+        assert (await started.json())["applied"] is True
+        policy.native = True
+        completed_payload = event_payload("message.completed", 1)
+        completed_payload["data"] = {"answer": "done"}
+        completed = await test_client.post("/events", json=completed_payload)
+        assert (await completed.json())["applied"] is True
+        assert len(client.sent) == 1
+        assert app[METRICS_KEY].native_bypass_events == 0
+
+        next_turn = await test_client.post(
+            "/events", json=event_payload("message.started", 0)
+        )
+        assert await next_turn.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert app[SESSIONS_KEY] == {}
+        assert len(client.sent) == 1
+        assert app[METRICS_KEY].native_bypass_events == 1
+    finally:
+        await test_client.close()
+
+
+async def test_reused_message_id_nonterminal_event_rechecks_policy_without_started():
+    class MutablePolicy:
+        def __init__(self):
+            self.native = False
+
+        def decide(self, chat_id, *, profile_id=""):
+            return ChatDeliveryPolicy(
+                native_chats=(chat_id,) if self.native else ()
+            ).decide(chat_id, profile_id=profile_id)
+
+        def safe_diagnostics(self):
+            return {"status": "ready", "native_chat_count": int(self.native)}
+
+    policy = MutablePolicy()
+    client = FakeFeishuClient()
+    app = create_app(
+        client,
+        delivery_policy=policy,
+        card_config={"flush_interval_ms": 0},
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        await test_client.post(
+            "/events",
+            json=event_payload("message.completed", 1, {"answer": "first"}),
+        )
+        policy.native = True
+
+        response = await test_client.post(
+            "/events",
+            json=event_payload(
+                "answer.delta",
+                0,
+                {"text": "next", "policy_new_turn": True},
+            ),
+        )
+
+        assert await response.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert app[SESSIONS_KEY] == {}
+        assert len(client.sent) == 1
+    finally:
+        await test_client.close()
+
+
+async def test_invalid_event_profile_is_native_before_default_session_creation():
+    client = FakeFeishuClient()
+    app = create_app(
+        client,
+        delivery_policy=ChatDeliveryPolicy(
+            profile_native_chats={"default": ()},
+        ),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    payload = event_payload("message.started", 0)
+    payload["data"]["profile_id"] = "../default"
+    try:
+        response = await test_client.post("/events", json=payload)
+        assert await response.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert app[SESSIONS_KEY] == {}
+        assert client.sent == []
+    finally:
+        await test_client.close()
+
+
 async def wait_for_card_update(feishu_client, expected_text, attempts=80):
     for _ in range(attempts):
         for message_id, card in reversed(feishu_client.updated):
@@ -745,6 +1010,11 @@ async def test_health_reports_healthy_status_and_active_sessions(client):
         "integrity_repair_attempts": 0,
         "integrity_repair_successes": 0,
         "integrity_repair_refusals": 0,
+        "policy_queries": 0,
+        "policy_auth_rejections": 0,
+        "policy_invalid_requests": 0,
+        "policy_event_checks": 0,
+        "native_bypass_events": 0,
         "feishu_send_attempts": 0,
         "feishu_noop_attempts": 0,
         "feishu_send_successes": 0,
@@ -4114,7 +4384,7 @@ async def test_profiled_hook_like_started_and_delta_apply_to_same_session():
     assert len(feishu_client.updated) == 1
 
 
-async def test_profile_diagnostics_sanitizes_invalid_profile_keys():
+async def test_invalid_profile_fails_native_without_default_profile_diagnostics():
     feishu_client = FakeFeishuClient()
     app = create_app(feishu_client)
     server = TestServer(app)
@@ -4130,13 +4400,19 @@ async def test_profile_diagnostics_sanitizes_invalid_profile_keys():
             ),
         )
         assert response.status == 200
+        response_body = await response.json()
         health = await test_client.get("/health")
         body = await health.json()
     finally:
         await test_client.close()
 
-    assert "bad:profile/path" not in body["profile_diagnostics"]
-    assert body["profile_diagnostics"]["default"]["events"] == 1
+    assert response_body == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    assert body["profile_diagnostics"] == {}
+    assert feishu_client.sent == []
 
 
 async def test_event_lifecycle_sends_then_updates_final_card(client):
@@ -6978,8 +7254,14 @@ async def test_session_card_config_preserves_base_text_size_roles_on_profile_ove
     assert footer["text_size"] == "notation"
 
 
-@pytest.mark.parametrize("profile_id", ["bad:profile/path", "", "x" * 65])
-async def test_invalid_profile_routes_with_default_factory_and_health_key(profile_id):
+@pytest.mark.parametrize(
+    ("profile_id", "uses_default_profile"),
+    [("bad:profile/path", False), ("", True), ("x" * 65, False)],
+)
+async def test_invalid_profile_is_native_but_empty_profile_uses_default(
+    profile_id,
+    uses_default_profile,
+):
     factory = FakeFeishuClientFactory()
 
     def bot_router(event):
@@ -7007,11 +7289,19 @@ async def test_invalid_profile_routes_with_default_factory_and_health_key(profil
         await test_client.close()
 
     assert status == 200
-    assert body == DELIVERED_RESPONSE
     assert factory.clients["default"].sent == []
-    assert len(factory.clients["sales"].sent) == 1
-    assert profile_id not in health_body["profile_diagnostics"]
-    assert health_body["profile_diagnostics"]["default"]["events"] == 1
+    if uses_default_profile:
+        assert body == DELIVERED_RESPONSE
+        assert len(factory.clients["sales"].sent) == 1
+        assert health_body["profile_diagnostics"]["default"]["events"] == 1
+    else:
+        assert body == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert factory.clients["sales"].sent == []
+        assert health_body["profile_diagnostics"] == {}
     assert health_body["routing"]["last_route_error"] == ""
 
 

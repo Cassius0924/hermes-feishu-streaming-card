@@ -20,9 +20,20 @@ from aiohttp import web
 
 from .bots import RouteResult
 from .config import load_config, merge_card_config, resolve_operations_hermes_root
+from .delivery_policy import (
+    CARD_DISPOSITION,
+    ChatDeliveryDecision,
+    ChatDeliveryPolicy,
+    NATIVE_DISPOSITION,
+)
 from .diagnostics import DiagnosticFinding, DiagnosticReport, build_diagnostic_report
 from .events import EventValidationError, SidecarEvent
-from .event_auth import EventAuthenticationError, EventProofVerifier
+from .event_auth import (
+    EventAuthenticationError,
+    EventProofVerifier,
+    PolicyAuthenticationError,
+    PolicyProofVerifier,
+)
 from .flush import FlushController
 from .feishu_client import FeishuAPIError, build_delivery_uuid
 from .lifecycle import (
@@ -90,6 +101,8 @@ RUNTIME_INTEGRITY_COORDINATOR_KEY = web.AppKey(
     "runtime_integrity_coordinator", RuntimeIntegrityCoordinator
 )
 RUNTIME_INTEGRITY_TASK_KEY = web.AppKey("runtime_integrity_task", asyncio.Task)
+DELIVERY_POLICY_KEY = web.AppKey("delivery_policy", Any)
+POLICY_AUTH_VERIFIER_KEY = web.AppKey("policy_auth_verifier", PolicyProofVerifier)
 MESSAGE_LOCKS_KEY = web.AppKey("message_locks", dict)
 MESSAGE_LOCK_USERS_KEY = web.AppKey("message_lock_users", dict)
 FOOTER_FIELDS_KEY = web.AppKey("footer_fields", Any)
@@ -135,6 +148,7 @@ OPERATIONS_DIAGNOSTIC_TIMEOUT_SECONDS = 12.0
 RESTART_CALLBACK_GRACE_SECONDS = 0.25
 _STABLE_PROFILE_SOURCES = PROFILE_SOURCES
 TERMINAL_EVENTS = {"message.completed", "message.failed"}
+TURN_REOPENING_EVENTS = {"thinking.delta", "tool.updated", "answer.delta"}
 SESSION_CREATING_EVENTS = {
     "thinking.delta",
     "tool.updated",
@@ -205,6 +219,7 @@ def create_app(
     noop_mode: bool = False,
     integrity_mode: str = "notify",
     expected_runtime_package_version: str = "",
+    delivery_policy: Any = None,
 ) -> web.Application:
     valid_transport_root = (
         isinstance(operations_transport_root_secret, bytes)
@@ -246,6 +261,13 @@ def create_app(
         )
     else:
         runtime_supervisor.mark_control_auth_unavailable()
+    app[DELIVERY_POLICY_KEY] = (
+        delivery_policy if delivery_policy is not None else ChatDeliveryPolicy()
+    )
+    if valid_transport_root:
+        app[POLICY_AUTH_VERIFIER_KEY] = PolicyProofVerifier(
+            operations_transport_root_secret
+        )
     app[MESSAGE_LOCKS_KEY] = {}
     app[MESSAGE_LOCK_USERS_KEY] = {}
     app[FLUSH_CONTROLLERS_KEY] = {}
@@ -308,6 +330,7 @@ def create_app(
     app.router.add_post("/card/actions", _card_actions)
     app.router.add_post("/commands", _commands)
     app.router.add_post("/runtime/events", _runtime_events)
+    app.router.add_post("/delivery/policy", _delivery_policy)
     app.router.add_post("/events", _events)
     app.on_startup.append(_start_runtime_cleanup)
     app.on_startup.append(_start_runtime_integrity_monitor)
@@ -457,6 +480,7 @@ async def _health(request: web.Request) -> web.Response:
         "diagnostics": _sanitize_health_diagnostics(diagnostics),
         "routing": _sanitize_health_diagnostics(request.app[ROUTING_DIAGNOSTICS_KEY]),
         "profile_diagnostics": _sanitize_health_diagnostics(request.app[PROFILE_DIAGNOSTICS_KEY]),
+        "delivery_policy": _safe_delivery_policy_diagnostics(request.app),
     }
     process_token = request.app[PROCESS_TOKEN_KEY]
     if process_token:
@@ -483,6 +507,16 @@ async def _health(request: web.Request) -> web.Response:
         response["profiles"] = profile_stats
 
     return web.json_response(response)
+
+
+def _safe_delivery_policy_diagnostics(app: web.Application) -> dict[str, Any]:
+    try:
+        diagnostics = app[DELIVERY_POLICY_KEY].safe_diagnostics()
+    except Exception:
+        return {"status": "unavailable"}
+    if not isinstance(diagnostics, dict):
+        return {"status": "unavailable"}
+    return _sanitize_health_diagnostics(diagnostics)
 
 
 async def _message_summary(request: web.Request) -> web.Response:
@@ -1770,6 +1804,123 @@ async def _runtime_events(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "accepted": accepted})
 
 
+async def _delivery_policy(request: web.Request) -> web.Response:
+    metrics: SidecarMetrics = request.app[METRICS_KEY]
+    verifier = request.app.get(POLICY_AUTH_VERIFIER_KEY)
+    if verifier is None:
+        metrics.policy_auth_rejections += 1
+        return web.json_response(
+            {"ok": False, "error": "policy authentication unavailable"},
+            status=503,
+        )
+    body = await request.read()
+    try:
+        verifier.verify(request.headers, body)
+    except PolicyAuthenticationError:
+        metrics.policy_auth_rejections += 1
+        return web.json_response(
+            {"ok": False, "error": "policy authentication failed"},
+            status=401,
+        )
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        payload = None
+    if not _valid_delivery_policy_payload(payload):
+        metrics.policy_invalid_requests += 1
+        return web.json_response(
+            {"ok": False, "error": "invalid policy request"},
+            status=400,
+        )
+    metrics.policy_queries += 1
+    decision = _policy_decision(
+        request.app,
+        payload["chat_id"],
+        profile_id=payload.get("profile_id", ""),
+    )
+    return web.json_response(
+        {
+            "ok": True,
+            "disposition": decision.disposition,
+            "reason": decision.reason,
+            "ttl_ms": 1000,
+        }
+    )
+
+
+def _valid_delivery_policy_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict) or payload.get("schema_version") != "1":
+        return False
+    allowed = {
+        "schema_version",
+        "chat_id",
+        "profile_id",
+        "message_id",
+        "conversation_id",
+        "turn_id",
+    }
+    if set(payload) - allowed:
+        return False
+    chat_id = payload.get("chat_id")
+    if (
+        not isinstance(chat_id, str)
+        or not chat_id.strip()
+        or len(chat_id) > 512
+        or _has_control_characters(chat_id)
+    ):
+        return False
+    profile_id = payload.get("profile_id", "")
+    if (
+        not isinstance(profile_id, str)
+        or len(profile_id) > 64
+        or _has_control_characters(profile_id)
+        or (profile_id and PROFILE_ID_PATTERN.fullmatch(profile_id) is None)
+    ):
+        return False
+    for field in ("message_id", "conversation_id", "turn_id"):
+        value = payload.get(field, "")
+        if (
+            not isinstance(value, str)
+            or len(value) > 512
+            or _has_control_characters(value)
+        ):
+            return False
+    return True
+
+
+def _has_control_characters(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _policy_decision(
+    app: web.Application,
+    chat_id: str,
+    *,
+    profile_id: str = "",
+) -> ChatDeliveryDecision:
+    try:
+        decision = app[DELIVERY_POLICY_KEY].decide(
+            chat_id,
+            profile_id=profile_id,
+        )
+    except Exception:
+        return ChatDeliveryDecision(NATIVE_DISPOSITION, "policy_unavailable")
+    if (
+        not isinstance(decision, ChatDeliveryDecision)
+        or decision.disposition not in {CARD_DISPOSITION, NATIVE_DISPOSITION}
+        or decision.reason
+        not in {
+            "default_card",
+            "bindings.native_chats",
+            "chat_identity_missing",
+            "profile_unknown",
+            "policy_unavailable",
+        }
+    ):
+        return ChatDeliveryDecision(NATIVE_DISPOSITION, "policy_unavailable")
+    return decision
+
+
 async def _events(request: web.Request) -> web.Response:
     metrics: SidecarMetrics = request.app[METRICS_KEY]
     if request.app[EVENT_AUTH_REQUIRED_KEY]:
@@ -2063,6 +2214,21 @@ def _session_key(event: SidecarEvent) -> str:
     return _session_key_for_message_id(event, event.message_id)
 
 
+def _policy_profile_id(event: SidecarEvent) -> str | None:
+    data = event.data if isinstance(event.data, dict) else {}
+    if "profile_id" not in data:
+        return ""
+    raw_profile_id = data.get("profile_id")
+    if not isinstance(raw_profile_id, str):
+        return None
+    candidate = raw_profile_id.strip()
+    if not candidate:
+        return "default"
+    if PROFILE_ID_PATTERN.fullmatch(candidate):
+        return candidate
+    return None
+
+
 def _session_key_for_message_id(event: SidecarEvent, message_id: str) -> str:
     has_profile_id = isinstance(event.data, dict) and "profile_id" in event.data
     profile_id = _safe_profile_id(event.data.get("profile_id") if has_profile_id else None)
@@ -2215,6 +2381,17 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
     sessions: Dict[str, CardSession] = request.app[SESSIONS_KEY]
     feishu_message_ids: Dict[str, str] = request.app[FEISHU_MESSAGE_IDS_KEY]
     message_bot_ids: Dict[str, str] = request.app[MESSAGE_BOT_IDS_KEY]
+    policy_profile_id = _policy_profile_id(event)
+    if policy_profile_id is None:
+        metrics.policy_event_checks += 1
+        metrics.native_bypass_events += 1
+        return web.json_response(
+            {
+                "ok": True,
+                "applied": False,
+                "disposition": NATIVE_DISPOSITION,
+            }
+        ), None
     _record_profile_diagnostics(request.app, event)
     _record_attachment_diagnostics(request.app, event)
     incoming_event = event
@@ -2223,6 +2400,42 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
     if session is not None:
         event = _event_for_session(incoming_event, session)
     event_is_terminal = _event_is_terminal(event)
+
+    if (
+        (
+            event.event == "message.started"
+            or (
+                event.event in TURN_REOPENING_EVENTS
+                and incoming_event.data.get("policy_new_turn") is True
+            )
+        )
+        and session is not None
+        and session.status in {"completed", "failed"}
+    ):
+        # A completed topic session can share the next turn's message id. A
+        # stream event is also sufficient evidence of a new turn when Hermes
+        # omitted message.started. Re-read policy before allocating card state.
+        _reset_session_for_new_turn(request.app, session_key)
+        session = None
+        event = incoming_event
+        event_is_terminal = _event_is_terminal(event)
+
+    if session is None:
+        metrics.policy_event_checks += 1
+        decision = _policy_decision(
+            request.app,
+            incoming_event.chat_id,
+            profile_id=policy_profile_id,
+        )
+        if decision.disposition == NATIVE_DISPOSITION:
+            metrics.native_bypass_events += 1
+            return web.json_response(
+                {
+                    "ok": True,
+                    "applied": False,
+                    "disposition": NATIVE_DISPOSITION,
+                }
+            ), None
 
     if _skip_native_text_fallback_interaction(request.app, event):
         metrics.events_ignored += 1
@@ -2252,19 +2465,8 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
 
     if event.event == "message.started":
         if session is not None:
-            if session.status in {"completed", "failed"}:
-                # Feishu topic (thread) groups reuse the same message_id across
-                # consecutive messages in the same thread, so a new turn's
-                # message.started collides with the previous, already-finished
-                # session for that key. Treat it as a fresh turn: discard the
-                # finished session and its delivery bookkeeping so the code below
-                # creates a new session and sends a NEW card (rather than
-                # ignoring the started event and losing the card entirely).
-                _reset_session_for_new_turn(request.app, session_key)
-                session = None
-            else:
-                metrics.events_ignored += 1
-                return web.json_response({"ok": True, "applied": False}), None
+            metrics.events_ignored += 1
+            return web.json_response({"ok": True, "applied": False}), None
     if event.event == "message.started" and session is None:
         # Abandon stale sessions for the same conversation — covers the case
         # where a new message arrives with its own explicit message_id (e.g.
@@ -3620,7 +3822,11 @@ def _resolve_route(request: web.Request, event: SidecarEvent) -> RouteResult | N
         _record_profile_route_success(diagnostics, current_profile_id, route_diagnostics)
     # 多 profile 模式：将 profile_id 注入 bot_id，以便 _client_for_bot 正确路由
     if current_profile_id is not None:
-        route = RouteResult(f"{current_profile_id}:{route.bot_id}", route.reason)
+        route = RouteResult(
+            f"{current_profile_id}:{route.bot_id}",
+            route.reason,
+            metadata=route.metadata,
+        )
     return route
 
 

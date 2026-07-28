@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .config import merge_card_config, normalize_text_sizes
+from .delivery_policy import ChatDeliveryPolicy
 from .feishu_client import FeishuClient, FeishuClientConfig
 
 
@@ -81,6 +82,7 @@ class BotRegistry:
         chat_bindings: dict[str, str] | None = None,
         group_rules: GroupRules | None = None,
         default_reason: str = "default",
+        delivery_policy: ChatDeliveryPolicy | None = None,
     ) -> None:
         if not bots:
             raise ValueError("at least one bot is required")
@@ -94,6 +96,9 @@ class BotRegistry:
         self.chat_bindings = dict(chat_bindings or {})
         self.group_rules = group_rules or GroupRules()
         self._default_reason = default_reason
+        self.delivery_policy = (
+            delivery_policy if delivery_policy is not None else ChatDeliveryPolicy()
+        )
 
         for chat_id, bot_id in self.chat_bindings.items():
             if bot_id not in self._bots:
@@ -148,6 +153,7 @@ class BotRegistry:
             chat_bindings=chat_bindings,
             group_rules=group_rules,
             default_reason=default_reason,
+            delivery_policy=ChatDeliveryPolicy.from_config(config),
         )
 
     def get(self, bot_id: str) -> BotConfig:
@@ -177,10 +183,20 @@ class BotRegistry:
         )
 
     def _route_metadata(self, context: RoutingContext) -> dict[str, Any]:
+        decision = self.delivery_policy.decide(
+            context.chat_id,
+            profile_id=context.profile_id,
+        )
+        metadata: dict[str, Any] = {
+            "delivery": {
+                "disposition": decision.disposition,
+                "reason": decision.reason,
+            }
+        }
         group = self.group_status(context)
-        if not group.get("is_group"):
-            return {}
-        return {"group": group}
+        if group.get("is_group"):
+            metadata["group"] = group
+        return metadata
 
     def safe_diagnostics(self) -> dict[str, Any]:
         return {
@@ -188,6 +204,7 @@ class BotRegistry:
             "bot_count": len(self._bots),
             "chat_binding_count": len(self.chat_bindings),
             "group_rules": self.group_rules.safe_diagnostics(),
+            "delivery_policy": self.delivery_policy.safe_diagnostics(),
             "bots": [
                 {
                     "bot_id": bot.bot_id,

@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from .delivery_policy import normalize_native_chats
+
 
 DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
     "server": {
@@ -21,6 +23,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
     "bots": {"default": "default", "items": {}},
     "bindings": {
         "chats": {},
+        "native_chats": [],
         "group_rules": {"enabled": False},
     },
     # Missing values stay notification-only for upgraded existing configs.
@@ -238,6 +241,7 @@ def load_config(
     _apply_env_overrides(config)
     _normalize_config_card_options(config)
     _normalize_integrity_mode(config)
+    _normalize_config_native_chats(config)
     config["server"]["port"] = _normalize_port(config["server"]["port"], "server.port")
     _validate_service_manager(config)
     return config
@@ -266,6 +270,28 @@ def _validate_service_manager(config: dict[str, Any]) -> None:
     if not isinstance(manager, str) or manager not in SERVICE_MANAGER_VALUES:
         values = ", ".join(sorted(SERVICE_MANAGER_VALUES))
         raise ValueError(f"service.manager must be one of: {values}")
+
+
+def _normalize_config_native_chats(config: dict[str, Any]) -> None:
+    bindings = config.get("bindings")
+    if isinstance(bindings, dict):
+        bindings["native_chats"] = normalize_native_chats(
+            bindings.get("native_chats", []),
+            path="bindings.native_chats",
+        )
+    profiles = config.get("profiles")
+    if not isinstance(profiles, Mapping):
+        return
+    for profile_id, profile in profiles.items():
+        if not isinstance(profile, dict):
+            continue
+        profile_bindings = profile.get("bindings")
+        if not isinstance(profile_bindings, dict):
+            continue
+        profile_bindings["native_chats"] = normalize_native_chats(
+            profile_bindings.get("native_chats", []),
+            path=f"profiles.{profile_id}.bindings.native_chats",
+        )
 
 
 def _normalize_config_card_options(config: dict[str, Any]) -> None:

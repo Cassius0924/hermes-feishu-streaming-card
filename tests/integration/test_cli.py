@@ -1433,3 +1433,94 @@ profiles:
     assert calls[0][1:] == ("sales", "oc-chat-1")
     assert "om-profile-bot-smoke" in captured.out
     assert "work-sales-secret" not in captured.out
+
+
+def test_chats_use_native_list_and_use_card_are_atomic_and_mask_chat_id(
+    tmp_path, capsys
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    raw_chat_id = "oc_private_native_chat"
+
+    assert main(["chats", "use-native", raw_chat_id, "--config", str(config_path)]) == 0
+    first = capsys.readouterr()
+    assert raw_chat_id not in first.out + first.err
+    assert "chat#" in first.out
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert data["bindings"]["native_chats"] == [raw_chat_id]
+
+    assert main(["chats", "list", "--config", str(config_path)]) == 0
+    listed = capsys.readouterr()
+    assert raw_chat_id not in listed.out + listed.err
+    assert "chat#" in listed.out
+
+    assert main(["chats", "use-card", raw_chat_id, "--config", str(config_path)]) == 0
+    removed = capsys.readouterr()
+    assert raw_chat_id not in removed.out + removed.err
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert data["bindings"]["native_chats"] == []
+
+
+def test_chats_mutation_preserves_private_config_permissions(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("server: {}\n", encoding="utf-8")
+    config_path.chmod(0o600)
+
+    assert main(
+        [
+            "chats",
+            "use-native",
+            "oc_private_mode",
+            "--config",
+            str(config_path),
+        ]
+    ) == 0
+    capsys.readouterr()
+
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_chats_multi_profile_requires_explicit_existing_profile_without_id_leak(
+    tmp_path, capsys
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "profiles:\n  work:\n    bindings:\n      native_chats: []\n",
+        encoding="utf-8",
+    )
+    raw_chat_id = "oc_profile_private_chat"
+
+    assert main(["chats", "use-native", raw_chat_id, "--config", str(config_path)]) == 1
+    missing = capsys.readouterr()
+    assert raw_chat_id not in missing.out + missing.err
+    assert "profile" in missing.err.lower()
+
+    assert main(
+        [
+            "chats",
+            "use-native",
+            raw_chat_id,
+            "--profile-id",
+            "unknown",
+            "--config",
+            str(config_path),
+        ]
+    ) == 1
+    unknown = capsys.readouterr()
+    assert raw_chat_id not in unknown.out + unknown.err
+
+    assert main(
+        [
+            "chats",
+            "use-native",
+            raw_chat_id,
+            "--profile-id",
+            "work",
+            "--config",
+            str(config_path),
+        ]
+    ) == 0
+    success = capsys.readouterr()
+    assert raw_chat_id not in success.out + success.err
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert data["profiles"]["work"]["bindings"]["native_chats"] == [raw_chat_id]

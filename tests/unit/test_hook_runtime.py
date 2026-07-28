@@ -13,7 +13,7 @@ from urllib import error
 import pytest
 
 from hermes_feishu_card import hook_runtime
-from hermes_feishu_card.event_auth import EventProofVerifier
+from hermes_feishu_card.event_auth import EventProofVerifier, PolicyProofVerifier
 
 
 def _operation_token(operation_id="operation-1"):
@@ -40,6 +40,11 @@ def clear_hook_env(monkeypatch):
     ):
         monkeypatch.delenv(name, raising=False)
     hook_runtime.reset_runtime_state()
+
+    def card_policy(*_args, **_kwargs):
+        return {"ok": True, "disposition": "card", "ttl_ms": 1000}
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", card_policy)
 
 
 def test_load_runtime_config_defaults():
@@ -2956,6 +2961,293 @@ def test_install_feishu_command_card_methods_repairs_stale_install_marker():
 
     assert result.success is True
     assert adapter.sent["msg_type"] == "interactive"
+
+
+def test_existing_slash_confirm_is_wrapped_and_native_calls_original_once(
+    monkeypatch,
+):
+    original_calls = []
+    sentinel = object()
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        async def send_slash_confirm(
+            self,
+            chat_id,
+            title,
+            message,
+            session_key,
+            confirm_id,
+            metadata=None,
+        ):
+            original_calls.append(
+                (chat_id, title, message, session_key, confirm_id, metadata)
+            )
+            return sentinel
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "disposition": "native",
+            "ttl_ms": 1000,
+        },
+    )
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    assert type(adapter).send_slash_confirm is hook_runtime._hfc_send_native_slash_confirm
+    assert callable(type(adapter).__dict__.get("_hfc_original_send_slash_confirm"))
+
+    result = asyncio.run(
+        adapter.send_slash_confirm(
+            "oc_native_original",
+            "Confirm",
+            "Details",
+            "session-1",
+            "confirm-1",
+            metadata={"reply_to_message_id": "om_reply"},
+        )
+    )
+
+    assert result is sentinel
+    assert original_calls == [
+        (
+            "oc_native_original",
+            "Confirm",
+            "Details",
+            "session-1",
+            "confirm-1",
+            {"reply_to_message_id": "om_reply"},
+        )
+    ]
+
+
+def test_inherited_slash_confirm_is_preserved_for_native_policy(monkeypatch):
+    original_calls = []
+    sentinel = object()
+
+    class BaseAdapter:
+        async def send_slash_confirm(self, *args, **kwargs):
+            original_calls.append((args, kwargs))
+            return sentinel
+
+    class DummyFeishuAdapter(BaseAdapter):
+        name = "feishu"
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "disposition": "native",
+            "ttl_ms": 1000,
+        },
+    )
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    result = asyncio.run(
+        adapter.send_slash_confirm(
+            "oc_inherited",
+            "Confirm",
+            "Details",
+            "session-2",
+            "confirm-2",
+        )
+    )
+
+    assert result is sentinel
+    assert len(original_calls) == 1
+
+
+def test_existing_model_and_resume_pickers_call_original_for_native_policy(
+    monkeypatch,
+):
+    model_calls = []
+    resume_calls = []
+    model_sentinel = object()
+    resume_sentinel = object()
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        async def send_model_picker(self, *args, **kwargs):
+            model_calls.append((args, kwargs))
+            return model_sentinel
+
+        async def send_resume_picker(self, **kwargs):
+            resume_calls.append(kwargs)
+            return resume_sentinel
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "disposition": "native",
+            "ttl_ms": 1000,
+        },
+    )
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    event = object()
+    original_handler = object()
+
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    assert type(adapter).send_model_picker is hook_runtime._hfc_send_native_model_picker
+    assert type(adapter).send_resume_picker is hook_runtime._hfc_send_native_resume_picker
+    assert callable(type(adapter).__dict__.get("_hfc_original_send_model_picker"))
+    assert callable(type(adapter).__dict__.get("_hfc_original_send_resume_picker"))
+    model_result = asyncio.run(
+        adapter.send_model_picker(
+            "oc_model_native",
+            [{"slug": "provider", "models": ["model"]}],
+            current_model="model",
+            current_provider="provider",
+            session_key="session-model",
+            on_model_selected=None,
+            metadata={"k": "v"},
+        )
+    )
+    resume_result = asyncio.run(
+        adapter.send_resume_picker(
+            chat_id="oc_resume_native",
+            sessions=[{"id": "session-1", "title": "One"}],
+            current_session_id="session-1",
+            runner=runner,
+            event=event,
+            original_handler=original_handler,
+            metadata={"reply_to_message_id": "om_resume"},
+        )
+    )
+
+    assert model_result is model_sentinel
+    assert resume_result is resume_sentinel
+    assert len(model_calls) == 1
+    assert resume_calls == [
+        {
+            "chat_id": "oc_resume_native",
+            "sessions": [{"id": "session-1", "title": "One"}],
+            "current_session_id": "session-1",
+            "runner": runner,
+            "event": event,
+            "original_handler": original_handler,
+            "metadata": {"reply_to_message_id": "om_resume"},
+        }
+    ]
+
+
+def test_existing_slash_confirm_uses_hfc_card_for_card_policy():
+    original_calls = []
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        def __init__(self):
+            self._client = object()
+            self.sent = []
+
+        async def send_slash_confirm(self, *args, **kwargs):
+            original_calls.append((args, kwargs))
+            return object()
+
+        async def _feishu_send_with_retry(self, **kwargs):
+            self.sent.append(kwargs)
+            return SimpleNamespace(success=True, message_id="om_hfc_confirm")
+
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    result = asyncio.run(
+        adapter.send_slash_confirm(
+            "oc_card_policy",
+            "Confirm",
+            "Details",
+            "session-card",
+            "confirm-card",
+        )
+    )
+
+    assert result.success is True
+    assert result.message_id == "om_hfc_confirm"
+    assert original_calls == []
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["msg_type"] == "interactive"
+
+
+def test_invalid_profile_delivery_context_keeps_direct_command_and_notice_native(
+    monkeypatch,
+):
+    policy_calls = []
+    original_calls = []
+
+    def unexpected_policy(*_args, **_kwargs):
+        policy_calls.append(True)
+        return {"ok": True, "disposition": "card", "ttl_ms": 1000}
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            original_calls.append((chat_id, content, reply_to, metadata))
+            return SimpleNamespace(success=True, message_id="om_native_direct")
+
+    source = SimpleNamespace(
+        platform="feishu",
+        chat_id="oc_invalid_direct",
+        message_id="om_invalid_direct",
+        profile_id="../work",
+    )
+    event = SimpleNamespace(
+        source=source,
+        message_id="om_invalid_direct",
+        get_command=lambda: "/new",
+    )
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        unexpected_policy,
+    )
+
+    assert hook_runtime.install_feishu_command_card_adapter_methods(
+        runner,
+        event=event,
+    )
+    context = hook_runtime._HFC_FEISHU_DELIVERY_CONTEXT.get()
+    assert context["profile_invalid"] is True
+
+    command_result = asyncio.run(
+        adapter.send("oc_invalid_direct", "Session reset", reply_to="om_reply")
+    )
+    notice_result = asyncio.run(
+        adapter.send(
+            "oc_invalid_direct",
+            "⏳ Working — 1 min — terminal",
+            reply_to="om_reply",
+        )
+    )
+
+    assert command_result.success is True
+    assert notice_result.success is True
+    assert policy_calls == []
+    assert original_calls == [
+        ("oc_invalid_direct", "Session reset", "om_reply", None),
+        (
+            "oc_invalid_direct",
+            "⏳ Working — 1 min — terminal",
+            "om_reply",
+            None,
+        ),
+    ]
 
 
 def test_install_feishu_command_card_methods_refreshes_live_callback_without_replacing_handler():
@@ -6412,6 +6704,7 @@ async def test_emit_from_hermes_locals_threadsafe_schedules_on_running_loop(monk
     assert payload["data"] == {
         "profile_id": "default",
         "profile_source": "fallback_default",
+        "policy_new_turn": True,
         "text": "hello",
     }
     assert timeout == 0.8
@@ -6556,8 +6849,6 @@ async def test_emit_cron_delivery_reports_sender_failure_from_running_loop(monke
 
     assert result is False
     assert len(payloads) == 1
-
-
 def test_emit_cron_delivery_falls_through_when_sidecar_requests_native(monkeypatch):
     posted = []
 
@@ -6624,6 +6915,7 @@ def test_emit_from_hermes_locals_threadsafe_uses_explicit_loop_from_sync_call(
     assert payload["data"] == {
         "profile_id": "default",
         "profile_source": "fallback_default",
+        "policy_new_turn": True,
         "tool_id": "tool_1",
         "name": "search",
         "status": "completed",
@@ -7174,6 +7466,500 @@ def test_interaction_select_ignores_incomplete_action(monkeypatch):
 
     assert called["posted"] is False
     assert response.card is None
+
+
+def test_native_policy_stops_before_event_sequence_and_delta_queue(monkeypatch):
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "disposition": "native",
+            "ttl_ms": 1000,
+        },
+    )
+    monkeypatch.setenv("HERMES_FEISHU_CARD_DELTA_COALESCE_MS", "1000")
+
+    handled = hook_runtime.emit_from_hermes_locals_threadsafe(
+        {
+            "chat_id": "oc_native",
+            "message_id": "om_native",
+            "text": "must stay native",
+        },
+        event_name="answer.delta",
+    )
+
+    assert handled is False
+    assert hook_runtime._SEQUENCES == {}
+    assert hook_runtime._PENDING_DELTAS == {}
+
+
+async def test_policy_failure_is_native_and_card_decision_is_pinned_for_turn(monkeypatch):
+    calls = []
+
+    def changing_policy(_url, _payload, _timeout):
+        calls.append(True)
+        if len(calls) == 1:
+            return {"ok": True, "disposition": "card", "ttl_ms": 0}
+        raise TimeoutError("policy unavailable")
+
+    posted = []
+
+    async def post(_url, payload, _timeout):
+        posted.append(payload["event"])
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", changing_policy)
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+    local_vars = {"chat_id": "oc_pin", "message_id": "om_pin"}
+
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        local_vars, "message.started"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**local_vars, "text": "x"}, "answer.delta"
+    )
+    assert calls == [True]
+    assert posted == ["message.started", "answer.delta"]
+
+    # A different new turn must query again; timeout fails open to Hermes native.
+    assert not await hook_runtime.emit_from_hermes_locals_async(
+        {"chat_id": "oc_pin", "message_id": "om_next"},
+        "message.started",
+    )
+    assert len(calls) == 2
+
+
+async def test_completed_topic_message_id_is_requeried_for_the_next_started_turn(
+    monkeypatch,
+):
+    calls = []
+
+    def policy(_url, _payload, _timeout):
+        calls.append(True)
+        return {
+            "ok": True,
+            "disposition": "card" if len(calls) == 1 else "native",
+            "ttl_ms": 1000,
+        }
+
+    async def post(_url, _payload, _timeout):
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", policy)
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+    local_vars = {"chat_id": "oc_topic", "message_id": "om_reused"}
+
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        local_vars, "message.started"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**local_vars, "answer": "first"}, "message.completed"
+    )
+    assert not await hook_runtime.emit_from_hermes_locals_async(
+        local_vars, "message.started"
+    )
+    assert len(calls) == 2
+
+
+async def test_first_event_without_message_id_requeries_policy_for_new_turn(
+    monkeypatch,
+):
+    calls = []
+
+    def policy(_url, _payload, _timeout):
+        calls.append(True)
+        return {
+            "ok": True,
+            "disposition": "card" if len(calls) == 1 else "native",
+            "ttl_ms": 1000,
+        }
+
+    async def post(_url, _payload, _timeout):
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", policy)
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+    first_turn = {"chat_id": "oc_missing_started", "message_id": "om_first"}
+
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        first_turn, "message.started"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**first_turn, "answer": "first"}, "message.completed"
+    )
+    assert not await hook_runtime.emit_from_hermes_locals_async(
+        {"chat_id": "oc_missing_started", "text": "next"},
+        "answer.delta",
+    )
+    assert len(calls) == 2
+
+
+async def test_reused_message_id_nonterminal_event_starts_new_policy_turn(
+    monkeypatch,
+):
+    calls = []
+
+    def policy(_url, _payload, _timeout):
+        calls.append(True)
+        return {
+            "ok": True,
+            "disposition": "card" if len(calls) == 1 else "native",
+            "ttl_ms": 1000,
+        }
+
+    async def post(_url, _payload, _timeout):
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", policy)
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+    reused = {"chat_id": "oc_reused_without_started", "message_id": "om_reused"}
+
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        reused, "message.started"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**reused, "answer": "first"}, "message.completed"
+    )
+    assert not await hook_runtime.emit_from_hermes_locals_async(
+        {**reused, "text": "next"}, "answer.delta"
+    )
+    assert not await hook_runtime.emit_from_hermes_locals_async(
+        {**reused, "text": "next again"}, "answer.delta"
+    )
+    assert len(calls) == 2
+
+
+async def test_reused_message_id_card_event_marks_new_turn_for_server(monkeypatch):
+    posted = []
+
+    async def post(_url, payload, _timeout):
+        posted.append(payload)
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+    reused = {"chat_id": "oc_reused_card", "message_id": "om_reused_card"}
+
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        reused, "message.started"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**reused, "answer": "first"}, "message.completed"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**reused, "text": "next"}, "answer.delta"
+    )
+
+    assert posted[-1]["event"] == "answer.delta"
+    assert posted[-1]["data"]["policy_new_turn"] is True
+
+
+async def test_invalid_explicit_profile_fails_native_before_policy_query(monkeypatch):
+    calls = []
+
+    def unexpected_policy(*_args, **_kwargs):
+        calls.append(True)
+        return {"ok": True, "disposition": "card", "ttl_ms": 1000}
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        unexpected_policy,
+    )
+
+    async def post(*_args, **_kwargs):
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+
+    handled = await hook_runtime.emit_from_hermes_locals_async(
+        {
+            "chat_id": "oc_invalid_profile",
+            "message_id": "om_invalid_profile",
+            "profile_id": "../work",
+        },
+        "message.started",
+    )
+
+    assert handled is False
+    assert calls == []
+
+
+async def test_terminal_policy_tombstone_remains_bounded_but_does_not_expire(
+    monkeypatch,
+):
+    now = [100.0]
+    calls = []
+
+    def policy(_url, _payload, _timeout):
+        calls.append(True)
+        return {
+            "ok": True,
+            "disposition": "card" if len(calls) == 1 else "native",
+            "ttl_ms": 1000,
+        }
+
+    async def post(_url, _payload, _timeout):
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", policy)
+
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+    turn = {"chat_id": "oc_terminal_replay", "message_id": "om_terminal_replay"}
+
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        turn, "message.started"
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**turn, "answer": "done"}, "message.completed"
+    )
+    now[0] += 3600.0
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {**turn, "answer": "done"}, "message.completed"
+    )
+    assert calls == [True]
+    assert len(hook_runtime._TERMINAL_POLICY_DECISIONS) == 1
+
+
+async def test_async_policy_gate_delegates_singleflight_off_event_loop(monkeypatch):
+    event_loop_thread = threading.get_ident()
+    worker_threads = []
+
+    def sync_gate(_config, _local_vars, _event_name):
+        worker_threads.append(threading.get_ident())
+        return hook_runtime._PolicyGateResult(True, None)
+
+    monkeypatch.setattr(hook_runtime, "_policy_gate_sync", sync_gate)
+
+    result = await hook_runtime._policy_gate_async(
+        hook_runtime.load_runtime_config(),
+        {"chat_id": "oc_thread_handoff"},
+        "answer.delta",
+    )
+
+    assert result.card is True
+    assert worker_threads and worker_threads[0] != event_loop_thread
+
+
+async def test_async_policy_gate_reuses_pinned_turn_without_worker_handoff(
+    monkeypatch,
+):
+    config = hook_runtime.load_runtime_config()
+    local_vars = {"chat_id": "oc_pinned_fast", "message_id": "om_pinned_fast"}
+
+    assert hook_runtime._policy_gate_sync(
+        config,
+        local_vars,
+        "message.started",
+    ).card
+
+    async def unexpected_to_thread(*_args, **_kwargs):
+        raise AssertionError("pinned decisions must stay on the fast path")
+
+    monkeypatch.setattr(hook_runtime.asyncio, "to_thread", unexpected_to_thread)
+
+    result = await hook_runtime._policy_gate_async(
+        config,
+        {**local_vars, "text": "delta"},
+        "answer.delta",
+    )
+
+    assert result.card is True
+
+
+async def test_async_policy_lock_is_not_idle_while_waiter_is_waking():
+    lock = asyncio.Lock()
+    await lock.acquire()
+    waiter = asyncio.create_task(lock.acquire())
+    await asyncio.sleep(0)
+
+    lock.release()
+
+    assert lock.locked() is False
+    assert hook_runtime._async_policy_lock_is_idle(lock) is False
+
+    await waiter
+    lock.release()
+    assert hook_runtime._async_policy_lock_is_idle(lock) is True
+
+
+def test_policy_headers_use_distinct_signed_domain(monkeypatch):
+    root = b"p" * 32
+    body = b'{"schema_version":"1"}'
+    monkeypatch.setattr(hook_runtime, "read_transport_root_secret", lambda: root)
+
+    headers = hook_runtime._post_headers(
+        "http://127.0.0.1:8765/delivery/policy",
+        body,
+    )
+
+    PolicyProofVerifier(root).verify(headers, body)
+    with pytest.raises(Exception):
+        EventProofVerifier(root).verify(headers, body)
+
+
+def test_policy_cache_is_bounded_and_reset_clears_all_policy_state():
+    config = hook_runtime.load_runtime_config()
+    for index in range(hook_runtime.POLICY_CACHE_LIMIT + 25):
+        identity = hook_runtime._policy_identity(
+            config,
+            {
+                "chat_id": f"oc_{index}",
+                "message_id": f"om_{index}",
+            },
+            "message.started",
+        )
+        assert identity is not None
+        hook_runtime._cache_policy_disposition(identity, "card", 1.0)
+        hook_runtime._pin_policy_disposition(identity, "card")
+
+    assert len(hook_runtime._POLICY_CACHE) == hook_runtime.POLICY_CACHE_LIMIT
+    assert len(hook_runtime._TURN_POLICY_DECISIONS) == hook_runtime.POLICY_CACHE_LIMIT
+
+    hook_runtime.reset_runtime_state()
+
+    assert hook_runtime._POLICY_CACHE == {}
+    assert hook_runtime._TURN_POLICY_DECISIONS == {}
+    assert hook_runtime._ACTIVE_POLICY_TURNS == {}
+    assert hook_runtime._TERMINAL_POLICY_DECISIONS == {}
+
+
+def test_policy_query_is_thread_safe_and_pins_one_decision_per_turn(monkeypatch):
+    calls = []
+    calls_lock = threading.Lock()
+
+    def slow_policy(*_args, **_kwargs):
+        with calls_lock:
+            calls.append(True)
+        time.sleep(0.02)
+        return {"ok": True, "disposition": "card", "ttl_ms": 0}
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", slow_policy)
+    config = hook_runtime.load_runtime_config()
+    local_vars = {"chat_id": "oc_thread", "message_id": "om_thread"}
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        results = list(
+            executor.map(
+                lambda _index: hook_runtime._policy_gate_sync(
+                    config,
+                    local_vars,
+                    "answer.delta",
+                ).card,
+                range(24),
+            )
+        )
+
+    assert results == [True] * 24
+    assert calls == [True]
+
+
+async def test_threadsafe_pending_flush_preserves_policy_new_turn_marker(
+    monkeypatch,
+):
+    flushed = []
+
+    async def flush(_config, event_locals, event_name):
+        flushed.append((event_locals, event_name))
+
+    monkeypatch.setattr(hook_runtime, "_queue_coalesced_delta", lambda *_args: False)
+    monkeypatch.setattr(
+        hook_runtime,
+        "_has_pending_deltas_for_local_vars",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(hook_runtime, "_flush_build_send_ordered", flush)
+
+    assert hook_runtime.emit_from_hermes_locals_threadsafe(
+        {"chat_id": "oc_pending_new", "message_id": "om_pending_new"},
+        "message.started",
+    )
+    await asyncio.sleep(0)
+
+    assert flushed[0][1] == "message.started"
+    assert flushed[0][0]["_hfc_policy_new_turn"] is True
+
+
+def test_cron_requires_applied_true_not_only_http_success(monkeypatch):
+    monkeypatch.setattr(
+        hook_runtime,
+        "_post_json_sync_response",
+        lambda *_args, **_kwargs: {"ok": True, "applied": False},
+    )
+
+    assert not hook_runtime.emit_cron_delivery(
+        {
+            "job": {
+                "id": "job-native",
+                "origin": {"platform": "feishu", "chat_id": "oc_cron"},
+            },
+            "content": "native cron result",
+        }
+    )
+
+
+async def test_native_direct_send_uses_original_content_once_and_clears_media_state(
+    monkeypatch,
+):
+    def native_policy(*_args, **_kwargs):
+        return {"ok": True, "disposition": "native", "ttl_ms": 1000}
+
+    calls = []
+
+    class Adapter:
+        async def original(self, chat_id, content, reply_to=None, metadata=None):
+            calls.append((chat_id, content, reply_to, metadata))
+            return SimpleNamespace(success=True, message_id="om_native")
+
+    Adapter._hfc_original_send = Adapter.original
+    hook_runtime._HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(
+        hook_runtime._NativeMediaTextSuppression("oc_native", "answer")
+    )
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", native_policy)
+
+    result = await hook_runtime._hfc_send_with_native_command_result_card(
+        Adapter(),
+        "oc_native",
+        "answer",
+    )
+
+    assert result.success is True
+    assert calls == [("oc_native", "answer", None, None)]
+    assert hook_runtime._HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.get() is None
+
+
+def test_native_platform_notice_falls_through_without_scheduling_card(monkeypatch):
+    monkeypatch.setattr(
+        hook_runtime,
+        "_fetch_delivery_policy_sync",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "disposition": "native",
+            "ttl_ms": 1000,
+        },
+    )
+    scheduled = []
+    monkeypatch.setattr(
+        hook_runtime,
+        "_hfc_schedule_platform_notice_card",
+        lambda **kwargs: scheduled.append(kwargs),
+    )
+    source = SimpleNamespace(
+        platform="feishu",
+        chat_id="oc_native_notice",
+        message_id="om_notice",
+    )
+    runner = SimpleNamespace(adapters={"feishu": object()})
+
+    handled = hook_runtime.handle_platform_notice_from_hermes(
+        runner,
+        source,
+        "⏳ Working — native notice",
+    )
+
+    assert handled is False
+    assert scheduled == []
 
 
 def test_interaction_select_returns_empty_response_when_sidecar_rejects(monkeypatch):

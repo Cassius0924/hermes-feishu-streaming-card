@@ -3,6 +3,7 @@ from pathlib import Path
 
 from hermes_feishu_card.bots import FeishuClientFactory
 from hermes_feishu_card.feishu_client import FeishuAPIError, FeishuClient
+from hermes_feishu_card.delivery_policy import ReloadingDeliveryPolicyProvider
 import hermes_feishu_card.runner as runner
 from hermes_feishu_card.runner import (
     NoopFeishuClient,
@@ -122,6 +123,10 @@ def test_main_passes_boundary_to_create_app_when_bot_credentials_exist(monkeypat
     assert captured["kwargs"]["operations_config_path"] == "config.yaml"
     assert captured["kwargs"]["integrity_mode"] == "notify"
     assert captured["kwargs"]["expected_runtime_package_version"] == runner.__version__
+    assert isinstance(
+        captured["kwargs"]["delivery_policy"],
+        ReloadingDeliveryPolicyProvider,
+    )
 
 
 def test_main_rejects_non_loopback_listener_without_explicit_opt_in(monkeypatch):

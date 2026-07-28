@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import OrderedDict
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from urllib import parse
 from urllib import request
 
 from . import __version__
-from .event_auth import sign_event_request
+from .event_auth import sign_event_request, sign_policy_request
 from .operations import sign_transport_proof
 from .operations_transport import (
     derive_operation_transport_secret,
@@ -49,6 +50,9 @@ OPERATIONS_ACTION_RETRY_DELAY_SECONDS = 0.1
 OPERATIONS_ACTION_WORKERS = 4
 OPERATIONS_ACTION_QUEUE_LIMIT = 64
 COMMAND_FEEDBACK_CONTEXT_TTL_SECONDS = 600.0
+POLICY_QUERY_TIMEOUT_SECONDS = 0.25
+POLICY_CACHE_TTL_SECONDS = 1.0
+POLICY_CACHE_LIMIT = 1024
 PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _CONTEXT_COMPACTION_STATUS_RE = re.compile(
     r"\bCompacting\s+context\b",
@@ -146,6 +150,30 @@ class _NativeMediaTextSuppression:
     content: str
 
 
+@dataclass(frozen=True)
+class _PolicyIdentity:
+    endpoint: str
+    profile_id: str
+    chat_id: str
+    conversation_id: str
+    message_id: str
+    scope_key: tuple[str, str, str, str]
+    turn_key: tuple[str, str, str, str]
+    is_new_turn: bool
+
+
+@dataclass(frozen=True)
+class _PolicyGateResult:
+    card: bool
+    identity: _PolicyIdentity | None
+
+
+@dataclass(frozen=True)
+class _PolicyCacheEntry:
+    disposition: str
+    expires_at: float
+
+
 _SEQUENCES: dict[str, int] = {}
 _SEQUENCE_LOCK = threading.Lock()
 _ACTIVE_FALLBACK_MESSAGE_IDS: dict[tuple[str, str, str | None], str] = {}
@@ -157,12 +185,36 @@ _SEND_LOCKS_GUARD = threading.Lock()
 _POST_FAILED = object()
 _PENDING_DELTAS: dict[tuple[int, str, str, str, str], _PendingDelta] = {}
 _PENDING_DELTAS_LOCK = threading.Lock()
+_POLICY_LOCK = threading.RLock()
+_POLICY_CACHE: OrderedDict[tuple[str, str, str], _PolicyCacheEntry] = OrderedDict()
+_TURN_POLICY_DECISIONS: OrderedDict[
+    tuple[str, str, str, str], str
+] = OrderedDict()
+_ACTIVE_POLICY_TURNS: dict[
+    tuple[str, str, str, str], tuple[str, str, str, str]
+] = {}
+_TERMINAL_POLICY_DECISIONS: OrderedDict[
+    tuple[str, str, str, str], _PolicyCacheEntry
+] = OrderedDict()
+_POLICY_QUERY_LOCKS: OrderedDict[
+    tuple[str, str, str, str], threading.Lock
+] = OrderedDict()
+_POLICY_ASYNC_QUERY_LOCKS: OrderedDict[
+    tuple[int, str, str, str, str], asyncio.Lock
+] = OrderedDict()
+_POLICY_ASYNC_EVENT_LOCKS: OrderedDict[
+    tuple[int, str, str, str, str], asyncio.Lock
+] = OrderedDict()
 _HFC_FEISHU_COMMAND_RESULT_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
     "hfc_feishu_command_result_context",
     default=None,
 )
 _HFC_FEISHU_NOTICE_CONTEXT: ContextVar[dict[str, str] | None] = ContextVar(
     "hfc_feishu_notice_context",
+    default=None,
+)
+_HFC_FEISHU_DELIVERY_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
+    "hfc_feishu_delivery_context",
     default=None,
 )
 _HFC_NATIVE_MEDIA_TEXT_SUPPRESSION: ContextVar[
@@ -241,10 +293,20 @@ def reset_runtime_state() -> None:
         _SEND_LOCKS.clear()
     with _PENDING_DELTAS_LOCK:
         _PENDING_DELTAS.clear()
+    with _POLICY_LOCK:
+        _POLICY_CACHE.clear()
+        _TURN_POLICY_DECISIONS.clear()
+        _ACTIVE_POLICY_TURNS.clear()
+        _TERMINAL_POLICY_DECISIONS.clear()
+        _POLICY_QUERY_LOCKS.clear()
+        _POLICY_ASYNC_QUERY_LOCKS.clear()
+        _POLICY_ASYNC_EVENT_LOCKS.clear()
     with _OPERATION_TRANSPORT_SECRETS_LOCK:
         _OPERATION_TRANSPORT_SECRETS.clear()
     _HFC_FEISHU_COMMAND_RESULT_CONTEXT.set(None)
     _HFC_FEISHU_NOTICE_CONTEXT.set(None)
+    _HFC_FEISHU_DELIVERY_CONTEXT.set(None)
+    _HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(None)
     reset_runtime_control_for_tests()
 
 
@@ -324,6 +386,388 @@ def _int_from_env(
     if not minimum <= parsed <= maximum:
         return default
     return parsed
+
+
+def _policy_gate_sync(
+    config: RuntimeConfig,
+    local_vars: dict[str, Any],
+    event_name: str,
+) -> _PolicyGateResult:
+    identity = _policy_identity(config, local_vars, event_name)
+    if identity is None:
+        return _PolicyGateResult(False, None)
+    disposition = _pinned_policy_disposition(identity)
+    if disposition is None:
+        query_lock = _policy_query_lock(identity)
+        with query_lock:
+            disposition = _pinned_policy_disposition(identity)
+            if disposition is None:
+                cached = _cached_policy_disposition(identity)
+                if cached is None:
+                    payload = _policy_payload(identity)
+                    try:
+                        fetched = _fetch_delivery_policy_sync(
+                            f"{_summary_base_url(config.event_url)}/delivery/policy",
+                            payload,
+                            min(config.timeout_seconds, POLICY_QUERY_TIMEOUT_SECONDS),
+                        )
+                    except Exception:
+                        fetched = None
+                    disposition, ttl_seconds = _normalize_policy_response(fetched)
+                    _cache_policy_disposition(identity, disposition, ttl_seconds)
+                else:
+                    disposition = cached
+                _pin_policy_disposition(identity, disposition)
+    result = _PolicyGateResult(disposition == "card", identity)
+    if not result.card:
+        _cleanup_native_policy_state(local_vars)
+    if event_name in {"message.completed", "message.failed"}:
+        _finish_policy_turn(identity, disposition)
+    return result
+
+
+async def _policy_gate_async(
+    config: RuntimeConfig,
+    local_vars: dict[str, Any],
+    event_name: str,
+) -> _PolicyGateResult:
+    identity = _policy_identity(config, local_vars, event_name)
+    if identity is None:
+        result = _PolicyGateResult(False, None)
+        _cleanup_native_policy_state(local_vars)
+        return result
+    disposition = _pinned_policy_disposition(identity)
+    if disposition is not None:
+        result = _PolicyGateResult(disposition == "card", identity)
+        if not result.card:
+            _cleanup_native_policy_state(local_vars)
+        if event_name in {"message.completed", "message.failed"}:
+            _finish_policy_turn(identity, disposition)
+        return result
+
+    # Preserve callback arrival order before dispatching the blocking query to
+    # a worker. This asyncio lock is never shared with synchronous callbacks;
+    # the worker still uses the common threading.Lock single-flight.
+    async_lock = _policy_async_query_lock(identity)
+    async with async_lock:
+        disposition = _pinned_policy_disposition(identity)
+        if disposition is not None:
+            result = _PolicyGateResult(disposition == "card", identity)
+            if event_name in {"message.completed", "message.failed"}:
+                _finish_policy_turn(identity, disposition)
+        else:
+            # Never hold the shared threading.Lock in the event-loop thread
+            # across an await: a synchronous callback on that loop could block
+            # waiting for it and prevent the async owner from resuming.
+            result = await asyncio.to_thread(
+                _policy_gate_sync,
+                config,
+                local_vars,
+                event_name,
+            )
+    if not result.card:
+        # ContextVar writes in the worker's copied context do not flow back to
+        # this task, so repeat the idempotent native cleanup here.
+        _cleanup_native_policy_state(local_vars)
+    return result
+
+
+def _policy_identity(
+    config: RuntimeConfig,
+    local_vars: dict[str, Any],
+    event_name: str,
+) -> _PolicyIdentity | None:
+    if local_vars.get("_hfc_profile_invalid") is True:
+        return None
+    source_obj = local_vars.get("source")
+    if _platform_name(local_vars, source_obj) != "feishu":
+        return None
+    message_obj = local_vars.get("message")
+    gateway_event_obj = local_vars.get("event")
+    chat_id = _first_string(local_vars, ("chat_id", "open_chat_id", "receive_id"))
+    if chat_id is None:
+        chat_id = _first_attr_string(
+            message_obj, ("chat_id", "open_chat_id", "receive_id")
+        )
+    if chat_id is None:
+        chat_id = _first_attr_string(
+            source_obj, ("chat_id", "open_chat_id", "receive_id")
+        )
+    if not chat_id:
+        return None
+    profile_id, profile_source = _profile_identity(
+        local_vars, source_obj, message_obj
+    )
+    if profile_source.startswith("sanitized_"):
+        return None
+    conversation_id = (
+        _first_string(local_vars, ("conversation_id", "thread_id", "session_id"))
+        or _first_attr_string(
+            message_obj, ("conversation_id", "thread_id", "session_id")
+        )
+        or _first_attr_string(
+            source_obj, ("conversation_id", "thread_id", "session_id")
+        )
+        or chat_id
+    )
+    message_id = (
+        _first_string(local_vars, ("message_id", "msg_id", "event_message_id"))
+        or _first_attr_string(message_obj, ("message_id", "msg_id"))
+        or _first_attr_string(gateway_event_obj, ("message_id", "msg_id"))
+        or ""
+    )
+    endpoint = _summary_base_url(config.event_url)
+    scope_key = (endpoint, profile_id, chat_id, conversation_id)
+    with _POLICY_LOCK:
+        active_turn = _ACTIVE_POLICY_TURNS.get(scope_key)
+    if message_id:
+        turn_token = f"message:{message_id}"
+    elif event_name != "message.started" and active_turn is not None:
+        turn_token = active_turn[3]
+    else:
+        created_token = _created_at_lifecycle_token(local_vars.get("created_at"))
+        turn_token = (
+            f"created:{created_token}"
+            if created_token is not None
+            else f"turn:{time.monotonic_ns()}"
+        )
+    turn_key = (endpoint, profile_id, chat_id, turn_token)
+    with _POLICY_LOCK:
+        _prune_policy_state_locked(time.monotonic())
+        terminal_known = turn_key in _TERMINAL_POLICY_DECISIONS
+    stream_reopens_turn = event_name in {
+        "thinking.delta",
+        "answer.delta",
+        "tool.updated",
+    }
+    is_new_turn = event_name == "message.started" or (
+        active_turn != turn_key
+        and (not terminal_known or stream_reopens_turn)
+        and (bool(message_id) or active_turn is None)
+    )
+    return _PolicyIdentity(
+        endpoint=endpoint,
+        profile_id=profile_id,
+        chat_id=chat_id,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        scope_key=scope_key,
+        turn_key=turn_key,
+        is_new_turn=is_new_turn,
+    )
+
+
+def _policy_payload(identity: _PolicyIdentity) -> dict[str, str]:
+    payload = {
+        "schema_version": "1",
+        "chat_id": identity.chat_id,
+        "profile_id": identity.profile_id,
+        "conversation_id": identity.conversation_id,
+    }
+    if identity.message_id:
+        payload["message_id"] = identity.message_id
+    return payload
+
+
+def _pinned_policy_disposition(identity: _PolicyIdentity) -> str | None:
+    now = time.monotonic()
+    with _POLICY_LOCK:
+        _prune_policy_state_locked(now)
+        terminal = (
+            None
+            if identity.is_new_turn
+            else _TERMINAL_POLICY_DECISIONS.get(identity.turn_key)
+        )
+        if terminal is not None:
+            _TERMINAL_POLICY_DECISIONS.move_to_end(identity.turn_key)
+            return terminal.disposition
+        disposition = _TURN_POLICY_DECISIONS.get(identity.turn_key)
+        if (
+            disposition is None
+            and not identity.message_id
+            and not identity.is_new_turn
+        ):
+            active_turn = _ACTIVE_POLICY_TURNS.get(identity.scope_key)
+            if active_turn is not None:
+                disposition = _TURN_POLICY_DECISIONS.get(active_turn)
+        if disposition is not None:
+            _TURN_POLICY_DECISIONS.move_to_end(
+                identity.turn_key
+                if identity.turn_key in _TURN_POLICY_DECISIONS
+                else _ACTIVE_POLICY_TURNS[identity.scope_key]
+            )
+        return disposition
+
+
+def _cached_policy_disposition(identity: _PolicyIdentity) -> str | None:
+    if identity.is_new_turn:
+        return None
+    key = (identity.endpoint, identity.profile_id, identity.chat_id)
+    now = time.monotonic()
+    with _POLICY_LOCK:
+        _prune_policy_state_locked(now)
+        entry = _POLICY_CACHE.get(key)
+        if entry is None:
+            return None
+        _POLICY_CACHE.move_to_end(key)
+        return entry.disposition
+
+
+def _cache_policy_disposition(
+    identity: _PolicyIdentity,
+    disposition: str,
+    ttl_seconds: float,
+) -> None:
+    key = (identity.endpoint, identity.profile_id, identity.chat_id)
+    with _POLICY_LOCK:
+        _POLICY_CACHE[key] = _PolicyCacheEntry(
+            disposition,
+            time.monotonic() + max(0.0, min(ttl_seconds, POLICY_CACHE_TTL_SECONDS)),
+        )
+        _POLICY_CACHE.move_to_end(key)
+        _bound_ordered_dict(_POLICY_CACHE)
+
+
+def _pin_policy_disposition(identity: _PolicyIdentity, disposition: str) -> None:
+    with _POLICY_LOCK:
+        if identity.is_new_turn:
+            _TERMINAL_POLICY_DECISIONS.pop(identity.turn_key, None)
+        _TURN_POLICY_DECISIONS[identity.turn_key] = disposition
+        _TURN_POLICY_DECISIONS.move_to_end(identity.turn_key)
+        _ACTIVE_POLICY_TURNS[identity.scope_key] = identity.turn_key
+        _bound_ordered_dict(_TURN_POLICY_DECISIONS)
+        while len(_ACTIVE_POLICY_TURNS) > POLICY_CACHE_LIMIT:
+            _ACTIVE_POLICY_TURNS.pop(next(iter(_ACTIVE_POLICY_TURNS)))
+
+
+def _finish_policy_turn(identity: _PolicyIdentity, disposition: str) -> None:
+    with _POLICY_LOCK:
+        _TURN_POLICY_DECISIONS.pop(identity.turn_key, None)
+        if _ACTIVE_POLICY_TURNS.get(identity.scope_key) == identity.turn_key:
+            _ACTIVE_POLICY_TURNS.pop(identity.scope_key, None)
+        _TERMINAL_POLICY_DECISIONS[identity.turn_key] = _PolicyCacheEntry(
+            disposition,
+            math.inf,
+        )
+        _TERMINAL_POLICY_DECISIONS.move_to_end(identity.turn_key)
+        _bound_ordered_dict(_TERMINAL_POLICY_DECISIONS)
+
+
+def _prune_policy_state_locked(now: float) -> None:
+    for key, entry in list(_POLICY_CACHE.items()):
+        if entry.expires_at <= now:
+            _POLICY_CACHE.pop(key, None)
+
+
+def _bound_ordered_dict(mapping: OrderedDict[Any, Any]) -> None:
+    while len(mapping) > POLICY_CACHE_LIMIT:
+        mapping.popitem(last=False)
+
+
+def _policy_query_lock(identity: _PolicyIdentity) -> threading.Lock:
+    with _POLICY_LOCK:
+        lock = _POLICY_QUERY_LOCKS.get(identity.turn_key)
+        if lock is None:
+            lock = threading.Lock()
+            _POLICY_QUERY_LOCKS[identity.turn_key] = lock
+        _POLICY_QUERY_LOCKS.move_to_end(identity.turn_key)
+        # Do not evict a locked entry; a small temporary overflow is safer than
+        # allowing a second decision for the same turn.
+        for key, candidate in list(_POLICY_QUERY_LOCKS.items()):
+            if len(_POLICY_QUERY_LOCKS) <= POLICY_CACHE_LIMIT:
+                break
+            if key != identity.turn_key and not candidate.locked():
+                _POLICY_QUERY_LOCKS.pop(key, None)
+        return lock
+
+
+def _policy_async_query_lock(identity: _PolicyIdentity) -> asyncio.Lock:
+    loop_key = id(asyncio.get_running_loop())
+    key = (loop_key, *identity.turn_key)
+    with _POLICY_LOCK:
+        lock = _POLICY_ASYNC_QUERY_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _POLICY_ASYNC_QUERY_LOCKS[key] = lock
+        _POLICY_ASYNC_QUERY_LOCKS.move_to_end(key)
+        for candidate_key, candidate in list(_POLICY_ASYNC_QUERY_LOCKS.items()):
+            if len(_POLICY_ASYNC_QUERY_LOCKS) <= POLICY_CACHE_LIMIT:
+                break
+            if candidate_key != key and _async_policy_lock_is_idle(candidate):
+                _POLICY_ASYNC_QUERY_LOCKS.pop(candidate_key, None)
+        return lock
+
+
+def _policy_async_event_lock(identity: _PolicyIdentity) -> asyncio.Lock:
+    loop_key = id(asyncio.get_running_loop())
+    key = (loop_key, *identity.scope_key)
+    with _POLICY_LOCK:
+        lock = _POLICY_ASYNC_EVENT_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _POLICY_ASYNC_EVENT_LOCKS[key] = lock
+        _POLICY_ASYNC_EVENT_LOCKS.move_to_end(key)
+        for candidate_key, candidate in list(_POLICY_ASYNC_EVENT_LOCKS.items()):
+            if len(_POLICY_ASYNC_EVENT_LOCKS) <= POLICY_CACHE_LIMIT:
+                break
+            if candidate_key != key and _async_policy_lock_is_idle(candidate):
+                _POLICY_ASYNC_EVENT_LOCKS.pop(candidate_key, None)
+        return lock
+
+
+def _async_policy_lock_is_idle(lock: asyncio.Lock) -> bool:
+    # release() wakes a waiter before that task resumes and marks the lock as
+    # acquired. During that gap locked() is False, but replacing the lock would
+    # split one scope into two concurrent critical sections. Keep it while the
+    # private waiter deque is non-empty; this is conservative for cancellation.
+    return not lock.locked() and not bool(getattr(lock, "_waiters", None))
+
+
+def _normalize_policy_response(result: Any) -> tuple[str, float]:
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return "native", 0.2
+    disposition = result.get("disposition")
+    if disposition not in {"card", "native"}:
+        return "native", 0.2
+    ttl_ms = result.get("ttl_ms")
+    if isinstance(ttl_ms, bool) or not isinstance(ttl_ms, (int, float)):
+        return "native", 0.2
+    if not math.isfinite(float(ttl_ms)) or ttl_ms < 0 or ttl_ms > 1000:
+        return "native", 0.2
+    return disposition, ttl_ms / 1000.0
+
+
+def _fetch_delivery_policy_sync(
+    url: str,
+    payload: dict[str, Any],
+    timeout: float,
+) -> Any:
+    return _post_json_sync_response(url, payload, timeout)
+
+
+def _cleanup_native_policy_state(local_vars: dict[str, Any]) -> None:
+    _HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(None)
+    _discard_pending_deltas_for_local_vars(local_vars)
+
+
+def _policy_event_locals(
+    local_vars: dict[str, Any],
+    gate: _PolicyGateResult,
+) -> dict[str, Any]:
+    identity = gate.identity
+    if identity is None or not identity.is_new_turn:
+        return local_vars
+    return {**local_vars, "_hfc_policy_new_turn": True}
+
+
+def _discard_pending_deltas_for_local_vars(local_vars: dict[str, Any]) -> None:
+    message_id = _message_id_from_local_vars(local_vars)
+    if not message_id:
+        return
+    with _PENDING_DELTAS_LOCK:
+        for key, pending in list(_PENDING_DELTAS.items()):
+            if _pending_message_id(key, pending) == message_id:
+                _PENDING_DELTAS.pop(key, None)
 
 
 def _queue_coalesced_delta(
@@ -537,7 +981,11 @@ def emit_from_hermes_locals(
         if not config.enabled:
             return False
         _ensure_runtime_control_started(config)
-        payload = build_event(event_name, local_vars)
+        gate = _policy_gate_sync(config, local_vars, event_name)
+        if not gate.card:
+            return False
+        event_locals = _policy_event_locals(local_vars, gate)
+        payload = build_event(event_name, event_locals)
         if payload is None:
             return False
         asyncio.get_running_loop()
@@ -562,33 +1010,43 @@ def emit_from_hermes_locals_threadsafe(
         if not config.enabled:
             return False
         _ensure_runtime_control_started(config)
-        if _queue_coalesced_delta(config, local_vars, event_name):
+        gate = _policy_gate_sync(config, local_vars, event_name)
+        if not gate.card:
+            return False
+        event_locals = _policy_event_locals(local_vars, gate)
+        if _queue_coalesced_delta(config, event_locals, event_name):
             return True
-        if _has_pending_deltas_for_local_vars(local_vars):
-            if "_hfc_loop" in local_vars:
-                coroutine = _flush_build_send_ordered(config, local_vars, event_name)
+        if _has_pending_deltas_for_local_vars(event_locals):
+            if "_hfc_loop" in event_locals:
+                coroutine = _flush_build_send_ordered(config, event_locals, event_name)
                 try:
-                    asyncio.run_coroutine_threadsafe(coroutine, local_vars["_hfc_loop"])
+                    asyncio.run_coroutine_threadsafe(
+                        coroutine,
+                        event_locals["_hfc_loop"],
+                    )
                 except Exception:
                     coroutine.close()
                     raise
             else:
                 asyncio.get_running_loop()
                 asyncio.create_task(
-                    _flush_build_send_ordered(config, local_vars, event_name)
+                    _flush_build_send_ordered(config, event_locals, event_name)
                 )
             return True
-        payload = build_event(event_name, local_vars)
+        payload = build_event(event_name, event_locals)
         if payload is None:
             return False
-        if "_hfc_loop" in local_vars:
+        if "_hfc_loop" in event_locals:
             coroutine = _send_fail_open_ordered(
                 config.event_url,
                 payload,
                 _timeout_for_event(config, event_name),
             )
             try:
-                asyncio.run_coroutine_threadsafe(coroutine, local_vars["_hfc_loop"])
+                asyncio.run_coroutine_threadsafe(
+                    coroutine,
+                    event_locals["_hfc_loop"],
+                )
             except Exception:
                 coroutine.close()
                 raise
@@ -650,20 +1108,30 @@ async def emit_from_hermes_locals_async(
         if not config.enabled:
             return False
         _ensure_runtime_control_started(config)
-        if event_name not in {"thinking.delta", "answer.delta"}:
-            await _flush_pending_deltas_for_local_vars(local_vars)
-        payload = build_event(event_name, local_vars)
-        if payload is None:
+        order_identity = _policy_identity(config, local_vars, event_name)
+        if order_identity is None:
+            _cleanup_native_policy_state(local_vars)
             return False
-        result = await _post_json_ordered_response(
-            config.event_url,
-            payload,
-            _timeout_for_event(config, event_name),
-        )
-        applied = _event_was_applied(result)
-        if event_name == "message.completed":
-            _register_native_media_text_suppression(payload, applied=applied)
-        return applied
+        event_lock = _policy_async_event_lock(order_identity)
+        async with event_lock:
+            gate = await _policy_gate_async(config, local_vars, event_name)
+            if not gate.card:
+                return False
+            event_locals = _policy_event_locals(local_vars, gate)
+            if event_name not in {"thinking.delta", "answer.delta"}:
+                await _flush_pending_deltas_for_local_vars(event_locals)
+            payload = build_event(event_name, event_locals)
+            if payload is None:
+                return False
+            result = await _post_json_ordered_response(
+                config.event_url,
+                payload,
+                _timeout_for_event(config, event_name),
+            )
+            applied = _event_was_applied(result)
+            if event_name == "message.completed":
+                _register_native_media_text_suppression(payload, applied=applied)
+            return applied
     except Exception:
         return False
 
@@ -711,12 +1179,58 @@ def _should_suppress_matching_native_media_text(chat_id: Any, content: Any) -> b
     return True
 
 
+def _cron_policy_local_vars(local_vars: dict[str, Any]) -> dict[str, Any] | None:
+    job = local_vars.get("job")
+    if not isinstance(job, dict):
+        return None
+    origin = job.get("origin")
+    if not isinstance(origin, dict):
+        origin = {}
+    resolved_targets = _resolved_cron_targets(local_vars, job)
+    platform = str(
+        _extract_real_platform(job.get("deliver"))
+        or _first_target_platform(resolved_targets)
+        or origin.get("platform")
+        or os.environ.get("HERMES_CRON_AUTO_DELIVER_PLATFORM")
+        or "feishu"
+    ).strip().lower()
+    origin_chat_id = (
+        origin.get("chat_id")
+        if str(origin.get("platform") or "").strip().lower() == "feishu"
+        else ""
+    )
+    chat_id = str(
+        _resolved_target_chat_id(resolved_targets, "feishu")
+        or _deliver_chat_id(job.get("deliver"))
+        or origin_chat_id
+        or os.environ.get("HERMES_CRON_AUTO_DELIVER_CHAT_ID")
+        or ""
+    ).strip()
+    if platform != "feishu" or not chat_id:
+        return None
+    return {
+        **local_vars,
+        "platform": "feishu",
+        "chat_id": chat_id,
+        "conversation_id": str(job.get("id") or chat_id),
+    }
+
+
 def emit_cron_delivery(local_vars: dict[str, Any]) -> bool:
     try:
         config = load_runtime_config()
         if not config.enabled:
             return False
         _ensure_runtime_control_started(config)
+        policy_locals = _cron_policy_local_vars(local_vars)
+        if policy_locals is None:
+            return False
+        if not _policy_gate_sync(
+            config,
+            policy_locals,
+            "message.completed",
+        ).card:
+            return False
         payload = build_cron_event(local_vars)
         if payload is None:
             return False
@@ -1021,6 +1535,12 @@ def request_interaction_from_hermes_locals(
         config = load_runtime_config()
         if not config.enabled:
             return None
+        if not _policy_gate_sync(
+            config,
+            local_vars,
+            "interaction.requested",
+        ).card:
+            return None
         payload = build_interaction_event(
             local_vars,
             kind=kind,
@@ -1113,6 +1633,14 @@ async def request_slash_confirm_from_hermes_locals_async(
     try:
         config = load_runtime_config()
         if not config.enabled:
+            return None
+        if not (
+            await _policy_gate_async(
+                config,
+                local_vars,
+                "interaction.requested",
+            )
+        ).card:
             return None
         if _hfc_native_feishu_command_cards_available(local_vars):
             return None
@@ -1335,6 +1863,14 @@ async def _request_command_card_choice_async(
     try:
         config = load_runtime_config()
         if not config.enabled:
+            return None
+        if not (
+            await _policy_gate_async(
+                config,
+                local_vars,
+                "interaction.requested",
+            )
+        ).card:
             return None
         payload = build_interaction_event(
             local_vars,
@@ -2252,6 +2788,88 @@ def _hfc_command_result_context_from_event(event: Any) -> dict[str, Any] | None:
     }
 
 
+def _hfc_delivery_context_from_event(event: Any) -> dict[str, Any] | None:
+    if event is None:
+        return None
+    source = getattr(event, "source", None)
+    if _platform_name({}, source) != "feishu":
+        return None
+    chat_id = str(getattr(source, "chat_id", "") or "").strip()
+    if not chat_id:
+        return None
+    local_vars = {"source": source, "event": event}
+    profile_id, profile_source = _profile_identity(local_vars, source, None)
+    message_id = _hfc_command_event_message_id(event)
+    thread_id = str(
+        getattr(source, "thread_id", "")
+        or getattr(event, "thread_id", "")
+        or ""
+    ).strip()
+    return {
+        "chat_id": chat_id,
+        "profile_id": profile_id,
+        "profile_invalid": profile_source.startswith("sanitized_"),
+        "message_id": message_id,
+        "conversation_id": thread_id or chat_id,
+        "thread_id": thread_id,
+    }
+
+
+def _hfc_direct_policy_locals(chat_id: Any) -> dict[str, Any]:
+    normalized_chat_id = str(chat_id or "").strip()
+    context = _HFC_FEISHU_DELIVERY_CONTEXT.get()
+    if not isinstance(context, dict):
+        context = {}
+    return {
+        "platform": "feishu",
+        "chat_id": normalized_chat_id,
+        "profile_id": str(context.get("profile_id") or "").strip(),
+        "_hfc_profile_invalid": context.get("profile_invalid") is True,
+        "message_id": str(context.get("message_id") or "").strip(),
+        "conversation_id": str(
+            context.get("conversation_id") or normalized_chat_id
+        ).strip(),
+    }
+
+
+def _hfc_direct_card_allowed_sync(
+    chat_id: Any,
+    *,
+    event_name: str = "system.notice",
+) -> bool:
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return False
+        return _policy_gate_sync(
+            config,
+            _hfc_direct_policy_locals(chat_id),
+            event_name,
+        ).card
+    except Exception:
+        return False
+
+
+async def _hfc_direct_card_allowed_async(
+    chat_id: Any,
+    *,
+    event_name: str = "system.notice",
+) -> bool:
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return False
+        return (
+            await _policy_gate_async(
+                config,
+                _hfc_direct_policy_locals(chat_id),
+                event_name,
+            )
+        ).card
+    except Exception:
+        return False
+
+
 def _hfc_command_result_title(command: str) -> str:
     normalized = str(command or "").strip().lower()
     return {
@@ -2334,11 +2952,17 @@ def _hfc_notice_context_from_source(
         or (getattr(event, "thread_id", "") if event is not None else "")
         or ""
     ).strip()
+    profile_id, _profile_source = _profile_identity(
+        {"source": source, "event": event},
+        source,
+        None,
+    )
     return {
         "chat_id": chat_id,
         "message_id": message_id,
         "conversation_id": thread_id or chat_id,
         "thread_id": thread_id,
+        "profile_id": profile_id,
     }
 
 
@@ -2480,6 +3104,8 @@ async def _hfc_send_system_notice_card(
     notice = _hfc_classify_system_notice(content)
     if notice is None:
         return _send_result(False, error="not a system notice")
+    if not await _hfc_direct_card_allowed_async(chat_id):
+        return _send_result(False, error="delivery_disposition=native")
     try:
         config = load_runtime_config()
         if not config.enabled:
@@ -2648,6 +3274,9 @@ def _hfc_build_system_notice_payload(
         "_hfc_notice_scope": notice_scope,
         "delivery_kind": "notice" if notice_scope == "independent" else "chat",
     }
+    profile_id = str(context.get("profile_id") or "").strip()
+    if profile_id:
+        local_vars["profile_id"] = profile_id
     if "notice_terminal" in notice:
         local_vars["_hfc_notice_terminal"] = bool(notice["notice_terminal"])
     if reply_id:
@@ -2667,6 +3296,8 @@ async def _hfc_send_native_command_result_card(
     metadata: dict[str, Any] | None,
     context: dict[str, Any],
 ) -> Any:
+    if not await _hfc_direct_card_allowed_async(chat_id):
+        return _send_result(False, error="delivery_disposition=native")
     if not getattr(adapter, "_client", None):
         return _send_result(False, error="not connected")
     if not hasattr(adapter, "_feishu_send_with_retry"):
@@ -2745,6 +3376,17 @@ async def _hfc_send_with_native_command_result_card(
     metadata: dict[str, Any] | None = None,
 ) -> Any:
     original = getattr(type(self), "_hfc_original_send", None)
+    if not await _hfc_direct_card_allowed_async(chat_id):
+        _HFC_NATIVE_MEDIA_TEXT_SUPPRESSION.set(None)
+        if callable(original):
+            return await original(
+                self,
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        return _send_result(False, error="original Feishu send unavailable")
     if _should_suppress_matching_native_media_text(chat_id, content):
         return _send_result(True, message_id="media_text_suppressed")
     context = _hfc_take_feishu_command_result_context(chat_id=chat_id, content=content)
@@ -2769,6 +3411,16 @@ async def _hfc_send_with_native_command_result_card(
     if getattr(notice_result, "success", False):
         return notice_result
     if _hfc_classify_system_notice(content) is not None:
+        if getattr(notice_result, "error", None) == "delivery_disposition=native":
+            if callable(original):
+                return await original(
+                    self,
+                    chat_id,
+                    content,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+            return _send_result(False, error="original Feishu send unavailable")
         outcome = _hfc_send_result_delivery_outcome(notice_result)
         if callable(original):
             fallback_content = (
@@ -2813,6 +3465,8 @@ def handle_platform_notice_from_hermes(runner: Any, source: Any, content: str) -
             return False
         chat_id = str(getattr(source, "chat_id", "") or "").strip()
         if not chat_id:
+            return False
+        if not _hfc_direct_card_allowed_sync(chat_id):
             return False
         if _hfc_classify_system_notice(str(content or "")) is None:
             return False
@@ -2952,6 +3606,21 @@ async def _hfc_send_native_slash_confirm(
     confirm_id: str,
     metadata: dict[str, Any] | None = None,
 ):
+    if not await _hfc_direct_card_allowed_async(
+        chat_id,
+        event_name="interaction.requested",
+    ):
+        original = getattr(self, "_hfc_original_send_slash_confirm", None)
+        if callable(original):
+            return await original(
+                chat_id,
+                title,
+                message,
+                session_key,
+                confirm_id,
+                metadata=metadata,
+            )
+        return _send_result(False, error="delivery_disposition=native")
     if not getattr(self, "_client", None):
         _hfc_warn("send_slash_confirm skipped: Feishu adapter is not connected")
         return _send_result(False, error="not connected")
@@ -3041,6 +3710,22 @@ async def _hfc_send_native_model_picker(
     on_model_selected: Any = None,
     metadata: dict[str, Any] | None = None,
 ):
+    if not await _hfc_direct_card_allowed_async(
+        chat_id,
+        event_name="interaction.requested",
+    ):
+        original = getattr(self, "_hfc_original_send_model_picker", None)
+        if callable(original):
+            return await original(
+                chat_id,
+                providers,
+                current_model=current_model,
+                current_provider=current_provider,
+                session_key=session_key,
+                on_model_selected=on_model_selected,
+                metadata=metadata,
+            )
+        return _send_result(False, error="delivery_disposition=native")
     if not getattr(self, "_client", None) or not hasattr(self, "_feishu_send_with_retry"):
         return await _hfc_send_model_picker(
             self,
@@ -3108,6 +3793,22 @@ async def _hfc_send_native_resume_picker(
     original_handler: Any,
     metadata: dict[str, Any] | None = None,
 ):
+    if not await _hfc_direct_card_allowed_async(
+        chat_id,
+        event_name="interaction.requested",
+    ):
+        original = getattr(self, "_hfc_original_send_resume_picker", None)
+        if callable(original):
+            return await original(
+                chat_id=chat_id,
+                sessions=sessions,
+                current_session_id=current_session_id,
+                runner=runner,
+                event=event,
+                original_handler=original_handler,
+                metadata=metadata,
+            )
+        return _send_result(False, error="delivery_disposition=native")
     if not getattr(self, "_client", None) or not hasattr(
         self, "_feishu_send_with_retry"
     ):
@@ -4436,6 +5137,14 @@ async def complete_command_card_from_hermes_locals_async(
         config = load_runtime_config()
         if not config.enabled:
             return False
+        if not (
+            await _policy_gate_async(
+                config,
+                local_vars,
+                "message.completed",
+            )
+        ).card:
+            return False
         payload = build_event(
             "message.completed",
             {
@@ -4449,9 +5158,41 @@ async def complete_command_card_from_hermes_locals_async(
             payload,
             _timeout_for_event(config, payload["event"]),
         )
-        return not (isinstance(post_result, dict) and post_result.get("ok") is False)
+        return _event_was_applied(post_result)
     except Exception:
         return False
+
+
+def _hfc_install_policy_adapter_method(
+    adapter_type: type,
+    *,
+    method_name: str,
+    wrapper: Callable[..., Any],
+    original_name: str,
+    internal_methods: tuple[Callable[..., Any], ...] = (),
+) -> bool:
+    current = getattr(adapter_type, method_name, None)
+    if current is wrapper:
+        # Repair an older install that shadowed an inherited Hermes method
+        # without preserving it first.
+        if not callable(getattr(adapter_type, original_name, None)):
+            for base in adapter_type.__mro__[1:]:
+                inherited = base.__dict__.get(method_name)
+                if callable(inherited) and inherited not in {
+                    wrapper,
+                    *internal_methods,
+                }:
+                    setattr(adapter_type, original_name, inherited)
+                    break
+        return True
+    if (
+        original_name not in adapter_type.__dict__
+        and callable(current)
+        and current not in {wrapper, *internal_methods}
+    ):
+        setattr(adapter_type, original_name, current)
+    setattr(adapter_type, method_name, wrapper)
+    return True
 
 
 def install_feishu_command_card_adapter_methods(runner: Any, event: Any = None) -> bool:
@@ -4462,6 +5203,7 @@ def install_feishu_command_card_adapter_methods(runner: Any, event: Any = None) 
             if event is not None:
                 _HFC_FEISHU_COMMAND_RESULT_CONTEXT.set(None)
             _HFC_FEISHU_NOTICE_CONTEXT.set(None)
+            _HFC_FEISHU_DELIVERY_CONTEXT.set(None)
             return False
         runner_type = type(runner)
         _hfc_install_resume_picker_handler(runner_type)
@@ -4492,46 +5234,34 @@ def install_feishu_command_card_adapter_methods(runner: Any, event: Any = None) 
             _hfc_command_result_context_from_event(event) if event is not None else None
         )
         notice_context = _hfc_notice_context_from_event(event) if event is not None else None
+        delivery_context = (
+            _hfc_delivery_context_from_event(event) if event is not None else None
+        )
         installed = False
         for key, adapter in list(adapters.items()):
             if not _is_feishu_adapter_key(key, adapter):
                 continue
             adapter_type = type(adapter)
             adapter_ready = False
-            existing_slash_confirm = adapter_type.__dict__.get("send_slash_confirm")
-            if (
-                existing_slash_confirm is None
-                or getattr(existing_slash_confirm, "__module__", "") == __name__
-            ):
-                setattr(adapter_type, "send_slash_confirm", _hfc_send_native_slash_confirm)
-                adapter_ready = True
-            elif callable(existing_slash_confirm):
-                adapter_ready = True
-
-            existing_model_picker = adapter_type.__dict__.get("send_model_picker")
-            if (
-                existing_model_picker is None
-                or existing_model_picker is _hfc_send_model_picker
-                or getattr(existing_model_picker, "__module__", "") == __name__
-            ):
-                setattr(adapter_type, "send_model_picker", _hfc_send_native_model_picker)
-                adapter_ready = True
-            elif callable(existing_model_picker):
-                adapter_ready = True
-
-            existing_resume_picker = adapter_type.__dict__.get("send_resume_picker")
-            if (
-                existing_resume_picker is None
-                or getattr(existing_resume_picker, "__module__", "") == __name__
-            ):
-                setattr(
-                    adapter_type,
-                    "send_resume_picker",
-                    _hfc_send_native_resume_picker,
-                )
-                adapter_ready = True
-            elif callable(existing_resume_picker):
-                adapter_ready = True
+            adapter_ready = _hfc_install_policy_adapter_method(
+                adapter_type,
+                method_name="send_slash_confirm",
+                wrapper=_hfc_send_native_slash_confirm,
+                original_name="_hfc_original_send_slash_confirm",
+            )
+            adapter_ready = _hfc_install_policy_adapter_method(
+                adapter_type,
+                method_name="send_model_picker",
+                wrapper=_hfc_send_native_model_picker,
+                original_name="_hfc_original_send_model_picker",
+                internal_methods=(_hfc_send_model_picker,),
+            ) or adapter_ready
+            adapter_ready = _hfc_install_policy_adapter_method(
+                adapter_type,
+                method_name="send_resume_picker",
+                wrapper=_hfc_send_native_resume_picker,
+                original_name="_hfc_original_send_resume_picker",
+            ) or adapter_ready
 
             current_action_handler = adapter_type.__dict__.get("_on_card_action_trigger")
             if current_action_handler is _hfc_on_feishu_card_action_trigger:
@@ -4618,12 +5348,16 @@ def install_feishu_command_card_adapter_methods(runner: Any, event: Any = None) 
                 command_result_context if installed else None
             )
             _HFC_FEISHU_NOTICE_CONTEXT.set(notice_context if installed else None)
+            _HFC_FEISHU_DELIVERY_CONTEXT.set(
+                delivery_context if installed else None
+            )
         return installed
     except Exception:
         if event is not None:
             try:
                 _HFC_FEISHU_COMMAND_RESULT_CONTEXT.set(None)
                 _HFC_FEISHU_NOTICE_CONTEXT.set(None)
+                _HFC_FEISHU_DELIVERY_CONTEXT.set(None)
             except Exception:
                 pass
         return False
@@ -4826,12 +5560,16 @@ def _post_json_sync_response(url: str, payload: dict[str, Any], timeout: float) 
 
 def _post_headers(url: str, body: bytes) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
-    if not parse.urlsplit(url).path.rstrip("/").endswith("/events"):
+    path = parse.urlsplit(url).path.rstrip("/")
+    if not path.endswith(("/events", "/delivery/policy")):
         return headers
     try:
         root_secret = read_transport_root_secret()
         if root_secret is not None:
-            headers.update(sign_event_request(root_secret, body))
+            if path.endswith("/delivery/policy"):
+                headers.update(sign_policy_request(root_secret, body))
+            else:
+                headers.update(sign_event_request(root_secret, body))
     except Exception:
         pass
     return headers
@@ -5324,6 +6062,8 @@ def _event_data(
         "profile_id": profile_id,
         "profile_source": profile_source,
     }
+    if local_vars.get("_hfc_policy_new_turn") is True:
+        data["policy_new_turn"] = True
     display_status = normalize_display_status(local_vars.get("display_status"))
     if display_status:
         data["display_status"] = display_status

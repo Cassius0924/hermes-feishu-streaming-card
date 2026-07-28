@@ -44,6 +44,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path):
         "bots": {"default": "default", "items": {}},
         "bindings": {
             "chats": {},
+            "native_chats": [],
             "group_rules": {"enabled": False},
         },
         "integrity": {"mode": "notify"},
@@ -127,6 +128,57 @@ def test_setup_template_writes_explicit_auto_service_manager():
     config = yaml.safe_load(_default_setup_config_text())
 
     assert config["service"] == {"manager": "auto"}
+
+
+def test_load_config_normalizes_native_chats_and_preserves_order(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+bindings:
+  native_chats:
+    - chat-b
+    - chat-a
+    - chat-b
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["bindings"]["native_chats"] == ["chat-b", "chat-a"]
+
+
+@pytest.mark.parametrize("value", ["'*'", "chat-a", "{}", "[1]"])
+def test_load_config_rejects_non_exact_native_chat_arrays(tmp_path, value):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"bindings:\n  native_chats: {value}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="bindings.native_chats"):
+        load_config(path)
+
+
+def test_load_config_normalizes_profile_native_chats_without_top_level_inheritance(
+    tmp_path,
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+bindings:
+  native_chats: [chat-top]
+profiles:
+  work:
+    bindings:
+      native_chats: [chat-work, chat-work]
+  personal: {}
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["bindings"]["native_chats"] == ["chat-top"]
+    assert config["profiles"]["work"]["bindings"]["native_chats"] == ["chat-work"]
+    assert config["profiles"]["personal"]["bindings"]["native_chats"] == []
 
 
 def test_operations_hermes_root_uses_process_hint_without_user_config(
@@ -420,6 +472,7 @@ def test_load_config_defaults_include_multi_bot_sections(tmp_path):
     assert config["bots"] == {"default": "default", "items": {}}
     assert config["bindings"] == {
         "chats": {},
+        "native_chats": [],
         "group_rules": {"enabled": False},
     }
 
@@ -699,7 +752,11 @@ profiles:
     assert config["profiles"]["default"]["feishu"]["app_id"] == "cli_a"
     # 验证 work profile 自动继承了默认的 bots / bindings
     assert config["profiles"]["work"]["bots"]["default"] == "default"
-    assert config["profiles"]["work"]["bindings"] == {"chats": {}, "group_rules": {"enabled": False}}
+    assert config["profiles"]["work"]["bindings"] == {
+        "chats": {},
+        "native_chats": [],
+        "group_rules": {"enabled": False},
+    }
 
 
 def test_load_config_without_profiles_still_works(tmp_path):

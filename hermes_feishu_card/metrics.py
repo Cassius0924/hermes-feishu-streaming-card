@@ -16,6 +16,11 @@ class SidecarMetrics:
     integrity_repair_attempts: int = 0
     integrity_repair_successes: int = 0
     integrity_repair_refusals: int = 0
+    policy_queries: int = 0
+    policy_auth_rejections: int = 0
+    policy_invalid_requests: int = 0
+    policy_event_checks: int = 0
+    native_bypass_events: int = 0
     feishu_send_attempts: int = 0
     feishu_noop_attempts: int = 0
     feishu_send_successes: int = 0
