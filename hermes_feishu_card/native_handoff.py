@@ -33,6 +33,9 @@ DEFAULT_MAX_FILE_BYTES = 256 * 1024
 NATIVE_HANDOFF_PROTOCOL = "hfc-native-handoff-v1"
 NATIVE_HANDOFF_TTL_SECONDS = 60 * 60
 LIFECYCLE_FENCE_TTL_SECONDS = 60 * 60
+NATIVE_HANDOFF_MANUAL_REVIEW_ACTION = (
+    "review_native_delivery_before_manual_retry"
+)
 _IDENTITY_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 _GENERATION_RE = re.compile(r"^[0-9a-f]{32,64}$")
 _HANDOFF_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -344,11 +347,14 @@ class NativeHandoffStore:
         counts = {state: 0 for state in sorted(_VALID_DELIVERY_STATES)}
         for record in records.values():
             counts[record.delivery_state] += 1
-        return {
+        status = {
             "records": len(records),
             "delivery_states": counts,
             "manual_review_required": counts["uncertain"] > 0,
         }
+        if counts["uncertain"] > 0:
+            status["next_action"] = NATIVE_HANDOFF_MANUAL_REVIEW_ACTION
+        return status
 
     def record_lifecycle_fence(
         self,

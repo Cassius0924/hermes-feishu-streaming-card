@@ -138,6 +138,7 @@ def test_unacked_handoff_expires_to_uncertain_without_rotating_descriptor(tmp_pa
     status = store.safe_status()
     assert status["delivery_states"]["uncertain"] == 1
     assert status["manual_review_required"] is True
+    assert status["next_action"] == "review_native_delivery_before_manual_retry"
 
 
 def test_generation_fence_prevents_old_tombstone_from_swallowing_new_turn(tmp_path):

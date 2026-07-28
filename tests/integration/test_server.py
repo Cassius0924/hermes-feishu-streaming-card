@@ -1770,6 +1770,52 @@ async def test_hfc_monitor_command_reports_safe_metrics(client):
     assert "om_monitor_secret" not in content
 
 
+async def test_hfc_operational_commands_surface_native_handoff_manual_review_safely():
+    feishu_client = FakeFeishuClient()
+    native_handoff_store = SimpleNamespace(
+        safe_status=lambda: {
+            "records": 4,
+            "delivery_states": {
+                "pending": 2,
+                "acked": 1,
+                "uncertain": 1,
+            },
+            "manual_review_required": True,
+            "next_action": "review_native_delivery_before_manual_retry",
+            "raw_identifier": "oc_must_not_leak",
+        }
+    )
+    app = create_app(
+        feishu_client,
+        native_handoff_store=native_handoff_store,
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+
+    try:
+        for command in ("status", "doctor", "monitor"):
+            response = await test_client.post(
+                "/commands",
+                json=signed_operations_command({
+                    "command": command,
+                    "chat_id": f"oc_{command}_secret",
+                    "message_id": f"om_{command}_secret",
+                }),
+            )
+
+            assert response.status == 200
+            content = str(feishu_client.sent[-1][1])
+            assert "native_handoff.records: 4" in content
+            assert "native_handoff.pending: 2" in content
+            assert "native_handoff.uncertain: 1" in content
+            assert "native_handoff.manual_review_required: true" in content
+            assert "native_handoff.next_action:" in content
+            assert "先确认飞书原生会话是否已收到答案" in content
+            assert "oc_must_not_leak" not in content
+    finally:
+        await test_client.close()
+
+
 def test_hfc_readiness_lines_expose_sanitized_integrity_coordinator_action():
     request = SimpleNamespace(
         app={
@@ -4674,6 +4720,111 @@ async def test_ack_capable_terminal_repeats_descriptor_until_signed_ack(tmp_path
             await test_client.post("/events", json=completed_payload)
         ).json()
         assert after_ack == {"ok": True, "applied": True}
+    finally:
+        await test_client.close()
+
+
+async def test_in_memory_native_terminal_recreates_missing_handoff_fence(tmp_path):
+    state_root = tmp_path / "handoff-state"
+    store = NativeHandoffStore(state_root)
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    generation = "4" * 32
+    obligation_key = "5" * 64
+    message_id = "message-state-loss"
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {
+            "answer": "STATE-LOSS-NATIVE-" + ("密" * 40_000),
+            "native_handoff": {
+                "generation": generation,
+                "capabilities": ["native-ack-v1", "stable-feishu-uuid-v1"],
+                "obligation_key": obligation_key,
+            },
+        },
+        message_id=message_id,
+    )
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": generation}},
+                message_id=message_id,
+            ),
+        )
+        first = await (await test_client.post("/events", json=completed_payload)).json()
+        assert first["applied"] is False
+        assert first["native_handoff"]["protocol"] == "hfc-native-handoff-v1"
+
+        store.path.unlink()
+        repeated = await (
+            await test_client.post("/events", json=completed_payload)
+        ).json()
+
+        assert repeated["applied"] is False
+        assert repeated["disposition"] == "native"
+        assert repeated["native_handoff"]["protocol"] == "hfc-native-handoff-v1"
+        identity = handoff_identity_key(
+            profile_id="",
+            chat_id="oc_abc",
+            conversation_id="conversation-1",
+            message_id=message_id,
+        )
+        assert store.get(identity) is not None
+        serialized = store.path.read_text(encoding="utf-8")
+        assert "STATE-LOSS-NATIVE" not in serialized
+    finally:
+        await test_client.close()
+
+
+async def test_in_memory_native_terminal_fails_open_when_handoff_state_is_corrupt(
+    tmp_path,
+):
+    state_root = tmp_path / "handoff-state"
+    store = NativeHandoffStore(state_root)
+    app = create_app(FakeFeishuClient(), native_handoff_store=store)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    generation = "6" * 32
+    message_id = "message-state-corrupt"
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {
+            "answer": "STATE-CORRUPT-NATIVE-" + ("密" * 40_000),
+            "native_handoff": {
+                "generation": generation,
+                "capabilities": ["native-ack-v1", "stable-feishu-uuid-v1"],
+                "obligation_key": "7" * 64,
+            },
+        },
+        message_id=message_id,
+    )
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"native_handoff": {"generation": generation}},
+                message_id=message_id,
+            ),
+        )
+        first = await test_client.post("/events", json=completed_payload)
+        assert (await first.json())["applied"] is False
+
+        store.path.write_text("{invalid", encoding="utf-8")
+        repeated = await test_client.post("/events", json=completed_payload)
+
+        assert repeated.status == 503
+        assert await repeated.json() == {
+            "ok": False,
+            "error": "native handoff state unavailable",
+        }
     finally:
         await test_client.close()
 

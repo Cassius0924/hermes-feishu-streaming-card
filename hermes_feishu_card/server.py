@@ -2192,6 +2192,7 @@ def _hfc_status_lines(
         "",
         _hfc_sidecar_line(request),
         *_hfc_readiness_lines(request),
+        *_hfc_native_handoff_lines(request),
         f"- active_sessions: {len(sessions)}",
         f"- events_received: {metrics.events_received}",
         f"- events_applied: {metrics.events_applied}",
@@ -2215,6 +2216,7 @@ def _hfc_doctor_lines(
         "",
         _hfc_sidecar_line(request),
         *_hfc_readiness_lines(request),
+        *_hfc_native_handoff_lines(request),
         f"- routing: {'ok' if not last_route_error else 'warning'}",
         f"- last_route_error: {last_route_error or 'none'}",
         f"- last_update_error: {last_update_error or 'none'}",
@@ -2261,10 +2263,52 @@ def _hfc_monitor_lines(request: web.Request, event: SidecarEvent) -> list[str]:
         "card_limit_elements",
         "card_limit_tables",
     )
-    lines = ["**/hfc monitor**", "", *_hfc_readiness_lines(request)]
+    lines = [
+        "**/hfc monitor**",
+        "",
+        *_hfc_readiness_lines(request),
+        *_hfc_native_handoff_lines(request),
+    ]
     lines.extend([f"- {key}: {snapshot.get(key, 0)}" for key in keys])
     lines.append(f"- active_sessions: {len(request.app[SESSIONS_KEY])}")
     lines.extend(_hfc_context_lines(event, None))
+    return lines
+
+
+def _hfc_native_handoff_lines(request: web.Request) -> list[str]:
+    snapshot = _safe_native_handoff_diagnostics(request.app)
+    delivery_states = snapshot.get("delivery_states")
+    if not isinstance(delivery_states, dict):
+        delivery_states = {}
+
+    def safe_count(value: Any) -> int:
+        return value if type(value) is int and value >= 0 else 0
+
+    records = safe_count(snapshot.get("records"))
+    pending = safe_count(delivery_states.get("pending"))
+    acked = safe_count(delivery_states.get("acked"))
+    uncertain = safe_count(delivery_states.get("uncertain"))
+    manual_review_required = (
+        snapshot.get("manual_review_required") is True or uncertain > 0
+    )
+    if not (records or pending or uncertain or manual_review_required):
+        return []
+
+    lines = [
+        f"- native_handoff.records: {records}",
+        f"- native_handoff.pending: {pending}",
+        f"- native_handoff.acked: {acked}",
+        f"- native_handoff.uncertain: {uncertain}",
+    ]
+    if manual_review_required:
+        lines.extend(
+            [
+                "- native_handoff.manual_review_required: true",
+                "- native_handoff.next_action: "
+                "先确认飞书原生会话是否已收到答案并核对 Hermes delivery ledger，"
+                "再决定是否人工重试；不要删除 handoff state，也不要自动重试",
+            ]
+        )
     return lines
 
 
@@ -2463,11 +2507,7 @@ def _event_starts_new_lifecycle(event: SidecarEvent) -> bool:
 def _get_native_handoff(
     app: web.Application, identity_key: str
 ) -> NativeHandoffRecord | None:
-    try:
-        return app[NATIVE_HANDOFF_STORE_KEY].get(identity_key)
-    except (NativeHandoffStoreError, OSError, ValueError):
-        logger.warning("native handoff state could not be read safely")
-        return None
+    return app[NATIVE_HANDOFF_STORE_KEY].get(identity_key)
 
 
 def _prepare_native_handoff_lifecycle(
@@ -2811,7 +2851,15 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
     # policy has since changed. Suppress it before considering a new policy
     # decision, but do not mutate handoff state for a genuinely native turn.
     if event_is_terminal and not starts_new_lifecycle:
-        prior_handoff = _get_native_handoff(request.app, handoff_identity)
+        try:
+            prior_handoff = _get_native_handoff(request.app, handoff_identity)
+        except (NativeHandoffStoreError, OSError, ValueError):
+            logger.warning("native handoff state could not be read safely")
+            metrics.events_rejected += 1
+            return web.json_response(
+                {"ok": False, "error": "native handoff state unavailable"},
+                status=503,
+            ), None
         if prior_handoff is not None:
             if handoff_generation and prior_handoff.generation != handoff_generation:
                 if incoming_event.created_at > prior_handoff.event_created_at:
@@ -2886,6 +2934,52 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                     ),
                 }
                 return web.json_response(response_payload), post_lock_task
+        if (
+            prior_handoff is None
+            and session is not None
+            and session.status in {"completed", "failed"}
+            and session.terminal_disposition == "native"
+        ):
+            # The in-memory session proves this terminal previously crossed
+            # the native handoff boundary, but its durable dedupe fence has
+            # disappeared. Never report applied=True from memory alone: that
+            # would suppress the only remaining copy of the native answer.
+            # Recreate a bounded descriptor when the store is writable; if it
+            # is corrupt or unsafe the 503 above preserves hook fail-open.
+            recreated, _ = _begin_native_handoff(
+                request.app,
+                handoff_identity,
+                feishu_message_id=feishu_message_ids.get(session_key),
+                bot_id=message_bot_ids.get(session_key),
+                event_created_at=incoming_event.created_at,
+                generation=handoff_generation,
+                ack_capable=_native_handoff_ack_capable(
+                    request.app, handoff_metadata
+                ),
+                obligation_key=str(handoff_metadata.get("obligation_key") or ""),
+            )
+            if recreated is None:
+                metrics.events_rejected += 1
+                return web.json_response(
+                    {"ok": False, "error": "native handoff state unavailable"},
+                    status=503,
+                ), None
+            request.app[DIAGNOSTICS_KEY]["last_terminal_event"] = {
+                "message_id_hash": _diagnostic_id_hash(incoming_event.message_id),
+                "event": incoming_event.event,
+                "sequence": incoming_event.sequence,
+                "applied": False,
+                "disposition": "native_state_recreated",
+            }
+            return _native_disposition_response(recreated), (
+                _schedule_pending_native_handoff_repair(
+                    request.app,
+                    handoff_identity,
+                    recreated,
+                    feishu_message_id=feishu_message_ids.get(session_key),
+                    bot_id=message_bot_ids.get(session_key),
+                )
+            )
 
     if session is None or reopens_completed_session:
         metrics.policy_event_checks += 1

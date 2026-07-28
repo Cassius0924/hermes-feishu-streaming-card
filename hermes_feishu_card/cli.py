@@ -2065,6 +2065,7 @@ def _run_status(args: argparse.Namespace) -> int:
         print(f"error: {status_error}", file=sys.stderr)
         return 1
     readiness_degraded = False
+    native_handoff_manual_review = False
     if status["running"]:
         print("status: running")
         print(f"pid: {status['pid'] or 'unknown'}")
@@ -2130,6 +2131,9 @@ def _run_status(args: argparse.Namespace) -> int:
                 value = metrics.get(name)
                 if isinstance(value, int):
                     print(f"{name}: {value}")
+        native_handoff_manual_review = _print_status_native_handoffs(
+            status["health"]
+        )
         _print_status_routing(status["health"])
     else:
         print("status: stopped")
@@ -2137,10 +2141,51 @@ def _run_status(args: argparse.Namespace) -> int:
             print(f"pid: {status['pid']} stale")
     hook_check = _lifecycle_hook_check(args)
     if hook_check is None:
-        return 1 if readiness_degraded else 0
+        return 1 if readiness_degraded or native_handoff_manual_review else 0
     hook_check["config"] = args.config
     _print_lifecycle_hook_check(hook_check)
-    return 1 if readiness_degraded or bool(hook_check["blocking"]) else 0
+    return (
+        1
+        if readiness_degraded
+        or native_handoff_manual_review
+        or bool(hook_check["blocking"])
+        else 0
+    )
+
+
+def _print_status_native_handoffs(health: dict[str, Any]) -> bool:
+    snapshot = health.get("native_handoffs")
+    if not isinstance(snapshot, dict):
+        return False
+    delivery_states = snapshot.get("delivery_states")
+    if not isinstance(delivery_states, dict):
+        delivery_states = {}
+
+    def safe_count(value: Any) -> int:
+        return value if type(value) is int and value >= 0 else 0
+
+    records = safe_count(snapshot.get("records"))
+    pending = safe_count(delivery_states.get("pending"))
+    acked = safe_count(delivery_states.get("acked"))
+    uncertain = safe_count(delivery_states.get("uncertain"))
+    manual_review_required = (
+        snapshot.get("manual_review_required") is True or uncertain > 0
+    )
+    if not (records or pending or uncertain or manual_review_required):
+        return False
+
+    print(f"native_handoff.records: {records}")
+    print(f"native_handoff.pending: {pending}")
+    print(f"native_handoff.acked: {acked}")
+    print(f"native_handoff.uncertain: {uncertain}")
+    if manual_review_required:
+        print("native_handoff.manual_review_required: true")
+        print(
+            "native_handoff.next_action: verify native conversation delivery "
+            "and the Hermes delivery ledger before manually retrying; do not "
+            "delete handoff state or retry automatically"
+        )
+    return manual_review_required
 
 
 def _print_status_integrity(snapshot: dict[str, Any]) -> None:

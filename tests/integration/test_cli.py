@@ -139,6 +139,54 @@ def test_status_reports_sanitized_integrity_repair_action(monkeypatch, capsys):
     assert "integrity migrate-safe" in output
 
 
+def test_status_reports_native_handoff_manual_review_without_identifiers(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda *_args, **_kwargs: {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "status_sidecar",
+        lambda _config: {
+            "running": True,
+            "pid": 123,
+            "manager": "detached",
+            "health": {
+                "status": "healthy",
+                "active_sessions": 0,
+                "metrics": {},
+                "native_handoffs": {
+                    "records": 4,
+                    "delivery_states": {
+                        "pending": 2,
+                        "acked": 1,
+                        "uncertain": 1,
+                    },
+                    "manual_review_required": True,
+                    "next_action": "review_native_delivery_before_manual_retry",
+                    "raw_identifier": "oc_must_not_leak",
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(cli_module, "_lifecycle_hook_check", lambda _args: None)
+
+    exit_code = main(["status", "--config", "config.yaml"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "native_handoff.records: 4" in output
+    assert "native_handoff.pending: 2" in output
+    assert "native_handoff.uncertain: 1" in output
+    assert "native_handoff.manual_review_required: true" in output
+    assert "native_handoff.next_action:" in output
+    assert "verify native conversation delivery" in output
+    assert "oc_must_not_leak" not in output
+
+
 def test_status_fails_closed_when_process_state_is_untrusted(
     monkeypatch, capsys
 ):
