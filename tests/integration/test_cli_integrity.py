@@ -66,6 +66,8 @@ def test_integrity_migrate_safe_preserves_yaml_and_updates_private_env(tmp_path)
 
     assert result.returncode == 0, result.stderr
     assert "integrity mode: safe" in result.stdout
+    assert "sidecar.restart_required: true" in result.stdout
+    assert "gateway.restart_required: false" in result.stdout
     assert config.read_text(encoding="utf-8") == original_config
     assert (
         "HERMES_FEISHU_CARD_INTEGRITY_MODE=safe"

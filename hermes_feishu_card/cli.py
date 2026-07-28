@@ -1994,6 +1994,7 @@ def _run_integrity(args: argparse.Namespace) -> int:
         return 1
     print("integrity migration: verified")
     print("integrity mode: safe")
+    print("sidecar.restart_required: true")
     print("gateway.restart_required: false")
     return 0
 
