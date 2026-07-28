@@ -11,7 +11,9 @@
 - [x] Issue #155：仅显式 `answer -> tool` 边界归档答案，`tool -> answer -> completed` 保留完整用户可见终态答案。
 - [x] Issue #147：图片/notice 自动化组合回归覆盖原生图片投递、一次性媒体文本抑制和 accepted notice 无 uncertain-delivery warning。
 - [x] 包元数据、当前安装入口、Docker Compose 默认、双语用户指南和发布门禁统一到 `v4.0.21`，不改变 UI 或配置。
-- [ ] 真实飞书图片 smoke：验证一张完成卡 + 一条 native image，无灰色重复答案和 uncertain-delivery warning；完成前不得发布或关闭 Issue #147。
+- [x] 真实飞书图片验收已通过（2026-07-28）：`/background` 图片任务观察到 1 条带标记 completion card + 1 条 native image，无“生成中”或 uncertain-delivery warning；正常任务两段各至少 180 中文字符答案保留在同一卡，bot 原生标记重复为 0。
+- [x] sidecar `events_received/events_applied=23/23`、1 次发送成功、16 次更新成功；event/auth rejection、send/update failures、notice uncertain warnings、notice update failures 均为 0，Gateway Feishu WebSocket 已连接，官方 install 后 Hermes venv site-packages 为 4.0.21。
+- [ ] 完成全量自动化、sdist/wheel、隔离 import，以及公开 tagged installer 与 Release assets 的 post-tag 验证；验收不宣称截图或桌面/移动端视觉 QA。
 
 ### V4.0.20：notice 异步 ACK 语义热修（发布候选）
 

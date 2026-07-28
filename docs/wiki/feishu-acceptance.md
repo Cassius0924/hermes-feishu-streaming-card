@@ -9,7 +9,11 @@
 - 让已接管卡片的 `system.notice` 返回 accepted，确认不出现 uncertain-delivery warning；保留既有 `MEDIA:` 清理、附件和 fail-open 分支。
 - 不改变卡片 UI 或配置；不要在验收记录中写入真实 chat/message/user 标识符、凭据、token、图片内容或本机路径。
 
-真实飞书图片 smoke 尚未完成：以上为发布前验收清单和自动化组合回归边界，不得写成已完成的飞书客户端视觉验收。完成后才可记录“一张完成卡 + 一条 native image、无灰色重复答案、无 uncertain-delivery warning”的真实观察。
+2026-07-28 真实验收结果：本机候选版使用真实 Hermes 配置模型处理真实 Feishu 用户消息。`/background` 图片任务产生 1 条带标记的 interactive completion card 与 1 条 native image；该卡无“生成中”，没有 uncertain-delivery warning。正常任务先调用只读 terminal，再产生两段各至少 180 中文字符的答案；两个标记同在 1 张 interactive completion card，bot 原生标记重复为 0。
+
+sidecar 最终 metrics：`events_received/events_applied=23/23`，1 次发送成功、16 次更新成功；event rejected、auth rejection、send/update failures、notice uncertain warnings、notice update failures 均为 0。Gateway 日志确认 Feishu WebSocket 已连接，候选 runtime 已通过官方 install 进入 Hermes venv site-packages 4.0.21。
+
+本记录不宣称截图或桌面/移动端视觉 QA，也不宣称真实故障注入。公开 tagged installer 与 Release assets 仍待 post-tag 验证；验收记录不包含真实标识符、marker 文本、本机路径、凭据或测试图片内容。
 
 ## V4.0.20 notice 异步 ACK 语义
 

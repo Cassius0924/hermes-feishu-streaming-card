@@ -2070,7 +2070,7 @@ def test_v4020_release_docs_cover_notice_accepted_ack_and_observability():
     assert "V4.0.20 notice 异步 ACK 语义" in acceptance
 
 
-def test_v4021_release_docs_preserve_content_integrity_and_pending_feishu_smoke():
+def test_v4021_release_docs_record_content_integrity_and_real_feishu_acceptance():
     changelog = read_doc("CHANGELOG.md")
     notes = read_doc("docs/release-notes-v4.0.21.md")
     notes_en = read_doc("docs/release-notes-v4.0.21.en.md")
@@ -2102,8 +2102,20 @@ def test_v4021_release_docs_preserve_content_integrity_and_pending_feishu_smoke(
             assert marker in text
     assert "不改变卡片 UI 或配置" in notes
     assert "does not change the card UI or configuration" in notes_en
-    assert "真实飞书图片 smoke 尚未完成" in notes
-    assert "real Feishu image smoke remains pending" in notes_en
+    assert "2026-07-28 真实飞书验收" in notes
+    assert "Real Feishu acceptance on 2026-07-28" in notes_en
+    assert "1 条 native image" in notes
+    assert "one native image" in notes_en
+    assert "23/23" in notes
+    assert "23/23" in notes_en
+    assert "1 次发送成功、16 次更新成功" in notes
+    assert "1 send success and 16 update successes" in notes_en
+    assert "site-packages 4.0.21" in notes
+    assert "site-packages 4.0.21" in notes_en
+    assert "不宣称截图或桌面/移动端视觉 QA" in notes
+    assert "does not claim screenshot or desktop/mobile visual QA" in notes_en
+    assert "公开 tagged installer 与 Release assets 仍待 post-tag 验证" in notes
+    assert "public tagged installer and Release assets remain pending post-tag verification" in notes_en
     assert "docs/release-notes-v4.0.21.md" in readme
     assert "docs/release-notes-v4.0.21.en.md" in readme_en
     assert "test_prepare_completed_answer_issue155.py" in testing
@@ -2111,7 +2123,10 @@ def test_v4021_release_docs_preserve_content_integrity_and_pending_feishu_smoke(
     assert "test_v4021_hook_runtime_keeps_image_delivery_and_accepted_notice_in_same_turn" in testing
     assert "test_v4021_hook_runtime_keeps_image_delivery_and_accepted_notice_in_same_turn" in testing_en
     assert "V4.0.21 内容完整性与媒体/notice 组合验收" in acceptance
-    assert "真实飞书图片 smoke 尚未完成" in acceptance
+    assert "2026-07-28 真实验收结果" in acceptance
+    assert "23/23" in acceptance
+    assert "site-packages 4.0.21" in acceptance
+    assert "不宣称截图或桌面/移动端视觉 QA" in acceptance
 
     assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
     for doc in (readme, readme_en, install_doc, guide, guide_en):
@@ -2131,12 +2146,23 @@ def test_v4021_release_docs_preserve_content_integrity_and_pending_feishu_smoke(
     assert "Current release candidate: `4.0.21`" in readiness_en
     assert "## V4.0.21 发布门禁" in readiness
     assert "## V4.0.21 Release Gates" in readiness_en
-    assert "真实飞书图片 smoke：**待完成**" in readiness
-    assert "Real Feishu image smoke: **pending**" in readiness_en
+    assert "真实飞书图片验收：**已通过（2026-07-28）**" in readiness
+    assert "Real Feishu image acceptance: **passed (2026-07-28)**" in readiness_en
+    assert "23/23" in readiness
+    assert "23/23" in readiness_en
+    assert "公开 tagged installer 与 Release assets 的 post-tag 验证仍待完成" in readiness
+    assert "public tagged installer and Release-asset post-tag verification remain pending" in readiness_en
     assert "## V4.0.20 发布门禁" in readiness
     assert "## V4.0.20 Release Gates" in readiness_en
     assert "V4.0.21" in todo
     assert "### V4.0.21：内容完整性与图片/notice 组合热修（发布候选）" in todo
+    assert "真实飞书图片验收已通过（2026-07-28）" in todo
+
+    v4021_acceptance_docs = "\n".join(
+        (notes, notes_en, testing, testing_en, acceptance, readiness, readiness_en, todo, guide, guide_en)
+    )
+    assert "真实飞书图片 smoke 尚未完成" not in v4021_acceptance_docs
+    assert "real Feishu image smoke remains pending" not in v4021_acceptance_docs
 
     public_v4021_docs = "\n".join((notes, notes_en, testing, testing_en, acceptance))
     assert re.search(r"\b(?:oc|om|ou)_[0-9a-f]{16,}\b", public_v4021_docs) is None

@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.0.21`. It fixes Issue #155's answer/tool archive boundary and locks the Issue #147 image/notice combined regression without changing the card UI or configuration. V3.9.1 was released on 2026-07-11; V4.0.20 and earlier releases remain historical release records; the real Feishu image smoke is still pending.
+Current release candidate: `4.0.21`. It fixes Issue #155's answer/tool archive boundary and locks the Issue #147 image/notice combined regression without changing the card UI or configuration. V3.9.1 was released on 2026-07-11; V4.0.20 and earlier releases remain historical release records; real Feishu image acceptance passed on 2026-07-28.
 
 ## Ready
 
@@ -150,8 +150,9 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 - Issue #155: only an explicit `answer -> tool` boundary can archive an answer; `tool -> answer -> completed` must retain the full user-visible terminal answer: **passed focused ordering coverage (`74 passed`)**.
 - Issue #147: after the completed card accepts the event, matching native media text is suppressed once, the native image still delivers, and an accepted queued notice emits no uncertain-delivery warning: **passed hook-runtime combination coverage (`277 passed`)**.
 - Current README, install guidance, Docker Compose, and bilingual user guides pin `v4.0.21`; UI and configuration remain unchanged: **passed documentation gate**.
-- Real Feishu image smoke: **pending**. Before release, observe one completed card plus one native image with no gray duplicate answer and no uncertain-delivery warning; automated combination coverage is not client visual acceptance.
-- Final full automation, sdist/wheel, isolated `site-packages` import, public tagged installer, and Release-asset verification remain required for release.
+- Real Feishu image acceptance: **passed (2026-07-28)**. Observed one marker-bearing completion card plus one native image with no running-state text or uncertain-delivery warning; a separate normal task retained two answer segments of at least 180 Chinese characters each in one card, with zero bot native marker duplicates.
+- Final sidecar metrics were `events_received/events_applied=23/23`, 1 send success and 16 update successes; event/auth rejection, send/update failures, notice uncertain warnings, and notice update failures were all zero. Gateway Feishu WebSocket was connected, and the official install placed the candidate in Hermes venv site-packages 4.0.21.
+- This acceptance does not claim screenshot or desktop/mobile visual QA and does not replace real fault injection. Final full automation, sdist/wheel, and isolated `site-packages` import remain required; public tagged installer and Release-asset post-tag verification remain pending.
 
 ## V4.0.20 Release Gates
 
