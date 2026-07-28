@@ -178,3 +178,24 @@ def test_build_message_payload_rejects_card_over_exact_delivery_limits():
 
     with pytest.raises(CardLimitExceeded, match="json_bytes"):
         client.build_message_payload("oc_abc", oversized)
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_unsafe_card_before_token_or_network():
+    cfg = FeishuClientConfig(app_id="cli_a", app_secret="sec")
+    client = FeishuClient(cfg)
+    oversized = {
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": "x" * 28_000},
+            ]
+        }
+    }
+
+    async def forbidden_token():
+        raise AssertionError("unsafe card reached token or network boundary")
+
+    client._tenant_token = forbidden_token
+
+    with pytest.raises(CardLimitExceeded, match="json_bytes"):
+        await client.update_card_message("om_test", oversized)

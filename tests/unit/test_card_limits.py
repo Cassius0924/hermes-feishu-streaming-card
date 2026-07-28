@@ -67,3 +67,39 @@ def test_inspector_reports_each_exact_limit_without_content_excerpts():
     assert inspection.safe is False
     assert inspection.violations == ("json_bytes", "elements", "tables")
     assert "secret-value" not in repr(inspection)
+
+
+def test_inspector_accepts_each_exact_boundary():
+    exact_elements = {
+        "body": {
+            "elements": [
+                {"tag": "plain_text", "content": "x"}
+                for _ in range(FEISHU_MAX_ELEMENTS)
+            ]
+        }
+    }
+    exact_tables = {
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": "\n\n".join(
+                        "| H |\n| --- |\n| value |"
+                        for _ in range(FEISHU_MAX_TABLES)
+                    ),
+                }
+            ]
+        }
+    }
+    exact_bytes = {"body": {"elements": [{"content": ""}]}}
+    overhead = len(serialize_card_json(exact_bytes).encode("utf-8"))
+    exact_bytes["body"]["elements"][0]["content"] = "x" * (
+        SAFE_CARD_JSON_BYTES - overhead
+    )
+
+    assert inspect_card_limits(exact_elements).element_count == FEISHU_MAX_ELEMENTS
+    assert inspect_card_limits(exact_elements).safe is True
+    assert inspect_card_limits(exact_tables).table_count == FEISHU_MAX_TABLES
+    assert inspect_card_limits(exact_tables).safe is True
+    assert inspect_card_limits(exact_bytes).json_bytes == SAFE_CARD_JSON_BYTES
+    assert inspect_card_limits(exact_bytes).safe is True
