@@ -72,7 +72,8 @@ def test_pid_record_accepts_only_expected_systemd_unit_identity(
     state_root = tmp_path / "state"
     monkeypatch.setattr(process, "pid_path", lambda: record_path)
     monkeypatch.setattr(process, "state_dir", lambda: state_root)
-    monkeypatch.setattr(process.os, "getuid", lambda: 501)
+    owner_uid = tmp_path.stat().st_uid
+    monkeypatch.setattr(process.os, "getuid", lambda: owner_uid)
     unit = process._systemd_system_unit_name()
 
     process.write_pid_record(
@@ -733,7 +734,8 @@ def test_start_sidecar_uses_explicit_transient_system_unit(monkeypatch, tmp_path
     monkeypatch.setattr(process, "state_dir", lambda: state_root)
     monkeypatch.setattr(process, "log_path", lambda: log_file)
     monkeypatch.setattr(process.secrets, "token_hex", lambda _length: token)
-    monkeypatch.setattr(process.os, "getuid", lambda: 501)
+    owner_uid = tmp_path.stat().st_uid
+    monkeypatch.setattr(process.os, "getuid", lambda: owner_uid)
     monkeypatch.setattr(process.os, "getgid", lambda: 20)
     monkeypatch.setattr(process.time, "monotonic", iter((0, 0)).__next__)
     monkeypatch.setattr(process.time, "sleep", lambda _seconds: None)
@@ -774,7 +776,7 @@ def test_start_sidecar_uses_explicit_transient_system_unit(monkeypatch, tmp_path
             f"--unit={unit}",
             "--collect",
             f"--setenv=HERMES_FEISHU_CARD_STATE_DIR={state_root}",
-            "--uid=501",
+            f"--uid={owner_uid}",
             "--gid=20",
             "--property=Type=exec",
             "--property=Restart=on-failure",
@@ -1021,7 +1023,8 @@ def test_start_sidecar_recovers_explicit_systemd_system_when_health_is_unavailab
     )
     stopped: list[tuple[str, str]] = []
     launched: list[tuple[list[str], str]] = []
-    monkeypatch.setattr(process.os, "getuid", lambda: 501)
+    owner_uid = tmp_path.stat().st_uid
+    monkeypatch.setattr(process.os, "getuid", lambda: owner_uid)
     monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
     unit = process._systemd_system_unit_name()
     monkeypatch.setattr(process, "fetch_health", lambda _config: next(health_responses))
@@ -1282,7 +1285,8 @@ def test_stop_sidecar_uses_explicit_system_manager_unit(monkeypatch, tmp_path):
     stopped: list[str] = []
     cleared: list[bool] = []
     monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
-    monkeypatch.setattr(process.os, "getuid", lambda: 501)
+    owner_uid = tmp_path.stat().st_uid
+    monkeypatch.setattr(process.os, "getuid", lambda: owner_uid)
     unit = process._systemd_system_unit_name()
     monkeypatch.setattr(
         process,
@@ -1334,7 +1338,8 @@ def test_stop_sidecar_recovers_explicit_systemd_unit_without_health(
     stopped: list[tuple[str, str]] = []
     cleared: list[bool] = []
     monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
-    monkeypatch.setattr(process.os, "getuid", lambda: 501)
+    owner_uid = tmp_path.stat().st_uid
+    monkeypatch.setattr(process.os, "getuid", lambda: owner_uid)
     unit = process._expected_unit(manager)
     monkeypatch.setattr(
         process,
@@ -1480,7 +1485,8 @@ def test_stop_sidecar_refuses_forged_system_unit_before_systemctl(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
-    monkeypatch.setattr(process.os, "getuid", lambda: 501)
+    owner_uid = tmp_path.stat().st_uid
+    monkeypatch.setattr(process.os, "getuid", lambda: owner_uid)
     monkeypatch.setattr(
         process,
         "read_pid_record",
@@ -1586,7 +1592,8 @@ def test_status_sidecar_rejects_boolean_systemd_process_pid(monkeypatch):
 def test_status_sidecar_reports_verified_manager(monkeypatch, tmp_path):
     token = "fixed-system-token"
     monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
-    monkeypatch.setattr(process.os, "getuid", lambda: 501)
+    owner_uid = tmp_path.stat().st_uid
+    monkeypatch.setattr(process.os, "getuid", lambda: owner_uid)
     unit = process._systemd_system_unit_name()
     monkeypatch.setattr(
         process,

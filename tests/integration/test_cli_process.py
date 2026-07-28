@@ -51,7 +51,10 @@ def write_config(tmp_path: Path, port: int) -> Path:
 
 def process_env(tmp_path: Path) -> dict[str, str]:
     state_dir = tmp_path / "state"
-    return {"HERMES_FEISHU_CARD_STATE_DIR": str(state_dir)}
+    return {
+        "HERMES_FEISHU_CARD_STATE_DIR": str(state_dir),
+        "HERMES_FEISHU_CARD_SERVICE_MANAGER": "detached",
+    }
 
 
 def pidfile_path(tmp_path: Path) -> Path:

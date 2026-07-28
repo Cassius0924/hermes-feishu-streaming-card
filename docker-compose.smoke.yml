@@ -21,7 +21,7 @@ services:
     environment:
       <<: *hfc-runtime-environment
       HFC_ENV_FILE: /opt/data/.env
-      HFC_INSTALL_SOURCE: /src
+      HFC_INSTALL_SOURCE: /tmp/hfc-install-source
       HFC_TEST_NOOP_DELIVERY: "1"
       HFC_SKIP_START: "1"
       HFC_NO_PROMPT: "1"
@@ -34,6 +34,9 @@ services:
       - bash
       - -ec
       - |
+        mkdir -p /tmp/hfc-install-source
+        cp /src/pyproject.toml /src/README.md /src/LICENSE /tmp/hfc-install-source/
+        cp -R /src/hermes_feishu_card /tmp/hfc-install-source/
         cp -R /src/tests/fixtures/hermes_v2026_4_23/. /opt/hermes/
         python -m venv /opt/hermes/venv
         cp /src/tests/fixtures/docker-smoke-config.yaml /opt/data/config.yaml

@@ -28,6 +28,8 @@ def test_github_actions_runs_full_pytest_matrix():
     assert "--detach --wait --wait-timeout 180" in text
     assert "docker compose -f docker-compose.smoke.yml run" in text
     assert "--rm --no-deps probe" in text
+    assert "docker compose -f docker-compose.smoke.yml logs" in text
+    assert "--no-color setup sidecar gateway" in text
     assert "--abort-on-container-exit" not in text
 
 
@@ -75,7 +77,11 @@ def test_docker_compose_runtime_smoke_uses_published_install_topology():
     setup_command = "\n".join(setup["command"])
     assert "/src/install-docker.sh" in setup_command
     assert "tests/fixtures/hermes_v2026_4_23" in setup_command
-    assert setup["environment"]["HFC_INSTALL_SOURCE"] == "/src"
+    assert setup["environment"]["HFC_INSTALL_SOURCE"] == "/tmp/hfc-install-source"
+    assert "mkdir -p /tmp/hfc-install-source" in setup_command
+    assert "cp /src/pyproject.toml /src/README.md /src/LICENSE" in setup_command
+    assert "cp -R /src/hermes_feishu_card" in setup_command
+    assert ".:/src:ro" in setup["volumes"]
     assert setup["environment"]["HFC_TEST_NOOP_DELIVERY"] == "1"
     assert setup["environment"]["HFC_SKIP_START"] == "1"
     assert sidecar["depends_on"]["setup"]["condition"] == "service_completed_successfully"

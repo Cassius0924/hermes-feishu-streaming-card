@@ -57,6 +57,11 @@ jobs:
         run: >-
           docker compose -f docker-compose.smoke.yml up
           --detach --wait --wait-timeout 180 --quiet-pull gateway
+      - name: Show Compose logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.smoke.yml ps -a
+          docker compose -f docker-compose.smoke.yml logs --no-color setup sidecar gateway
       - name: Probe installed Gateway and sidecar
         run: >-
           timeout 30 docker compose -f docker-compose.smoke.yml run
