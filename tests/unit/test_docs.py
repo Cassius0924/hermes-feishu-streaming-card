@@ -2110,8 +2110,8 @@ def test_v4021_release_docs_record_content_integrity_and_real_feishu_acceptance(
     assert "23/23" in notes_en
     assert "1 次发送成功、16 次更新成功" in notes
     assert "1 send success and 16 update successes" in notes_en
-    assert "site-packages 4.0.21" in notes
-    assert "site-packages 4.0.21" in notes_en
+    assert "site-packages 中的候选 runtime 为 4.0.21" in notes
+    assert "site-packages was 4.0.21" in notes_en
     assert "不宣称截图或桌面/移动端视觉 QA" in notes
     assert "does not claim screenshot or desktop/mobile visual QA" in notes_en
     assert "公开 tagged installer 与 Release assets 仍待 post-tag 验证" in notes
@@ -2125,7 +2125,7 @@ def test_v4021_release_docs_record_content_integrity_and_real_feishu_acceptance(
     assert "V4.0.21 内容完整性与媒体/notice 组合验收" in acceptance
     assert "2026-07-28 真实验收结果" in acceptance
     assert "23/23" in acceptance
-    assert "site-packages 4.0.21" in acceptance
+    assert "site-packages 中的候选 runtime 为 4.0.21" in acceptance
     assert "不宣称截图或桌面/移动端视觉 QA" in acceptance
 
     assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
@@ -2157,6 +2157,39 @@ def test_v4021_release_docs_record_content_integrity_and_real_feishu_acceptance(
     assert "V4.0.21" in todo
     assert "### V4.0.21：内容完整性与图片/notice 组合热修（发布候选）" in todo
     assert "真实飞书图片验收已通过（2026-07-28）" in todo
+
+    v4021_acceptance = re.search(
+        r"(?ms)^## V4\.0\.21.*?(?=^## V4\.0\.20|\Z)", acceptance
+    ).group(0)
+    v4021_readiness = re.search(
+        r"(?ms)^## V4\.0\.21.*?(?=^## V4\.0\.20|\Z)", readiness
+    ).group(0)
+    v4021_readiness_en = re.search(
+        r"(?ms)^## V4\.0\.21.*?(?=^## V4\.0\.20|\Z)", readiness_en
+    ).group(0)
+    v4021_todo = re.search(r"(?ms)^### V4\.0\.21.*?(?=^### |\Z)", todo).group(0)
+    for text in (notes, v4021_acceptance, v4021_readiness, v4021_todo):
+        for unsupported_detail in (
+            "本机候选版",
+            "真实 Hermes 配置模型",
+            "`/background`",
+            "只读 terminal",
+            "各至少 180 中文字符",
+            "两个标记同在",
+            "官方 install",
+        ):
+            assert unsupported_detail not in text
+    for text in (notes_en, v4021_readiness_en):
+        for unsupported_detail in (
+            "local candidate",
+            "configured real Hermes model",
+            "`/background`",
+            "read-only terminal",
+            "at least 180 Chinese characters",
+            "both markers appeared",
+            "official install",
+        ):
+            assert unsupported_detail not in text
 
     v4021_acceptance_docs = "\n".join(
         (notes, notes_en, testing, testing_en, acceptance, readiness, readiness_en, todo, guide, guide_en)

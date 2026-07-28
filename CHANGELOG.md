@@ -19,7 +19,7 @@ See also: [docs/release-notes-v4.0.21.md](docs/release-notes-v4.0.21.md)
 ### Verification
 - Task 1 focused ordering coverage passed `74 passed`; Task 2 image/notice combination coverage passed `277 passed` without requiring a production runtime change.
 - Real Feishu acceptance on 2026-07-28 confirmed the image and answer-ordering paths with zero matching native duplicates or uncertain-delivery warnings; this is not a screenshot or desktop/mobile visual-QA claim.
-- The candidate runtime was installed through the official flow into Hermes venv `site-packages` as `4.0.21`. Public tagged-installer and Release-asset verification remain pending post-tag.
+- The candidate runtime was observed in Hermes venv `site-packages` as `4.0.21`. Public tagged-installer and Release-asset verification remain pending post-tag.
 
 ## V4.0.20 — 2026-07-22
 

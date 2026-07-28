@@ -19,9 +19,9 @@ V4.0.21 是针对 Issue #155 的内容完整性热修，并为 Issue #147 固化
 ## 验证边界
 
 - Task 1 的答案顺序聚焦回归为 `74 passed`；Task 2 的图片/notice 组合回归为 `277 passed`，且未发现需要运行时代码改动的新根因。
-- 2026-07-28 真实飞书验收：使用本机候选版、真实 Hermes 配置模型和真实 Feishu 用户消息。`/background` 图片任务产生 1 条带标记的 interactive completion card 与 1 条 native image；该卡不含“生成中”，且没有 uncertain-delivery warning。正常任务先调用只读 terminal，再产生两段各至少 180 中文字符的答案；两个标记同在 1 张 interactive completion card，bot 原生标记重复为 0。
+- 2026-07-28 真实飞书验收：图片回合观测到 1 条带标记、非“生成中”的 interactive completion card 与 1 条 native image，且没有 uncertain-delivery warning。正常工具回合的两段答案保留在同一张卡，bot 原生标记重复为 0。
 - sidecar 最终 metrics 为 `events_received/events_applied=23/23`、1 次发送成功、16 次更新成功；event rejected、auth rejection、send/update failures、notice uncertain warnings 与 notice update failures 均为 0。Gateway 日志确认 Feishu WebSocket 已连接。
-- 候选 runtime 已通过官方 install 进入 Hermes venv site-packages 4.0.21。本验收不宣称截图或桌面/移动端视觉 QA，也不扩大为真实故障注入结论。
+- Hermes venv site-packages 中的候选 runtime 为 4.0.21。本验收不宣称截图或桌面/移动端视觉 QA，也不扩大为真实故障注入结论。
 - 公开 tagged installer 与 Release assets 仍待 post-tag 验证。
 - 本说明不包含真实 chat/message/user 标识符、凭据、token 或本机路径。
 

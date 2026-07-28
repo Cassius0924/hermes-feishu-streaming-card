@@ -19,9 +19,9 @@ V4.0.21 is a content-integrity hotfix for Issue #155 and locks the combined imag
 ## Verification boundary
 
 - Task 1 focused answer-ordering coverage passed `74 passed`; Task 2 image/notice combination coverage passed `277 passed` and exposed no new root cause requiring a production runtime change.
-- Real Feishu acceptance on 2026-07-28 used the local candidate, the configured real Hermes model, and a real Feishu user message. A `/background` image task produced one marker-bearing interactive completion card and one native image; the card contained no running-state text and no uncertain-delivery warning. A normal task called a read-only terminal first, then produced two answer segments of at least 180 Chinese characters each; both markers appeared in one interactive completion card and the bot native marker duplicate count was zero.
+- Real Feishu acceptance on 2026-07-28 observed one marker-bearing, non-running interactive completion card and one native image for an image turn, with no uncertain-delivery warning. A normal tool turn retained two answer segments in one card, with a bot native marker duplicate count of zero.
 - Final sidecar metrics were `events_received/events_applied=23/23`, 1 send success and 16 update successes; event rejected, auth rejection, send/update failures, notice uncertain warnings, and notice update failures were all zero. Gateway logs confirmed the Feishu WebSocket connection.
-- The candidate runtime entered Hermes venv site-packages 4.0.21 through the official install flow. This does not claim screenshot or desktop/mobile visual QA, nor a real fault-injection result.
+- The candidate runtime in Hermes venv site-packages was 4.0.21. This does not claim screenshot or desktop/mobile visual QA, nor a real fault-injection result.
 - The public tagged installer and Release assets remain pending post-tag verification.
 - These notes include no real chat/message/user identifiers, credentials, tokens, or local paths.
 
