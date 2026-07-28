@@ -993,6 +993,246 @@ def test_restore_legacy_manifest_does_not_touch_unowned_base_files(tmp_path):
     assert orphan_backup.read_text(encoding="utf-8") == "# user-owned backup\n"
 
 
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_v1_manifest_refuses_exact_base_patch_pair_without_ownership_fields(
+    tmp_path, command
+):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = json.loads(manifest_path(hermes_dir).read_text(encoding="utf-8"))
+    manifest["manifest_version"] = 1
+    for field in cli._BASE_MANIFEST_FIELDS:
+        manifest.pop(field)
+    manifest_path(hermes_dir).write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    evidence = {
+        "run.py": run_py(hermes_dir).read_bytes(),
+        "run backup": backup_path(hermes_dir).read_bytes(),
+        "manifest": manifest_path(hermes_dir).read_bytes(),
+        "exact Base": base_path(hermes_dir).read_bytes(),
+        "exact Base backup": base_backup_path(hermes_dir).read_bytes(),
+    }
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "exact Base evidence exists but manifest ownership is missing" in result.stderr
+    assert run_py(hermes_dir).read_bytes() == evidence["run.py"]
+    assert backup_path(hermes_dir).read_bytes() == evidence["run backup"]
+    assert manifest_path(hermes_dir).read_bytes() == evidence["manifest"]
+    assert base_path(hermes_dir).read_bytes() == evidence["exact Base"]
+    assert base_backup_path(hermes_dir).read_bytes() == evidence["exact Base backup"]
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_commands_refuse_symlinked_manifest_before_reading(tmp_path, command):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    manifest = manifest_path(hermes_dir)
+    manifest.unlink()
+    manifest.symlink_to(hermes_dir / "missing-manifest")
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "manifest" in result.stderr
+    assert "symlink" in result.stderr
+    assert manifest.is_symlink()
+    assert backup_path(hermes_dir).exists()
+    assert "HERMES_FEISHU_CARD_PATCH_BEGIN" in run_py(hermes_dir).read_text(
+        encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_commands_refuse_symlinked_exact_base_backup(tmp_path, command):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    base_backup = base_backup_path(hermes_dir)
+    original_backup = base_backup.read_bytes()
+    symlink_target = hermes_dir / "base-backup-target.py"
+    symlink_target.write_bytes(original_backup)
+    base_backup.unlink()
+    base_backup.symlink_to(symlink_target)
+    manifest_before = manifest_path(hermes_dir).read_bytes()
+    run_before = run_py(hermes_dir).read_bytes()
+    base_before = base_path(hermes_dir).read_bytes()
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "exact Base backup" in result.stderr
+    assert "symlink" in result.stderr
+    assert base_backup.is_symlink()
+    assert symlink_target.read_bytes() == original_backup
+    assert manifest_path(hermes_dir).read_bytes() == manifest_before
+    assert run_py(hermes_dir).read_bytes() == run_before
+    assert base_path(hermes_dir).read_bytes() == base_before
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+@pytest.mark.parametrize(
+    "symlinked_path",
+    [
+        run_py,
+        backup_path,
+        cron_path,
+        cron_backup_path,
+    ],
+)
+def test_restore_commands_refuse_all_run_and_cron_symlink_evidence(
+    tmp_path, command, symlinked_path
+):
+    hermes_dir = make_cron_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    path = symlinked_path(hermes_dir)
+    original = path.read_bytes()
+    symlink_target = path.with_name(f"{path.name}.target")
+    symlink_target.write_bytes(original)
+    path.unlink()
+    path.symlink_to(symlink_target)
+    manifest_before = manifest_path(hermes_dir).read_bytes()
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+    assert path.is_symlink()
+    assert symlink_target.read_bytes() == original
+    assert manifest_path(hermes_dir).read_bytes() == manifest_before
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_commands_refuse_symlinked_hermes_root_before_reading(
+    tmp_path, command
+):
+    real_hermes_dir = copy_hermes(tmp_path / "real")
+    assert cli.main(["install", "--hermes-dir", str(real_hermes_dir), "--yes"]) == 0
+    hermes_link = tmp_path / "hermes-link"
+    hermes_link.symlink_to(real_hermes_dir, target_is_directory=True)
+    manifest_before = manifest_path(real_hermes_dir).read_bytes()
+    run_before = run_py(real_hermes_dir).read_bytes()
+    backup_before = backup_path(real_hermes_dir).read_bytes()
+
+    result = run_cli(command, "--hermes-dir", str(hermes_link), "--yes")
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+    assert hermes_link.is_symlink()
+    assert manifest_path(real_hermes_dir).read_bytes() == manifest_before
+    assert run_py(real_hermes_dir).read_bytes() == run_before
+    assert backup_path(real_hermes_dir).read_bytes() == backup_before
+
+
+@pytest.mark.parametrize(
+    ("factory", "parent_parts", "relative_evidence"),
+    [
+        (copy_hermes, ("gateway",), ("run.py", BACKUP_NAME)),
+        (make_cron_hermes, ("cron",), ("scheduler.py", "scheduler.py.hermes_feishu_card.bak")),
+        (make_exact_019_hermes, ("gateway", "platforms"), ("base.py", "base.py.hermes_feishu_card.bak")),
+    ],
+)
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_commands_refuse_symlinked_managed_parent_directories(
+    tmp_path, command, factory, parent_parts, relative_evidence
+):
+    hermes_dir = factory(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    parent = hermes_dir.joinpath(*parent_parts)
+    real_parent = parent.with_name(f"{parent.name}-real")
+    parent.rename(real_parent)
+    parent.symlink_to(real_parent, target_is_directory=True)
+    evidence_before = {
+        name: (real_parent / name).read_bytes() for name in relative_evidence
+    }
+    manifest_before = manifest_path(hermes_dir).read_bytes()
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+    assert parent.is_symlink()
+    assert manifest_path(hermes_dir).read_bytes() == manifest_before
+    assert {
+        name: (real_parent / name).read_bytes() for name in relative_evidence
+    } == evidence_before
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_restore_commands_refuse_symlinked_exact_base_target(tmp_path, command):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    target = base_path(hermes_dir)
+    original = target.read_bytes()
+    symlink_target = target.with_name("base-target.py")
+    symlink_target.write_bytes(original)
+    target.unlink()
+    target.symlink_to(symlink_target)
+    manifest_before = manifest_path(hermes_dir).read_bytes()
+    backup_before = base_backup_path(hermes_dir).read_bytes()
+
+    result = run_cli(command, "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert "exact Base" in result.stderr
+    assert "symlink" in result.stderr
+    assert target.is_symlink()
+    assert symlink_target.read_bytes() == original
+    assert manifest_path(hermes_dir).read_bytes() == manifest_before
+    assert base_backup_path(hermes_dir).read_bytes() == backup_before
+
+
+def test_restore_refuses_leaf_swap_after_manifest_validation(tmp_path, monkeypatch):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    backup = backup_path(hermes_dir)
+    backup_before = backup.read_bytes()
+    symlink_target = backup.with_name("run-backup-target.py")
+    symlink_target.write_bytes(backup_before)
+    original_read = cli._read_restore_text
+
+    def replace_backup_after_manifest_read(path, expected_identity):
+        contents = original_read(path, expected_identity)
+        if path == manifest_path(hermes_dir):
+            backup.unlink()
+            backup.symlink_to(symlink_target)
+        return contents
+
+    monkeypatch.setattr(cli, "_read_restore_text", replace_backup_after_manifest_read)
+
+    result = cli._run_restore(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert backup.is_symlink()
+    assert symlink_target.read_bytes() == backup_before
+    assert manifest_path(hermes_dir).exists()
+
+
+def test_restore_refuses_backup_swap_before_cleanup(tmp_path, monkeypatch):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    backup = backup_path(hermes_dir)
+    backup_before = backup.read_bytes()
+    symlink_target = backup.with_name("run-backup-target.py")
+    symlink_target.write_bytes(backup_before)
+
+    def replace_backup_before_cleanup(_changes):
+        backup.unlink()
+        backup.symlink_to(symlink_target)
+
+    monkeypatch.setattr(
+        cli, "_write_targets_transactionally", replace_backup_before_cleanup
+    )
+
+    result = cli._run_restore(Namespace(hermes_dir=str(hermes_dir), yes=True))
+
+    assert result != 0
+    assert backup.is_symlink()
+    assert symlink_target.read_bytes() == backup_before
+    assert manifest_path(hermes_dir).exists()
+
+
 def test_019_doctor_state_requires_base_ownership_but_install_can_migrate(tmp_path):
     hermes_dir = copy_hermes(tmp_path)
     assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
