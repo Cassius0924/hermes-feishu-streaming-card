@@ -129,7 +129,7 @@ For an existing Hermes container:
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.0.20
+export HFC_VERSION=v4.0.21
 bash install-docker.sh
 ```
 

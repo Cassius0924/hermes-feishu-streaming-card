@@ -1320,9 +1320,9 @@ def test_v400_release_docs_cover_live_runtime_cards():
     assert "tool.updated.detail" in notes_en
     assert "thinking.delta" in notes_en
     assert "运行态 Header" in readme
-    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.20}"' in compose
+    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
     for doc in (readme, readme_en, install_doc, guide, guide_en):
-        assert "HFC_VERSION=v4.0.20" in doc
+        assert "HFC_VERSION=v4.0.21" in doc
     for event_name in (
         "progress_callback.preview",
         "tool.updated.detail",
@@ -1716,9 +1716,9 @@ def test_v4012_release_docs_cover_compaction_text_sizes_and_noop_credentials():
             assert asset in text
     assert "docs/release-notes-v4.0.12.md" in readme
     assert "docs/release-notes-v4.0.12.en.md" in readme_en
-    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.20}"' in compose
+    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
     for doc in (readme, readme_en, install_doc, guide, guide_en):
-        assert "HFC_VERSION=v4.0.20" in doc
+        assert "HFC_VERSION=v4.0.21" in doc
     assert "V4.0.12" in todo
 
 
@@ -1759,9 +1759,9 @@ def test_v4013_release_docs_cover_all_command_feedback_cards():
             assert asset in text
     assert "docs/release-notes-v4.0.13.md" in readme
     assert "docs/release-notes-v4.0.13.en.md" in readme_en
-    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.20}"' in compose
+    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
     for doc in (readme, readme_en, install_doc, guide, guide_en):
-        assert "HFC_VERSION=v4.0.20" in doc
+        assert "HFC_VERSION=v4.0.21" in doc
     assert "V4.0.13" in todo
     assert "V4.0.13 发布门禁" in readiness
     assert "V4.0.13 Release Gates" in readiness_en
@@ -1804,9 +1804,9 @@ def test_v4014_release_docs_cover_long_running_heartbeat_fix():
             assert asset in text
     assert "docs/release-notes-v4.0.14.md" in readme
     assert "docs/release-notes-v4.0.14.en.md" in readme_en
-    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.20}"' in compose
+    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
     for doc in (readme, readme_en, install_doc, guide, guide_en):
-        assert "HFC_VERSION=v4.0.20" in doc
+        assert "HFC_VERSION=v4.0.21" in doc
     assert "V4.0.14" in todo
     assert "V4.0.14 发布门禁" in readiness
     assert "V4.0.14 Release Gates" in readiness_en
@@ -1850,9 +1850,9 @@ def test_v4015_release_docs_cover_tool_timeline_and_upgrade_guard():
             assert asset in text
     assert "docs/release-notes-v4.0.15.md" in readme
     assert "docs/release-notes-v4.0.15.en.md" in readme_en
-    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.20}"' in compose
+    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
     for doc in (readme, readme_en, install_doc, guide, guide_en):
-        assert "HFC_VERSION=v4.0.20" in doc
+        assert "HFC_VERSION=v4.0.21" in doc
     assert "V4.0.15" in todo
     assert "V4.0.15 发布门禁" in readiness
     assert "V4.0.15 Release Gates" in readiness_en
@@ -1894,9 +1894,9 @@ def test_v4016_release_docs_cover_loading_dedup_and_real_tool_duration():
             assert asset in text
     assert "docs/release-notes-v4.0.16.md" in readme
     assert "docs/release-notes-v4.0.16.en.md" in readme_en
-    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.20}"' in compose
+    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
     for doc in (readme, readme_en, install_doc, guide, guide_en):
-        assert "HFC_VERSION=v4.0.20" in doc
+        assert "HFC_VERSION=v4.0.21" in doc
     assert "V4.0.16" in todo
     assert "V4.0.16 发布门禁" in readiness
     assert "V4.0.16 Release Gates" in readiness_en
@@ -1937,9 +1937,9 @@ def test_v4017_release_docs_cover_parallel_tool_correlation():
             assert asset in text
     assert "docs/release-notes-v4.0.17.md" in readme
     assert "docs/release-notes-v4.0.17.en.md" in readme_en
-    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.20}"' in compose
+    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
     for doc in (readme, readme_en, install_doc, guide, guide_en):
-        assert "HFC_VERSION=v4.0.20" in doc
+        assert "HFC_VERSION=v4.0.21" in doc
     assert "V4.0.17" in todo
     assert "V4.0.17 发布门禁" in readiness
     assert "V4.0.17 Release Gates" in readiness_en
@@ -1980,9 +1980,9 @@ def test_v4018_release_docs_cover_feishu_sdk_capability_guard():
             assert asset in text
     assert "docs/release-notes-v4.0.18.md" in readme
     assert "docs/release-notes-v4.0.18.en.md" in readme_en
-    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.20}"' in compose
+    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
     for doc in (readme, readme_en, install_doc, guide, guide_en):
-        assert "HFC_VERSION=v4.0.20" in doc
+        assert "HFC_VERSION=v4.0.21" in doc
     assert "V4.0.18" in todo
     assert "V4.0.18 发布门禁" in readiness
     assert "V4.0.18 Release Gates" in readiness_en
@@ -2017,9 +2017,9 @@ def test_v4019_release_docs_cover_venv_pip_install_guard():
             assert asset in text
     assert "docs/release-notes-v4.0.19.md" in readme
     assert "docs/release-notes-v4.0.19.en.md" in readme_en
-    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.20}"' in compose
+    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
     for doc in (readme, readme_en, install_doc, guide, guide_en):
-        assert "HFC_VERSION=v4.0.20" in doc
+        assert "HFC_VERSION=v4.0.21" in doc
     assert "V4.0.19" in todo
     assert "V4.0.19 发布门禁" in readiness
     assert "V4.0.19 Release Gates" in readiness_en
@@ -2061,9 +2061,9 @@ def test_v4020_release_docs_cover_notice_accepted_ack_and_observability():
             assert asset in text
     assert "docs/release-notes-v4.0.20.md" in readme
     assert "docs/release-notes-v4.0.20.en.md" in readme_en
-    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.20}"' in compose
+    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
     for doc in (readme, readme_en, install_doc, guide, guide_en):
-        assert "HFC_VERSION=v4.0.20" in doc
+        assert "HFC_VERSION=v4.0.21" in doc
     assert "V4.0.20" in todo
     assert "V4.0.20 发布门禁" in readiness
     assert "V4.0.20 Release Gates" in readiness_en
@@ -2079,6 +2079,13 @@ def test_v4021_release_docs_preserve_content_integrity_and_pending_feishu_smoke(
     testing = read_doc("docs/testing.md")
     testing_en = read_doc("docs/testing.en.md")
     acceptance = read_doc("docs/wiki/feishu-acceptance.md")
+    install_doc = read_doc("README-install.md")
+    guide = read_doc("docs/user-guide.md")
+    guide_en = read_doc("docs/user-guide.en.md")
+    compose = read_doc("docker-compose.example.yml")
+    readiness = read_doc("docs/release-readiness.md")
+    readiness_en = read_doc("docs/release-readiness.en.md")
+    todo = read_doc("TODO.md")
 
     assert "## V4.0.21 — 2026-07-28" in changelog
     assert "[docs/release-notes-v4.0.21.md](docs/release-notes-v4.0.21.md)" in changelog
@@ -2105,6 +2112,22 @@ def test_v4021_release_docs_preserve_content_integrity_and_pending_feishu_smoke(
     assert "test_v4021_hook_runtime_keeps_image_delivery_and_accepted_notice_in_same_turn" in testing_en
     assert "V4.0.21 内容完整性与媒体/notice 组合验收" in acceptance
     assert "真实飞书图片 smoke 尚未完成" in acceptance
+
+    assert 'HFC_VERSION: "${HFC_VERSION:-v4.0.21}"' in compose
+    for doc in (readme, readme_en, install_doc, guide, guide_en):
+        assert "HFC_VERSION=v4.0.21" in doc
+    assert "| [v4.0.21](release-notes-v4.0.21.md) | 2026-07-28 |" in guide
+    assert "| [v4.0.21](release-notes-v4.0.21.en.md) | 2026-07-28 |" in guide_en
+    assert "当前发布候选为 `4.0.21`" in readiness
+    assert "Current release candidate: `4.0.21`" in readiness_en
+    assert "## V4.0.21 发布门禁" in readiness
+    assert "## V4.0.21 Release Gates" in readiness_en
+    assert "真实飞书图片 smoke：**待完成**" in readiness
+    assert "Real Feishu image smoke: **pending**" in readiness_en
+    assert "## V4.0.20 发布门禁" in readiness
+    assert "## V4.0.20 Release Gates" in readiness_en
+    assert "V4.0.21" in todo
+    assert "### V4.0.21：内容完整性与图片/notice 组合热修（发布候选）" in todo
 
     public_v4021_docs = "\n".join((notes, notes_en, testing, testing_en, acceptance))
     assert re.search(r"\b(?:oc|om|ou)_[0-9a-f]{16,}\b", public_v4021_docs) is None
