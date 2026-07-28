@@ -8,6 +8,7 @@ import subprocess
 
 import pytest
 
+import hermes_feishu_card.install.integrity as integrity_module
 from hermes_feishu_card.install.detect import detect_hermes
 from hermes_feishu_card.install.integrity import (
     IntegrityRepairRefused,
@@ -192,6 +193,51 @@ def test_execute_integrity_repair_refuses_changed_fingerprint(git_installed_stat
 
     with pytest.raises(IntegrityRepairRefused, match="evidence changed"):
         execute_integrity_repair(detection, expected_fingerprint=plan.fingerprint)
+
+
+def test_execute_integrity_repair_rechecks_git_snapshot_immediately_before_write(
+    git_installed_state, monkeypatch
+):
+    root, detection, run_source, cron_source = git_installed_state
+    _commit_upstream_upgrade(root, detection, run_source, cron_source)
+    detection = detect_hermes(root)
+    plan = plan_integrity_repair(detection)
+    tree = _git(root, "write-tree")
+    unrelated = subprocess.run(
+        ["git", "-C", str(root), "commit-tree", tree],
+        check=True,
+        capture_output=True,
+        input="unrelated history\n",
+        text=True,
+    ).stdout.strip()
+    tracked_paths = [
+        detection.run_py,
+        detection.cron_py,
+        detection.run_py.with_name("run.py.hermes_feishu_card.bak"),
+        detection.cron_py.with_name("scheduler.py.hermes_feishu_card.bak"),
+        root / ".hermes_feishu_card_manifest",
+    ]
+    before = {path: path.read_bytes() for path in tracked_paths}
+    original_install_manifest = integrity_module._install_manifest
+
+    def switch_head_after_candidate_build(*args, **kwargs):
+        manifest = original_install_manifest(*args, **kwargs)
+        _git(root, "update-ref", "HEAD", unrelated)
+        return manifest
+
+    monkeypatch.setattr(
+        integrity_module,
+        "_install_manifest",
+        switch_head_after_candidate_build,
+    )
+
+    with pytest.raises(IntegrityRepairRefused, match="evidence changed"):
+        execute_integrity_repair(
+            detection,
+            expected_fingerprint=plan.fingerprint,
+        )
+
+    assert {path: path.read_bytes() for path in tracked_paths} == before
 
 
 def test_migrate_integrity_manifest_requires_healthy_installed_git_state(

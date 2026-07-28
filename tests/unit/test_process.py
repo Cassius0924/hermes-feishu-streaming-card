@@ -1094,6 +1094,83 @@ def test_status_sidecar_reports_verified_manager(monkeypatch, tmp_path):
     assert status["unit"] == unit
 
 
+def test_stop_sidecar_refuses_symlinked_state_parent_before_pid_or_health(
+    monkeypatch, tmp_path
+):
+    target_parent = tmp_path / "target-parent"
+    private_state = target_parent / "state"
+    private_state.mkdir(parents=True, mode=0o700)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(target_parent, target_is_directory=True)
+    monkeypatch.setattr(process, "state_dir", lambda: linked_parent / "state")
+    monkeypatch.setattr(
+        process,
+        "read_pid_record",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("untrusted state reached pidfile parsing")
+        ),
+    )
+    monkeypatch.setattr(
+        process,
+        "fetch_health",
+        lambda _config: (_ for _ in ()).throw(
+            AssertionError("untrusted state reached health ownership checks")
+        ),
+    )
+    monkeypatch.setattr(
+        process,
+        "stop_pid",
+        lambda _pid: (_ for _ in ()).throw(
+            AssertionError("untrusted state reached process termination")
+        ),
+    )
+
+    result = process.stop_sidecar(
+        {"server": {"host": "127.0.0.1", "port": 8765}}
+    )
+
+    assert result == "failed: state directory path must not contain symbolic links"
+
+
+def test_status_sidecar_refuses_symlinked_state_parent_before_pid_or_health(
+    monkeypatch, tmp_path
+):
+    target_parent = tmp_path / "target-parent"
+    private_state = target_parent / "state"
+    private_state.mkdir(parents=True, mode=0o700)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(target_parent, target_is_directory=True)
+    monkeypatch.setattr(process, "state_dir", lambda: linked_parent / "state")
+    monkeypatch.setattr(
+        process,
+        "read_pid_record",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("untrusted state reached pidfile parsing")
+        ),
+    )
+    monkeypatch.setattr(
+        process,
+        "fetch_health",
+        lambda _config: (_ for _ in ()).throw(
+            AssertionError("untrusted state reached health ownership checks")
+        ),
+    )
+
+    status = process.status_sidecar(
+        {"server": {"host": "127.0.0.1", "port": 8765}}
+    )
+
+    assert status == {
+        "running": False,
+        "pid": None,
+        "health": None,
+        "pid_running": False,
+        "manager": "invalid",
+        "unit": "",
+        "error": "state directory path must not contain symbolic links",
+    }
+
+
 def test_fetch_health_bypasses_proxy_for_loopback(monkeypatch):
     calls: list[tuple[str, float]] = []
 

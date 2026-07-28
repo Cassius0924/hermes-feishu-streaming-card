@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -1974,10 +1975,18 @@ def _run_integrity(args: argparse.Namespace) -> int:
     )
     manifest_path = detection.root / MANIFEST_NAME
     try:
+        if manifest_path.is_symlink():
+            raise ValueError("integrity manifest must not be a symbolic link")
         manifest_before = _read_text_preserve_newlines(manifest_path)
+        manifest_mode = stat.S_IMODE(manifest_path.stat().st_mode)
+        if env_path.is_symlink():
+            raise ValueError("HFC env file must not be a symbolic link")
         env_existed = env_path.exists()
         env_before = (
             _read_text_preserve_newlines(env_path) if env_existed else ""
+        )
+        env_mode = (
+            stat.S_IMODE(env_path.stat().st_mode) if env_existed else 0o600
         )
         migrate_integrity_manifest(detection)
         update_hfc_env(
@@ -1986,13 +1995,34 @@ def _run_integrity(args: argparse.Namespace) -> int:
         )
     except (OSError, UnicodeError, ValueError) as exc:
         try:
-            if "manifest_before" in locals():
-                _atomic_write_text(manifest_path, manifest_before)
-            if "env_existed" in locals() and env_existed:
-                _atomic_write_text(env_path, env_before)
-            elif "env_existed" in locals():
+            if (
+                "manifest_before" in locals()
+                and "manifest_mode" in locals()
+                and _file_state_differs(
+                    manifest_path,
+                    manifest_before,
+                    manifest_mode,
+                )
+            ):
+                _atomic_write_text(
+                    manifest_path,
+                    manifest_before,
+                    mode=manifest_mode,
+                )
+            if (
+                "env_existed" in locals()
+                and env_existed
+                and "env_mode" in locals()
+                and _file_state_differs(env_path, env_before, env_mode)
+            ):
+                _atomic_write_text(env_path, env_before, mode=env_mode)
+            elif (
+                "env_existed" in locals()
+                and not env_existed
+                and (env_path.exists() or env_path.is_symlink())
+            ):
                 env_path.unlink(missing_ok=True)
-        except OSError:
+        except (OSError, ValueError):
             print(
                 "error: integrity migration rollback failed; manual review required",
                 file=sys.stderr,
@@ -2015,6 +2045,10 @@ def _run_status(args: argparse.Namespace) -> int:
         return 1
 
     status = status_sidecar(config)
+    status_error = status.get("error")
+    if isinstance(status_error, str) and status_error:
+        print(f"error: {status_error}", file=sys.stderr)
+        return 1
     readiness_degraded = False
     if status["running"]:
         print("status: running")
@@ -3030,11 +3064,38 @@ def _read_text_preserve_newlines(path: Path) -> str:
         return handle.read()
 
 
-def _atomic_write_text(path: Path, contents: str) -> None:
+def _file_state_differs(path: Path, contents: str, mode: int) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        return (
+            _read_text_preserve_newlines(path) != contents
+            or stat.S_IMODE(path.stat().st_mode) != mode
+        )
+    except (OSError, UnicodeError):
+        return True
+
+
+def _atomic_write_text(
+    path: Path,
+    contents: str,
+    *,
+    mode: int | None = None,
+) -> None:
+    if path.is_symlink():
+        raise ValueError("refusing to replace a symbolic link")
+    preserved_mode = (
+        stat.S_IMODE(path.stat().st_mode) if path.exists() else None
+    )
     temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
         with temp_path.open("w", encoding="utf-8", newline="") as handle:
             handle.write(contents)
+        selected_mode = mode if mode is not None else preserved_mode
+        if selected_mode is not None:
+            temp_path.chmod(selected_mode)
+        if path.is_symlink():
+            raise ValueError("refusing to replace a symbolic link")
         temp_path.replace(path)
     finally:
         try:

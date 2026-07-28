@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from hermes_feishu_card.card_limits import serialize_card_json
+from hermes_feishu_card.card_limits import CardLimitExceeded, serialize_card_json
 
 from hermes_feishu_card.feishu_client import (
     FeishuAPIError,
@@ -162,3 +162,19 @@ def test_build_message_payload_rejects_unserializable_card():
     client = FeishuClient(cfg)
     with pytest.raises(TypeError):
         client.build_message_payload("oc_abc", {"bad": object()})
+
+
+def test_build_message_payload_rejects_card_over_exact_delivery_limits():
+    cfg = FeishuClientConfig(app_id="cli_a", app_secret="sec")
+    client = FeishuClient(cfg)
+    oversized = {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": "x" * 28_000},
+            ]
+        },
+    }
+
+    with pytest.raises(CardLimitExceeded, match="json_bytes"):
+        client.build_message_payload("oc_abc", oversized)

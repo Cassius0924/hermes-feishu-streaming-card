@@ -13,6 +13,13 @@ FEISHU_MAX_ELEMENTS = 200
 SAFE_CARD_JSON_BYTES = 28_000
 
 
+class CardLimitExceeded(ValueError):
+    def __init__(self, violations: tuple[str, ...]):
+        self.violations = violations
+        reasons = ",".join(violations) or "unknown"
+        super().__init__(f"card exceeds safe Feishu limits: {reasons}")
+
+
 @dataclass(frozen=True)
 class CardLimitInspection:
     json_bytes: int
@@ -51,6 +58,13 @@ def inspect_card_limits(card: Mapping[str, Any]) -> CardLimitInspection:
         table_count=table_count,
         violations=tuple(violations),
     )
+
+
+def serialize_card_for_delivery(card: Mapping[str, Any]) -> str:
+    inspection = inspect_card_limits(card)
+    if not inspection.safe:
+        raise CardLimitExceeded(inspection.violations)
+    return serialize_card_json(card)
 
 
 def _count_card_nodes(value: Any) -> tuple[int, int]:

@@ -229,6 +229,21 @@ def execute_integrity_repair(
                 json.dumps(manifest, sort_keys=True) + "\n",
             )
         )
+        def validate_repair_snapshot() -> None:
+            latest = plan_integrity_repair(detection)
+            if latest.fingerprint != fresh.fingerprint or not latest.executable:
+                raise IntegrityRepairRefused(
+                    "integrity evidence changed; rerun diagnosis"
+                )
+            if _read_text(detection.run_py) != run_source:
+                raise IntegrityRepairRefused(
+                    "integrity evidence changed; rerun diagnosis"
+                )
+            if cron_py is not None and _read_text(cron_py) != cron_source:
+                raise IntegrityRepairRefused(
+                    "integrity evidence changed; rerun diagnosis"
+                )
+
         def validate_committed_state() -> None:
             installed = plan_recovery(detection)
             if installed.state != "installed" or any(
@@ -238,7 +253,11 @@ def execute_integrity_repair(
                     "integrity repair validation failed after commit"
                 )
 
-        _atomic_replace_many(changes, validate=validate_committed_state)
+        _atomic_replace_many(
+            changes,
+            pre_commit_validate=validate_repair_snapshot,
+            validate=validate_committed_state,
+        )
         return IntegrityRepairResult(
             status="repaired",
             restart_required=True,
@@ -509,6 +528,7 @@ def _read_text(path: Path) -> str:
 def _atomic_replace_many(
     changes: list[tuple[Path, str]],
     *,
+    pre_commit_validate: Callable[[], None] | None = None,
     validate: Callable[[], None] | None = None,
 ) -> None:
     staged: dict[Path, Path] = {}
@@ -522,6 +542,8 @@ def _atomic_replace_many(
                 _stage_text(target, _read_text(target)) if target.exists() else None
             )
             staged[target] = _stage_text(target, contents)
+        if pre_commit_validate is not None:
+            pre_commit_validate()
         for target, _contents in changes:
             os.replace(staged[target], target)
             staged.pop(target, None)

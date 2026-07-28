@@ -7,6 +7,7 @@ from pathlib import Path
 import secrets
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,20 @@ def process_token_hash(token: str | None) -> str:
 
 
 def status_sidecar(config: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    state_error = _state_dir_security_error(
+        allow_missing=True,
+        require_private_mode=True,
+    )
+    if state_error:
+        return {
+            "running": False,
+            "pid": None,
+            "health": None,
+            "pid_running": False,
+            "manager": "invalid",
+            "unit": "",
+            "error": state_error,
+        }
     record = read_pid_record()
     if record is not None and not _record_identity_valid(record):
         record = None
@@ -173,6 +188,12 @@ def start_sidecar(
 
 
 def stop_sidecar(config: dict[str, dict[str, Any]]) -> str:
+    state_error = _state_dir_security_error(
+        allow_missing=True,
+        require_private_mode=True,
+    )
+    if state_error:
+        return f"failed: {state_error}"
     record = read_pid_record()
     if record is None:
         if fetch_health(config) is not None:
@@ -330,15 +351,65 @@ def _sidecar_command(
 
 def _prepare_private_state_dir() -> str:
     private_state_dir = state_dir()
+    security_error = _state_dir_security_error(
+        allow_missing=True,
+        require_private_mode=False,
+    )
+    if security_error:
+        return f"failed: {security_error}"
     try:
-        if private_state_dir.is_symlink():
-            return "failed: state directory must not be a symbolic link"
         private_state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if private_state_dir.is_symlink() or not private_state_dir.is_dir():
-            return "failed: state directory is not a private directory"
+        security_error = _state_dir_security_error(
+            allow_missing=False,
+            require_private_mode=False,
+        )
+        if security_error:
+            return f"failed: {security_error}"
         private_state_dir.chmod(0o700)
     except OSError:
         return "failed: state directory could not be prepared"
+    security_error = _state_dir_security_error(
+        allow_missing=False,
+        require_private_mode=True,
+    )
+    if security_error:
+        return f"failed: {security_error}"
+    return ""
+
+
+def _state_dir_security_error(
+    *,
+    allow_missing: bool,
+    require_private_mode: bool,
+) -> str:
+    candidate = state_dir().expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    parts = candidate.parts
+    current = Path(parts[0])
+    for part in parts[1:]:
+        current = current / part
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            return "" if allow_missing else "state directory does not exist"
+        except OSError:
+            return "state directory could not be inspected"
+        if stat.S_ISLNK(metadata.st_mode):
+            if current == candidate:
+                return "state directory must not be a symbolic link"
+            return "state directory path must not contain symbolic links"
+        if current != candidate and not stat.S_ISDIR(metadata.st_mode):
+            return "state directory parent is not a directory"
+        if current != candidate:
+            continue
+        if not stat.S_ISDIR(metadata.st_mode):
+            return "state directory is not a private directory"
+        getuid = getattr(os, "getuid", None)
+        if callable(getuid) and metadata.st_uid != getuid():
+            return "state directory is not owned by the current user"
+        if require_private_mode and stat.S_IMODE(metadata.st_mode) & 0o077:
+            return "state directory permissions must be private"
     return ""
 
 

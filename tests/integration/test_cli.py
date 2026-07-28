@@ -93,6 +93,46 @@ def test_status_reports_runtime_readiness_and_fails_when_degraded(
     assert "gateway.restart_required: true" in output
 
 
+def test_status_fails_closed_when_process_state_is_untrusted(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda *_args, **_kwargs: {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "status_sidecar",
+        lambda _config: {
+            "running": False,
+            "pid": None,
+            "health": None,
+            "pid_running": False,
+            "manager": "invalid",
+            "unit": "",
+            "error": "state directory path must not contain symbolic links",
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_lifecycle_hook_check",
+        lambda _args: (_ for _ in ()).throw(
+            AssertionError("untrusted process state must stop status evaluation")
+        ),
+    )
+
+    exit_code = main(["status", "--config", "config.yaml"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert (
+        captured.err
+        == "error: state directory path must not contain symbolic links\n"
+    )
+
+
 def test_start_passes_explicit_env_file_to_sidecar(tmp_path, monkeypatch, capsys):
     config_path = tmp_path / "config.yaml"
     env_path = tmp_path / "CUSTOM.env"

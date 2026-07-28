@@ -97,3 +97,32 @@ def test_integrity_migrate_safe_refuses_user_edits_without_changing_env(tmp_path
     assert result.returncode == 1
     assert "error:" in result.stderr
     assert not (tmp_path / ".env").exists()
+
+
+def test_integrity_migrate_safe_failure_preserves_existing_secret_env_mode(
+    tmp_path,
+):
+    root, _manifest_path = _legacy_git_install(tmp_path)
+    config = tmp_path / "config.yaml"
+    config.write_text("server: {}\n", encoding="utf-8")
+    env_path = tmp_path / ".env"
+    original = b"FEISHU_APP_SECRET=private-test-value\n"
+    env_path.write_bytes(original)
+    env_path.chmod(0o600)
+    run_py = root / "gateway" / "run.py"
+    run_py.write_text(run_py.read_text(encoding="utf-8") + "# user edit\n")
+
+    result = _run_cli(
+        "integrity",
+        "migrate-safe",
+        "--config",
+        str(config),
+        "--hermes-dir",
+        str(root),
+        "--yes",
+    )
+
+    assert result.returncode == 1
+    assert "error:" in result.stderr
+    assert env_path.read_bytes() == original
+    assert env_path.stat().st_mode & 0o777 == 0o600
