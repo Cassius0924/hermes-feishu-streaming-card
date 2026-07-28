@@ -407,12 +407,17 @@ def _state_dir_security_error(
             continue
         if not stat.S_ISDIR(metadata.st_mode):
             return "state directory is not a private directory"
-        getuid = getattr(os, "getuid", None)
-        if callable(getuid) and metadata.st_uid != getuid():
-            return "state directory is not owned by the current user"
-        if require_private_mode and stat.S_IMODE(metadata.st_mode) & 0o077:
-            return "state directory permissions must be private"
+        if _supports_posix_state_permissions():
+            getuid = getattr(os, "getuid", None)
+            if callable(getuid) and metadata.st_uid != getuid():
+                return "state directory is not owned by the current user"
+            if require_private_mode and stat.S_IMODE(metadata.st_mode) & 0o077:
+                return "state directory permissions must be private"
     return ""
+
+
+def _supports_posix_state_permissions() -> bool:
+    return os.name != "nt"
 
 
 def _record_manager(record: dict[str, Any]) -> str:

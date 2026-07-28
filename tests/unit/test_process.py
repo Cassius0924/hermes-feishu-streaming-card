@@ -1219,6 +1219,25 @@ def test_status_sidecar_refuses_filesystem_root_as_state_directory(monkeypatch):
     assert status["error"] == "state directory must not be filesystem root"
 
 
+def test_status_sidecar_does_not_apply_posix_mode_bits_on_windows(
+    monkeypatch, tmp_path
+):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o755)
+    state.chmod(0o755)
+    monkeypatch.setattr(process, "state_dir", lambda: state)
+    monkeypatch.setattr(process, "_supports_posix_state_permissions", lambda: False)
+    monkeypatch.setattr(process, "read_pid_record", lambda: None)
+    monkeypatch.setattr(process, "fetch_health", lambda _config: None)
+
+    status = process.status_sidecar(
+        {"server": {"host": "127.0.0.1", "port": 8765}}
+    )
+
+    assert status["running"] is False
+    assert "error" not in status
+
+
 def test_fetch_health_bypasses_proxy_for_loopback(monkeypatch):
     calls: list[tuple[str, float]] = []
 
