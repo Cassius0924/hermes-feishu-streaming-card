@@ -875,7 +875,7 @@ def test_session_timeline_records_pre_tool_preface_tool_answer_order():
     assert session.answer_text == "最终回答开始"
 
 
-def test_session_archives_last_preface_on_completion_when_final_answer_arrives():
+def test_session_keeps_post_tool_answer_out_of_reasoning_on_completion():
     session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
 
     assert session.apply(event("answer.delta", 1, {"text": "先验证版本。"}))
@@ -890,13 +890,14 @@ def test_session_archives_last_preface_on_completion_when_final_answer_arrives()
     assert [(item.kind, item.title, item.status) for item in entries] == [
         ("reasoning", "思考 1", "completed"),
         ("tool", "terminal", "completed"),
-        ("reasoning", "思考 2", "completed"),
     ]
     assert entries[0].content == "先验证版本。"
-    assert entries[2].content == "还差 README，我继续查。"
+    assert "还差 README，我继续查。" not in "\n".join(
+        item.content for item in entries
+    )
 
 
-def test_session_strips_archived_preface_prefix_from_completed_answer():
+def test_session_preserves_post_tool_answer_prefix_in_completed_answer():
     session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
 
     assert session.apply(event("tool.updated", 1, {"tool_id": "gh", "name": "terminal", "status": "completed"}))
@@ -917,9 +918,12 @@ def test_session_strips_archived_preface_prefix_from_completed_answer():
     )
 
     entries = session.timeline.snapshot()
-    assert session.answer_text == "最终总结：v3.7.0 到 v3.8.1 主要变化如下。"
-    assert entries[-1].kind == "reasoning"
-    assert entries[-1].content == "3. 补查结果\nREADME 和 diff 都查完了。"
+    assert session.answer_text == (
+        "3. 补查结果\nREADME 和 diff 都查完了。\n\n"
+        "---\n\n"
+        "最终总结：v3.7.0 到 v3.8.1 主要变化如下。"
+    )
+    assert all(entry.kind != "reasoning" for entry in entries)
 
 
 def test_completed_answer_keeps_nearly_complete_streamed_body_after_tools():
