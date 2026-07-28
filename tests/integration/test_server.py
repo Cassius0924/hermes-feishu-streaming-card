@@ -28,6 +28,10 @@ from hermes_feishu_card.lifecycle import (
     cleanup_orphan_message_lock,
     cleanup_runtime_state,
 )
+from hermes_feishu_card.native_handoff import (
+    NativeHandoffStore,
+    handoff_identity_key,
+)
 from hermes_feishu_card.operations import OperationStore, sign_transport_proof
 from hermes_feishu_card.operations_transport import (
     derive_operation_transport_secret,
@@ -47,6 +51,7 @@ from hermes_feishu_card.server import (
     MESSAGE_LOCKS_KEY,
     MESSAGE_LOCK_USERS_KEY,
     METRICS_KEY,
+    NATIVE_HANDOFF_STORE_KEY,
     RUNTIME_CLEANUP_INTERVAL_SECONDS,
     SESSION_ALIASES_KEY,
     SESSION_CARD_CONFIGS_KEY,
@@ -454,6 +459,7 @@ def event_payload(
     message_id="hermes-message-1",
     chat_id="oc_abc",
     thread_id="",
+    created_at=None,
 ):
     payload = {
         "schema_version": "1",
@@ -463,7 +469,9 @@ def event_payload(
         "chat_id": chat_id,
         "platform": "feishu",
         "sequence": sequence,
-        "created_at": 1777017600.0 + sequence,
+        "created_at": (
+            1777017600.0 + sequence if created_at is None else created_at
+        ),
         "data": data or {},
     }
     if thread_id:
@@ -472,9 +480,12 @@ def event_payload(
 
 
 @pytest.fixture
-async def client():
+async def client(tmp_path):
     feishu_client = FakeFeishuClient()
-    app = create_app(feishu_client)
+    app = create_app(
+        feishu_client,
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
     server = TestServer(app)
     test_client = TestClient(server)
     await test_client.start_server()
@@ -482,6 +493,16 @@ async def client():
         yield test_client, feishu_client
     finally:
         await test_client.close()
+
+
+@pytest.fixture(autouse=True)
+def isolated_default_native_handoff_state(tmp_path, monkeypatch):
+    """Keep direct create_app() calls away from the user's real state dir."""
+
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_STATE_DIR",
+        str(tmp_path / "default-handoff-state"),
+    )
 
 
 async def test_event_auth_required_rejects_unsigned_and_reports_bounded_health():
@@ -839,6 +860,14 @@ async def wait_for_card_update(feishu_client, expected_text, attempts=80):
                 return message_id, card
         await _REAL_ASYNCIO_SLEEP(0.01)
     raise AssertionError(f"card update containing {expected_text!r} was not observed")
+
+
+async def wait_for_condition(predicate, attempts=80):
+    for _ in range(attempts):
+        if predicate():
+            return
+        await _REAL_ASYNCIO_SLEEP(0.01)
+    raise AssertionError("condition was not observed")
 
 
 async def test_new_turn_abandons_interrupted_session_in_same_conversation(client):
@@ -4516,7 +4545,7 @@ async def test_nonterminal_oversize_updates_existing_card_with_waiting_handoff(c
     assert metrics["card_limit_json_bytes"] == 1
 
 
-async def test_existing_card_terminal_oversize_hands_off_once_and_retry_is_native(client):
+async def test_existing_card_terminal_oversize_hands_off_once_and_duplicate_is_applied(client):
     test_client, feishu_client = client
     sensitive = "SENSITIVE-TERMINAL-" + ("密" * 40_000)
 
@@ -4544,17 +4573,13 @@ async def test_existing_card_terminal_oversize_hands_off_once_and_retry_is_nativ
     )
     await asyncio.sleep(0.05)
 
-    assert await duplicate.json() == {
-        "ok": True,
-        "applied": False,
-        "disposition": "native",
-    }
+    assert await duplicate.json() == {"ok": True, "applied": True}
     assert len(feishu_client.updated) == update_count
     session = next(iter(test_client.app[SESSIONS_KEY].values()))
     assert session.terminal_disposition == "native"
     assert session.terminal_limit_reason == "json_bytes"
     metrics = (await (await test_client.get("/health")).json())["metrics"]
-    assert metrics["events_applied"] == 2
+    assert metrics["events_applied"] == 3
     assert metrics["events_ignored"] == 0
     assert metrics["card_native_handoffs"] == 1
     assert metrics["card_limit_json_bytes"] == 1
@@ -4573,20 +4598,471 @@ async def test_terminal_only_oversize_cron_uses_native_without_sending_handoff_c
     completed = await test_client.post("/events", json=payload)
     duplicate = await test_client.post("/events", json=payload)
 
-    expected = {"ok": True, "applied": False, "disposition": "native"}
-    assert await completed.json() == expected
-    assert await duplicate.json() == expected
+    assert await completed.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    assert await duplicate.json() == {"ok": True, "applied": True}
     assert feishu_client.sent == []
     assert feishu_client.updated == []
     session = next(iter(test_client.app[SESSIONS_KEY].values()))
     assert session.answer_text == sensitive
     assert session.terminal_disposition == "native"
     metrics = (await (await test_client.get("/health")).json())["metrics"]
-    assert metrics["events_applied"] == 1
+    assert metrics["events_applied"] == 2
     assert metrics["events_ignored"] == 0
     assert metrics["cron_cards_sent"] == 0
     assert metrics["cron_fallbacks"] == 1
     assert metrics["card_native_handoffs"] == 1
+
+
+async def test_terminal_only_handoff_survives_restart_and_duplicate_is_applied(
+    tmp_path,
+):
+    state_root = tmp_path / "handoff-state"
+    payload = event_payload(
+        "message.completed",
+        0,
+        {"answer": "SENSITIVE-QUEUED-" + ("密" * 40_000), "queue_state": "queued"},
+        message_id="message-restart-stable",
+    )
+    first_feishu = FakeFeishuClient()
+    first_app = create_app(
+        first_feishu,
+        native_handoff_store=NativeHandoffStore(state_root),
+    )
+    first_client = TestClient(TestServer(first_app))
+    await first_client.start_server()
+    try:
+        first = await first_client.post("/events", json=payload)
+        assert await first.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        assert first_feishu.sent == []
+    finally:
+        await first_client.close()
+
+    second_feishu = FakeFeishuClient()
+    second_app = create_app(
+        second_feishu,
+        native_handoff_store=NativeHandoffStore(state_root),
+    )
+    second_client = TestClient(TestServer(second_app))
+    await second_client.start_server()
+    try:
+        duplicate = await second_client.post("/events", json=payload)
+        assert await duplicate.json() == {"ok": True, "applied": True}
+        assert second_feishu.sent == []
+        assert second_feishu.updated == []
+    finally:
+        await second_client.close()
+
+
+async def test_pending_handoff_retries_after_restart_and_commits(
+    tmp_path,
+    monkeypatch,
+):
+    state_root = tmp_path / "handoff-state"
+    payload = event_payload(
+        "message.completed",
+        1,
+        {"answer": "SENSITIVE-REPAIR-" + ("密" * 40_000)},
+        message_id="message-pending-stable",
+    )
+    failing_feishu = FakeFeishuClient()
+    failing_feishu.update_failures_remaining = 100
+    first_app = create_app(
+        failing_feishu,
+        native_handoff_store=NativeHandoffStore(state_root),
+    )
+    first_client = TestClient(TestServer(first_app))
+
+    async def no_delayed_retry(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(sidecar_server, "_retry_terminal_update", no_delayed_retry)
+    await first_client.start_server()
+    try:
+        await first_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, message_id="message-pending-stable"
+            ),
+        )
+        first = await first_client.post("/events", json=payload)
+        assert await first.json() == {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+        }
+        identity = handoff_identity_key(
+            profile_id="",
+            chat_id="oc_abc",
+            conversation_id="conversation-1",
+            message_id="message-pending-stable",
+        )
+        await wait_for_condition(
+            lambda: first_app[NATIVE_HANDOFF_STORE_KEY].get(identity).state
+            == "pending"
+        )
+    finally:
+        await first_client.close()
+
+    repaired_feishu = FakeFeishuClient()
+    second_store = NativeHandoffStore(state_root)
+    second_app = create_app(
+        repaired_feishu,
+        native_handoff_store=second_store,
+    )
+    second_client = TestClient(TestServer(second_app))
+    await second_client.start_server()
+    try:
+        duplicate = await second_client.post("/events", json=payload)
+        assert await duplicate.json() == {"ok": True, "applied": True}
+        await wait_for_condition(lambda: len(repaired_feishu.updated) == 1)
+        assert repaired_feishu.sent == []
+        message_id, handoff_card = repaired_feishu.updated[0]
+        assert message_id == "feishu-message-1"
+        assert "完整内容已切换为 Hermes 原生消息发送" in str(handoff_card)
+        assert "SENSITIVE-REPAIR" not in str(handoff_card)
+        await wait_for_condition(lambda: second_store.get(identity).state == "committed")
+    finally:
+        await second_client.close()
+
+
+async def test_cleanup_does_not_remove_committed_handoff_deduplication(client):
+    test_client, feishu_client = client
+    sensitive = "SENSITIVE-CLEANUP-" + ("密" * 40_000)
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    completed = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": sensitive}),
+    )
+    assert (await completed.json())["disposition"] == "native"
+    await wait_for_card_update(
+        feishu_client,
+        "完整内容已切换为 Hermes 原生消息发送",
+    )
+    update_count = len(feishu_client.updated)
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    cleanup_runtime_state(test_client.app, now=session.updated_at + 3601)
+    assert test_client.app[SESSIONS_KEY] == {}
+
+    duplicate = await test_client.post(
+        "/events",
+        json=event_payload("message.completed", 1, {"answer": sensitive}),
+    )
+    assert await duplicate.json() == {"ok": True, "applied": True}
+    await asyncio.sleep(0.05)
+    assert len(feishu_client.updated) == update_count
+
+
+async def test_new_started_lifecycle_clears_same_identity_handoff(client):
+    test_client, feishu_client = client
+    payload = event_payload(
+        "message.completed",
+        0,
+        {"answer": "SENSITIVE-FIRST-" + ("密" * 40_000)},
+        message_id="reused-message-id",
+        created_at=1777017600.0,
+    )
+    first = await test_client.post("/events", json=payload)
+    assert (await first.json())["disposition"] == "native"
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            message_id="reused-message-id",
+            created_at=1777017700.0,
+        ),
+    )
+    assert (await started.json())["applied"] is True
+    assert len(feishu_client.sent) == 1
+
+    second = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": "SENSITIVE-SECOND-" + ("密" * 40_000)},
+            message_id="reused-message-id",
+            created_at=1777017701.0,
+        ),
+    )
+    assert await second.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+
+
+async def test_explicit_new_lifecycle_without_started_clears_handoff(client):
+    test_client, feishu_client = client
+    message_id = "explicit-lifecycle-id"
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            0,
+            {"answer": "SENSITIVE-OLD-" + ("密" * 40_000)},
+            message_id=message_id,
+            created_at=1777017600.0,
+        ),
+    )
+
+    fresh = await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            0,
+            {"text": "fresh lifecycle", "lifecycle_start": True},
+            message_id=message_id,
+            created_at=1777017700.0,
+        ),
+    )
+
+    assert (await fresh.json())["applied"] is True
+    assert len(feishu_client.sent) == 1
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    assert session.answer_text == "fresh lifecycle"
+
+
+async def test_replayed_old_started_does_not_clear_handoff_tombstone(client):
+    test_client, feishu_client = client
+    message_id = "replayed-started-id"
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {"answer": "SENSITIVE-REPLAY-" + ("密" * 40_000)},
+        message_id=message_id,
+        created_at=1777017700.0,
+    )
+    first = await test_client.post("/events", json=completed_payload)
+    assert (await first.json())["disposition"] == "native"
+
+    replayed_started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            message_id=message_id,
+            created_at=1777017600.0,
+        ),
+    )
+    assert await replayed_started.json() == {"ok": True, "applied": False}
+    assert feishu_client.sent == []
+
+    duplicate = await test_client.post("/events", json=completed_payload)
+    assert await duplicate.json() == {"ok": True, "applied": True}
+    assert feishu_client.sent == []
+
+
+async def test_replayed_old_terminal_cannot_complete_new_lifecycle(client):
+    test_client, feishu_client = client
+    message_id = "interleaved-lifecycle-id"
+    old_completed = event_payload(
+        "message.completed",
+        1,
+        {"answer": "SENSITIVE-OLD-TERMINAL-" + ("密" * 40_000)},
+        message_id=message_id,
+        created_at=1777017601.0,
+    )
+    first = await test_client.post("/events", json=old_completed)
+    assert (await first.json())["disposition"] == "native"
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            message_id=message_id,
+            created_at=1777017700.0,
+        ),
+    )
+    assert (await started.json())["applied"] is True
+
+    stale = await test_client.post("/events", json=old_completed)
+    assert await stale.json() == {"ok": True, "applied": True}
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    assert session.status == "thinking"
+    assert session.answer_text == ""
+
+    fresh = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": "SENSITIVE-NEW-TERMINAL-" + ("密" * 40_000)},
+            message_id=message_id,
+            created_at=1777017701.0,
+        ),
+    )
+    assert await fresh.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+    assert len(feishu_client.sent) == 1
+
+
+async def test_new_terminal_equal_to_lifecycle_timestamp_is_allowed(client):
+    test_client, _feishu_client = client
+    message_id = "equal-lifecycle-timestamp-id"
+    first = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": "SENSITIVE-EQUAL-OLD-" + ("密" * 40_000)},
+            message_id=message_id,
+            created_at=1777017600.0,
+        ),
+    )
+    assert (await first.json())["disposition"] == "native"
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            message_id=message_id,
+            created_at=1777017700.0,
+        ),
+    )
+    assert (await started.json())["applied"] is True
+
+    completed = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": "SENSITIVE-EQUAL-NEW-" + ("密" * 40_000)},
+            message_id=message_id,
+            created_at=1777017700.0,
+        ),
+    )
+    assert await completed.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
+
+
+async def test_cleanup_tracks_all_repair_tasks_when_identity_is_reused(tmp_path):
+    app = create_app(
+        FakeFeishuClient(),
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    blocker = asyncio.Event()
+
+    async def wait_forever():
+        await blocker.wait()
+
+    first = asyncio.create_task(wait_forever())
+    second = asyncio.create_task(wait_forever())
+    sidecar_server._track_native_handoff_repair_task(app, "same-identity", first)
+    sidecar_server._track_native_handoff_repair_task(app, "same-identity", second)
+    try:
+        await sidecar_server._stop_native_handoff_repairs(app)
+        assert first.done()
+        assert second.done()
+    finally:
+        for task in (first, second):
+            task.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+
+
+async def test_new_lifecycle_cancels_previous_handoff_repair(client):
+    test_client, _feishu_client = client
+    message_id = "cancel-old-repair-id"
+    identity = handoff_identity_key(
+        profile_id="",
+        chat_id="oc_abc",
+        conversation_id="conversation-1",
+        message_id=message_id,
+    )
+    store = test_client.app[NATIVE_HANDOFF_STORE_KEY]
+    store.begin(
+        identity,
+        feishu_message_id="fake-card-old",
+        bot_id="fake-bot",
+        event_created_at=1777017600.0,
+    )
+    blocker = asyncio.Event()
+
+    async def wait_forever():
+        await blocker.wait()
+
+    old_repair = asyncio.create_task(wait_forever())
+    sidecar_server._track_native_handoff_repair_task(
+        test_client.app,
+        identity,
+        old_repair,
+    )
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            message_id=message_id,
+            created_at=1777017700.0,
+        ),
+    )
+    await asyncio.gather(old_repair, return_exceptions=True)
+
+    assert (await started.json())["applied"] is True
+    assert old_repair.cancelled()
+
+
+@pytest.mark.parametrize("with_existing_card", [False, True])
+async def test_handoff_store_failure_does_not_consume_terminal_session(
+    client,
+    monkeypatch,
+    with_existing_card,
+):
+    test_client, _feishu_client = client
+    if with_existing_card:
+        started = await test_client.post(
+            "/events",
+            json=event_payload("message.started", 0),
+        )
+        assert (await started.json())["applied"] is True
+
+    store = test_client.app[NATIVE_HANDOFF_STORE_KEY]
+    real_write = store._write_records
+
+    def fail_write(*_args, **_kwargs):
+        raise sidecar_server.NativeHandoffStoreError("injected write failure")
+
+    monkeypatch.setattr(store, "_write_records", fail_write)
+    completed_payload = event_payload(
+        "message.completed",
+        1,
+        {"answer": "SENSITIVE-STORE-FAILURE-" + ("密" * 40_000)},
+    )
+    failed = await test_client.post("/events", json=completed_payload)
+
+    assert failed.status == 503
+    if with_existing_card:
+        session = next(iter(test_client.app[SESSIONS_KEY].values()))
+        assert session.status == "thinking"
+        assert session.answer_text == ""
+    else:
+        assert test_client.app[SESSIONS_KEY] == {}
+
+    monkeypatch.setattr(store, "_write_records", real_write)
+    retried = await test_client.post("/events", json=completed_payload)
+    assert await retried.json() == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+    }
 
 
 async def test_existing_card_oversize_cron_records_native_fallback(client):

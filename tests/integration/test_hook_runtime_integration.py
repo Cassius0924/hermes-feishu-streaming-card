@@ -19,6 +19,7 @@ from hermes_feishu_card import server as sidecar_server
 from hermes_feishu_card.diagnostics import DiagnosticFinding, DiagnosticReport
 from hermes_feishu_card.delivery_policy import ChatDeliveryPolicy
 from hermes_feishu_card.feishu_client import FeishuAPIError
+from hermes_feishu_card.native_handoff import NativeHandoffStore
 from hermes_feishu_card.server import create_app
 from hermes_feishu_card.operations_transport import ensure_transport_root_secret
 
@@ -327,7 +328,10 @@ async def test_installed_standard_hook_keeps_full_native_answer_on_limit_handoff
     monkeypatch,
 ):
     feishu_client = _OperationsFeishuClient()
-    app = create_app(feishu_client)
+    app = create_app(
+        feishu_client,
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
     client = TestClient(TestServer(app))
     await client.start_server()
     huge_answer = "NATIVE-ANSWER-" + ("密" * 40_000)

@@ -378,6 +378,14 @@ def _render_limit_handoff_card(*, title: str, terminal: bool) -> Dict[str, Any]:
     }
 
 
+def render_terminal_limit_handoff_card(
+    title: str = DEFAULT_TITLE,
+) -> Dict[str, Any]:
+    """Render the fixed, answer-free terminal handoff used for repair retries."""
+
+    return _render_limit_handoff_card(title=title, terminal=True)
+
+
 def _render_status(
     session: CardSession, *, status_config: Optional[StatusConfig] = None
 ) -> Dict[str, str]:
