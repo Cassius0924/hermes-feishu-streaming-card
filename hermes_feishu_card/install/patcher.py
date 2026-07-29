@@ -97,6 +97,7 @@ def apply_patch(content: str, strategy: str = "legacy_gateway_run") -> str:
             "_run_still_current",
         ),
         required_callback_args=("text",),
+        required_callback_calls=(("_stream_consumer", "on_delta"),),
     )
     content = _apply_callback_patch(
         content,
@@ -716,6 +717,7 @@ def _apply_callback_patch(
     renderer,
     required_outer_names=(),
     required_callback_args=(),
+    required_callback_calls=(),
 ) -> str:
     owned_block = _find_simple_marker_block(
         content,
@@ -726,6 +728,22 @@ def _apply_callback_patch(
     if owned_block is not None:
         lines = content.splitlines(keepends=True)
         begin_index, end_index = owned_block
+        if required_callback_calls:
+            # Hermes may define the same local callback name for multiple
+            # mutually-exclusive transports. Rebuild selector-sensitive
+            # blocks from the unpatched source so upgrades can relocate an
+            # older hook that landed in the wrong callback.
+            content = "".join(lines[:begin_index] + lines[end_index + 1 :])
+            return _apply_callback_patch(
+                content,
+                callback_name=callback_name,
+                begin_marker=begin_marker,
+                end_marker=end_marker,
+                renderer=renderer,
+                required_outer_names=required_outer_names,
+                required_callback_args=required_callback_args,
+                required_callback_calls=required_callback_calls,
+            )
         indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
         newline = _line_ending(lines[begin_index]) or _detect_newline(content)
         expected = renderer(indent, newline)
@@ -741,6 +759,7 @@ def _apply_callback_patch(
         callback_name,
         required_outer_names=required_outer_names,
         required_callback_args=required_callback_args,
+        required_callback_calls=required_callback_calls,
     )
     if callback_body is None:
         return content
@@ -1006,10 +1025,12 @@ def _find_callback_body_location(
     *,
     required_outer_names=(),
     required_callback_args=(),
+    required_callback_calls=(),
 ):
     run_agent = _find_run_agent_node(tree)
     if run_agent is None:
         return None
+    candidates = []
     for node in ast.walk(run_agent):
         if isinstance(node, ast.FunctionDef) and node.name == callback_name:
             if not _has_required_callback_scope(
@@ -1018,9 +1039,21 @@ def _find_callback_body_location(
                 required_outer_names,
                 required_callback_args,
             ):
-                return None
-            return _body_location(node, lines)
-    return None
+                continue
+            candidates.append(node)
+    if required_callback_calls:
+        preferred = [
+            node
+            for node in candidates
+            if _has_required_callback_calls(node, required_callback_calls)
+        ]
+        if preferred:
+            candidates = preferred
+        elif len(candidates) != 1:
+            return None
+    if not candidates:
+        return None
+    return _body_location(candidates[0], lines)
 
 
 def _find_stable_tool_lifecycle_location(tree, lines):
@@ -1068,6 +1101,19 @@ def _has_required_callback_scope(
     return set(required_outer_names).issubset(outer_names) and set(
         required_callback_args
     ).issubset(callback_args)
+
+
+def _has_required_callback_calls(callback, required_callback_calls) -> bool:
+    if not required_callback_calls:
+        return True
+    calls = {
+        (child.func.value.id, child.func.attr)
+        for child in ast.walk(callback)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and isinstance(child.func.value, ast.Name)
+    }
+    return set(required_callback_calls).issubset(calls)
 
 
 def _function_scope_names(node) -> set[str]:

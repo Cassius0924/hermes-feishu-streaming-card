@@ -816,6 +816,79 @@ def test_apply_patch_inserts_streaming_callback_hooks():
     assert patcher.remove_patch(patched) == content
 
 
+def test_answer_delta_hook_targets_native_text_stream_when_tts_fallback_exists():
+    content = (
+        "async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):\n"
+        "    return await self._run_agent(event_message_id=event.message_id)\n"
+        "\n"
+        "async def _run_agent(self, source, event_message_id=None):\n"
+        "    _loop_for_step = asyncio.get_running_loop()\n"
+        "    session_key = 'sess-1'\n"
+        "    _status_chat_id = source.chat_id\n"
+        "    _approval_session_key = session_key\n"
+        "    def _run_still_current():\n"
+        "        return True\n"
+        "\n"
+        "    if _want_stream_deltas or _want_interim_consumer:\n"
+        "        try:\n"
+        "            if _adapter:\n"
+        "                if _want_stream_deltas:\n"
+        "                    def _stream_delta_cb(text: str) -> None:\n"
+        "                        if _run_still_current():\n"
+        "                            _stream_consumer.on_delta(text)\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "\n"
+        "    if _stream_delta_cb is None and _stts_consumer_ref is not None:\n"
+        "        def _stream_delta_cb(text: str) -> None:\n"
+        "            if _run_still_current():\n"
+        "                _stts_consumer_ref.on_delta(text)\n"
+        "\n"
+        "    def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:\n"
+        "        status_queue.put(text)\n"
+    )
+
+    patched = patcher.apply_patch(content)
+
+    native_stream_index = patched.index("_stream_consumer.on_delta(text)")
+    tts_fallback_index = patched.index("_stts_consumer_ref.on_delta(text)")
+    answer_hook_index = patched.index(patcher.ANSWER_DELTA_PATCH_BEGIN)
+    assert answer_hook_index < native_stream_index < tts_fallback_index
+    assert patched.count(patcher.ANSWER_DELTA_PATCH_BEGIN) == 1
+    assert patcher.remove_patch(patched) == content
+
+    patched_lines = patched.splitlines(keepends=True)
+    begin = next(
+        index
+        for index, line in enumerate(patched_lines)
+        if patcher.ANSWER_DELTA_PATCH_BEGIN in line
+    )
+    end = next(
+        index
+        for index, line in enumerate(patched_lines[begin:], start=begin)
+        if patcher.ANSWER_DELTA_PATCH_END in line
+    )
+    stale = "".join(patched_lines[:begin] + patched_lines[end + 1 :])
+    fallback_body = (
+        "            if _run_still_current():\n"
+        "                _stts_consumer_ref.on_delta(text)\n"
+    )
+    stale = stale.replace(
+        fallback_body,
+        "".join(patcher._render_answer_delta_hook_block("            ", "\n"))
+        + fallback_body,
+        1,
+    )
+
+    upgraded = patcher.apply_patch(stale)
+
+    assert upgraded.index(patcher.ANSWER_DELTA_PATCH_BEGIN) < upgraded.index(
+        "_stream_consumer.on_delta(text)"
+    )
+    assert upgraded.count(patcher.ANSWER_DELTA_PATCH_BEGIN) == 1
+    assert patcher.remove_patch(upgraded) == content
+
+
 def test_apply_patch_uses_stable_tool_call_ids_when_gateway_exposes_callbacks():
     content = (
         "async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):\n"
