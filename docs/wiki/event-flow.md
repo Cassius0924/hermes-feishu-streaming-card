@@ -56,6 +56,7 @@ sidecar 为 Feishu create/reply 初始卡片生成同一条逻辑投递稳定、
 3. `tool.updated`
    - 更新工具调用 timeline。
    - 尽量附带参数摘要、耗时和失败原因；长详情保持紧凑折叠。
+   - Hermes 提供稳定 `call_id` callback 时，以 agent 上实际安装的 start/complete wrapper 为准并抑制 legacy progress path；只有稳定卡片事件未被接受时，显式 fallback 才允许旧路径 fail-open，避免一次调用显示两项。
    - terminal 事件前 flush pending delta。
 4. `message.completed`
    - 渲染终态卡片。

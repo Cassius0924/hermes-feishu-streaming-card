@@ -803,7 +803,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
-| [v4.1.2](release-notes-v4.1.2.md) | 2026-07-29 | 修复 Gateway 正常重启窗口中 stale heartbeat 误写持久化 restart fence 的竞态；新 matching hello 一次恢复 ready |
+| [v4.1.2](release-notes-v4.1.2.md) | 2026-07-29 | 修复 stale heartbeat 二次 restart fence，并消除同一工具调用被 stable callback 与 legacy progress path 重复记录 |
 | [v4.1.1](release-notes-v4.1.1.md) | 2026-07-28 | 升级恢复热修：heartbeat 等待不写 fence、受约束的 review acknowledgement、legacy pidfile/process fail-closed、setup 对齐 Hermes venv 与运行 identity |
 | [v4.1.0](release-notes-v4.1.0.md) | 2026-07-28 | 精确 per-chat 原生策略、超量表格无损 compact、认证 runtime 完整性与 strict repair、四种显式 service manager |
 | [v4.0.21](release-notes-v4.0.21.md) | 2026-07-28 | Issue #155：仅显式 `answer -> tool` 边界归档答案，避免 post-tool 最终答案进入 timeline；Issue #147 真实飞书验收已观测 completion card + native image、两段答案留在同一卡、无匹配原生重复或 uncertain-delivery warning；不宣称截图或桌面/移动端视觉 QA |

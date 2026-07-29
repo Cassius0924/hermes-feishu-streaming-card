@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.1.2`. On top of the V4.1.1 upgrade-recovery safety boundary, it fixes a race where the stale-heartbeat window during a normal Gateway restart could persist a second restart fence. V3.9.1 was released on 2026-07-11; V4.1.2 automation, real Feishu, local/remote upgrades, public tag/install, Release assets, and exact-merge-SHA gates are marked passed only after completion.
+Current release candidate: `4.1.2`. On top of the V4.1.1 upgrade-recovery safety boundary, it fixes a race where the stale-heartbeat window during a normal Gateway restart could persist a second restart fence and removes duplicate recording of one tool call by the stable callback and legacy progress paths. V3.9.1 was released on 2026-07-11; V4.1.2 automation, real Feishu, local/remote upgrades, public tag/install, Release assets, and exact-merge-SHA gates are marked passed only after completion.
 
 ## Ready
 
@@ -149,7 +149,8 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 
 - The installed-plan, old-runtime hello, stale heartbeat, coordinator check, and new matching hello race must create no fence and restore ready in one cycle: **focused regression passed**.
 - Generation/package mismatch, unavailable control authentication, manual-review/restart fences, and real strict repair remain fail-closed with no automatic Gateway restart: **safety-boundary regression passed**.
-- Full pytest, `git diff --check`, wheel/sdist, isolated `site-packages`, exact merge SHA, public tagged install, Release assets, local/remote upgrades, and real Feishu: **pending release workflow**.
+- Stable-wrapper detection plus the explicit fail-open fallback must prevent one call from traversing both the stable and legacy progress paths; real Hermes-configured-model runs on the local and remote MacBook Pro each rendered one timed terminal entry: **automation and dual-machine real Feishu passed**.
+- Candidate full pytest **`2197 passed, 4 skipped`**, `git diff --check`, wheel/sdist, and isolated `site-packages`/CLI provenance: **passed**; exact merge SHA, public tagged install, and Release assets: **pending after merge**.
 
 ## V4.1.1 Release Gates
 

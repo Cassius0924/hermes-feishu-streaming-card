@@ -181,7 +181,7 @@ bash install-docker.sh
 ![飞书话题内卡片连续更新与思考工具 timeline 展示](docs/assets/feishu-topic-card-showcase-v389.png)
 | 版本 | 重点 |
 |---|---|
-| [v4.1.2](docs/release-notes-v4.1.2.md) | 修复 Gateway 正常重启时 heartbeat 短暂 stale 被误写为持久化 restart fence 的竞态；新 matching hello 可一次恢复 ready；延续 [v4.1.1](docs/release-notes-v4.1.1.md) 的升级恢复安全边界 |
+| [v4.1.2](docs/release-notes-v4.1.2.md) | 修复 Gateway 重启时 stale heartbeat 写入二次 restart fence 的竞态，并消除稳定 tool callback 与旧 progress path 对同一次工具调用的重复记录；延续 [v4.1.1](docs/release-notes-v4.1.1.md) 的安全边界 |
 | [v4.1.0](docs/release-notes-v4.1.0.md) | 按会话精确选择原生/卡片投递；第 6 张及后续表格默认无损 compact；认证 runtime 完整性监控与 strict repair；四种显式 sidecar manager，`auto` 不提权 |
 | [v4.0.21](docs/release-notes-v4.0.21.md) | Issue #155：仅显式 `answer -> tool` 边界归档答案，避免 post-tool 最终答案被移入 timeline；Issue #147 真实飞书验收已观测到 completion card + native image、无匹配原生重复或 uncertain-delivery warning，UI 与配置不变 |
 | [v4.0.20](docs/release-notes-v4.0.20.md) | 修复 Issue #153：已有卡片的 notice 异步更新返回 `accepted`，不再误报投递未知；真实 PATCH 失败保留脱敏指标和错误码 |

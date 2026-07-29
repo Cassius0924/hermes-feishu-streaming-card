@@ -182,7 +182,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ![Feishu topic reply card continuity and reasoning/tool timeline showcase](docs/assets/feishu-topic-card-showcase-v389.png)
 | Version | Highlights |
 |---|---|
-| [v4.1.2](docs/release-notes-v4.1.2.en.md) | Fixes a restart race where a transient stale heartbeat during a normal Gateway restart could persist a second restart fence; the new matching hello restores ready in one cycle while retaining the [v4.1.1](docs/release-notes-v4.1.1.en.md) safety boundary |
+| [v4.1.2](docs/release-notes-v4.1.2.en.md) | Fixes the stale-heartbeat second-restart race and removes duplicate recording of one tool call by the stable callback and legacy progress paths, while retaining the [v4.1.1](docs/release-notes-v4.1.1.en.md) safety boundary |
 | [v4.1.0](docs/release-notes-v4.1.0.en.md) | Exact per-chat card/native policy, lossless compaction after five tables, authenticated runtime integrity with strict repair, and four explicit sidecar managers with no privilege escalation from `auto` |
 | [v4.0.21](docs/release-notes-v4.0.21.en.md) | Issue #155 archives answers only at an explicit `answer -> tool` boundary so post-tool final answers stay visible; Issue #147 real Feishu acceptance observed a completion card plus native image with no matching native duplicate or uncertain-delivery warning; UI and configuration remain unchanged |
 | [v4.0.20](docs/release-notes-v4.0.20.en.md) | Fixes Issue #153: queued notice updates return `accepted` without false unknown-delivery warnings, while real PATCH failures retain redacted metrics and error codes |

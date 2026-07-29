@@ -840,6 +840,26 @@ def test_apply_patch_uses_stable_tool_call_ids_when_gateway_exposes_callbacks():
     assert "agent.tool_start_callback = _hfc_tool_start_callback" in patched
     assert "agent.tool_complete_callback = _hfc_tool_complete_callback" in patched
     assert "_hfc_pending_tool_previews" in patched
+    assert 'kwargs.get("_hfc_force_tool_progress_fallback")' in patched
+    assert (
+        'getattr(agent.tool_start_callback, "_hfc_stable_wrapper", False)'
+        in patched
+    )
+    assert (
+        'getattr(agent.tool_complete_callback, "_hfc_stable_wrapper", False)'
+        in patched
+    )
+    assert "_hfc_original_tool_progress_callback = getattr(" in patched
+    assert "def _hfc_tool_progress_callback(" in patched
+    assert "agent.tool_progress_callback = _hfc_tool_progress_callback" in patched
+    assert "_hfc_tool_progress_callback._hfc_stable_wrapper = True" in patched
+    assert (
+        "_hfc_original_tool_progress_callback("
+        '"tool.started", tool_name, _hfc_tool_preview, args,'
+        in patched
+    )
+    assert patched.count("_hfc_force_tool_progress_fallback=True") == 2
+    ast.parse(patched)
     assert patcher.apply_patch(patched, strategy="gateway_run_013_plus") == patched
     assert patcher.remove_patch(patched) == content
 

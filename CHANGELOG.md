@@ -11,6 +11,7 @@ See also: [docs/release-notes-v4.1.2.md](docs/release-notes-v4.1.2.md)
 
 ### Fixed
 - A verified `installed` Hermes plan no longer turns a transient `runtime_heartbeat_stale` window during a normal Gateway restart into a persistent restart fence. Readiness remains degraded while the heartbeat is stale, then returns to ready when the new matching `runtime.hello` arrives.
+- Stable Hermes tool lifecycle callbacks now suppress the parallel legacy progress path by checking the callbacks actually installed on the agent. An explicit fallback marker preserves fail-open native progress when card delivery is unavailable, while one real tool call no longer renders as two timeline entries.
 - Generation/package mismatches, unavailable control authentication, manual-review fences, and actual integrity repair remain fail-closed; HFC still never restarts Hermes Gateway automatically.
 
 ## V4.1.1 — 2026-07-28
