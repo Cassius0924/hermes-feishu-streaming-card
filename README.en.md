@@ -141,7 +141,7 @@ For an existing Hermes container:
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.1.2
+export HFC_VERSION=v4.1.3
 bash install-docker.sh
 ```
 
@@ -182,6 +182,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ![Feishu topic reply card continuity and reasoning/tool timeline showcase](docs/assets/feishu-topic-card-showcase-v389.png)
 | Version | Highlights |
 |---|---|
+| [v4.1.3](docs/release-notes-v4.1.3.en.md) | Fixes Issue #158 by allowing `acknowledge-review` to atomically migrate an old plan binding only for the same Hermes target, a verified current plan, a stopped sidecar, and an unchanged fence CAS snapshot; doctor now prints explicit `migrate-safe` / `acknowledge-review` commands |
 | [v4.1.2](docs/release-notes-v4.1.2.en.md) | Fixes the stale-heartbeat second-restart race and removes duplicate recording of one tool call by the stable callback and legacy progress paths, while retaining the [v4.1.1](docs/release-notes-v4.1.1.en.md) safety boundary |
 | [v4.1.0](docs/release-notes-v4.1.0.en.md) | Exact per-chat card/native policy, lossless compaction after five tables, authenticated runtime integrity with strict repair, and four explicit sidecar managers with no privilege escalation from `auto` |
 | [v4.0.21](docs/release-notes-v4.0.21.en.md) | Issue #155 archives answers only at an explicit `answer -> tool` boundary so post-tool final answers stay visible; Issue #147 real Feishu acceptance observed a completion card plus native image with no matching native duplicate or uncertain-delivery warning; UI and configuration remain unchanged |

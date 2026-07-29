@@ -140,7 +140,7 @@ Hermes `v2026.4.23` 起的旧版和 Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.1.2
+export HFC_VERSION=v4.1.3
 bash install-docker.sh
 ```
 
@@ -181,6 +181,7 @@ bash install-docker.sh
 ![飞书话题内卡片连续更新与思考工具 timeline 展示](docs/assets/feishu-topic-card-showcase-v389.png)
 | 版本 | 重点 |
 |---|---|
+| [v4.1.3](docs/release-notes-v4.1.3.md) | 修复 Issue #158：官方 `acknowledge-review` 可在同一 Hermes target、已验证当前 plan、sidecar 停止且 fence CAS 未漂移时原子迁移旧 plan binding；doctor 会给出明确的 `migrate-safe` / `acknowledge-review` 命令 |
 | [v4.1.2](docs/release-notes-v4.1.2.md) | 修复 Gateway 重启时 stale heartbeat 写入二次 restart fence 的竞态，并消除稳定 tool callback 与旧 progress path 对同一次工具调用的重复记录；延续 [v4.1.1](docs/release-notes-v4.1.1.md) 的安全边界 |
 | [v4.1.0](docs/release-notes-v4.1.0.md) | 按会话精确选择原生/卡片投递；第 6 张及后续表格默认无损 compact；认证 runtime 完整性监控与 strict repair；四种显式 sidecar manager，`auto` 不提权 |
 | [v4.0.21](docs/release-notes-v4.0.21.md) | Issue #155：仅显式 `answer -> tool` 边界归档答案，避免 post-tool 最终答案被移入 timeline；Issue #147 真实飞书验收已观测到 completion card + native image、无匹配原生重复或 uncertain-delivery warning，UI 与配置不变 |
@@ -202,7 +203,6 @@ bash install-docker.sh
 | [v4.0.5](docs/release-notes-v4.0.5.md) | 修复升级后 Gateway venv 仍加载旧插件的问题；安装器会比较 runtime 版本、自动同步并在安装后复核版本与路径 |
 | [v4.0.4](docs/release-notes-v4.0.4.md) | 修复 Markdown `MEDIA:` 字面量、SDK 预绑定旧 callback 的交互转发，以及 Codex 只返回单个限额窗口时的错误 `5h` 标签 |
 | [v4.0.3](docs/release-notes-v4.0.3.md) | 修复仅升级包并重启、但仍保留 V4.0.0 completion hook 时的媒体回答灰色正文重复；匹配正文只抑制一次，原生图片/文件继续发送 |
-| [v4.0.2](docs/release-notes-v4.0.2.md) | 修复 manifest 与 backup 均可信时，合法旧 owned hook 仍被拒绝升级的问题；保留 v4.0.1 的媒体正文去重修复 |
 | [v4.0.0](docs/release-notes-v4.0.0.md) | 运行态 Header 实时显示 Hermes 工具 preview，正文独立流式显示公开阶段输出；等待、失败、完成状态自然衔接并保持现有 Footer/引用边界 |
 | [v3.10.0](docs/release-notes-v3.10.0.md) | 裸 `/resume` 使用原生会话下拉卡并沿用 Hermes 安全恢复路径；模型 footer 增加转义后的轻量语义色，不改变布局和字段顺序 |
 | [v3.9.1](docs/release-notes-v3.9.1.md) | 可靠性热修：完成答案不截断、打断任务终态串行化、模型选择回调异步化，以及可验证的 marker-only 安装损坏恢复；普通流式卡 footer/layout 保持不变 |

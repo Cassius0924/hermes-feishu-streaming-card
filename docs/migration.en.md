@@ -82,6 +82,12 @@ An empty `pre_repair_runtime_hash` means runtime identity cannot prove a process
 
 A legacy `0644` pidfile can be tightened in place to `0600` only inside a current-user-owned private `0700` state directory with a strictly matching shape and identity. Every other case fails closed.
 
+## Upgrading From V4.1.2 To V4.1.3
+
+V4.1.3 fixes the recovery convergence gap reproduced in Issue #158 after a real Hermes upstream update. Once official `install` reinjects the hook, the current integrity-plan fingerprint changes while the old manual-review fence remains bound to the pre-upgrade plan. `integrity acknowledge-review` can now atomically update that plan binding and clear manual review only after two verified-current-installed-plan checks, two stopped-sidecar checks, an unchanged fence CAS snapshot, and an exact match between the old and current Hermes target identity. A different target, remaining pidfile/health, dirty or unverifiable plan, or unknown legacy fence still fails closed. A non-empty restart hash remains until a new matching `runtime.hello` clears the independent restart fence.
+
+Do not edit `runtime-integrity-fence.json` or call internal Python functions. When `doctor --explain` reports `integrity_migration_required`, run the displayed `integrity migrate-safe` command. For another verified manual-review fence, stop the sidecar, run the complete `integrity acknowledge-review --config CONFIG --hermes-dir PATH --state-dir STATE --yes` command printed by doctor, then manually restart the sidecar and Hermes Gateway.
+
 ## Upgrading From V4.1.1 To V4.1.2
 
 V4.1.2 fixes the race where a brief stale-heartbeat window during a normal Gateway restart could be persisted as a restart fence. Upgrade through the official `setup` path and restart the Gateway once. After the new matching `runtime.hello`, readiness should return directly to `runtime_ready`. If restart-required remains, do not restart repeatedly; use `doctor --explain` to inspect generation/package, control authentication, and any existing fence.

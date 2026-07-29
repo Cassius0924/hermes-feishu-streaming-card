@@ -291,6 +291,69 @@ def test_integrity_acknowledge_review_refuses_wrong_or_unsafe_legacy_binding(
         assert str(state_root) not in result.stdout + result.stderr
 
 
+def test_integrity_acknowledge_review_migrates_verified_same_target_plan_transition(
+    tmp_path,
+):
+    root, _manifest_path = _legacy_git_install(tmp_path)
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "server:\n  host: 127.0.0.1\n  port: 65531\n", encoding="utf-8"
+    )
+    migrated = _run_cli(
+        "integrity",
+        "migrate-safe",
+        "--config",
+        str(config),
+        "--hermes-dir",
+        str(root),
+        "--yes",
+    )
+    assert migrated.returncode == 0, migrated.stderr
+    current_binding = card_cli._verified_integrity_acknowledgement_binding(root)
+    state_root = tmp_path / "transition-state"
+    state_root.mkdir(mode=0o700)
+    fence = state_root / "runtime-integrity-fence.json"
+    fence.write_text(
+        json.dumps(
+            {
+                "schema_version": "2",
+                "restart_required": True,
+                "manual_review_required": True,
+                "pre_repair_runtime_hash": "f" * 64,
+                "target_identity": current_binding.target_identity,
+                "plan_fingerprint": "e" * 64,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fence.chmod(0o600)
+
+    result = _run_cli(
+        "integrity",
+        "acknowledge-review",
+        "--config",
+        str(config),
+        "--hermes-dir",
+        str(root),
+        "--state-dir",
+        str(state_root),
+        "--yes",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "manual review: acknowledged" in result.stdout
+    payload = json.loads(fence.read_text(encoding="utf-8"))
+    assert payload["target_identity"] == current_binding.target_identity
+    assert payload["plan_fingerprint"] == current_binding.plan_fingerprint
+    assert payload["manual_review_required"] is False
+    assert payload["restart_required"] is True
+    assert payload["pre_repair_runtime_hash"] == "f" * 64
+    assert str(root) not in result.stdout + result.stderr
+    assert str(state_root) not in result.stdout + result.stderr
+
+
 def test_integrity_acknowledge_review_rechecks_before_bound_cas(
     tmp_path,
     monkeypatch,

@@ -82,6 +82,12 @@ hermes-feishu-card integrity acknowledge-review \
 
 旧版 `0644` pidfile 只有位于当前用户拥有的私有 `0700` state dir、形状与 identity 均严格匹配时才能原 inode 收紧为 `0600`；其他情况 fail-closed。
 
+## 从 V4.1.2 升级到 V4.1.3
+
+V4.1.3 修复 Issue #158 中真实 Hermes upstream 更新后的恢复收敛问题：官方 `install` 重新注入 hook 后，当前 integrity plan fingerprint 会变化，而旧 manual-review fence 仍绑定升级前 plan。`integrity acknowledge-review` 现在可在双重验证当前 installed plan、双重确认 sidecar 已停止、旧新 binding 指向同一 Hermes target 且 fence CAS 未变化时，原子更新 plan binding 并解除 manual-review。不同 target、残留 pidfile/health、dirty 或不可验证 plan、未知 legacy fence 仍拒绝；已有非空 restart hash 继续保留，直到新 matching `runtime.hello` 自行解除 restart fence。
+
+不要手工编辑 `runtime-integrity-fence.json` 或调用内部 Python 函数。若 `doctor --explain` 报告 `integrity_migration_required`，按输出运行 `integrity migrate-safe`；其他已验证 manual review 先停止 sidecar，再运行 doctor 给出的完整 `integrity acknowledge-review --config CONFIG --hermes-dir PATH --state-dir STATE --yes`，最后人工重启 sidecar 与 Hermes Gateway。
+
 ## 从 V4.1.1 升级到 V4.1.2
 
 V4.1.2 修复 Gateway 正常重启期间 heartbeat 短暂 stale 被误写为持久化 restart fence 的竞态。按官方 `setup` 升级并只重启 Gateway 一次；在新 matching `runtime.hello` 到达后，readiness 应直接恢复 `runtime_ready`。如果仍显示 restart required，不要反复重启，先用 `doctor --explain` 检查 generation/package、control auth 与既有 fence。

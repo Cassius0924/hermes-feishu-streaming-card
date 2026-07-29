@@ -878,26 +878,37 @@ def _runtime_integrity_findings(
     if readiness.get("status") != "degraded":
         return ()
     reason = str(readiness.get("reason") or "manual_review_required")
-    actions = {
-        "gateway_restart_required": (
-            "Restart Hermes Gateway through its normal service command, then recheck readiness.",
-        ),
-        "runtime_heartbeat_missing": (
-            "Confirm Hermes Gateway is running and restart it if the card runtime remains missing.",
-        ),
-        "runtime_heartbeat_stale": (
-            "Check Hermes Gateway health and restart it if the runtime heartbeat stays stale.",
-        ),
-        "control_auth_unavailable": (
-            "Rerun setup so the sidecar and Hermes hook share a valid private transport, then restart both services.",
-        ),
-        "manual_review_required": (
-            "Run hermes-feishu-card doctor and review verified install-state findings before changing files.",
-        ),
-    }.get(
-        reason,
-        ("Run hermes-feishu-card doctor and recheck runtime readiness.",),
-    )
+    integrity = _runtime_integrity(health.get("integrity"))
+    integrity_reason = str(integrity.get("last_reason") or "")
+    if reason == "manual_review_required" and integrity_reason == (
+        "integrity_migration_required"
+    ):
+        actions = (
+            "Run hermes-feishu-card integrity migrate-safe --config CONFIG --hermes-dir PATH --yes, then rerun doctor.",
+        )
+    elif reason == "manual_review_required":
+        actions = (
+            "Run hermes-feishu-card doctor --explain and review verified install-state findings.",
+            "After stopping the sidecar, run hermes-feishu-card integrity acknowledge-review --config CONFIG --hermes-dir PATH --state-dir STATE --yes.",
+        )
+    else:
+        actions = {
+            "gateway_restart_required": (
+                "Restart Hermes Gateway through its normal service command, then recheck readiness.",
+            ),
+            "runtime_heartbeat_missing": (
+                "Confirm Hermes Gateway is running and restart it if the card runtime remains missing.",
+            ),
+            "runtime_heartbeat_stale": (
+                "Check Hermes Gateway health and restart it if the runtime heartbeat stays stale.",
+            ),
+            "control_auth_unavailable": (
+                "Rerun setup so the sidecar and Hermes hook share a valid private transport, then restart both services.",
+            ),
+        }.get(
+            reason,
+            ("Run hermes-feishu-card doctor and recheck runtime readiness.",),
+        )
     return (
         DiagnosticFinding(
             "runtime_integrity_degraded",

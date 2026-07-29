@@ -600,6 +600,80 @@ def test_bound_fence_acknowledge_rejects_wrong_binding_and_stale_snapshot(tmp_pa
     assert inspect_runtime_integrity_review(state_root).manual_review_required
 
 
+def test_bound_fence_acknowledge_allows_explicit_same_target_plan_transition(
+    tmp_path,
+):
+    state_root = tmp_path / "private-state"
+    previous_binding = RuntimeIntegrityFenceBinding(
+        target_identity="a" * 64,
+        plan_fingerprint="b" * 64,
+    )
+    current_binding = RuntimeIntegrityFenceBinding(
+        target_identity=previous_binding.target_identity,
+        plan_fingerprint="c" * 64,
+    )
+    supervisor = RuntimeIntegritySupervisor(mode="safe", state_directory=state_root)
+    assert supervisor.record(
+        RuntimeControlEvent.from_dict(
+            _payload(runtime_id="runtime-before-transition-123", created_at=100.0)
+        )
+    )
+    supervisor.mark_restart_required(binding=previous_binding)
+    supervisor.mark_manual_review_required(binding=previous_binding)
+    review = inspect_runtime_integrity_review(state_root)
+    before = json.loads(
+        (state_root / "runtime-integrity-fence.json").read_text(encoding="utf-8")
+    )
+
+    with pytest.raises(ValueError, match="could not be acknowledged safely"):
+        runtime_control.acknowledge_runtime_integrity_review(
+            state_root,
+            expected_state_token=review.state_token,
+            expected_binding=current_binding,
+        )
+
+    assert runtime_control.acknowledge_runtime_integrity_review(
+        state_root,
+        expected_state_token=review.state_token,
+        expected_binding=current_binding,
+        allow_same_target_plan_transition=True,
+    ) is True
+
+    after = json.loads(
+        (state_root / "runtime-integrity-fence.json").read_text(encoding="utf-8")
+    )
+    assert after["target_identity"] == current_binding.target_identity
+    assert after["plan_fingerprint"] == current_binding.plan_fingerprint
+    assert after["manual_review_required"] is False
+    assert after["restart_required"] is True
+    assert after["pre_repair_runtime_hash"] == before["pre_repair_runtime_hash"]
+
+
+def test_bound_fence_plan_transition_never_changes_target_identity(tmp_path):
+    state_root = tmp_path / "private-state"
+    previous_binding = RuntimeIntegrityFenceBinding(
+        target_identity="a" * 64,
+        plan_fingerprint="b" * 64,
+    )
+    supervisor = RuntimeIntegritySupervisor(mode="safe", state_directory=state_root)
+    supervisor.mark_manual_review_required(binding=previous_binding)
+    review = inspect_runtime_integrity_review(state_root)
+    before = (state_root / "runtime-integrity-fence.json").read_bytes()
+
+    with pytest.raises(ValueError, match="could not be acknowledged safely"):
+        runtime_control.acknowledge_runtime_integrity_review(
+            state_root,
+            expected_state_token=review.state_token,
+            expected_binding=RuntimeIntegrityFenceBinding(
+                target_identity="d" * 64,
+                plan_fingerprint="e" * 64,
+            ),
+            allow_same_target_plan_transition=True,
+        )
+
+    assert (state_root / "runtime-integrity-fence.json").read_bytes() == before
+
+
 def test_legacy_unbound_nonempty_restart_fence_is_never_acknowledged(tmp_path):
     state_root = tmp_path / "private-state"
     state_root.mkdir(mode=0o700)

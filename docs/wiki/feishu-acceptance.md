@@ -2,13 +2,13 @@
 
 自动化测试不能完全证明 Feishu/Lark 客户端体验。涉及卡片 UX、topic、系统提示、命令卡片的版本，发布前需要真实飞书 smoke。
 
-## V4.1.2 升级恢复与 V4.1 安全控制验收
+## V4.1.3 升级恢复与 V4.1 安全控制验收
 
 - heartbeat fence：verified `installed` plan 在 startup grace 内外等待首次 heartbeat，或 Gateway 正常重启造成 heartbeat stale，均不得出现持久化 fence 或 repair mutation；新 matching `runtime.hello` 到达后应一次恢复 ready。
-- review acknowledgement：只有双重 installed/integrity plan、sidecar health 不可达、无 pidfile、target binding 与 snapshot CAS 均匹配才允许命令成功；V4.1.0 unbound empty hash 只迁移精确已知形态，unbound non-empty 拒绝，bound non-empty 保留 restart/hash。命令后人工重启 sidecar 与 Gateway。
+- review acknowledgement：只有双重 installed/integrity plan、sidecar health 不可达、无 pidfile、snapshot CAS 未变化且旧新 binding 指向同一 target identity 才允许迁移 plan fingerprint；不同 target 拒绝。V4.1.0 unbound empty hash 只迁移精确已知形态，unbound non-empty 拒绝，bound non-empty 保留 restart/hash。命令后人工重启 sidecar 与 Gateway。
 - legacy process：私有 owned `0700` state dir 内的精确 `0644` legacy pidfile 可经同 inode/fd identity 收紧到 `0600`；非私有目录、symlink、未知 shape、identity race 全部拒绝。detached child 必须在读取配置/监听前验证父进程写入的精确 PID/token 管理记录；detached stop 需 loopback token 自停并确认 health 消失，不得向数字 PID/PGID 发 TERM/KILL。具体 non-loopback 地址需同时验证同地址族 loopback 管理监听，wildcard 不重复绑定；pidfile-less、旧接口或超时进程保持运行，先人工停旧服务再重跑。
 - setup identity：以 `python -I` 复检 Hermes venv `site-packages`；构造 package version/Python identity 匹配与不匹配两条 `/health` 分支，确认仅后者触发 sidecar 受管自停/重启；start/status/stop 的 selected env 必须一致，之后人工重启 Gateway。
-- 以上为 V4.1.2 发布前待验收项；未实际完成自动化、macOS 本机/远端升级与真实飞书前不得标记通过。
+- Issue #158 还需在 Ubuntu 24.04 / Hermes 实际 upstream update 后走完整官方命令复测；不得手工修改 fence 或调用内部函数。以上为 V4.1.3 发布前待验收项，未实际完成自动化、候选安装与真实环境复测前不得标记通过。
 
 ## V4.1.0 安全控制验收
 
