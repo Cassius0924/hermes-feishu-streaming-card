@@ -481,14 +481,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.1.1`.
+The Compose example defaults `HFC_VERSION` to `v4.1.2`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.1.1
+export HFC_VERSION=v4.1.2
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -731,6 +731,7 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.1.2](release-notes-v4.1.2.en.md) | 2026-07-29 | Fixes a restart race where a transient stale heartbeat during a normal Gateway restart persisted a second restart fence; a new matching hello restores ready in one cycle |
 | [v4.1.1](release-notes-v4.1.1.en.md) | 2026-07-28 | Upgrade-recovery hotfix: heartbeat waiting without a fence, constrained review acknowledgement, fail-closed legacy pidfile/process handling, and Hermes-venv/running-identity alignment during setup |
 | [v4.1.0](release-notes-v4.1.0.en.md) | 2026-07-28 | Exact per-chat native policy, lossless compact rendering for excess tables, authenticated runtime integrity with strict repair, and four explicit service managers |
 | [v4.0.21](release-notes-v4.0.21.en.md) | 2026-07-28 | Issue #155 archives only at an explicit `answer -> tool` boundary so post-tool final answers stay visible; Issue #147 real Feishu acceptance observed a completion card plus native image and two answer segments in one card with no matching native duplicate or uncertain-delivery warning; it does not claim screenshot or desktop/mobile visual QA |

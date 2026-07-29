@@ -288,6 +288,76 @@ def test_installed_plan_waits_for_first_heartbeat_without_persisting_fence(
         assert not (state_root / "runtime-integrity-fence.json").exists()
 
 
+def test_installed_plan_does_not_persist_fence_during_gateway_restart_gap(
+    tmp_path,
+):
+    clock = [0.0]
+    state_root = tmp_path / "gateway-restart-gap"
+    supervisor = RuntimeIntegritySupervisor(
+        mode="safe",
+        expected_package_version="4.1.2",
+        now=lambda: clock[0],
+        stale_after_seconds=15.0,
+        state_directory=state_root,
+    )
+    assert supervisor.record(
+        RuntimeControlEvent.from_dict(
+            {
+                "schema_version": "1",
+                "event": "runtime.hello",
+                "runtime_id": "runtime-before-restart-123",
+                "sequence": 1,
+                "created_at": clock[0],
+                "hook_generation": RUNTIME_HOOK_GENERATION,
+                "package_version": "4.1.2",
+            }
+        )
+    )
+    assert supervisor.snapshot()["reason"] == "runtime_ready"
+
+    clock[0] = 16.0
+    assert supervisor.snapshot()["reason"] == "runtime_heartbeat_stale"
+    coordinator = RuntimeIntegrityCoordinator(
+        mode="safe",
+        hermes_root="/sanitized-in-test",
+        supervisor=supervisor,
+        detector=lambda _root: object(),
+        planner=lambda _detection: _plan(
+            executable=False,
+            state="installed",
+        ),
+        executor=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must not execute")
+        ),
+    )
+
+    assert coordinator.check_once() == {
+        "status": "idle",
+        "reason": "recovery_not_required",
+        "attempted": False,
+    }
+    readiness = supervisor.snapshot()
+    assert readiness["reason"] == "runtime_heartbeat_stale"
+    assert readiness["restart_required"] is False
+    assert not (state_root / "runtime-integrity-fence.json").exists()
+
+    assert supervisor.record(
+        RuntimeControlEvent.from_dict(
+            {
+                "schema_version": "1",
+                "event": "runtime.hello",
+                "runtime_id": "runtime-after-restart-456",
+                "sequence": 1,
+                "created_at": clock[0],
+                "hook_generation": RUNTIME_HOOK_GENERATION,
+                "package_version": "4.1.2",
+            }
+        )
+    )
+    assert supervisor.snapshot()["reason"] == "runtime_ready"
+    assert not (state_root / "runtime-integrity-fence.json").exists()
+
+
 def test_missing_control_auth_never_triggers_source_inspection_or_repair():
     calls = []
     coordinator = RuntimeIntegrityCoordinator(

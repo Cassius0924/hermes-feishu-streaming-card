@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.1.2 — 2026-07-29
+
+See also: [docs/release-notes-v4.1.2.md](docs/release-notes-v4.1.2.md)
+
+### Fixed
+- A verified `installed` Hermes plan no longer turns a transient `runtime_heartbeat_stale` window during a normal Gateway restart into a persistent restart fence. Readiness remains degraded while the heartbeat is stale, then returns to ready when the new matching `runtime.hello` arrives.
+- Generation/package mismatches, unavailable control authentication, manual-review fences, and actual integrity repair remain fail-closed; HFC still never restarts Hermes Gateway automatically.
+
 ## V4.1.1 — 2026-07-28
 
 See also: [docs/release-notes-v4.1.1.md](docs/release-notes-v4.1.1.md)

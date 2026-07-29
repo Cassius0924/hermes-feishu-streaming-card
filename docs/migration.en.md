@@ -82,6 +82,10 @@ An empty `pre_repair_runtime_hash` means runtime identity cannot prove a process
 
 A legacy `0644` pidfile can be tightened in place to `0600` only inside a current-user-owned private `0700` state directory with a strictly matching shape and identity. Every other case fails closed.
 
+## Upgrading From V4.1.1 To V4.1.2
+
+V4.1.2 fixes the race where a brief stale-heartbeat window during a normal Gateway restart could be persisted as a restart fence. Upgrade through the official `setup` path and restart the Gateway once. After the new matching `runtime.hello`, readiness should return directly to `runtime_ready`. If restart-required remains, do not restart repeatedly; use `doctor --explain` to inspect generation/package, control authentication, and any existing fence.
+
 ## Upgrading To V4.1.0
 
 V4.1.0 preserves cards as the default and does not silently mutate an old configuration. Upgrade the package and rerun setup/install first, then add only the controls you need:
