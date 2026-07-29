@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.1.1`。它在 V4.1.0 的 per-chat native policy、无损表格 compact、认证 runtime integrity 与显式 sidecar service manager 之上，修复升级恢复、heartbeat fence、人工 review acknowledgement、legacy pidfile/process 与 setup runtime identity。V3.9.1 已于 2026-07-11 发布；V4.1.0 及更早版本保留为历史发布记录。V4.1.1 的自动化、真实飞书、Linux/Docker、public tag/install 和 exact merge SHA 门禁只有完成后才会标记通过。
+当前发布候选为 `4.1.2`。它在 V4.1.1 升级恢复安全边界之上，修复 Gateway 正常重启时 heartbeat stale 窗口误写持久化 restart fence 的竞态，并消除稳定 tool callback 与旧 progress path 对同一次调用的重复记录。V3.9.1 已于 2026-07-11 发布；V4.1.2 的自动化、真实飞书、本机/远端升级、public tag/install、Release assets 和 exact merge SHA 门禁只有完成后才会标记通过。
 
 ## 已具备
 
@@ -144,6 +144,13 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.1.2 发布门禁
+
+- 已安装 plan、旧 runtime hello、heartbeat stale、coordinator check、新 matching hello 的竞态必须不产生 fence，并一次恢复 ready：**聚焦回归通过**。
+- generation/package mismatch、control auth unavailable、manual-review/restart fence 和实际 strict repair 继续 fail-closed，且不自动重启 Gateway：**安全边界回归通过**。
+- stable tool wrapper 检测与显式 fail-open fallback 必须避免同一 call 同时走稳定 callback 和 legacy progress path；本机与远端 MacBook Pro 的真实 Hermes 配置模型均验证 terminal 只出现一个带耗时条目：**自动化与双机真实飞书通过**。
+- 候选完整 pytest **`2197 passed, 4 skipped`**，`git diff --check`、wheel/sdist 与隔离 `site-packages`/CLI provenance：**通过**；exact merge SHA、public tagged install 与 Release assets：**待合并后完成**。
 
 ## V4.1.1 发布门禁
 

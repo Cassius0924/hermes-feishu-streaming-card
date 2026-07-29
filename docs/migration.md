@@ -82,6 +82,10 @@ hermes-feishu-card integrity acknowledge-review \
 
 旧版 `0644` pidfile 只有位于当前用户拥有的私有 `0700` state dir、形状与 identity 均严格匹配时才能原 inode 收紧为 `0600`；其他情况 fail-closed。
 
+## 从 V4.1.1 升级到 V4.1.2
+
+V4.1.2 修复 Gateway 正常重启期间 heartbeat 短暂 stale 被误写为持久化 restart fence 的竞态。按官方 `setup` 升级并只重启 Gateway 一次；在新 matching `runtime.hello` 到达后，readiness 应直接恢复 `runtime_ready`。如果仍显示 restart required，不要反复重启，先用 `doctor --explain` 检查 generation/package、control auth 与既有 fence。
+
 ## 升级到 V4.1.0
 
 V4.1.0 保持旧会话的卡片默认与旧配置的非自动变更边界。建议先升级包并重新运行 setup/install，再按需加入：

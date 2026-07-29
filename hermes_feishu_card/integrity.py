@@ -214,6 +214,7 @@ class RuntimeIntegrityCoordinator:
             if readiness_reason in {
                 "runtime_heartbeat_waiting",
                 "runtime_heartbeat_missing",
+                "runtime_heartbeat_stale",
             }:
                 return self._record(
                     "idle",

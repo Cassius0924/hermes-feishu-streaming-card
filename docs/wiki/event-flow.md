@@ -29,7 +29,7 @@ ACK-capable handoff 只在默认 profile 且受管的 Hermes 0.19 `gateway/run.p
 
 每个逻辑分片使用稳定 Feishu UUID，adapter 内部重试与 Hermes ledger recovery 都复用相同 UUID。`hfc-native-handoff-recovery-v2` 只按 obligation、content、plan、route、target 五项精确查询，并始终重放 ledger 中保存的原始 content；terminal POST 已在 sidecar 提交但响应丢失/损坏时，Gateway 也立即用这五项查询找回 descriptor。若两次本机响应都丢失，本轮可先使用同五项派生的 provisional UUID seed，并在 ledger 标记 delivered 后异步重查完整 descriptor；provisional seed 本身不构成 ACK 权限。可见 recovered marker 或随机兜底文本只能走普通原生发送，不能借用旧 descriptor。只有全部 required chunks 成功且 Hermes ledger 已持久化 `delivered` 后才发送签名 ACK；ACK 失败不能回滚 ledger。若进程在平台成功与 ledger transition 之间退出，一小时窗口内由 ledger recovery 与稳定 UUID 提供 bounded idempotency；窗口外 exact descriptor 失效、sidecar 记录为 uncertain，Hermes 仍可用带可见 `RECOVERED_MARKER` 的有界 native recovery 避免答案丢失。状态丢失或损坏时同样优先保留这条可见 fail-open，而不虚构 exact 成功；该普通随机 UUID 路径不属于 exact 契约，因此不承诺永久 exactly-once。任何空 body、非 object 或缺少显式 `ok:true, applied:true` 的 terminal/cron/command 响应都必须 fail-open，不能抑制 Hermes 原生答案。附件/媒体、Cron 与 direct command 仍沿用 Hermes 原生 best-effort/fail-open 契约，不纳入这条 exact Base ledger ACK 保证。
 
-Gateway runtime 以独立 `hfc-runtime-v1` 域发送 `runtime.hello` / `runtime.heartbeat`。sidecar readiness 根据本机 monotonic receipt、generation 和 strict integrity 状态计算；heartbeat 只证明 runtime 活性，不授权写源码。on-disk plan 已是 `installed` 时，等待首次 heartbeat 只保持 waiting/missing readiness，不触发 repair，也不写 restart/manual-review fence。safe repair 仍需 Git/manifest/backup/blob/anchor/fingerprint 证据，成功后只设置 `gateway.restart_required`，不自动重启 Gateway。
+Gateway runtime 以独立 `hfc-runtime-v1` 域发送 `runtime.hello` / `runtime.heartbeat`。sidecar readiness 根据本机 monotonic receipt、generation 和 strict integrity 状态计算；heartbeat 只证明 runtime 活性，不授权写源码。on-disk plan 已是 `installed` 时，等待首次 heartbeat 的 waiting/missing 与 Gateway 正常重启期间的 `runtime_heartbeat_stale` 都只保持 degraded readiness，不触发 repair，也不写 restart/manual-review fence；新 matching hello 可一次恢复 ready。safe repair 仍需 Git/manifest/backup/blob/anchor/fingerprint 证据，成功后只设置 `gateway.restart_required`，不自动重启 Gateway。
 
 restart/manual-review fence 会原子写入私有 state dir，修复前 runtime 只保存 domain-separated hash；V4.1.1 fence 还以脱敏 hash 绑定 Hermes target/integrity plan，并由跨进程锁与 snapshot CAS 保护。重启 sidecar 不会清除 fence，旧 runtime 的 hello/heartbeat 与新 runtime 的 heartbeat也不能绕过。bound non-empty hash 的 `integrity acknowledge-review` 只清除 manual-review 位，restart fence 与 hash 继续等待不同 runtime id 且 generation/package 匹配的 `runtime.hello`。V4.1.0 unbound empty-hash fence 只在精确已知形态、两次 plan/pidfile/health 检查均稳定时允许显式迁移；其他 unbound fence拒绝。随后必须人工重启 sidecar 与 Gateway，并以新 hello 恢复 ready。
 
@@ -56,6 +56,7 @@ sidecar 为 Feishu create/reply 初始卡片生成同一条逻辑投递稳定、
 3. `tool.updated`
    - 更新工具调用 timeline。
    - 尽量附带参数摘要、耗时和失败原因；长详情保持紧凑折叠。
+   - Hermes 提供稳定 `call_id` callback 时，以 agent 上实际安装的 start/complete wrapper 为准并抑制 legacy progress path；只有稳定卡片事件未被接受时，显式 fallback 才允许旧路径 fail-open，避免一次调用显示两项。
    - terminal 事件前 flush pending delta。
 4. `message.completed`
    - 渲染终态卡片。
