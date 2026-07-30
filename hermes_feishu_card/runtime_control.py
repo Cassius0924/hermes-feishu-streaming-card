@@ -242,6 +242,7 @@ class _RuntimeIntegrityFenceStore:
         expected_state_token: str,
         expected_binding: RuntimeIntegrityFenceBinding,
         allow_legacy_unbound_empty_restart: bool,
+        allow_same_target_plan_transition: bool,
     ) -> bool:
         with self.locked():
             state, raw = self._load_unlocked()
@@ -263,10 +264,22 @@ class _RuntimeIntegrityFenceStore:
                 output_binding = expected_binding
             else:
                 if state.binding != expected_binding:
-                    raise _RuntimeIntegrityFenceStateError(
-                        "runtime integrity fence binding changed"
-                    )
-                output_binding = state.binding
+                    # The caller must independently verify the current installed
+                    # plan before opting in. The store still anchors the change to
+                    # the exact old snapshot and never permits a target transition.
+                    if not (
+                        allow_same_target_plan_transition
+                        and hmac.compare_digest(
+                            state.binding.target_identity,
+                            expected_binding.target_identity,
+                        )
+                    ):
+                        raise _RuntimeIntegrityFenceStateError(
+                            "runtime integrity fence binding changed"
+                        )
+                    output_binding = expected_binding
+                else:
+                    output_binding = state.binding
             if not state.manual_review_required:
                 return False
             unresolved_restart = bool(
@@ -306,13 +319,15 @@ def acknowledge_runtime_integrity_review(
     expected_state_token: str,
     expected_binding: RuntimeIntegrityFenceBinding,
     allow_legacy_unbound_empty_restart: bool = False,
+    allow_same_target_plan_transition: bool = False,
 ) -> bool:
-    """CAS-clear a bound review fence, with one explicit V4.1.0 migration."""
+    """CAS-clear a review fence with explicit legacy/same-target permissions."""
     if (
         not isinstance(expected_state_token, str)
         or _SHA256_RE.fullmatch(expected_state_token) is None
         or not isinstance(expected_binding, RuntimeIntegrityFenceBinding)
         or not isinstance(allow_legacy_unbound_empty_restart, bool)
+        or not isinstance(allow_same_target_plan_transition, bool)
     ):
         raise RuntimeControlValidationError(
             "runtime integrity review could not be acknowledged safely"
@@ -323,6 +338,7 @@ def acknowledge_runtime_integrity_review(
             expected_state_token=expected_state_token,
             expected_binding=expected_binding,
             allow_legacy_unbound_empty_restart=allow_legacy_unbound_empty_restart,
+            allow_same_target_plan_transition=allow_same_target_plan_transition,
         )
     except (OSError, _RuntimeIntegrityFenceStateError) as exc:
         raise RuntimeControlValidationError(

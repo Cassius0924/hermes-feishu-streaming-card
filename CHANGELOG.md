@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.1.3 — 2026-07-30
+
+See also: [docs/release-notes-v4.1.3.md](docs/release-notes-v4.1.3.md)
+
+### Fixed
+- `integrity acknowledge-review` can now atomically move a bound manual-review fence to the current verified integrity plan after an official Hermes upgrade, but only when the old and current bindings identify the same Hermes target, the fence CAS snapshot is unchanged, the installed plan is verified twice, and the sidecar is confirmed stopped twice.
+- A different target identity, stale fence snapshot, running sidecar, unsafe legacy fence, or unverifiable current plan still fails closed. An independent restart fence and its pre-repair runtime hash remain intact.
+- `doctor --explain` now points integrity migration to `integrity migrate-safe` and prints the complete explicit `integrity acknowledge-review` command for other manual-review fences.
+- The answer-delta hook now selects the native `_stream_consumer.on_delta` callback when Hermes also defines a same-name streaming-TTS fallback, and relocates an older managed hook during upgrade (PR #168, thanks @dake6767).
+- Hermes' `TurnRunner` refactor no longer drops stable tool, answer, thinking, clarify, approval, or status hooks. Managed blocks use the verified `TurnContext` seam, remain idempotent and removable, and compatibility detection now fails closed when named TurnRunner callbacks cannot actually be patched (Issue #169).
+
 ## V4.1.2 — 2026-07-29
 
 See also: [docs/release-notes-v4.1.2.md](docs/release-notes-v4.1.2.md)

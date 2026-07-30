@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.1.2`。它在 V4.1.1 升级恢复安全边界之上，修复 Gateway 正常重启时 heartbeat stale 窗口误写持久化 restart fence 的竞态，并消除稳定 tool callback 与旧 progress path 对同一次调用的重复记录。V3.9.1 已于 2026-07-11 发布；V4.1.2 的自动化、真实飞书、本机/远端升级、public tag/install、Release assets 和 exact merge SHA 门禁只有完成后才会标记通过。
+当前发布候选为 `4.1.3`。它修复 Issue #158 的同 target integrity fence binding 收敛、合入 PR #168 的原生 answer-delta callback 选择，并修复 Issue #169 中 Hermes `TurnRunner` 重构导致的 tool/streaming/interaction hook 丢失与 doctor 误报。V3.9.1 已于 2026-07-11 发布；V4.1.3 的合并候选自动化、构建、CI、Issue #158 Ubuntu 真实复测、Issue #169 最新 Hermes 真实复测、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 ## 已具备
 
@@ -144,6 +144,15 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.1.3 发布门禁
+
+- 同一 target 的旧 plan binding 只有在当前 recovery/integrity plan 连续两次为 installed、sidecar 连续两次确认停止且 fence CAS 未漂移时才能迁移：**聚焦回归通过**。
+- 不同 target、状态漂移、残留 pidfile/health、unknown legacy fence 与不可验证 plan 继续 fail-closed；非空 restart/hash fence 必须保留：**安全边界回归通过**。
+- `doctor --explain` 必须分别给出完整 `integrity migrate-safe` 与 `integrity acknowledge-review` 命令，且不泄露路径、fingerprint 或私密状态证据：**诊断回归通过**。
+- PR #168 必须只选择调用 `_stream_consumer.on_delta` 的原生文本流 callback，并可迁移旧 hook：**独立审查、完整自动化与真实 Hermes 源码注入验证通过，已保留贡献者署名合并**。
+- Hermes `1a3a9de` 的 TurnRunner 源码必须恢复 14 个受管 hook block，6 个迁移 hook 各一次，status 在 ctx 绑定后执行，重复 patch 幂等、卸载逐字还原、doctor 为 `supported/full`；不可识别结构必须 `not safely patchable`：**回归、真实源码与 PR #170 CI 通过**。
+- 合并候选完整 pytest **`2207 passed, 4 skipped`**、`git diff --check`、wheel/sdist 与隔离 Python 3.12 `site-packages` 包版本/distribution/CLI entry point provenance：**本地通过**；Issue #158 Ubuntu 官方流程复测、Issue #169 最新 Hermes 真实 Feishu 复测、候选 CI、exact merge SHA、public tagged install 与 Release assets：**待完成**。
 
 ## V4.1.2 发布门禁
 

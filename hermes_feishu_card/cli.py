@@ -2398,13 +2398,23 @@ def _run_integrity_acknowledge_review(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        changed = acknowledge_runtime_integrity_review(
-            target_state,
-            expected_state_token=review.state_token,
-            expected_binding=first_binding,
-            allow_legacy_unbound_empty_restart=bool(
+        acknowledgement_options = {
+            "expected_state_token": review.state_token,
+            "expected_binding": first_binding,
+            "allow_legacy_unbound_empty_restart": bool(
                 args.yes is True and review.legacy_unbound_empty_restart
             ),
+        }
+        if (
+            args.yes is True
+            and review.binding is not None
+            and review.binding != first_binding
+            and review.binding.target_identity == first_binding.target_identity
+        ):
+            acknowledgement_options["allow_same_target_plan_transition"] = True
+        changed = acknowledge_runtime_integrity_review(
+            target_state,
+            **acknowledgement_options,
         )
     except (OSError, RuntimeError, ValueError):
         print(
