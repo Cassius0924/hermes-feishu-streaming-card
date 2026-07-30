@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.1.3`. It fixes the Issue #158 recovery-convergence gap after a real Hermes upstream update: when official install changes the current integrity-plan fingerprint, the old binding can transition atomically only for the same target, under double current-plan/process verification and fence CAS protection. Doctor also prints explicit migration/review commands. V3.9.1 was released on 2026-07-11; V4.1.3 automation, build, CI, real Ubuntu retest, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.1.3`. It fixes same-target integrity fence-binding convergence from Issue #158, includes PR #168's native answer-delta callback selection, and fixes the tool/streaming/interaction hook loss plus false doctor report after Hermes' `TurnRunner` refactor from Issue #169. V3.9.1 was released on 2026-07-11; combined-candidate automation, build, CI, the Issue #158 Ubuntu retest, the Issue #169 latest-Hermes retest, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 ## Ready
 
@@ -150,7 +150,9 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 - An old plan binding for the same target can transition only after two current recovery/integrity-plan checks report installed, two checks confirm the sidecar stopped, and the fence CAS snapshot remains unchanged: **focused regression passed**.
 - A different target, state drift, remaining pidfile/health, unknown legacy fence, or unverifiable plan remains fail-closed; a non-empty restart/hash fence is preserved: **safety-boundary regression passed**.
 - `doctor --explain` must print complete `integrity migrate-safe` and `integrity acknowledge-review` commands without exposing paths, fingerprints, or private state evidence: **diagnostic regression passed**.
-- Full pytest **`2203 passed, 4 skipped`**, `git diff --check`, wheel/sdist, and isolated `site-packages` version/entry-point provenance: **local candidate gate passed**; CI, Issue #158 real Ubuntu upstream-update retest through the official flow, exact merge SHA, public tagged install, and Release assets: **pending**.
+- PR #168 must select only the native text callback that calls `_stream_consumer.on_delta` and relocate an older hook: **independent review, full automation, and real Hermes source injection passed; merged with contributor authorship preserved**.
+- Hermes `1a3a9de` TurnRunner source must restore 14 managed hook blocks, one of each of the six moved hooks, place status after ctx binding, remain idempotent and byte-for-byte removable, and report `supported/full`; unknown shapes must be `not safely patchable`: **regression, real-source verification, and PR #170 CI passed**.
+- Combined-candidate full pytest **`2207 passed, 4 skipped`**, `git diff --check`, wheel/sdist, and isolated Python 3.12 `site-packages` package/distribution/CLI entry-point provenance: **passed locally**; Issue #158 official Ubuntu retest, Issue #169 latest-Hermes real Feishu retest, candidate CI, exact merge SHA, public tagged install, and Release assets: **pending**.
 
 ## V4.1.2 Release Gates
 

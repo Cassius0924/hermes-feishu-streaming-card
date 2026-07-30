@@ -181,7 +181,7 @@ bash install-docker.sh
 ![飞书话题内卡片连续更新与思考工具 timeline 展示](docs/assets/feishu-topic-card-showcase-v389.png)
 | 版本 | 重点 |
 |---|---|
-| [v4.1.3](docs/release-notes-v4.1.3.md) | 修复 Issue #158：官方 `acknowledge-review` 可在同一 Hermes target、已验证当前 plan、sidecar 停止且 fence CAS 未漂移时原子迁移旧 plan binding；doctor 会给出明确的 `migrate-safe` / `acknowledge-review` 命令 |
+| [v4.1.3](docs/release-notes-v4.1.3.md) | 修复 Issue #158 的同 target fence binding 收敛；合入 PR #168 的原生 delta 回调选择；修复 Issue #169 中 Hermes `TurnRunner` 重构造成的 tool/streaming/interaction hook 丢失与 doctor 误报 |
 | [v4.1.2](docs/release-notes-v4.1.2.md) | 修复 Gateway 重启时 stale heartbeat 写入二次 restart fence 的竞态，并消除稳定 tool callback 与旧 progress path 对同一次工具调用的重复记录；延续 [v4.1.1](docs/release-notes-v4.1.1.md) 的安全边界 |
 | [v4.1.0](docs/release-notes-v4.1.0.md) | 按会话精确选择原生/卡片投递；第 6 张及后续表格默认无损 compact；认证 runtime 完整性监控与 strict repair；四种显式 sidecar manager，`auto` 不提权 |
 | [v4.0.21](docs/release-notes-v4.0.21.md) | Issue #155：仅显式 `answer -> tool` 边界归档答案，避免 post-tool 最终答案被移入 timeline；Issue #147 真实飞书验收已观测到 completion card + native image、无匹配原生重复或 uncertain-delivery warning，UI 与配置不变 |

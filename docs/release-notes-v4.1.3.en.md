@@ -2,7 +2,7 @@
 
 [English](release-notes-v4.1.3.en.md) | [中文](release-notes-v4.1.3.md)
 
-V4.1.3 is a narrow upgrade-recovery hotfix for Issue #158. A real Hermes upstream update first removes the managed hook. After official `install` reinjects it, the current integrity-plan fingerprint changes while the manual-review fence remains bound to the pre-upgrade plan. V4.1.2 correctly rejected that binding mismatch but provided no supported transition from the old plan to the current plan, forcing the reporter to edit the fence manually.
+V4.1.3 combines three upgrade-compatibility fixes: integrity fence-binding convergence from Issue #158, same-name answer-delta callback selection contributed by @dake6767 in PR #168, and the tool/streaming/interaction hook loss after Hermes' `TurnRunner` refactor reported in Issue #169. The goal is to keep official upgrade, diagnosis, and uninstall flows verifiable and reversible without weakening fail-closed safety.
 
 ## Fix
 
@@ -10,6 +10,9 @@ V4.1.3 is a narrow upgrade-recovery hotfix for Issue #158. A real Hermes upstrea
 - A different target identity, state drift, a running sidecar, an unknown legacy fence, or a dirty/unverifiable plan still fails closed. This is not a force-clear mechanism.
 - When an independent restart fence has a non-empty `pre_repair_runtime_hash`, acknowledgement clears manual review and updates the plan binding while preserving restart/hash until a different runtime id sends a generation/package-matching `runtime.hello`.
 - `doctor --explain` prints the complete `integrity migrate-safe` command for `integrity_migration_required`. Other manual-review cases first require installed-evidence review and then print a complete `integrity acknowledge-review` command with explicit config, Hermes, and state paths.
+- When Hermes defines same-name `_stream_delta_cb` functions for native text streaming and a streaming-TTS fallback, the answer-delta hook selects only the callback that calls `_stream_consumer.on_delta`; upgrades relocate an older misplaced managed hook.
+- Hermes commit `1a3a9de`'s `TurnRunner` seam is supported: stable tool, answer, thinking, clarify, approval, and status hooks use verified `TurnContext` fields, and the status hook runs only after `ctx = self._ctx` is bound.
+- Doctor now derives callback capabilities from actual patcher output. A named TurnRunner callback whose structure is not safely patchable produces an explicit `not safely patchable` refusal instead of a false partial/supported result; legacy Hermes and corrupt-marker recovery remain available.
 
 ## Upgrade and Recovery
 
@@ -27,5 +30,6 @@ If a real Hermes update removes the hook, rerun official `install` as directed b
 
 - Automated coverage includes successful same-target plan transition, default refusal, different-target refusal, double current-plan/state/process checks, CAS protection, and restart/hash preservation.
 - Diagnostics cover complete migration and manual-review commands without exposing real paths, fingerprints, or private state evidence.
-- Before release, the Issue #158 reporter still needs to retest the candidate commit on Ubuntu 24.04 after a real Hermes upstream update using only the official flow; manual fence edits do not count as a pass.
+- The source regression against Hermes `1a3a9de630a809cf1b177ec0ddf5b7ff66291e65` must produce 14 managed hook blocks, one of each of the six moved TurnRunner hooks, idempotent repeat patching, byte-for-byte `remove_patch`, and `supported/full` doctor detection.
+- Before release, the Issue #158 reporter still needs to retest the candidate on Ubuntu 24.04 after a real Hermes upstream update through the official flow. The Issue #169 reporter needs to use the same candidate on latest Hermes and confirm full doctor compatibility, restored tool/streaming output, and no duplicate native gray text. Manual edits to Hermes `gateway/run.py` or the fence do not count.
 - Exact merge SHA, public tag/install, and Release assets remain release-stage gates.

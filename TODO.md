@@ -6,13 +6,16 @@
 
 详细路线见 [docs/superpowers/specs/2026-06-30-v3-8-design.md](docs/superpowers/specs/2026-06-30-v3-8-design.md) 和 [docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md](docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md)。
 
-### V4.1.3：Issue #158 升级 fence binding 收敛（发布候选）
+### V4.1.3：升级恢复与 TurnRunner 兼容性热修（发布候选）
 
 - [x] 同一 Hermes target 的旧/新 plan binding 只在双重 current-plan、双重 sidecar-stopped 与 snapshot CAS 校验后原子迁移。
 - [x] 不同 target、状态漂移、残留进程和不可验证 plan 继续 fail-closed；独立 restart/hash fence 保留。
 - [x] doctor 对 integrity migration 与 manual review 输出完整官方命令。
-- [x] 本地完整自动化 `2203 passed, 4 skipped`、`git diff --check`、wheel/sdist 与隔离 `site-packages` provenance。
-- [ ] CI、Ubuntu 真实 upstream update 官方流程复测、exact merge、public tag/install 与 Release assets。
+- [x] PR #168 在多个同名 `_stream_delta_cb` 中选择原生 `_stream_consumer.on_delta`，并可迁移旧的受管 hook。
+- [x] Issue #169 在 Hermes `1a3a9de` 的 `TurnRunner` seam 中恢复 stable tool、answer、thinking、clarify、approval 与 status hook；doctor 根据真实可注入性 fail-closed。
+- [x] 合并候选完整自动化 `2207 passed, 4 skipped` 与 `git diff --check`。
+- [x] wheel/sdist 构建与隔离 Python 3.12 `site-packages` 包版本、distribution、CLI entry point provenance。
+- [ ] CI、Issue #158 Ubuntu 真实 upstream update 与 Issue #169 最新 Hermes 官方流程复测、exact merge、public tag/install 与 Release assets。
 
 ### V4.1.2：Gateway 重启竞态热修（已发布）
 

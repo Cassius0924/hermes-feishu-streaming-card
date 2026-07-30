@@ -86,6 +86,8 @@ hermes-feishu-card integrity acknowledge-review \
 
 V4.1.3 修复 Issue #158 中真实 Hermes upstream 更新后的恢复收敛问题：官方 `install` 重新注入 hook 后，当前 integrity plan fingerprint 会变化，而旧 manual-review fence 仍绑定升级前 plan。`integrity acknowledge-review` 现在可在双重验证当前 installed plan、双重确认 sidecar 已停止、旧新 binding 指向同一 Hermes target 且 fence CAS 未变化时，原子更新 plan binding 并解除 manual-review。不同 target、残留 pidfile/health、dirty 或不可验证 plan、未知 legacy fence 仍拒绝；已有非空 restart hash 继续保留，直到新 matching `runtime.hello` 自行解除 restart fence。
 
+该版本也合入 PR #168 的同名 answer-delta callback 选择，并修复 Issue #169：Hermes `1a3a9de` 将 callbacks 移入 `TurnRunner` 后，官方 patcher 会通过 `TurnContext` 恢复 stable tool、answer、thinking、clarify、approval 与 status hook。doctor 以实际 patchability 为准；无法安全识别的新 TurnRunner 结构会停止安装并报告 `not safely patchable`，不能靠手工修改 `gateway/run.py` 绕过。
+
 不要手工编辑 `runtime-integrity-fence.json` 或调用内部 Python 函数。若 `doctor --explain` 报告 `integrity_migration_required`，按输出运行 `integrity migrate-safe`；其他已验证 manual review 先停止 sidecar，再运行 doctor 给出的完整 `integrity acknowledge-review --config CONFIG --hermes-dir PATH --state-dir STATE --yes`，最后人工重启 sidecar 与 Hermes Gateway。
 
 ## 从 V4.1.1 升级到 V4.1.2

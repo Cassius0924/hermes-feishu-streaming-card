@@ -2470,7 +2470,7 @@ def test_v412_release_docs_define_gateway_restart_race_contract():
     assert re.search(r"FEISHU_APP_SECRET=(?!xxx\b)[^\s]+", public_docs) is None
 
 
-def test_v413_release_docs_define_verified_fence_binding_transition():
+def test_v413_release_docs_define_combined_upgrade_compatibility_candidate():
     changelog = read_doc("CHANGELOG.md")
     readme = read_doc("README.md")
     readme_en = read_doc("README.en.md")
@@ -2491,7 +2491,7 @@ def test_v413_release_docs_define_verified_fence_binding_transition():
     assert "docs/release-notes-v4.1.3.en.md" in readme_en
     assert "HFC_VERSION=v4.1.3" in install_doc
     assert "HFC_VERSION: v4.1.3" in workflow
-    assert "### V4.1.3：Issue #158 升级 fence binding 收敛（发布候选）" in todo
+    assert "### V4.1.3：升级恢复与 TurnRunner 兼容性热修（发布候选）" in todo
     assert "当前发布候选为 `4.1.3`" in readiness
     assert "Current release candidate: `4.1.3`" in readiness_en
     assert "## V4.1.3 发布门禁" in readiness
@@ -2507,6 +2507,14 @@ def test_v413_release_docs_define_verified_fence_binding_transition():
     assert "Upgrading From V4.1.2 To V4.1.3" in migration_en
     assert "V4.1.3 升级恢复" in acceptance
     assert "不得手工修改 fence" in acceptance
+
+    combined_candidate_docs = "\n".join(
+        (changelog, readme, readme_en, notes, notes_en, migration, migration_en, readiness, readiness_en, acceptance, todo)
+    )
+    for marker in ("Issue #158", "PR #168", "Issue #169", "TurnRunner"):
+        assert marker in combined_candidate_docs
+    for text in (notes, notes_en, migration, migration_en, readiness, readiness_en, acceptance):
+        assert "1a3a9de" in text
 
     public_docs = "\n".join(
         (notes, notes_en, migration, migration_en, readiness, readiness_en, acceptance)
