@@ -1,8 +1,14 @@
 import ast
+from pathlib import Path
 
 import pytest
 
 from hermes_feishu_card.install import patcher
+
+
+TURN_RUNNER_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hermes_turn_runner.py"
+)
 
 
 def test_apply_patch_accepts_explicit_legacy_strategy():
@@ -887,6 +893,37 @@ def test_answer_delta_hook_targets_native_text_stream_when_tts_fallback_exists()
     )
     assert upgraded.count(patcher.ANSWER_DELTA_PATCH_BEGIN) == 1
     assert patcher.remove_patch(upgraded) == content
+
+
+def test_apply_patch_restores_hooks_after_turn_runner_refactor():
+    content = TURN_RUNNER_FIXTURE.read_text(encoding="utf-8")
+
+    patched = patcher.apply_patch(content, strategy="gateway_run_013_plus")
+
+    for marker in (
+        patcher.STABLE_TOOL_PATCH_BEGIN,
+        patcher.ANSWER_DELTA_PATCH_BEGIN,
+        patcher.THINKING_DELTA_PATCH_BEGIN,
+        patcher.CLARIFY_PATCH_BEGIN,
+        patcher.APPROVAL_PATCH_BEGIN,
+        patcher.STATUS_PATCH_BEGIN,
+    ):
+        assert marker in patched
+    assert 'event_name="tool.updated"' in patched
+    assert 'event_name="answer.delta"' in patched
+    assert 'event_name="thinking.delta"' in patched
+    assert "_hfc_turn_ctx = ctx" in patched
+    assert '"source": _hfc_turn_ctx.source' in patched
+    assert '"message_id": _hfc_turn_ctx.event_message_id' in patched
+    assert '"_hfc_loop": _hfc_turn_ctx._loop_for_step' in patched
+    assert '"chat_id": _hfc_turn_ctx._status_chat_id' in patched
+    status_method = patched.index("def _status_callback_sync")
+    status_context = patched.index("ctx = self._ctx", status_method)
+    status_hook = patched.index(patcher.STATUS_PATCH_BEGIN, status_method)
+    assert status_context < status_hook
+    ast.parse(patched)
+    assert patcher.apply_patch(patched, strategy="gateway_run_013_plus") == patched
+    assert patcher.remove_patch(patched) == content
 
 
 def test_apply_patch_uses_stable_tool_call_ids_when_gateway_exposes_callbacks():

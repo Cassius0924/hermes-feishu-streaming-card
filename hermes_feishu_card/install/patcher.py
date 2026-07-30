@@ -98,6 +98,7 @@ def apply_patch(content: str, strategy: str = "legacy_gateway_run") -> str:
         ),
         required_callback_args=("text",),
         required_callback_calls=(("_stream_consumer", "on_delta"),),
+        allow_turn_context=True,
     )
     content = _apply_callback_patch(
         content,
@@ -112,6 +113,7 @@ def apply_patch(content: str, strategy: str = "legacy_gateway_run") -> str:
             "_run_still_current",
         ),
         required_callback_args=("text", "already_streamed"),
+        allow_turn_context=True,
     )
     content = _apply_callback_patch(
         content,
@@ -127,6 +129,7 @@ def apply_patch(content: str, strategy: str = "legacy_gateway_run") -> str:
             "_run_still_current",
         ),
         required_callback_args=("question", "choices"),
+        allow_turn_context=True,
     )
     content = _apply_callback_patch(
         content,
@@ -142,6 +145,7 @@ def apply_patch(content: str, strategy: str = "legacy_gateway_run") -> str:
             "_run_still_current",
         ),
         required_callback_args=("approval_data",),
+        allow_turn_context=True,
     )
     if strategy == "gateway_run_013_plus":
         content = _apply_callback_patch(
@@ -158,6 +162,7 @@ def apply_patch(content: str, strategy: str = "legacy_gateway_run") -> str:
                 "_run_still_current",
             ),
             required_callback_args=("event_type", "message"),
+            allow_turn_context=True,
         )
     return content
 
@@ -718,6 +723,7 @@ def _apply_callback_patch(
     required_outer_names=(),
     required_callback_args=(),
     required_callback_calls=(),
+    allow_turn_context=False,
 ) -> str:
     owned_block = _find_simple_marker_block(
         content,
@@ -743,10 +749,16 @@ def _apply_callback_patch(
                 required_outer_names=required_outer_names,
                 required_callback_args=required_callback_args,
                 required_callback_calls=required_callback_calls,
+                allow_turn_context=allow_turn_context,
             )
         indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
         newline = _line_ending(lines[begin_index]) or _detect_newline(content)
-        expected = renderer(indent, newline)
+        expected = (
+            _render_turn_context_hook_block(renderer, indent, newline)
+            if allow_turn_context
+            and any("_hfc_turn_ctx = ctx" in line for line in lines[begin_index : end_index + 1])
+            else renderer(indent, newline)
+        )
         if lines[begin_index : end_index + 1] == expected:
             return content
         return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
@@ -761,12 +773,26 @@ def _apply_callback_patch(
         required_callback_args=required_callback_args,
         required_callback_calls=required_callback_calls,
     )
+    use_turn_context = False
+    if callback_body is None and allow_turn_context:
+        callback_body = _find_turn_runner_callback_body_location(
+            tree,
+            lines,
+            callback_name,
+            required_callback_args=required_callback_args,
+            required_callback_calls=required_callback_calls,
+        )
+        use_turn_context = callback_body is not None
     if callback_body is None:
         return content
 
     newline = _detect_newline(content)
     insert_at, body_indent = callback_body
-    hook = renderer(body_indent, newline)
+    hook = (
+        _render_turn_context_hook_block(renderer, body_indent, newline)
+        if use_turn_context
+        else renderer(body_indent, newline)
+    )
     return "".join(lines[:insert_at] + hook + lines[insert_at:])
 
 
@@ -782,7 +808,13 @@ def _apply_stable_tool_lifecycle_patch(content: str) -> str:
         begin_index, end_index = owned_block
         indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
         newline = _line_ending(lines[begin_index]) or _detect_newline(content)
-        expected = _render_stable_tool_lifecycle_hook_block(indent, newline)
+        expected = (
+            _render_turn_context_hook_block(
+                _render_stable_tool_lifecycle_hook_block, indent, newline
+            )
+            if any("_hfc_turn_ctx = ctx" in line for line in lines[begin_index : end_index + 1])
+            else _render_stable_tool_lifecycle_hook_block(indent, newline)
+        )
         if lines[begin_index : end_index + 1] == expected:
             return content
         return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
@@ -790,11 +822,21 @@ def _apply_stable_tool_lifecycle_patch(content: str) -> str:
     tree = _parse_content(content)
     lines = content.splitlines(keepends=True)
     location = _find_stable_tool_lifecycle_location(tree, lines)
+    use_turn_context = False
+    if location is None:
+        location = _find_turn_runner_stable_tool_lifecycle_location(tree, lines)
+        use_turn_context = location is not None
     if location is None:
         return content
     insert_at, indent = location
     newline = _detect_newline(content)
-    hook = _render_stable_tool_lifecycle_hook_block(indent, newline)
+    hook = (
+        _render_turn_context_hook_block(
+            _render_stable_tool_lifecycle_hook_block, indent, newline
+        )
+        if use_turn_context
+        else _render_stable_tool_lifecycle_hook_block(indent, newline)
+    )
     return "".join(lines[:insert_at] + hook + lines[insert_at:])
 
 
@@ -1056,6 +1098,58 @@ def _find_callback_body_location(
     return _body_location(candidates[0], lines)
 
 
+def _find_turn_runner_callback_body_location(
+    tree,
+    lines,
+    callback_name: str,
+    *,
+    required_callback_args=(),
+    required_callback_calls=(),
+):
+    turn_runner = _find_turn_runner_node(tree)
+    if turn_runner is None:
+        return None
+
+    if callback_name == "_status_callback_sync":
+        candidates = [
+            node
+            for node in turn_runner.body
+            if isinstance(node, ast.FunctionDef) and node.name == callback_name
+        ]
+    else:
+        run_sync = _find_direct_class_function_node(turn_runner, "run_sync")
+        if run_sync is None or not _binds_turn_context(run_sync):
+            return None
+        candidates = [
+            node
+            for node in ast.walk(run_sync)
+            if isinstance(node, ast.FunctionDef) and node.name == callback_name
+        ]
+
+    candidates = [
+        node
+        for node in candidates
+        if set(required_callback_args).issubset(_function_argument_names(node))
+    ]
+    if callback_name == "_status_callback_sync":
+        candidates = [node for node in candidates if _binds_turn_context(node)]
+    if required_callback_calls:
+        preferred = [
+            node
+            for node in candidates
+            if _has_required_callback_calls(node, required_callback_calls)
+        ]
+        if preferred:
+            candidates = preferred
+        elif len(candidates) != 1:
+            return None
+    if not candidates:
+        return None
+    if callback_name == "_status_callback_sync":
+        return _turn_context_binding_location(candidates[0], lines)
+    return _body_location(candidates[0], lines)
+
+
 def _find_stable_tool_lifecycle_location(tree, lines):
     run_agent = _find_run_agent_node(tree)
     if run_agent is None:
@@ -1079,6 +1173,82 @@ def _find_stable_tool_lifecycle_location(tree, lines):
         end_lineno = getattr(node, "end_lineno", None) or node.lineno
         return end_lineno, _line_indent(lines, node.lineno - 1)
     return None
+
+
+def _find_turn_runner_stable_tool_lifecycle_location(tree, lines):
+    turn_runner = _find_turn_runner_node(tree)
+    if turn_runner is None:
+        return None
+    run_sync = _find_direct_class_function_node(turn_runner, "run_sync")
+    if run_sync is None or not _binds_turn_context(run_sync):
+        return None
+    if "agent" not in _function_scope_names(run_sync):
+        return None
+    for node in ast.walk(run_sync):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(
+            _is_agent_callback_target(target, "tool_start_callback")
+            for target in targets
+        ):
+            continue
+        end_lineno = getattr(node, "end_lineno", None) or node.lineno
+        return end_lineno, _line_indent(lines, node.lineno - 1)
+    return None
+
+
+def _find_turn_runner_node(tree):
+    return next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "TurnRunner"
+        ),
+        None,
+    )
+
+
+def _find_direct_class_function_node(class_node, name: str):
+    return next(
+        (
+            node
+            for node in class_node.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ),
+        None,
+    )
+
+
+def _binds_turn_context(node) -> bool:
+    return _find_turn_context_binding(node) is not None
+
+
+def _find_turn_context_binding(node):
+    for statement in node.body:
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            continue
+        target = statement.targets[0]
+        value = statement.value
+        if (
+            isinstance(target, ast.Name)
+            and target.id == "ctx"
+            and isinstance(value, ast.Attribute)
+            and value.attr == "_ctx"
+            and isinstance(value.value, ast.Name)
+            and value.value.id == "self"
+        ):
+            return statement
+    return None
+
+
+def _turn_context_binding_location(node, lines):
+    binding = _find_turn_context_binding(node)
+    if binding is None:
+        return None
+    end_lineno = getattr(binding, "end_lineno", None) or binding.lineno
+    return end_lineno, _line_indent(lines, binding.lineno - 1)
 
 
 def _is_agent_callback_target(node, attribute: str) -> bool:
@@ -2047,6 +2217,17 @@ def _find_simple_owned_patch(
     expected_blocks = [expected]
     if renderer is _render_command_card_adapter_hook_block:
         expected_blocks.append(_render_legacy_command_card_adapter_hook_block(indent, newline))
+    if renderer in (
+        _render_stable_tool_lifecycle_hook_block,
+        _render_answer_delta_hook_block,
+        _render_thinking_delta_hook_block,
+        _render_clarify_hook_block,
+        _render_approval_hook_block,
+        _render_status_hook_block,
+    ):
+        expected_blocks.append(
+            _render_turn_context_hook_block(renderer, indent, newline)
+        )
     actual = lines[begin_index : end_index + 1]
     if actual not in expected_blocks:
         raise ValueError(f"corrupt {error_label}")
@@ -2659,6 +2840,40 @@ def _render_previous_async_complete_hook_block_without_platform_guard(
         *_render_hook_exception_handler(indent, newline),
         f"{indent}{COMPLETE_PATCH_END}{newline}",
     ]
+
+
+def _render_turn_context_hook_block(renderer, indent: str, newline: str):
+    """Adapt a legacy closure hook to Hermes' ``TurnRunner`` context seam."""
+    block = renderer(indent, newline)
+    replacements = (
+        ("_run_still_current()", "_hfc_turn_ctx._run_still_current()"),
+        ('"source": source,', '"source": _hfc_turn_ctx.source,'),
+        (
+            '"message_id": event_message_id,',
+            '"message_id": _hfc_turn_ctx.event_message_id,',
+        ),
+        ('"_hfc_loop": _loop_for_step,', '"_hfc_loop": _hfc_turn_ctx._loop_for_step,'),
+        (
+            '"_hfc_loop": locals().get("_loop_for_step"),',
+            '"_hfc_loop": _hfc_turn_ctx._loop_for_step,',
+        ),
+        ('"chat_id": _status_chat_id,', '"chat_id": _hfc_turn_ctx._status_chat_id,'),
+        (
+            '"conversation_id": session_key or _status_chat_id,',
+            '"conversation_id": _hfc_turn_ctx.session_key or _hfc_turn_ctx._status_chat_id,',
+        ),
+        (
+            '"conversation_id": _approval_session_key or _status_chat_id,',
+            '"conversation_id": _approval_session_key or _hfc_turn_ctx._status_chat_id,',
+        ),
+    )
+    adapted = []
+    for line in block:
+        for old, new in replacements:
+            line = line.replace(old, new)
+        adapted.append(line)
+    adapted.insert(1, f"{indent}_hfc_turn_ctx = ctx{newline}")
+    return adapted
 
 
 def _render_tool_hook_block(indent: str, newline: str):

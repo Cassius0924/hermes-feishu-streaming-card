@@ -16,6 +16,9 @@ FIXTURE_ROOT = (
 EXACT_BASE_FIXTURE = (
     Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base.py"
 )
+TURN_RUNNER_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hermes_turn_runner.py"
+)
 
 
 def test_detect_hermes_supports_v2026_4_23_fixture():
@@ -119,6 +122,37 @@ class GatewayRunner:
 
     assert detection.supported is True
     assert detection.capabilities["status_callback"] is True
+
+
+def test_detect_turn_runner_callbacks_from_actual_patchability(tmp_path):
+    root = tmp_path / "hermes"
+    _write_hermes_root(
+        root,
+        version="v0.18.2",
+        run_py=TURN_RUNNER_FIXTURE.read_text(encoding="utf-8"),
+    )
+
+    detection = detect_hermes(root)
+
+    assert detection.supported is True
+    assert detection.compatibility == "full"
+    assert detection.capabilities["tool_callback"] is True
+    assert detection.capabilities["answer_delta_callback"] is True
+    assert detection.capabilities["thinking_delta_callback"] is True
+    assert detection.capabilities["status_callback"] is True
+
+
+def test_detect_rejects_named_turn_runner_callbacks_that_are_not_patchable(tmp_path):
+    root = tmp_path / "hermes"
+    unpatchable = TURN_RUNNER_FIXTURE.read_text(encoding="utf-8").replace(
+        "        ctx = self._ctx\n", "        context = self._ctx\n"
+    )
+    _write_hermes_root(root, version="v0.18.2", run_py=unpatchable)
+
+    detection = detect_hermes(root)
+
+    assert detection.supported is False
+    assert "not safely patchable" in detection.reason
 
 
 @pytest.mark.parametrize(
