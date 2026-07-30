@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 
+from . import patcher
 from .patcher import apply_base_patch, remove_base_patch
 
 
@@ -173,6 +174,15 @@ def detect_hermes(root: str | Path) -> HermesDetection:
     else:
         compatibility = "unsupported"
     if not core_ok:
+        return result(
+            False,
+            capability_error,
+            compatibility=compatibility,
+            capabilities=capabilities,
+            base_required=base_required,
+        )
+
+    if capability_error != "supported":
         return result(
             False,
             capability_error,
@@ -371,14 +381,14 @@ def _detect_capabilities(
     else:
         completion_return = _find_completion_return(handler)
 
+    callback_capabilities, callback_error = _detect_callback_patchability(
+        contents, module
+    )
     capabilities = {
         "message_handler": handler is not None,
         "completion_return": completion_return is not None,
         "run_agent": _find_run_agent(module) is not None,
-        "tool_callback": _find_callback(module, "progress_callback") is not None,
-        "answer_delta_callback": _find_callback(module, "_stream_delta_cb") is not None,
-        "thinking_delta_callback": _find_callback(module, "_interim_assistant_cb") is not None,
-        "status_callback": _has_patchable_status_callback(module),
+        **callback_capabilities,
         "cron_delivery": _has_cron_delivery(contents, cron_contents),
         "reply_context": "reply_to_message_id" in contents
         or "_reply_anchor_for_event" in contents,
@@ -390,8 +400,73 @@ def _detect_capabilities(
         return capabilities, f"gateway/run.py missing async anchor function: {HANDLER_NAME}"
     if not capabilities["completion_return"]:
         return capabilities, 'gateway/run.py missing handler anchor: hooks.emit("agent:end", ...)'
+    if callback_error:
+        return capabilities, callback_error
 
     return capabilities, "supported"
+
+
+def _detect_callback_patchability(
+    contents: str, module: ast.Module
+) -> tuple[dict[str, bool], str]:
+    try:
+        patched = patcher.apply_patch(contents, strategy="gateway_run_013_plus")
+    except ValueError:
+        # Detection also runs while the recovery planner is inspecting an
+        # already-installed file with damaged markers. Preserve the legacy
+        # structural capability report here so recovery, not compatibility
+        # detection, remains responsible for classifying that state.
+        return {
+            "tool_callback": _find_callback(module, "progress_callback") is not None,
+            "answer_delta_callback": _find_callback(module, "_stream_delta_cb")
+            is not None,
+            "thinking_delta_callback": _find_callback(
+                module, "_interim_assistant_cb"
+            )
+            is not None,
+            "status_callback": _has_patchable_status_callback(module),
+        }, ""
+
+    capabilities = {
+        "tool_callback": (
+            patcher.STABLE_TOOL_PATCH_BEGIN in patched
+            or patcher.TOOL_PATCH_BEGIN in patched
+        ),
+        "answer_delta_callback": patcher.ANSWER_DELTA_PATCH_BEGIN in patched,
+        "thinking_delta_callback": patcher.THINKING_DELTA_PATCH_BEGIN in patched,
+        "status_callback": patcher.STATUS_PATCH_BEGIN in patched,
+    }
+
+    turn_runner = _find_turn_runner(module)
+    if turn_runner is None:
+        return capabilities, ""
+
+    required_markers = []
+    if _turn_runner_assigns_agent_callback(turn_runner, "tool_start_callback"):
+        required_markers.append(
+            ("tool lifecycle", patcher.STABLE_TOOL_PATCH_BEGIN)
+        )
+    for callback_name, label, marker in (
+        ("_stream_delta_cb", "answer delta", patcher.ANSWER_DELTA_PATCH_BEGIN),
+        (
+            "_interim_assistant_cb",
+            "thinking delta",
+            patcher.THINKING_DELTA_PATCH_BEGIN,
+        ),
+        ("_clarify_callback_sync", "clarify", patcher.CLARIFY_PATCH_BEGIN),
+        ("_approval_notify_sync", "approval", patcher.APPROVAL_PATCH_BEGIN),
+        ("_status_callback_sync", "status", patcher.STATUS_PATCH_BEGIN),
+    ):
+        if _turn_runner_has_callback(turn_runner, callback_name):
+            required_markers.append((label, marker))
+
+    missing = [label for label, marker in required_markers if marker not in patched]
+    if missing:
+        return capabilities, (
+            "gateway/run.py TurnRunner hooks are not safely patchable: "
+            + ", ".join(missing)
+        )
+    return capabilities, ""
 
 
 def _has_cron_delivery(contents: str, cron_contents: str) -> bool:
@@ -476,6 +551,43 @@ def _find_callback(
         if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == name:
             return node
     return None
+
+
+def _find_turn_runner(module: ast.Module) -> ast.ClassDef | None:
+    return next(
+        (
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == "TurnRunner"
+        ),
+        None,
+    )
+
+
+def _turn_runner_has_callback(turn_runner: ast.ClassDef, name: str) -> bool:
+    return any(
+        isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name == name
+        for node in ast.walk(turn_runner)
+    )
+
+
+def _turn_runner_assigns_agent_callback(
+    turn_runner: ast.ClassDef, attribute: str
+) -> bool:
+    for node in ast.walk(turn_runner):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if any(
+            isinstance(target, ast.Attribute)
+            and target.attr == attribute
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "agent"
+            for target in targets
+        ):
+            return True
+    return False
 
 
 def _has_patchable_status_callback(module: ast.Module) -> bool:

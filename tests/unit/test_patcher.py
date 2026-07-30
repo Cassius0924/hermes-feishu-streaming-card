@@ -913,6 +913,14 @@ def test_apply_patch_restores_hooks_after_turn_runner_refactor():
     assert 'event_name="answer.delta"' in patched
     assert 'event_name="thinking.delta"' in patched
     assert "_hfc_turn_ctx = ctx" in patched
+    assert '"source": _hfc_turn_ctx.source' in patched
+    assert '"message_id": _hfc_turn_ctx.event_message_id' in patched
+    assert '"_hfc_loop": _hfc_turn_ctx._loop_for_step' in patched
+    assert '"chat_id": _hfc_turn_ctx._status_chat_id' in patched
+    status_method = patched.index("def _status_callback_sync")
+    status_context = patched.index("ctx = self._ctx", status_method)
+    status_hook = patched.index(patcher.STATUS_PATCH_BEGIN, status_method)
+    assert status_context < status_hook
     ast.parse(patched)
     assert patcher.apply_patch(patched, strategy="gateway_run_013_plus") == patched
     assert patcher.remove_patch(patched) == content
