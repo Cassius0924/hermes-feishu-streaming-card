@@ -2,18 +2,25 @@
 
 当前 active runtime 是 `hermes_feishu_card/`。legacy adapter、dual mode、旧 `sidecar/`、旧 `patch/` 和 `installer_v2.py` 不是 active runtime，仅保留作历史参考。
 
-## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0
+## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1
 
 详细路线见 [docs/superpowers/specs/2026-06-30-v3-8-design.md](docs/superpowers/specs/2026-06-30-v3-8-design.md) 和 [docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md](docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md)。
 
-### V4.2.0：飞书私聊安全升级（发布候选）
+### V4.2.1：Gateway 首个 heartbeat 任务计数热修（发布候选）
+
+- [x] startup adapter 在 runtime control 启动前登记 live runner，首个 heartbeat 直接调用同一次 `_active_work_count()` 聚合采样。
+- [x] Gateway 重启后的第一条私聊裸 `/update` 不再依赖其他消息预热；缺失计数仍 fail-closed。
+- [x] Python 3.9 / 3.12 完整 pytest、构建与隔离安装。
+- [ ] PR CI、exact merge、public tag/install 与 Release assets。
+
+### V4.2.0：飞书私聊安全升级（已发布）
 
 - [x] 私聊裸 `/update` 使用 120 秒、发起者/会话/profile/目标证据绑定的确认卡；群聊、非飞书、别名和带参数命令保持 Hermes 原路径。
 - [x] 独立维护 runtime 在 Hermes checkout 外运行官方 `hermes update --yes`，从私有缓存重装同一 HFC wheel，并恢复 hook、sidecar 与 Gateway。
 - [x] durable job store、journal、锁、重入恢复、卡片阶段更新和 `maintenance provision/status/run/resume` 本机恢复入口均有回归。
 - [x] 非 HFC tracked 改动、Git 未完成操作、artifact/版本漂移或最终验证失败均停止；不使用 force flag、自定义 reset/checkout/stash/rollback。
 - [x] 完整 pytest、`git diff --check`、wheel/sdist 与隔离 `site-packages` provenance。
-- [ ] PR CI、真实飞书私聊卡片验收、exact merge SHA、public tag/install 与 Release assets。
+- [x] PR CI、exact merge SHA、public tag/install 与 Release assets；真实飞书确认卡流程保留为用户侧验收。
 
 ### V4.1.4：Windows 旧版 manifest 迁移热修（已发布）
 

@@ -2036,6 +2036,29 @@ def test_maintenance_admission_fence_blocks_new_gateway_work(
     ) is False
 
 
+def test_command_adapter_install_registers_gateway_runner_before_heartbeat(
+    monkeypatch,
+):
+    snapshots = []
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "_ensure_runtime_control_started",
+        lambda: snapshots.append(hook_runtime.gateway_active_work_snapshot()) or True,
+    )
+
+    class Runner:
+        adapters = {}
+
+        def _active_work_count(self):
+            return 0
+
+    runner = Runner()
+
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner) is False
+    assert snapshots == [(0, True)]
+
+
 def test_gateway_drain_home_requires_runtime_home_to_match_checkout(
     tmp_path,
     monkeypatch,

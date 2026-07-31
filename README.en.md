@@ -141,7 +141,7 @@ For an existing Hermes container:
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.0
+export HFC_VERSION=v4.2.1
 bash install-docker.sh
 ```
 
@@ -182,6 +182,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ![Feishu topic reply card continuity and reasoning/tool timeline showcase](docs/assets/feishu-topic-card-showcase-v389.png)
 | Version | Highlights |
 |---|---|
+| [v4.2.1](docs/release-notes-v4.2.1.en.md) | Registers the live Gateway runner before the first runtime heartbeat, so the first bare private-chat `/update` after restart has complete active-work evidence; missing evidence remains fail-closed |
 | [v4.2.0](docs/release-notes-v4.2.0.en.md) | A bare `/update` in a Feishu private chat uses a 120-second confirmation and an independent maintenance process to run the official Hermes updater, then restores the same HFC version, hooks, sidecar, and Gateway; group and parameterized commands keep native Hermes behavior |
 | [v4.1.4](docs/release-notes-v4.1.4.en.md) | Fixes Issue #171: on Windows, official install/setup can rebuild a missing manifest for a legacy owned hook only after byte-for-byte gateway, cron, and exact Base evidence checks; edits outside owned blocks still fail closed |
 | [v4.1.3](docs/release-notes-v4.1.3.en.md) | Fixes the same-target fence-binding convergence gap from Issue #158, includes PR #168's native delta-callback selection, and restores tool/streaming/interaction hooks plus truthful doctor detection after Hermes' `TurnRunner` refactor from Issue #169 |

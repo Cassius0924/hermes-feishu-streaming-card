@@ -7028,6 +7028,7 @@ def _hfc_install_policy_adapter_method(
 
 def install_feishu_command_card_adapter_methods(runner: Any, event: Any = None) -> bool:
     try:
+        _remember_gateway_runner(runner)
         _ensure_runtime_control_started()
         _install_delivery_ledger_mark_delivered_wrapper()
         adapters = getattr(runner, "adapters", None)

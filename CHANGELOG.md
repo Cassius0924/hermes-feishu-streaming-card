@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.2.1 — 2026-07-31
+
+See also: [docs/release-notes-v4.2.1.md](docs/release-notes-v4.2.1.md)
+
+### Fixed
+- Gateway startup now registers the live runner before runtime control starts, so the first authenticated heartbeat can prove the complete `_active_work_count()` aggregate immediately.
+- The first bare private-chat `/update` after a Gateway restart no longer needs an unrelated warm-up message before its maintenance preflight can accept complete active-work evidence.
+
+### Safety
+- Complete active-work evidence still comes from one `_active_work_count()` sample. Missing, invalid, or failing aggregates remain fail-closed and are never treated as zero work.
+
 ## V4.2.0 — 2026-07-31
 
 See also: [docs/release-notes-v4.2.0.md](docs/release-notes-v4.2.0.md)
