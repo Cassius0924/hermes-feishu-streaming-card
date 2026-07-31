@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 import time
-from typing import Callable, Sequence
+from typing import Callable, Optional, Sequence
 
 from .install.detect import detect_hermes
 from .install.recovery import plan_recovery
@@ -98,7 +98,7 @@ class UpdateInspection:
 
 
 CommandRunner = Callable[[Sequence[str], float], CommandResult]
-HealthFetcher = Callable[[], dict[str, object] | None]
+HealthFetcher = Callable[[], Optional[dict[str, object]]]
 JobPublisher = Callable[[UpdateJob], bool]
 
 
