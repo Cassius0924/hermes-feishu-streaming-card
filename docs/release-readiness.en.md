@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.2.1`. It fixes the first runtime heartbeat after Gateway restart not yet being bound to the live runner, so the first bare Feishu private-chat `/update` has complete active-work evidence; missing or invalid counts remain fail-closed. Full automation, build, CI, real private-chat acceptance, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.2.2`. It fixes Feishu private-chat `/update` actions that changed durable state without asynchronously PATCHing the original confirmation card: cancel must show a terminal state without starting the updater, while confirm must show locking/preparation before maintenance starts. The callback still ACKs quickly, and existing identity, chat, expiry, preflight, drain, and fail-closed boundaries remain unchanged. Full automation, build, CI, real private-chat acceptance, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -146,6 +146,12 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.2.2 Release Gates
+
+- The native card action must return its empty acknowledgement first, then let the sidecar asynchronously PATCH the original confirmation card; Feishu API latency must stay outside the callback deadline: **focused regression passed**.
+- Cancel must persist `cancelled`, render the terminal cancellation card, and never schedule the updater; confirm must attempt the locking/preparing card transition before independent maintenance is scheduled: **related operations/server/hook-runtime matrix passed (`378 passed`)**.
+- Full pytest reports **`2307 passed, 5 skipped`** on both Python 3.9 and 3.12; `git diff --check`, wheel/sdist, clean Python 3.12 `site-packages` package/distribution/CLI provenance, and an independent V4.2.2 maintenance runtime: **local candidate gate passed**. PR CI, exact merge SHA, public tag/install, Release assets, and real Feishu cancellation acceptance: **pending release-flow verification**.
 
 ## V4.2.1 Release Gates
 

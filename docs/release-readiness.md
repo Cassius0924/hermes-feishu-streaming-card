@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.2.1`。它修复 Gateway 重启后首个 runtime heartbeat 尚未绑定 live runner 的问题，让第一条飞书私聊裸 `/update` 即可获得完整任务计数证据；缺失或无效计数仍 fail-closed。完整自动化、构建、CI、真实飞书私聊验收、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.2.2`。它修复飞书私聊 `/update` 按钮在 durable state 已变化后未异步 PATCH 原确认卡的问题：取消必须显示“已取消更新”终态且不启动 updater，确认必须先显示 locking/准备态再启动维护任务。回调仍快速 ACK，现有身份、会话、过期、预检、drain 与 fail-closed 边界不变。完整自动化、构建、CI、真实飞书私聊验收、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -146,6 +146,12 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.2.2 发布门禁
+
+- native card action 必须先快速空 ACK，再由 sidecar 异步 PATCH 原确认卡；Feishu API 延迟不得阻塞 callback deadline：**聚焦回归通过**。
+- 取消必须写入 durable `cancelled` 后显示“已取消更新”终态，且不得调度 updater；确认必须先尝试发布 locking/准备态，再调度独立维护任务：**相关 operations/server/hook-runtime 矩阵 `378 passed`**。
+- Python 3.9 / 3.12 全量均为 **`2307 passed, 5 skipped`**；`git diff --check`、wheel/sdist、干净 Python 3.12 `site-packages` package/distribution/CLI provenance 与独立 maintenance runtime 4.2.2：**本地候选门禁通过**。PR CI、exact merge SHA、public tag/install、Release assets 与真实飞书取消终态：**待发布流程验证**。
 
 ## V4.2.1 发布门禁
 

@@ -1951,10 +1951,17 @@ async def test_private_update_command_sends_signed_confirmation_and_dispatches_o
     monkeypatch.setattr(
         sidecar_server, "_inspect_update_for_app", inspect_for_app
     )
+    def schedule_update_job(app, operation):
+        assert any(
+            "正在准备更新" in str(card)
+            for _message_id, card in feishu_client.updated
+        )
+        launched.append(operation.operation_id)
+
     monkeypatch.setattr(
         sidecar_server,
         "_schedule_update_job",
-        lambda app, operation: launched.append(operation.operation_id),
+        schedule_update_job,
     )
     maintenance_root = tmp_path / "maintenance"
     selected_maintenance_paths = sidecar_server.maintenance_paths(maintenance_root)
@@ -2005,7 +2012,7 @@ async def test_private_update_command_sends_signed_confirmation_and_dispatches_o
             ),
         )
         action_body = await action.json()
-        await _REAL_ASYNCIO_SLEEP(0.01)
+        await _wait_until(lambda: bool(launched))
     finally:
         await test_client.close()
 
@@ -2015,7 +2022,81 @@ async def test_private_update_command_sends_signed_confirmation_and_dispatches_o
     assert "确认更新 Hermes" in str(card)
     assert action.status == 200
     assert action_body["toast"]["content"] == "正在准备更新"
+    assert feishu_client.updated[-1][0] == "feishu-message-1"
     assert launched == [body["operation_id"]]
+
+
+async def test_private_update_cancel_publishes_terminal_card_after_callback_ack(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    inspection = sidecar_server.UpdateInspection(
+        ready=True,
+        reason_code="ready",
+        current_version="0.19.1",
+        current_head="f3cda0ce",
+        target_summary="0.19.2 available",
+        target_fingerprint="a" * 64,
+        hfc_version="4.2.2",
+        artifact_sha256="b" * 64,
+        active_sessions=0,
+        requires_drain=False,
+        hook_state="installed",
+        hook_fingerprint="c" * 64,
+        maintenance_ready=True,
+        changed_paths=(),
+        created_at=100.0,
+        target_head="e" * 40,
+    )
+
+    async def inspect_for_app(app):
+        return inspection
+
+    monkeypatch.setattr(
+        sidecar_server, "_inspect_update_for_app", inspect_for_app
+    )
+    app = create_app(feishu_client, expected_runtime_package_version="4.2.2")
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        command = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "update",
+                    "chat_id": "oc_private",
+                    "message_id": "om_update_cancel",
+                    "chat_type": "private",
+                    "operator": {"open_id": "ou_owner"},
+                }
+            ),
+        )
+        await _wait_until(lambda: bool(feishu_client.sent))
+        confirmation_card = feishu_client.sent[0][1]
+        cancel_value = operations_button(confirmation_card, "取消")
+
+        cancelled = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                cancel_value,
+                chat_id="oc_private",
+                operator="ou_owner",
+            ),
+        )
+        cancelled_body = await cancelled.json()
+        await _wait_until(
+            lambda: any(
+                "已取消更新" in str(card)
+                for _message_id, card in feishu_client.updated
+            )
+        )
+    finally:
+        await test_client.close()
+
+    assert command.status == 200
+    assert cancelled.status == 200
+    assert cancelled_body["toast"]["content"] == "已取消更新"
+    assert feishu_client.updated[-1][0] == "feishu-message-1"
 
 
 def test_gateway_runtime_update_evidence_requires_fresh_v2_telemetry():
