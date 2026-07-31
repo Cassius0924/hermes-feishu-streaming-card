@@ -48,6 +48,12 @@ matches the checkout. Group, non-Feishu, alias, and parameterized update command
 Hermes' original behavior. Run `hermes-feishu-card maintenance status` before
 using the card flow.
 
+V4.2.1 registers the live Gateway runner before runtime control starts. The
+first authenticated heartbeat after a restart can therefore prove the complete
+turn/cron/API aggregate immediately, and the first bare private-chat `/update`
+does not require an unrelated warm-up message. Missing aggregate evidence still
+fails closed.
+
 From V3.8.4, those standalone command cards also work in Feishu/Lark WebSocket
 long-connection deployments by patching the Feishu adapter's native interactive
 card action path; local/private sidecars no longer have to fall back to gray
@@ -263,7 +269,7 @@ a privileged container, or mount host system-service directories.
 ```
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.0
+export HFC_VERSION=v4.2.1
 bash install-docker.sh
 ```
 

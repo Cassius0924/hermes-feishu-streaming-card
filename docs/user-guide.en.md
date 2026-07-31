@@ -71,6 +71,7 @@ An exact bare `/update` in a Feishu private chat first performs read-only checks
 - Only a bare private-chat `/update` uses the maintenance card. Group, non-Feishu, alias, and parameterized commands remain owned by Hermes' original handler.
 - Unrelated tracked changes, incomplete Git operations, maintenance-artifact drift, or failed verification stop the workflow. Untracked files are preserved and no custom Git rollback runs.
 - Setup provisions the independent runtime outside the Hermes checkout. Run `hermes-feishu-card maintenance status` before use; `maintenance resume` recovers from the durable journal when required.
+- V4.2.1 registers the live Gateway runner before runtime control starts, so the first heartbeat after restart proves the complete aggregate and the first bare private-chat `/update` needs no unrelated warm-up message.
 
 See the [V4.2.0 release notes](release-notes-v4.2.0.en.md) for the complete boundary and acceptance steps.
 
@@ -491,14 +492,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.2.0`.
+The Compose example defaults `HFC_VERSION` to `v4.2.1`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.0
+export HFC_VERSION=v4.2.1
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -741,6 +742,7 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.2.1](release-notes-v4.2.1.en.md) | 2026-07-31 | Registers the live runner at Gateway startup so the first heartbeat carries complete active-work evidence and the first private-chat `/update` after restart is not refused |
 | [v4.2.0](release-notes-v4.2.0.en.md) | 2026-07-31 | A bare private-chat `/update` uses an evidence-bound confirmation and independent maintenance runtime to run the official updater and restore the same HFC version, hooks, sidecar, and Gateway |
 | [v4.1.4](release-notes-v4.1.4.en.md) | 2026-07-31 | Issue #171: official Windows install/setup can rebuild a missing manifest when legacy owned hooks and clean backups match byte-for-byte; outside-block edits and inconsistent evidence remain refused |
 | [v4.1.3](release-notes-v4.1.3.en.md) | 2026-07-29 | Issue #158: verified same-Hermes-target plan transitions converge through the official atomic acknowledgement path, with explicit migration/review commands from doctor |
