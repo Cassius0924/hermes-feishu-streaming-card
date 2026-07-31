@@ -11,11 +11,12 @@ import time
 from typing import Callable
 
 from .diagnostics import DiagnosticReport
+from .maintenance_update import UpdateInspection
 
 
 _TOKEN_MAX_CHARS = 2048
 _TRANSPORT_PROOF_MAX_AGE_SECONDS = 30
-_INFLIGHT_STATES = frozenset({"preparing", "executing", "restarting"})
+_INFLIGHT_STATES = frozenset({"preparing", "executing", "restarting", "locking"})
 _MUTATION_ACTIONS = {
     "repair",
     "confirm_repair",
@@ -128,6 +129,9 @@ class OperationRecord:
     owner_open_id: str
     state: str
     expires_at: float
+    kind: str = "diagnostic"
+    update_evidence_fingerprint: str = ""
+    update_inspection: UpdateInspection | None = None
     result: dict[str, object] | None = None
     successor_operation_id: str = ""
     report: DiagnosticReport | None = None
@@ -226,6 +230,75 @@ class OperationStore:
             self._transport_secrets[operation_id] = transport_secret
             self._idempotency[idempotency_key] = (operation_id, record.expires_at)
             return record, True
+
+    def prepare_update(
+        self,
+        *,
+        chat_id: str,
+        profile_id: str,
+        initiator_open_id: str,
+        operation_id: str,
+        transport_secret: bytes,
+        idempotency_key: str,
+        inspection: UpdateInspection | None = None,
+    ) -> tuple[OperationRecord, bool]:
+        if not initiator_open_id:
+            raise OperationRejected("operator identity required")
+        if inspection is not None and not inspection.ready:
+            raise OperationRejected("update inspection is not ready")
+        with self._lock:
+            record, created = self.prepare(
+                chat_id=chat_id,
+                profile_id=profile_id,
+                group=False,
+                initiator_open_id="",
+                operation_id=operation_id,
+                transport_secret=transport_secret,
+                idempotency_key=idempotency_key,
+            )
+            fingerprint = inspection.fingerprint if inspection is not None else ""
+            if created:
+                record.kind = "update"
+                record.owner_open_id = initiator_open_id
+                if inspection is not None:
+                    record.state = "awaiting_confirmation"
+                    record.report_fingerprint = fingerprint
+                    record.update_evidence_fingerprint = fingerprint
+                    record.update_inspection = inspection
+                return record, True
+            if (
+                record.kind != "update"
+                or record.owner_open_id != initiator_open_id
+                or (
+                    inspection is not None
+                    and record.update_evidence_fingerprint != fingerprint
+                )
+            ):
+                raise OperationRejected("update operation scope mismatch")
+            return record, False
+
+    def diagnose_update(
+        self,
+        operation_id: str,
+        inspection: UpdateInspection,
+    ) -> OperationRecord:
+        with self._lock:
+            record = self._records.get(operation_id)
+            if (
+                record is None
+                or record.kind != "update"
+                or record.state != "preparing"
+            ):
+                raise OperationRejected("operation state changed")
+            fingerprint = inspection.fingerprint
+            record.report_fingerprint = fingerprint
+            record.update_evidence_fingerprint = fingerprint
+            record.update_inspection = inspection
+            record.state = (
+                "awaiting_confirmation" if inspection.ready else "unavailable"
+            )
+            record.expires_at = self._now() + 120.0
+            return record
 
     def diagnose(
         self,
@@ -417,7 +490,7 @@ class OperationStore:
             self._remove_locked(candidate)
 
     def _capacity_protected_locked(self, record: OperationRecord) -> bool:
-        return record.state in {"executing", "restarting"} or (
+        return record.state in {"executing", "restarting", "locking"} or (
             record.state == "preparing" and record.expires_at > self._now()
         )
 
@@ -703,6 +776,44 @@ class OperationStore:
                 elif operator_open_id != record.owner_open_id:
                     raise OperationRejected("different operator")
             record.state = _next_operation_state(record.state, action)
+            return record
+
+    def transition_update(
+        self,
+        token: str,
+        *,
+        action: str,
+        operator_open_id: str,
+        callback_chat_id: str,
+        callback_profile_id: str,
+        callback_evidence_fingerprint: str,
+    ) -> OperationRecord:
+        with self._lock:
+            claims, record = self._verify_token_locked(token)
+            self._verify_callback_locked(
+                claims,
+                record,
+                callback_chat_id=callback_chat_id,
+                callback_profile_id=callback_profile_id,
+                callback_report_fingerprint="",
+                callback_recovery_fingerprint="",
+            )
+            if record.kind != "update" or claims.action != action:
+                raise OperationRejected("operation action mismatch")
+            if action not in {"confirm_update", "cancel_update"}:
+                raise OperationRejected("operation action mismatch")
+            if not operator_open_id:
+                raise OperationRejected("operator identity required")
+            if operator_open_id != record.owner_open_id:
+                raise OperationRejected("different operator")
+            if not hmac.compare_digest(
+                callback_evidence_fingerprint,
+                record.update_evidence_fingerprint,
+            ):
+                raise OperationRejected("update evidence changed")
+            if record.state != "awaiting_confirmation":
+                raise OperationRejected("invalid update transition")
+            record.state = "locking" if action == "confirm_update" else "cancelled"
             return record
 
     def complete(

@@ -1920,6 +1920,123 @@ async def test_hfc_help_command_sends_read_only_diagnostic_card(client):
     assert "omt_secret_thread" not in content
 
 
+async def test_private_update_command_sends_signed_confirmation_and_dispatches_once(
+    monkeypatch,
+):
+    feishu_client = FakeFeishuClient()
+    inspection = sidecar_server.UpdateInspection(
+        ready=True,
+        reason_code="ready",
+        current_version="0.19.1",
+        current_head="f3cda0ce",
+        target_summary="0.19.2 available",
+        target_fingerprint="a" * 64,
+        hfc_version="4.2.0",
+        artifact_sha256="b" * 64,
+        active_sessions=0,
+        requires_drain=False,
+        hook_state="installed",
+        hook_fingerprint="c" * 64,
+        maintenance_ready=True,
+        changed_paths=(),
+        created_at=100.0,
+    )
+
+    async def inspect_for_app(app):
+        return inspection
+
+    launched = []
+    monkeypatch.setattr(
+        sidecar_server, "_inspect_update_for_app", inspect_for_app
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "_schedule_update_job",
+        lambda app, operation: launched.append(operation.operation_id),
+    )
+    app = create_app(feishu_client, expected_runtime_package_version="4.2.0")
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "update",
+                    "chat_id": "oc_private",
+                    "message_id": "om_update",
+                    "chat_type": "private",
+                    "operator": {"open_id": "ou_owner"},
+                }
+            ),
+        )
+        body = await response.json()
+        await _wait_until(lambda: bool(feishu_client.sent))
+        card = feishu_client.sent[0][1]
+        confirmation = next(
+            column["elements"][0]["behaviors"][0]["value"]
+            for element in card["elements"]
+            if element.get("tag") == "column_set"
+            for column in element["columns"]
+            if column["elements"][0]["text"]["content"] == "确认更新"
+        )
+        action = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                confirmation,
+                chat_id="oc_private",
+                operator="ou_owner",
+            ),
+        )
+        action_body = await action.json()
+        await _REAL_ASYNCIO_SLEEP(0.01)
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    assert body["command"] == "update"
+    assert body["operation_id"]
+    assert "确认更新 Hermes" in str(card)
+    assert action.status == 200
+    assert action_body["toast"]["content"] == "正在准备更新"
+    assert launched == [body["operation_id"]]
+
+
+async def test_update_command_rejects_group_and_missing_operator():
+    app = create_app(FakeFeishuClient())
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        group = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "update",
+                    "chat_id": "oc_group",
+                    "message_id": "om_group_update",
+                    "chat_type": "group",
+                    "operator": {"open_id": "ou_owner"},
+                }
+            ),
+        )
+        missing = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "update",
+                    "chat_id": "oc_private",
+                    "message_id": "om_private_update",
+                    "chat_type": "private",
+                }
+            ),
+        )
+    finally:
+        await test_client.close()
+
+    assert group.status == 403
+    assert missing.status == 403
+
+
 async def test_hfc_command_request_returns_before_slow_feishu_send():
     class BlockingFeishuClient(FakeFeishuClient):
         def __init__(self):

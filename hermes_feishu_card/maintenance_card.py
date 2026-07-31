@@ -179,6 +179,35 @@ def render_update_job_card(
     )
 
 
+def render_update_operation_card(
+    inspection: UpdateInspection,
+    state: str,
+    *,
+    title: str = "Hermes Agent",
+) -> dict[str, object]:
+    if state == "cancelled":
+        return _base_card(
+            title,
+            "已取消更新",
+            "grey",
+            "**已取消更新**\n\n未执行 Hermes 更新。",
+        )
+    return _base_card(
+        title,
+        "正在准备更新",
+        "blue",
+        "\n".join(
+            [
+                "**正在准备更新**",
+                "",
+                "正在重新核对更新目标和本机安全证据。",
+                f"- HFC：`{inspection.hfc_version}`（保持不变）",
+                "- 尚未执行 Hermes 更新。",
+            ]
+        ),
+    )
+
+
 class FeishuJobPublisher:
     def __init__(self, client: Any):
         self._client = client

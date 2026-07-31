@@ -3159,6 +3159,104 @@ def _hfc_install_compress_command_handler(runner_type: type[Any]) -> bool:
     return True
 
 
+async def _hfc_request_update_command(runner: Any, event: Any) -> bool:
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return False
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        message_id = _hfc_command_event_message_id(event)
+        operator_open_id = _hfc_resume_operator_open_id(event)
+        if not chat_id or not message_id or not operator_open_id:
+            return False
+        local_vars = {
+            "source": source,
+            "event": event,
+            "message": event,
+            "runner": runner,
+        }
+        profile_id, profile_source = _profile_identity(local_vars, source, event)
+        payload = {
+            "command": "update",
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "thread_id": str(getattr(source, "thread_id", "") or "").strip(),
+            "reply_to_message_id": message_id,
+            "profile_id": profile_id,
+            "profile_source": profile_source,
+            "chat_type": str(getattr(source, "chat_type", "") or "").strip().lower(),
+            "operator": {"open_id": operator_open_id},
+            "created_at": _created_at(getattr(event, "created_at", None)),
+            "platform": "feishu",
+        }
+        root_secret = read_transport_root_secret()
+        if root_secret is None:
+            return False
+        payload["adapter_command_proof"] = sign_command_transport_proof(
+            root_secret,
+            payload,
+            timestamp=int(time.time()),
+            nonce=secrets.token_urlsafe(18),
+        )
+        result = await _post_json_response(
+            f"{_summary_base_url(config.event_url)}/commands",
+            payload,
+            config.timeout_seconds,
+        )
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            return False
+        operation_id = str(result.get("operation_id") or "").strip()
+        if not operation_id:
+            return False
+        _remember_operation_transport(
+            operation_id,
+            derive_operation_transport_secret(root_secret, operation_id),
+            profile_id,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _hfc_handle_update_command_with_card(runner: Any, event: Any) -> Any:
+    original = getattr(type(runner), "_hfc_original_handle_update_command", None)
+    if not callable(original):
+        return None
+    source = getattr(event, "source", None)
+    if source is None or _platform_name({}, source) != "feishu":
+        return await original(runner, event)
+    try:
+        get_args = getattr(event, "get_command_args", None)
+        raw_args = str(get_args() or "").strip() if callable(get_args) else ""
+    except Exception:
+        raw_args = ""
+    chat_type = str(getattr(source, "chat_type", "") or "").strip().lower()
+    if raw_args or chat_type not in {"dm", "p2p", "private"}:
+        return await original(runner, event)
+    if not _hfc_resume_operator_open_id(event):
+        return "自动更新暂不可用：无法确认操作者身份，未执行 Hermes 更新。"
+    if await _hfc_request_update_command(runner, event):
+        return None
+    return "自动更新暂不可用，请稍后重试；未执行 Hermes 更新。"
+
+
+def _hfc_install_update_command_handler(runner_type: type[Any]) -> bool:
+    current = runner_type.__dict__.get("_handle_update_command")
+    if current is _hfc_handle_update_command_with_card:
+        setattr(runner_type, "_hfc_update_command_wrapped", True)
+        return True
+    if getattr(runner_type, "_hfc_update_command_wrapped", False):
+        return callable(getattr(runner_type, "_handle_update_command", None))
+    original = current or getattr(runner_type, "_handle_update_command", None)
+    if not callable(original):
+        return False
+    setattr(runner_type, "_hfc_original_handle_update_command", original)
+    setattr(runner_type, "_handle_update_command", _hfc_handle_update_command_with_card)
+    setattr(runner_type, "_hfc_update_command_wrapped", True)
+    return True
+
+
 def _parse_model_picker_choice(choice: str) -> tuple[str, str] | None:
     try:
         data = json.loads(choice)
@@ -6809,6 +6907,7 @@ def install_feishu_command_card_adapter_methods(runner: Any, event: Any = None) 
         runner_type = type(runner)
         _hfc_install_resume_picker_handler(runner_type)
         _hfc_install_compress_command_handler(runner_type)
+        _hfc_install_update_command_handler(runner_type)
         current_notice_delivery = runner_type.__dict__.get("_deliver_platform_notice")
         if current_notice_delivery is _hfc_deliver_platform_notice_with_card:
             setattr(runner_type, "_hfc_platform_notice_wrapped", True)

@@ -1848,6 +1848,135 @@ def test_compress_handler_wrapper_is_idempotent_and_non_feishu_bypasses_card():
     assert runner.original_calls == 1
 
 
+@pytest.mark.parametrize(
+    ("platform", "chat_type", "args"),
+    [
+        ("telegram", "private", ""),
+        ("feishu", "group", ""),
+        ("feishu", "private", "--yes"),
+    ],
+)
+def test_update_command_wrapper_preserves_original_outside_exact_private_bare_command(
+    platform,
+    chat_type,
+    args,
+    monkeypatch,
+):
+    requests = []
+
+    async def request_update(runner, event):
+        requests.append((runner, event))
+        return True
+
+    monkeypatch.setattr(hook_runtime, "_hfc_request_update_command", request_update)
+
+    class DummyRunner:
+        adapters = {}
+
+        def __init__(self):
+            self.original_calls = 0
+
+        async def _handle_update_command(self, event):
+            self.original_calls += 1
+            return "original update"
+
+    runner = DummyRunner()
+    event = SimpleNamespace(
+        source=SimpleNamespace(
+            platform=platform,
+            chat_type=chat_type,
+            chat_id="oc_private",
+        ),
+        get_command_args=lambda: args,
+    )
+
+    hook_runtime.install_feishu_command_card_adapter_methods(runner, event=event)
+    result = asyncio.run(runner._handle_update_command(event))
+
+    assert result == "original update"
+    assert runner.original_calls == 1
+    assert requests == []
+
+
+def test_update_command_wrapper_routes_exact_private_bare_command_and_fails_closed(
+    monkeypatch,
+):
+    outcomes = iter([True, False])
+    requests = []
+
+    async def request_update(runner, event):
+        requests.append((runner, event))
+        return next(outcomes)
+
+    monkeypatch.setattr(hook_runtime, "_hfc_request_update_command", request_update)
+
+    class DummyRunner:
+        adapters = {}
+
+        def __init__(self):
+            self.original_calls = 0
+
+        async def _handle_update_command(self, event):
+            self.original_calls += 1
+            return "original update"
+
+    runner = DummyRunner()
+    event = SimpleNamespace(
+        source=SimpleNamespace(
+            platform="feishu",
+            chat_type="private",
+            chat_id="oc_private",
+        ),
+        sender_id=SimpleNamespace(open_id="ou_owner"),
+        get_command_args=lambda: "",
+    )
+
+    hook_runtime.install_feishu_command_card_adapter_methods(runner, event=event)
+    assert asyncio.run(runner._handle_update_command(event)) is None
+    unavailable = asyncio.run(runner._handle_update_command(event))
+
+    assert "暂不可用" in unavailable
+    assert runner.original_calls == 0
+    assert len(requests) == 2
+
+
+def test_update_command_wrapper_requires_private_operator_identity(monkeypatch):
+    requests = []
+
+    async def request_update(runner, event):
+        requests.append((runner, event))
+        return True
+
+    monkeypatch.setattr(hook_runtime, "_hfc_request_update_command", request_update)
+
+    class DummyRunner:
+        adapters = {}
+
+        def __init__(self):
+            self.original_calls = 0
+
+        async def _handle_update_command(self, event):
+            self.original_calls += 1
+            return "original update"
+
+    runner = DummyRunner()
+    event = SimpleNamespace(
+        source=SimpleNamespace(
+            platform="feishu",
+            chat_type="private",
+            chat_id="oc_private",
+        ),
+        get_command_args=lambda: "",
+    )
+
+    hook_runtime.install_feishu_command_card_adapter_methods(runner, event=event)
+    result = asyncio.run(runner._handle_update_command(event))
+
+    assert "无法确认操作者" in result
+    assert runner.original_calls == 0
+    assert requests == []
+
+
 def test_manual_compress_original_exception_is_not_swallowed():
     class DummyFeishuAdapter:
         name = "feishu"
