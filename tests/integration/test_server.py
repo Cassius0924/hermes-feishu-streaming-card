@@ -1920,6 +1920,249 @@ async def test_hfc_help_command_sends_read_only_diagnostic_card(client):
     assert "omt_secret_thread" not in content
 
 
+async def test_private_update_command_sends_signed_confirmation_and_dispatches_once(
+    monkeypatch,
+    tmp_path,
+):
+    feishu_client = FakeFeishuClient()
+    inspection = sidecar_server.UpdateInspection(
+        ready=True,
+        reason_code="ready",
+        current_version="0.19.1",
+        current_head="f3cda0ce",
+        target_summary="0.19.2 available",
+        target_fingerprint="a" * 64,
+        hfc_version="4.2.0",
+        artifact_sha256="b" * 64,
+        active_sessions=0,
+        requires_drain=False,
+        hook_state="installed",
+        hook_fingerprint="c" * 64,
+        maintenance_ready=True,
+        changed_paths=(),
+        created_at=100.0,
+        target_head="e" * 40,
+    )
+
+    async def inspect_for_app(app):
+        return inspection
+
+    launched = []
+    monkeypatch.setattr(
+        sidecar_server, "_inspect_update_for_app", inspect_for_app
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "_schedule_update_job",
+        lambda app, operation: launched.append(operation.operation_id),
+    )
+    maintenance_root = tmp_path / "maintenance"
+    selected_maintenance_paths = sidecar_server.maintenance_paths(maintenance_root)
+    monkeypatch.setattr(
+        sidecar_server,
+        "maintenance_paths",
+        lambda: selected_maintenance_paths,
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "_reserve_update_job_for_operation",
+        lambda app, operation, *, owner_id, paths: sidecar_server.reserve_drain_lease(
+            paths, owner_id=owner_id
+        ),
+    )
+    app = create_app(feishu_client, expected_runtime_package_version="4.2.0")
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        response = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "update",
+                    "chat_id": "oc_private",
+                    "message_id": "om_update",
+                    "chat_type": "private",
+                    "operator": {"open_id": "ou_owner"},
+                }
+            ),
+        )
+        body = await response.json()
+        await _wait_until(lambda: bool(feishu_client.sent))
+        card = feishu_client.sent[0][1]
+        confirmation = next(
+            column["elements"][0]["behaviors"][0]["value"]
+            for element in card["body"]["elements"]
+            if element.get("tag") == "column_set"
+            for column in element["columns"]
+            if column["elements"][0]["text"]["content"] == "确认更新"
+        )
+        action = await test_client.post(
+            "/card/actions",
+            json=operations_action_payload(
+                confirmation,
+                chat_id="oc_private",
+                operator="ou_owner",
+            ),
+        )
+        action_body = await action.json()
+        await _REAL_ASYNCIO_SLEEP(0.01)
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    assert body["command"] == "update"
+    assert body["operation_id"]
+    assert "确认更新 Hermes" in str(card)
+    assert action.status == 200
+    assert action_body["toast"]["content"] == "正在准备更新"
+    assert launched == [body["operation_id"]]
+
+
+def test_gateway_runtime_update_evidence_requires_fresh_v2_telemetry():
+    valid = {
+        "status": "ready",
+        "runtime_id_hash": "a" * 64,
+        "last_sequence": 3,
+        "active_sessions": 0,
+        "admission_draining": False,
+        "active_work_count_complete": True,
+        "drain_home_verified": True,
+    }
+
+    assert sidecar_server._gateway_runtime_update_evidence(valid) == (True, 0)
+    for key, value in (
+        ("status", "degraded"),
+        ("runtime_id_hash", ""),
+        ("last_sequence", 0),
+        ("active_sessions", None),
+        ("admission_draining", None),
+        ("active_work_count_complete", None),
+        ("drain_home_verified", None),
+    ):
+        changed = dict(valid)
+        changed[key] = value
+        assert sidecar_server._gateway_runtime_update_evidence(changed) == (
+            False,
+            0,
+        )
+
+
+def test_update_confirmation_creates_durable_job_before_admission_fence(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+    inspection = SimpleNamespace(
+        ready=True,
+        current_version="0.19.1",
+        current_head="a" * 40,
+        target_fingerprint="b" * 64,
+        target_head="c" * 40,
+    )
+    operation = SimpleNamespace(
+        operation_id="operation-1",
+        update_inspection=inspection,
+        profile_id="default",
+        chat_id="oc_private",
+        owner_open_id="ou_owner",
+    )
+    supervisor = SimpleNamespace(
+        snapshot=lambda: {
+            "status": "ready",
+            "runtime_id_hash": "d" * 64,
+            "last_sequence": 2,
+            "active_sessions": 0,
+            "admission_draining": False,
+            "active_work_count_complete": True,
+            "drain_home_verified": True,
+        }
+    )
+    app = {
+        sidecar_server.OPERATIONS_DELIVERIES_KEY: {
+            operation.operation_id: {
+                "message_id": "om_card",
+                "bot_id": "default",
+            }
+        },
+        sidecar_server.PACKAGE_VERSION_KEY: "4.2.0",
+        sidecar_server.RUNTIME_INTEGRITY_SUPERVISOR_KEY: supervisor,
+        sidecar_server.OPERATIONS_HERMES_ROOT_KEY: tmp_path / "hermes",
+        sidecar_server.OPERATIONS_CONFIG_PATH_KEY: tmp_path / "config.yaml",
+        sidecar_server.OPERATIONS_ENV_FILE_KEY: None,
+    }
+    artifact = SimpleNamespace(version="4.2.0")
+    job = SimpleNamespace(path=tmp_path / "job.json")
+    monkeypatch.setattr(
+        sidecar_server,
+        "load_verified_artifact",
+        lambda *_args, **_kwargs: artifact,
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "create_job",
+        lambda *_args, **_kwargs: calls.append("job") or job,
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "reserve_drain_lease",
+        lambda *_args, **_kwargs: calls.append("lease"),
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "set_gateway_external_drain",
+        lambda *_args, **_kwargs: calls.append("native-drain") or True,
+    )
+    monkeypatch.setattr(
+        sidecar_server,
+        "stage_job_credentials",
+        lambda *_args, **_kwargs: calls.append("credentials"),
+    )
+
+    sidecar_server._reserve_update_job_for_operation(
+        app,
+        operation,
+        owner_id=operation.operation_id,
+        paths=SimpleNamespace(),
+    )
+
+    assert calls == ["job", "lease", "native-drain", "credentials"]
+
+
+async def test_update_command_rejects_group_and_missing_operator():
+    app = create_app(FakeFeishuClient())
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        group = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "update",
+                    "chat_id": "oc_group",
+                    "message_id": "om_group_update",
+                    "chat_type": "group",
+                    "operator": {"open_id": "ou_owner"},
+                }
+            ),
+        )
+        missing = await test_client.post(
+            "/commands",
+            json=signed_operations_command(
+                {
+                    "command": "update",
+                    "chat_id": "oc_private",
+                    "message_id": "om_private_update",
+                    "chat_type": "private",
+                }
+            ),
+        )
+    finally:
+        await test_client.close()
+
+    assert group.status == 403
+    assert missing.status == 403
+
+
 async def test_hfc_command_request_returns_before_slow_feishu_send():
     class BlockingFeishuClient(FakeFeishuClient):
         def __init__(self):
@@ -2223,7 +2466,8 @@ async def test_operations_diagnosis_receives_sanitized_runtime_readiness(monkeyp
     assert captured["readiness"]["status"] == "degraded"
     assert captured["readiness"]["reason"] == "manual_review_required"
     assert captured["integrity"]["mode"] == "safe"
-    assert "runtime_id" not in json.dumps(captured)
+    assert "runtime_id" not in captured["readiness"]
+    assert isinstance(captured["readiness"]["runtime_id_hash"], str)
     assert "fingerprint" not in json.dumps(captured)
 
 

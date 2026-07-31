@@ -23,6 +23,7 @@ from types import CodeType, SimpleNamespace
 import threading
 import time
 from typing import Any, Callable
+import weakref
 from urllib import error as urlerror
 from urllib import parse
 from urllib import request
@@ -266,6 +267,8 @@ _OPERATION_TRANSPORT_SECRETS: dict[str, tuple[bytes, str, float]] = {}
 _OPERATION_TRANSPORT_SECRETS_LOCK = threading.Lock()
 _OPERATION_TRANSPORT_SECRET_TTL_SECONDS = 600.0
 _OPERATION_TRANSPORT_SECRET_LIMIT = 256
+_GATEWAY_RUNNER_LOCK = threading.Lock()
+_GATEWAY_RUNNER_REF: weakref.ReferenceType[Any] | None = None
 
 
 class _OperationsActionDispatcher:
@@ -323,6 +326,7 @@ _OPERATIONS_ACTION_DISPATCHER = _OperationsActionDispatcher(
 
 
 def reset_runtime_state() -> None:
+    global _GATEWAY_RUNNER_REF
     with _SEQUENCE_LOCK:
         _SEQUENCES.clear()
     _ACTIVE_FALLBACK_MESSAGE_IDS.clear()
@@ -355,6 +359,8 @@ def reset_runtime_state() -> None:
         task.cancel()
     _NATIVE_HANDOFF_ACK_TASKS.clear()
     _NATIVE_HANDOFF_PLAN_FINGERPRINTS.clear()
+    with _GATEWAY_RUNNER_LOCK:
+        _GATEWAY_RUNNER_REF = None
     reset_runtime_control_for_tests()
 
 
@@ -366,7 +372,132 @@ def _ensure_runtime_control_started(config: RuntimeConfig | None = None) -> bool
         return start_runtime_control(
             event_url=resolved.event_url,
             package_version=__version__,
+            active_work_snapshot_provider=gateway_active_work_snapshot,
+            admission_draining_provider=gateway_external_drain_active,
+            drain_home_verified_provider=gateway_drain_home_verified,
         )
+    except Exception:
+        return False
+
+
+def _remember_gateway_runner(runner: Any) -> None:
+    global _GATEWAY_RUNNER_REF
+    if runner is None:
+        return
+    try:
+        reference = weakref.ref(runner)
+    except TypeError:
+        return
+    with _GATEWAY_RUNNER_LOCK:
+        _GATEWAY_RUNNER_REF = reference
+
+
+def gateway_active_work_snapshot() -> tuple[int, bool]:
+    with _GATEWAY_RUNNER_LOCK:
+        reference = _GATEWAY_RUNNER_REF
+    runner = reference() if reference is not None else None
+    if runner is None:
+        return 0, False
+    aggregate = getattr(runner, "_active_work_count", None)
+    if callable(aggregate):
+        try:
+            value = aggregate()
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return value, True
+        except Exception:
+            pass
+    running_agents = getattr(runner, "_running_agents", {})
+    agent_count = len(running_agents) if isinstance(running_agents, dict) else 0
+    adapters: list[Any] = []
+    primary = getattr(runner, "adapters", {})
+    if isinstance(primary, dict):
+        adapters.extend(primary.values())
+    profile_maps = getattr(runner, "_profile_adapters", {})
+    if isinstance(profile_maps, dict):
+        for profile_map in profile_maps.values():
+            if isinstance(profile_map, dict):
+                adapters.extend(profile_map.values())
+    seen: set[int] = set()
+    adapter_count = 0
+    for adapter in adapters:
+        identity = id(adapter)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        active = getattr(adapter, "_active_sessions", {})
+        if isinstance(active, dict):
+            adapter_count += len(active)
+    return max(0, agent_count, adapter_count), False
+
+
+def gateway_active_session_count() -> int:
+    return gateway_active_work_snapshot()[0]
+
+
+def gateway_external_drain_active() -> bool:
+    with _GATEWAY_RUNNER_LOCK:
+        reference = _GATEWAY_RUNNER_REF
+    runner = reference() if reference is not None else None
+    return bool(runner is not None and getattr(runner, "_external_drain_active", False))
+
+
+def gateway_drain_home_verified() -> bool:
+    module = sys.modules.get("gateway.run")
+    source = getattr(module, "__file__", None)
+    if not isinstance(source, str) or not source:
+        return False
+    try:
+        gateway_source = Path(source).resolve(strict=True)
+        if gateway_source.parent.name != "gateway":
+            return False
+        hermes_root = gateway_source.parent.parent
+        constants = importlib.import_module("hermes_constants")
+        resolver = getattr(constants, "get_process_hermes_home", None)
+        if not callable(resolver):
+            resolver = getattr(constants, "get_hermes_home", None)
+        if not callable(resolver):
+            return False
+        gateway_home = Path(resolver()).expanduser().resolve(strict=False)
+    except Exception:
+        return False
+    return os.path.normcase(str(gateway_home)) == os.path.normcase(
+        str(hermes_root.parent.resolve(strict=False))
+    )
+
+
+async def maintenance_admission_from_hermes_locals(
+    local_vars: dict[str, Any],
+) -> bool:
+    runner = local_vars.get("self") if isinstance(local_vars, dict) else None
+    _remember_gateway_runner(runner)
+    try:
+        from .maintenance_store import (
+            MaintenanceRefused,
+            load_active_drain_lease,
+            maintenance_paths,
+        )
+
+        try:
+            lease = load_active_drain_lease(maintenance_paths())
+            blocked = lease is not None
+            message = "Hermes 正在维护升级中，请稍后再试。"
+        except MaintenanceRefused:
+            blocked = True
+            message = "Hermes 维护状态需要本机检查，暂不接入新任务。"
+        if not blocked:
+            return False
+        event = local_vars.get("event")
+        source = local_vars.get("source") or getattr(event, "source", None)
+        adapter_for_source = getattr(runner, "_adapter_for_source", None)
+        adapter = adapter_for_source(source) if callable(adapter_for_source) else None
+        send = getattr(adapter, "send", None)
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        if callable(send) and chat_id:
+            try:
+                await send(chat_id, message)
+            except Exception:
+                pass
+        return True
     except Exception:
         return False
 
@@ -3156,6 +3287,106 @@ def _hfc_install_compress_command_handler(runner_type: type[Any]) -> bool:
         _hfc_handle_compress_command_with_card,
     )
     setattr(runner_type, "_hfc_compress_command_wrapped", True)
+    return True
+
+
+async def _hfc_request_update_command(runner: Any, event: Any) -> bool:
+    try:
+        config = load_runtime_config()
+        if not config.enabled:
+            return False
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        message_id = _hfc_command_event_message_id(event)
+        operator_open_id = _hfc_resume_operator_open_id(event)
+        if not chat_id or not message_id or not operator_open_id:
+            return False
+        local_vars = {
+            "source": source,
+            "event": event,
+            "message": event,
+            "runner": runner,
+        }
+        profile_id, profile_source = _profile_identity(local_vars, source, event)
+        payload = {
+            "command": "update",
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "thread_id": str(getattr(source, "thread_id", "") or "").strip(),
+            "reply_to_message_id": message_id,
+            "profile_id": profile_id,
+            "profile_source": profile_source,
+            "chat_type": str(getattr(source, "chat_type", "") or "").strip().lower(),
+            "operator": {"open_id": operator_open_id},
+            "created_at": _created_at(getattr(event, "created_at", None)),
+            "platform": "feishu",
+        }
+        root_secret = read_transport_root_secret()
+        if root_secret is None:
+            return False
+        payload["adapter_command_proof"] = sign_command_transport_proof(
+            root_secret,
+            payload,
+            timestamp=int(time.time()),
+            nonce=secrets.token_urlsafe(18),
+        )
+        result = await _post_json_response(
+            f"{_summary_base_url(config.event_url)}/commands",
+            payload,
+            config.timeout_seconds,
+        )
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            return False
+        operation_id = str(result.get("operation_id") or "").strip()
+        if not operation_id:
+            return False
+        _remember_operation_transport(
+            operation_id,
+            derive_operation_transport_secret(root_secret, operation_id),
+            profile_id,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _hfc_handle_update_command_with_card(runner: Any, event: Any) -> Any:
+    original = getattr(type(runner), "_hfc_original_handle_update_command", None)
+    if not callable(original):
+        return None
+    source = getattr(event, "source", None)
+    if source is None or _platform_name({}, source) != "feishu":
+        return await original(runner, event)
+    if _hfc_command_from_event(event) != "update":
+        return await original(runner, event)
+    try:
+        get_args = getattr(event, "get_command_args", None)
+        raw_args = str(get_args() or "").strip() if callable(get_args) else ""
+    except Exception:
+        raw_args = ""
+    chat_type = str(getattr(source, "chat_type", "") or "").strip().lower()
+    if raw_args or chat_type not in {"dm", "p2p", "private"}:
+        return await original(runner, event)
+    if not _hfc_resume_operator_open_id(event):
+        return "自动更新暂不可用：无法确认操作者身份，未执行 Hermes 更新。"
+    if await _hfc_request_update_command(runner, event):
+        return None
+    return "自动更新暂不可用，请稍后重试；未执行 Hermes 更新。"
+
+
+def _hfc_install_update_command_handler(runner_type: type[Any]) -> bool:
+    current = runner_type.__dict__.get("_handle_update_command")
+    if current is _hfc_handle_update_command_with_card:
+        setattr(runner_type, "_hfc_update_command_wrapped", True)
+        return True
+    if getattr(runner_type, "_hfc_update_command_wrapped", False):
+        return callable(getattr(runner_type, "_handle_update_command", None))
+    original = current or getattr(runner_type, "_handle_update_command", None)
+    if not callable(original):
+        return False
+    setattr(runner_type, "_hfc_original_handle_update_command", original)
+    setattr(runner_type, "_handle_update_command", _hfc_handle_update_command_with_card)
+    setattr(runner_type, "_hfc_update_command_wrapped", True)
     return True
 
 
@@ -6809,6 +7040,7 @@ def install_feishu_command_card_adapter_methods(runner: Any, event: Any = None) 
         runner_type = type(runner)
         _hfc_install_resume_picker_handler(runner_type)
         _hfc_install_compress_command_handler(runner_type)
+        _hfc_install_update_command_handler(runner_type)
         current_notice_delivery = runner_type.__dict__.get("_deliver_platform_notice")
         if current_notice_delivery is _hfc_deliver_platform_notice_with_card:
             setattr(runner_type, "_hfc_platform_notice_wrapped", True)

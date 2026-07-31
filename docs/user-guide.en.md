@@ -64,6 +64,16 @@ Since V3.8.2, the final answer stays in the primary content area while pre-tool 
 | Multi-bot, group, and profile routing is hard to inspect | `bindings.chats`, safe `group_rules` diagnostics, profile-aware sessions, and `/health.routing` diagnostics |
 | Hook or sidecar failures are hard to debug | `doctor`, runtime import checks, `/health` metrics, fail-closed installer, restore/uninstall |
 
+## V4.2.0 Safe Private-Chat Updates
+
+An exact bare `/update` in a Feishu private chat first performs read-only checks of the Hermes version, Git worktree, managed hooks, current `origin/main` snapshot, active work, and the cached same-version maintenance wheel. It then shows a 120-second confirmation card. Confirmation authorizes the official `hermes update --yes` to fetch the latest `origin/main` at execution time. If the remote advances after confirmation, the independent runtime first reinstalls the same HFC version and restores the hook, sidecar, and Gateway, then reports the snapshot change as a failure in the original card. Card-based automatic update is available only when runtime telemetry proves complete turn/cron/API counting from one aggregate sample and verifies that the running `HERMES_HOME` matches the checkout marker directory.
+
+- Only a bare private-chat `/update` uses the maintenance card. Group, non-Feishu, alias, and parameterized commands remain owned by Hermes' original handler.
+- Unrelated tracked changes, incomplete Git operations, maintenance-artifact drift, or failed verification stop the workflow. Untracked files are preserved and no custom Git rollback runs.
+- Setup provisions the independent runtime outside the Hermes checkout. Run `hermes-feishu-card maintenance status` before use; `maintenance resume` recovers from the durable journal when required.
+
+See the [V4.2.0 release notes](release-notes-v4.2.0.en.md) for the complete boundary and acceptance steps.
+
 ## V4.1.0 Delivery Policy, Content Protection, and Runtime Safety
 
 V4.1.1 fixes upgrade recovery without changing the delivery experience below: waiting for the first heartbeat writes no persistent fence; `integrity acknowledge-review` is constrained by two plan checks, a stopped sidecar, no pidfile, target binding, and a CAS snapshot; setup rechecks the Hermes venv with isolated Python and uses `/health` package/Python identity for restart decisions. Detached processes stop through token-authenticated self-shutdown rather than forced numeric PID/PGID signals. See [V4.1 safety controls and troubleshooting](wiki/v4.1-safety-controls.md) for the complete order.
@@ -220,7 +230,7 @@ V3.8.10 clarifies the group-chat boundary. Hermes Gateway remains responsible fo
 
 - **Automatic chat-binding hints**: in a group, `/hfc status` reports when the chat is not listed in `bindings.chats`, explains that fallback/default routing is active, and prints the suggested `hermes-feishu-card bots bind-chat ...` command.
 - **@mention and allowlist boundary**: `bindings.group_rules` is read only for safe diagnostics and counts. It does not leak raw chat/user ids, and it does not replace Hermes Feishu adapter admission.
-- **Group slash-command behavior**: `/new`, `/model`, `/reset`, and similar commands first pass Hermes group admission, then use standalone command cards. `/update` remains Hermes' background upgrade command.
+- **Group slash-command behavior**: `/new`, `/model`, `/reset`, and similar commands first pass Hermes group admission, then use standalone command cards. Group `/update` keeps Hermes' native background-upgrade path; V4.2.0's maintenance confirmation is private-chat-only.
 - **Richer tool details**: the tool timeline now tries to show argument summaries, duration, and failure reason so slow, failed, or mis-targeted tools are easier to inspect from the card.
 
 Full release notes: [docs/release-notes-v3.8.10.md](release-notes-v3.8.10.md).
@@ -271,7 +281,7 @@ Full release notes: [docs/release-notes-v3.8.6.md](release-notes-v3.8.6.md).
 
 ## V3.8.5 Command Result Card Feedback Patch
 
-V3.8.5 completes the V3.8.4 always-allowed/no-confirm path. When Hermes directly executes `/new`, `/reset`, `/clear`, `/undo`, `/stop`, or direct `/model <model>`, the command result now replies as a Feishu/Lark interactive card instead of gray native text. `/model` switch feedback stays in a green card, while `/update` remains Hermes' background upgrade command and does not render an interaction card.
+V3.8.5 completes the V3.8.4 always-allowed/no-confirm path. When Hermes directly executes `/new`, `/reset`, `/clear`, `/undo`, `/stop`, or direct `/model <model>`, the command result now replies as a Feishu/Lark interactive card instead of gray native text. `/model` switch feedback stays in a green card. At that release, `/update` remained Hermes' native background upgrade; V4.2.0 changes only the exact bare command in a private chat.
 
 - **Direct command results become cards**: the patcher passes the current `event` into hook runtime, so Feishu adapter `send()` can recognize standalone slash-command results.
 - **Cleaner interactive updates**: button and dropdown clicks rely on the Feishu callback response to update the original card, without an extra unsupported interactive `message.update` call.
@@ -286,7 +296,7 @@ V3.8.4 fixes the V3.8.3 local/private sidecar gap where slash commands still fel
 - **WebSocket-native confirmation cards**: the plugin dynamically installs Feishu adapter `send_slash_confirm(...)`, and button clicks route through `_on_card_action_trigger` into `tools.slash_confirm.resolve(...)`.
 - **WebSocket-native model picker**: when Hermes asks the Feishu adapter for `send_model_picker(...)`, the plugin installs a Feishu-only picker and writes the callback result back to the same command card.
 - **No duplicate choice cards**: when WebSocket-native command cards are available, the sidecar pre-interaction is skipped so `/new` does not show both a sidecar choice card and a native button card.
-- **No `/update` interaction card**: `/update` remains Hermes's background upgrade command and does not render interactive buttons.
+- **Historical `/update` boundary**: V3.8.4 added no update buttons. From V4.2.0, only an exact private-chat command uses an evidence-bound maintenance confirmation card; every other path stays native.
 - **Safe fallback**: if native Feishu cards, the sidecar, polling, or completion updates fail, Hermes native text behavior remains available.
 
 Full release notes: [docs/release-notes-v3.8.4.md](release-notes-v3.8.4.md). The previous standalone command-card baseline is documented in [docs/release-notes-v3.8.3.md](release-notes-v3.8.3.md).
@@ -481,14 +491,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.1.4`.
+The Compose example defaults `HFC_VERSION` to `v4.2.0`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.1.4
+export HFC_VERSION=v4.2.0
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -731,6 +741,7 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.2.0](release-notes-v4.2.0.en.md) | 2026-07-31 | A bare private-chat `/update` uses an evidence-bound confirmation and independent maintenance runtime to run the official updater and restore the same HFC version, hooks, sidecar, and Gateway |
 | [v4.1.4](release-notes-v4.1.4.en.md) | 2026-07-31 | Issue #171: official Windows install/setup can rebuild a missing manifest when legacy owned hooks and clean backups match byte-for-byte; outside-block edits and inconsistent evidence remain refused |
 | [v4.1.3](release-notes-v4.1.3.en.md) | 2026-07-29 | Issue #158: verified same-Hermes-target plan transitions converge through the official atomic acknowledgement path, with explicit migration/review commands from doctor |
 | [v4.1.2](release-notes-v4.1.2.en.md) | 2026-07-29 | Fixes the stale-heartbeat second-restart race and duplicate recording of one tool call by stable and legacy progress paths |

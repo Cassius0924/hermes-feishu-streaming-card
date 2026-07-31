@@ -30,7 +30,7 @@
 - Feishu/Lark 话题体验：后续事件通过 `reply_to_message_id` 回到原卡片，避免 topic timeline 停住。
 - 群聊诊断：`/hfc status` 提示 chat binding、fallback/default 路由和群内 slash command 边界，真实 @/白名单准入仍由 Hermes 控制。
 - 系统提示卡片化：`Working`、上下文窗口/压缩、session reset、skill loading、自我改进 review 等归一为 `system.notice`。
-- 全命令反馈卡片：所有进入 Hermes 的 slash command（含 built-in、alias、plugin/quick 和 unknown command）只要产生非空文本反馈，就由独立 Feishu interactive card 承载；`/update` 仍保持后台升级语义，仅将重启前反馈卡片化。
+- 全命令反馈卡片：所有进入 Hermes 的 slash command（含 built-in、alias、plugin/quick 和 unknown command）只要产生非空文本反馈，就由独立 Feishu interactive card 承载；V4.2.0 的私聊裸 `/update` 使用专用维护确认卡，群聊/非飞书/别名/参数化更新保持 Hermes 原路径。
 - 安装与诊断：`install/setup/doctor/repair/restore/uninstall` 覆盖本机、Hermes venv、Docker/source-stripped Hermes。
 - V4.1 安全控制：exact `native_chats`、无损 table compact、认证 runtime readiness、strict repair 与不隐式提权的 service manager。
 
@@ -50,3 +50,9 @@
 仓库内 wiki 是公开、可随项目发布的维护资料；Bailey 的 Obsidian LLM Wiki 是长期检索层，会保存项目总览、维护规则和跨项目复用经验。
 
 当本目录新增稳定知识时，同步到 Bailey 的 Obsidian LLM Wiki 镜像；仓库文档不记录本机绝对路径。
+# v4.2 maintenance update
+
+The private Feishu `/update` workflow is documented in
+[`event-flow.md`](event-flow.md), operated through
+[`maintenance-guide.md`](maintenance-guide.md), and verified with the
+[`feishu-acceptance.md`](feishu-acceptance.md) checklist.

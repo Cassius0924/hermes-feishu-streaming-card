@@ -116,6 +116,12 @@ async def test_runtime_endpoint_accepts_signed_hello_and_health_becomes_ready():
         "generation_match": True,
         "restart_required": False,
         "last_seen_age_seconds": 0,
+        "runtime_id_hash": "bc48bbf1d754a75633bd24699a81443cc84efba9580957897f6769f8414639fa",
+        "last_sequence": 1,
+        "active_sessions": None,
+        "admission_draining": None,
+        "active_work_count_complete": None,
+        "drain_home_verified": None,
     }
     assert replay.status == 401
 
@@ -178,7 +184,8 @@ async def test_runtime_generation_mismatch_degrades_readiness_not_liveness():
     assert health["readiness"]["status"] == "degraded"
     assert health["readiness"]["reason"] == "gateway_restart_required"
     assert health["readiness"]["restart_required"] is True
-    assert "runtime_id" not in json.dumps(health)
+    assert "runtime_id" not in health["readiness"]
+    assert len(health["readiness"]["runtime_id_hash"]) == 64
 
 
 async def test_missing_private_root_degrades_readiness_and_refuses_runtime_control():

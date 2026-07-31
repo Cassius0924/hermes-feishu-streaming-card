@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.2.0 — 2026-07-31
+
+See also: [docs/release-notes-v4.2.0.md](docs/release-notes-v4.2.0.md)
+
+### Added
+- A bare `/update` in a Feishu private chat now opens an evidence-bound confirmation card instead of immediately mutating Hermes.
+- A private, independent maintenance runtime caches the exact HFC wheel, journals each phase, runs only `hermes update --yes`, reinstalls the same HFC version, restores hooks and services, and verifies the final runtime.
+- `maintenance provision`, `maintenance status`, `maintenance run`, and `maintenance resume` expose the recovery boundary locally.
+
+### Safety
+- Confirmation is bound to the exact initiator, chat, profile, target evidence, and 120-second window. Group, non-Feishu, alias, and parameterized update commands retain Hermes' original behavior.
+- Unrelated tracked changes, incomplete Git operations, missing maintenance evidence, version drift, CI-independent runtime drift, and verification failure stop before unsafe mutation. Untracked files are preserved and no custom Git rollback is used.
+
 ## V4.1.4 — 2026-07-31
 
 See also: [docs/release-notes-v4.1.4.md](docs/release-notes-v4.1.4.md)

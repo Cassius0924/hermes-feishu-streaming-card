@@ -29,7 +29,9 @@ ACK-capable handoff 只在默认 profile 且受管的 Hermes 0.19 `gateway/run.p
 
 每个逻辑分片使用稳定 Feishu UUID，adapter 内部重试与 Hermes ledger recovery 都复用相同 UUID。`hfc-native-handoff-recovery-v2` 只按 obligation、content、plan、route、target 五项精确查询，并始终重放 ledger 中保存的原始 content；terminal POST 已在 sidecar 提交但响应丢失/损坏时，Gateway 也立即用这五项查询找回 descriptor。若两次本机响应都丢失，本轮可先使用同五项派生的 provisional UUID seed，并在 ledger 标记 delivered 后异步重查完整 descriptor；provisional seed 本身不构成 ACK 权限。可见 recovered marker 或随机兜底文本只能走普通原生发送，不能借用旧 descriptor。只有全部 required chunks 成功且 Hermes ledger 已持久化 `delivered` 后才发送签名 ACK；ACK 失败不能回滚 ledger。若进程在平台成功与 ledger transition 之间退出，一小时窗口内由 ledger recovery 与稳定 UUID 提供 bounded idempotency；窗口外 exact descriptor 失效、sidecar 记录为 uncertain，Hermes 仍可用带可见 `RECOVERED_MARKER` 的有界 native recovery 避免答案丢失。状态丢失或损坏时同样优先保留这条可见 fail-open，而不虚构 exact 成功；该普通随机 UUID 路径不属于 exact 契约，因此不承诺永久 exactly-once。任何空 body、非 object 或缺少显式 `ok:true, applied:true` 的 terminal/cron/command 响应都必须 fail-open，不能抑制 Hermes 原生答案。附件/媒体、Cron 与 direct command 仍沿用 Hermes 原生 best-effort/fail-open 契约，不纳入这条 exact Base ledger ACK 保证。
 
-Gateway runtime 以独立 `hfc-runtime-v1` 域发送 `runtime.hello` / `runtime.heartbeat`。sidecar readiness 根据本机 monotonic receipt、generation 和 strict integrity 状态计算；heartbeat 只证明 runtime 活性，不授权写源码。on-disk plan 已是 `installed` 时，等待首次 heartbeat 的 waiting/missing 与 Gateway 正常重启期间的 `runtime_heartbeat_stale` 都只保持 degraded readiness，不触发 repair，也不写 restart/manual-review fence；新 matching hello 可一次恢复 ready。safe repair 仍需 Git/manifest/backup/blob/anchor/fingerprint 证据，成功后只设置 `gateway.restart_required`，不自动重启 Gateway。
+Gateway runtime 以独立 `hfc-runtime-v1` 签名域发送 `runtime.hello` / `runtime.heartbeat`。V4.2 的 payload schema v2 额外携带当前活跃任务计数，用于 `/update` 维护 drain；v1 仍可维持普通 readiness，但不能授权自动维护。sidecar readiness 根据本机 monotonic receipt、generation 和 strict integrity 状态计算；heartbeat 只证明 runtime 活性，不授权写源码。on-disk plan 已是 `installed` 时，等待首次 heartbeat 的 waiting/missing 与 Gateway 正常重启期间的 `runtime_heartbeat_stale` 都只保持 degraded readiness，不触发 repair，也不写 restart/manual-review fence；新 matching hello 可一次恢复 ready。safe repair 仍需 Git/manifest/backup/blob/anchor/fingerprint 证据，成功后只设置 `gateway.restart_required`，不自动重启 Gateway。
+
+飞书私聊裸 `/update` 被确认后，sidecar 在返回 ACK 前创建 durable job，再持久化有 owner 和过期时间的 HFC drain lease，并通过 Hermes 自带 `gateway.drain_control` 写入同一实例的 external drain marker。Gateway 自身停止新 turn、cron 与 API admission；HFC schema v2 heartbeat 从一次 `_active_work_count()` 调用同时产生聚合计数和“计数完整”证据，并验证实际 `HERMES_HOME` 与 checkout marker 目录一致。维护进程只在 external drain 已生效、lease 仍有效、sidecar 与 Gateway 计数都为零且连续两个 heartbeat sequence 前进时继续。随后停止 Gateway、清理 native marker、停止 sidecar、恢复 owned hook并运行官方 updater。确认卡明确授权 updater 在执行时再次 fetch 最新 `origin/main`；若实际 HEAD 不再等于确认时展示的快照，仍先重装 HFC、恢复 hook/服务并验证新 runtime，再以 mismatch 失败终态结束。恢复完成必须看到新的 sidecar PID、新的 runtime identity 与 fresh heartbeat，旧进程或旧 heartbeat 不能冒充成功。
 
 restart/manual-review fence 会原子写入私有 state dir，修复前 runtime 只保存 domain-separated hash；V4.1.1 fence 还以脱敏 hash 绑定 Hermes target/integrity plan，并由跨进程锁与 snapshot CAS 保护。重启 sidecar 不会清除 fence，旧 runtime 的 hello/heartbeat 与新 runtime 的 heartbeat也不能绕过。bound non-empty hash 的 `integrity acknowledge-review` 只清除 manual-review 位，restart fence 与 hash 继续等待不同 runtime id 且 generation/package 匹配的 `runtime.hello`。V4.1.0 unbound empty-hash fence 只在精确已知形态、两次 plan/pidfile/health 检查均稳定时允许显式迁移；其他 unbound fence拒绝。随后必须人工重启 sidecar 与 Gateway，并以新 hello 恢复 ready。
 
@@ -193,7 +195,7 @@ Hermes 原生运行提示会被归一为 `system.notice`：
 - `/model`、裸 `/resume` 和 `/new`、`/reset`、`/undo` 等 destructive confirmation 继续使用原有按钮、下拉框和同卡结果更新；成功时不会再创建第二张命令卡。
 - `/hfc help/status/doctor/monitor` 继续使用 sidecar 运维卡；只有专用路径失败返回文本时才进入统一反馈卡。
 - `/learn`、`/blueprint`、`/steer`、`/queue`、`/moa` 等转入 Agent turn 的命令只把即时确认、usage 或错误当作命令反馈；正常 reasoning/answer 仍由普通流式卡承载。
-- `/update` 的重启前反馈进入命令卡；Gateway 重启后的状态继续由现有 `system.notice` 卡承载。
+- 飞书私聊裸 `/update` 由 V4.2.0 专用维护确认卡接管，并由独立 runtime 跨重启 PATCH 原卡；群聊、非飞书、别名和带参数更新仍使用 Hermes 原路径。
 - 文件、图片、音频等附件继续使用 Hermes 原生媒体发送路径。
 
 ### V4.0.9 WebSocket live handler 边界
@@ -235,7 +237,7 @@ sidecar 负责：
 - 根据 `bindings.chats` 选择 bot 或 fallback/default 路由。
 - 在群内 `/hfc status` 中提示是否已绑定当前 chat。
 - 读取 `bindings.group_rules` 的 enabled/require_mention/计数用于安全诊断，不展示真实 chat/user id。
-- 说明群内所有 slash command 先经过 Hermes 准入；built-in、alias、plugin/quick 和 unknown command 的非空文本反馈都进入独立命令卡片。`/update` 仍是后台升级命令，仅将重启前反馈卡片化。
+- 说明群内所有 slash command 先经过 Hermes 准入；built-in、alias、plugin/quick 和 unknown command 的非空文本反馈都进入独立命令卡片。群内 `/update` 仍是 Hermes 原生后台升级命令，V4.2.0 专用维护确认卡仅接管私聊裸命令。
 
 ## 运维卡与恢复边界
 
@@ -266,3 +268,26 @@ profile 路由由 setup 的显式参数、进程环境变量、选定 env file�
 - `cleanup_*` metrics
 
 如果 Feishu UI 出现灰色重复文本，同时 `/health` 显示卡片成功更新，应优先查 hook runtime 的 native fallback suppression。
+# Private `/update` maintenance flow
+
+An exact bare `/update` from a verified Feishu private chat is handled as a
+maintenance operation, not as an ordinary model turn. The hook submits an
+authenticated `/commands` request, the sidecar performs read-only inspection,
+and the confirmation card carries an initiator-, chat-, profile-, and
+evidence-bound token that expires after 120 seconds.
+
+After confirmation, the sidecar rechecks the evidence, persists a private job
+journal, writes the native drain marker only after a heartbeat proves the
+running `HERMES_HOME` matches the checkout, and launches the independent
+maintenance runtime. One `_active_work_count()` call produces both the
+turn/cron/API count and the proof that the aggregate API was available. The
+confirmation authorizes the official updater to fetch the latest `origin/main`
+at execution time. The runtime waits for active card sessions, restores
+HFC-owned hooks, runs only
+`hermes update --yes`, reinstalls the cached exact HFC wheel, reapplies hooks,
+starts services, and verifies version, import origin, health, and hook state. A
+remote advance after confirmation is reported as target mismatch only after
+those services have been restored.
+Once the sidecar stops, the maintenance process updates the original Feishu
+card directly. Group, non-Feishu, alias, and parameterized update commands
+remain on Hermes' native path.

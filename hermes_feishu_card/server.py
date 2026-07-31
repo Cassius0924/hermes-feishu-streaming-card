@@ -90,6 +90,31 @@ from .runtime_control import (
     RuntimeProofVerifier,
 )
 from .integrity import RuntimeIntegrityCoordinator, sanitize_integrity_snapshot
+from .maintenance_card import (
+    render_update_inspection_card,
+    render_update_job_card,
+    render_update_operation_card,
+)
+from .maintenance_process import inspect_runtime, launch_job
+from .maintenance_store import (
+    MaintenanceRefused,
+    create_job,
+    discard_job_credentials,
+    discard_unstarted_job,
+    load_active_drain_lease,
+    load_job,
+    load_verified_artifact,
+    maintenance_paths,
+    release_drain_lease,
+    reserve_drain_lease,
+    stage_job_credentials,
+    transition_job,
+)
+from .maintenance_update import (
+    UpdateInspection,
+    inspect_update,
+    set_gateway_external_drain,
+)
 
 FEISHU_CLIENT_KEY = web.AppKey("feishu_client", Any)
 SESSIONS_KEY = web.AppKey("sessions", dict)
@@ -530,16 +555,38 @@ async def _health(request: web.Request) -> web.Response:
     sessions: Dict[str, CardSession] = request.app[SESSIONS_KEY]
     metrics: SidecarMetrics = request.app[METRICS_KEY]
     diagnostics = request.app[DIAGNOSTICS_KEY]
+    readiness = request.app[RUNTIME_INTEGRITY_SUPERVISOR_KEY].snapshot()
+    try:
+        drain_lease = load_active_drain_lease(maintenance_paths())
+        maintenance_drain = {
+            "active": drain_lease is not None,
+            "owner_hash": (
+                _diagnostic_id_hash(drain_lease.owner_id)
+                if drain_lease is not None
+                else ""
+            ),
+            "valid": True,
+        }
+    except MaintenanceRefused:
+        maintenance_drain = {"active": True, "owner_hash": "", "valid": False}
     response = {
         "status": "degraded" if request.app[NOOP_MODE_KEY] else "healthy",
         "noop_mode": request.app[NOOP_MODE_KEY],
         "delivery": {"mode": "noop" if request.app[NOOP_MODE_KEY] else "live"},
         "event_auth_required": request.app[EVENT_AUTH_REQUIRED_KEY],
-        "readiness": request.app[RUNTIME_INTEGRITY_SUPERVISOR_KEY].snapshot(),
+        "readiness": readiness,
         "integrity": sanitize_integrity_snapshot(
             request.app[RUNTIME_INTEGRITY_COORDINATOR_KEY].snapshot()
         ),
         "active_sessions": len(sessions),
+        "maintenance_active_sessions": sum(
+            1
+            for session in sessions.values()
+            if str(getattr(session, "status", "") or "").lower()
+            not in {"completed", "failed", "cancelled"}
+        ),
+        "gateway_active_sessions": readiness.get("active_sessions"),
+        "maintenance_drain": maintenance_drain,
         "process_pid": os.getpid(),
         "package_version": request.app[PACKAGE_VERSION_KEY],
         "python_identity": request.app[PYTHON_IDENTITY_KEY],
@@ -777,6 +824,19 @@ async def _operations_action(
     except OperationRejected:
         return web.json_response({"ok": False, "error": "operation rejected"})
 
+    if record.kind == "update":
+        return _update_operation_action(
+            request.app,
+            record,
+            token=token,
+            action=action,
+            operator_open_id=operator_open_id,
+            chat_id=chat_id,
+            evidence_fingerprint=str(
+                value.get("update_evidence_fingerprint") or ""
+            ).strip(),
+        )
+
     report = _operation_report_snapshot(record)
     successor = store.current_successor(record.operation_id)
     if successor is not None and successor.operation_id != record.operation_id:
@@ -893,6 +953,157 @@ async def _operations_action(
     return _operations_response(request.app, report, transitioned)
 
 
+def _update_operation_action(
+    app: web.Application,
+    record: OperationRecord,
+    *,
+    token: str,
+    action: str,
+    operator_open_id: str,
+    chat_id: str,
+    evidence_fingerprint: str,
+) -> web.Response:
+    inspection = record.update_inspection
+    if inspection is None:
+        return web.json_response(
+            {"ok": False, "error": "operation rejected"}, status=409
+        )
+    store: OperationStore = app[OPERATIONS_STORE_KEY]
+    try:
+        paths = maintenance_paths()
+        transitioned = store.transition_update(
+            token,
+            action=action,
+            operator_open_id=operator_open_id,
+            callback_chat_id=chat_id,
+            callback_profile_id=record.profile_id,
+            callback_evidence_fingerprint=evidence_fingerprint,
+            reserve_update=(
+                (
+                    lambda owner_id: _reserve_update_job_for_operation(
+                        app,
+                        record,
+                        owner_id=owner_id,
+                        paths=paths,
+                    )
+                )
+                if action == "confirm_update"
+                else None
+            ),
+        )
+    except (OperationRejected, MaintenanceRefused):
+        return web.json_response(
+            {"ok": False, "error": "operation rejected"}, status=409
+        )
+    card = render_update_operation_card(
+        inspection,
+        transitioned.state,
+        title=app[CARD_TITLE_KEY],
+    )
+    follow_up = (
+        (lambda: _schedule_update_job(app, transitioned))
+        if transitioned.state == "locking"
+        else None
+    )
+    return _AfterEofJsonResponse(
+        {
+            "ok": True,
+            "operation_id": transitioned.operation_id,
+            "toast": {
+                "type": "success",
+                "content": (
+                    "正在准备更新"
+                    if transitioned.state == "locking"
+                    else "已取消更新"
+                ),
+            },
+            "card": card,
+        },
+        follow_up,
+    )
+
+
+def _reserve_update_job_for_operation(
+    app: web.Application,
+    operation: OperationRecord,
+    *,
+    owner_id: str,
+    paths,
+) -> None:
+    inspection = operation.update_inspection
+    delivery = app[OPERATIONS_DELIVERIES_KEY].get(operation.operation_id)
+    if inspection is None or not inspection.ready or not isinstance(delivery, dict):
+        raise MaintenanceRefused("update reservation evidence unavailable")
+    message_id = str(delivery.get("message_id") or "").strip()
+    if not message_id:
+        raise MaintenanceRefused("update reservation delivery unavailable")
+    artifact = load_verified_artifact(
+        paths,
+        expected_version=app[PACKAGE_VERSION_KEY],
+    )
+    runtime_snapshot = app[RUNTIME_INTEGRITY_SUPERVISOR_KEY].snapshot()
+    runtime_evidence_ready, _active = _gateway_runtime_update_evidence(
+        runtime_snapshot
+    )
+    if not runtime_evidence_ready:
+        raise MaintenanceRefused("gateway runtime evidence unavailable")
+    job = create_job(
+        paths,
+        hermes_root=app[OPERATIONS_HERMES_ROOT_KEY],
+        config_path=app[OPERATIONS_CONFIG_PATH_KEY],
+        env_file=app[OPERATIONS_ENV_FILE_KEY],
+        profile_id=operation.profile_id,
+        chat_id=operation.chat_id,
+        card_message_id=message_id,
+        operator_hash=hashlib.sha256(
+            operation.owner_open_id.encode("utf-8")
+        ).hexdigest(),
+        pre_update_version=inspection.current_version,
+        pre_update_head=inspection.current_head,
+        target_fingerprint=inspection.target_fingerprint,
+        target_head=inspection.target_head,
+        artifact=artifact,
+        bot_id=str(delivery.get("bot_id") or "default"),
+        job_id=owner_id,
+        pre_sidecar_pid=os.getpid(),
+        pre_runtime_id_hash=str(runtime_snapshot.get("runtime_id_hash") or ""),
+        pre_runtime_sequence=int(runtime_snapshot.get("last_sequence") or 0),
+    )
+    try:
+        reserve_drain_lease(paths, owner_id=owner_id)
+        if not set_gateway_external_drain(
+            app[OPERATIONS_HERMES_ROOT_KEY],
+            active=True,
+        ):
+            raise MaintenanceRefused("gateway drain unavailable")
+        stage_job_credentials(
+            paths,
+            job_id=owner_id,
+            environment=os.environ,
+        )
+    except Exception:
+        try:
+            set_gateway_external_drain(
+                app[OPERATIONS_HERMES_ROOT_KEY],
+                active=False,
+            )
+        except Exception:
+            pass
+        try:
+            release_drain_lease(paths, owner_id=owner_id)
+        except Exception:
+            pass
+        try:
+            discard_job_credentials(paths, job_id=owner_id)
+        except Exception:
+            pass
+        try:
+            discard_unstarted_job(job.path)
+        except Exception:
+            pass
+        raise
+
+
 async def _commands(request: web.Request) -> web.Response:
     try:
         payload = await request.json()
@@ -902,7 +1113,7 @@ async def _commands(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "payload must be an object"}, status=400)
 
     command = _normalize_hfc_command(payload.get("command"))
-    if command == "doctor":
+    if command in {"doctor", "update"}:
         verifier = request.app.get(OPERATIONS_COMMAND_AUTH_KEY)
         if verifier is None:
             return web.json_response(
@@ -952,6 +1163,52 @@ async def _commands(request: web.Request) -> web.Response:
     )
     route = _resolve_route(request, event)
     operation_id = ""
+    if command == "update":
+        profile_id = _safe_profile_id(data.get("profile_id"))
+        profile_source = _safe_command_string(data.get("profile_source"))
+        operator_open_id = _safe_command_operator(payload.get("operator"))
+        if chat_type.lower() not in {"dm", "p2p", "private"} or not operator_open_id:
+            return web.json_response(
+                {"ok": False, "error": "private operator required"},
+                status=403,
+            )
+        try:
+            root_secret = request.app[OPERATIONS_TRANSPORT_ROOT_KEY]
+            prepared_operation_id = secrets.token_urlsafe(18)
+            operation, created = request.app[OPERATIONS_STORE_KEY].prepare_update(
+                chat_id=chat_id,
+                profile_id=profile_id,
+                initiator_open_id=operator_open_id,
+                operation_id=prepared_operation_id,
+                transport_secret=derive_operation_transport_secret(
+                    root_secret, prepared_operation_id
+                ),
+                idempotency_key=_update_idempotency_key(
+                    chat_id, profile_id, message_id
+                ),
+            )
+        except (KeyError, OperationRejected, ValueError):
+            return web.json_response(
+                {"ok": False, "error": "operations overloaded"},
+                status=503,
+            )
+        if created:
+            _schedule_update_inspection(
+                request.app,
+                operation,
+                bot_id=route.bot_id if route is not None else None,
+                thread_id=thread_id or None,
+                reply_to_message_id=reply_to_message_id or message_id,
+                profile_source=profile_source,
+            )
+        return web.json_response(
+            {
+                "ok": True,
+                "handled": True,
+                "command": command,
+                "operation_id": operation.operation_id,
+            }
+        )
     if command == "doctor":
         profile_id = _safe_profile_id(data.get("profile_id"))
         profile_source = _safe_command_string(data.get("profile_source"))
@@ -1061,6 +1318,321 @@ def _log_background_task_failure(task: asyncio.Task[None]) -> None:
 def _doctor_idempotency_key(chat_id: str, profile_id: str, message_id: str) -> str:
     value = f"doctor\0{chat_id}\0{profile_id}\0{message_id}".encode("utf-8")
     return hashlib.sha256(value).hexdigest()
+
+
+def _update_idempotency_key(chat_id: str, profile_id: str, message_id: str) -> str:
+    value = f"update\0{chat_id}\0{profile_id}\0{message_id}".encode("utf-8")
+    return hashlib.sha256(value).hexdigest()
+
+
+def _schedule_update_inspection(
+    app: web.Application,
+    operation: OperationRecord,
+    *,
+    bot_id: str | None,
+    thread_id: str | None,
+    reply_to_message_id: str | None,
+    profile_source: str,
+) -> None:
+    task = asyncio.create_task(
+        _run_update_inspection(
+            app,
+            operation,
+            bot_id=bot_id,
+            thread_id=thread_id,
+            reply_to_message_id=reply_to_message_id,
+            profile_source=profile_source,
+        )
+    )
+    _track_operations_task(app, task)
+
+
+async def _run_update_inspection(
+    app: web.Application,
+    operation: OperationRecord,
+    *,
+    bot_id: str | None,
+    thread_id: str | None,
+    reply_to_message_id: str | None,
+    profile_source: str,
+) -> None:
+    del profile_source
+    store: OperationStore = app[OPERATIONS_STORE_KEY]
+    try:
+        inspection = await _inspect_update_for_app(app)
+        diagnosed = store.diagnose_update(operation.operation_id, inspection)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        inspection = _unavailable_update_inspection(
+            app, "maintenance_runtime_unavailable"
+        )
+        try:
+            diagnosed = store.diagnose_update(operation.operation_id, inspection)
+        except OperationRejected:
+            return
+    card = _render_update_inspection_for_app(app, diagnosed, inspection)
+    await _send_command_card(
+        app,
+        diagnosed.chat_id,
+        card,
+        bot_id,
+        thread_id=thread_id,
+        reply_to_message_id=reply_to_message_id,
+        operation_id=diagnosed.operation_id,
+    )
+
+
+async def _inspect_update_for_app(app: web.Application) -> UpdateInspection:
+    paths = maintenance_paths()
+    artifact = load_verified_artifact(
+        paths,
+        expected_version=app[PACKAGE_VERSION_KEY],
+    )
+    sessions = app[SESSIONS_KEY]
+    sidecar_active_sessions = sum(
+        1
+        for session in sessions.values()
+        if str(getattr(session, "status", "") or "").lower()
+        not in {"completed", "failed", "cancelled"}
+    )
+    readiness = app[RUNTIME_INTEGRITY_SUPERVISOR_KEY].snapshot()
+    gateway_evidence_ready, gateway_active = _gateway_runtime_update_evidence(
+        readiness
+    )
+    if not gateway_evidence_ready:
+        return _unavailable_update_inspection(app, "gateway_runtime_unavailable")
+    active_sessions = max(
+        sidecar_active_sessions,
+        gateway_active,
+    )
+    runtime = await _run_operations_mutation(
+        app,
+        inspect_runtime,
+        paths,
+        artifact,
+        hermes_root=app[OPERATIONS_HERMES_ROOT_KEY],
+    )
+    inspection = await _run_operations_mutation(
+        app,
+        inspect_update,
+        hermes_root=app[OPERATIONS_HERMES_ROOT_KEY],
+        artifact=artifact,
+        installed_hfc_version=app[PACKAGE_VERSION_KEY],
+        active_sessions=active_sessions,
+    )
+    if not runtime.available:
+        return replace(
+            inspection,
+            ready=False,
+            reason_code="maintenance_runtime_unavailable",
+            maintenance_ready=False,
+        )
+    return inspection
+
+
+def _gateway_runtime_update_evidence(
+    readiness: object,
+) -> tuple[bool, int]:
+    if not isinstance(readiness, dict):
+        return False, 0
+    runtime_hash = readiness.get("runtime_id_hash")
+    sequence = readiness.get("last_sequence")
+    active_sessions = readiness.get("active_sessions")
+    valid = (
+        readiness.get("status") == "ready"
+        and isinstance(runtime_hash, str)
+        and len(runtime_hash) == 64
+        and all(character in "0123456789abcdef" for character in runtime_hash)
+        and isinstance(sequence, int)
+        and not isinstance(sequence, bool)
+        and sequence >= 1
+        and isinstance(active_sessions, int)
+        and not isinstance(active_sessions, bool)
+        and active_sessions >= 0
+        and isinstance(readiness.get("admission_draining"), bool)
+        and readiness.get("active_work_count_complete") is True
+        and readiness.get("drain_home_verified") is True
+    )
+    return valid, active_sessions if valid else 0
+
+
+def _unavailable_update_inspection(
+    app: web.Application,
+    reason_code: str,
+) -> UpdateInspection:
+    return UpdateInspection(
+        ready=False,
+        reason_code=reason_code,
+        current_version="",
+        current_head="",
+        target_summary="",
+        target_fingerprint="",
+        hfc_version=app[PACKAGE_VERSION_KEY],
+        artifact_sha256="",
+        active_sessions=0,
+        requires_drain=False,
+        hook_state="",
+        hook_fingerprint="",
+        maintenance_ready=False,
+        changed_paths=(),
+        created_at=time.time(),
+        target_head="",
+    )
+
+
+def _render_update_inspection_for_app(
+    app: web.Application,
+    operation: OperationRecord,
+    inspection: UpdateInspection,
+) -> dict[str, object]:
+    def value(action: str) -> dict[str, object]:
+        return {
+            "hfc_action": "operations.select",
+            "operation_action": action,
+            "token": app[OPERATIONS_STORE_KEY].token(operation, action),
+            "profile_scope": app[OPERATIONS_STORE_KEY].scope_fingerprint(operation),
+            "transport_lineage_id": operation.transport_lineage_id,
+            "update_evidence_fingerprint": inspection.fingerprint,
+        }
+
+    return render_update_inspection_card(
+        inspection,
+        value("confirm_update"),
+        value("cancel_update"),
+        title=app[CARD_TITLE_KEY],
+    )
+
+
+def _schedule_update_job(app: web.Application, operation: OperationRecord) -> None:
+    _track_operations_task(
+        app, asyncio.create_task(_run_update_job_launch(app, operation))
+    )
+
+
+async def _run_update_job_launch(
+    app: web.Application,
+    operation: OperationRecord,
+) -> None:
+    if operation.state != "locking" or operation.update_inspection is None:
+        return
+    delivery = app[OPERATIONS_DELIVERIES_KEY].get(operation.operation_id)
+    if not isinstance(delivery, dict):
+        _release_update_reservation(app, operation.operation_id)
+        return
+    message_id = str(delivery.get("message_id") or "").strip()
+    if not message_id:
+        _release_update_reservation(app, operation.operation_id)
+        return
+    try:
+        paths = maintenance_paths()
+        job = load_job(paths.jobs / f"{operation.operation_id}.json")
+        current = await _inspect_update_for_app(app)
+        if (
+            not current.ready
+            or current.fingerprint != operation.update_evidence_fingerprint
+            or current.current_head != job.pre_update_head
+            or current.target_head != job.target_head
+            or current.target_fingerprint != job.target_fingerprint
+        ):
+            raise MaintenanceRefused("update evidence changed")
+        artifact = load_verified_artifact(
+            paths, expected_version=app[PACKAGE_VERSION_KEY]
+        )
+        runtime = await _run_operations_mutation(
+            app,
+            inspect_runtime,
+            paths,
+            artifact,
+            hermes_root=app[OPERATIONS_HERMES_ROOT_KEY],
+        )
+        if not runtime.available:
+            raise MaintenanceRefused("maintenance runtime unavailable")
+        launched = await _run_operations_mutation(
+            app,
+            launch_job,
+            runtime,
+            job,
+        )
+        if not launched.started:
+            job = transition_job(
+                job.path,
+                expected_phase="locking",
+                phase="failed",
+                result={
+                    "error_code": launched.reason_code,
+                    "recovery_boundary": "before_hermes_update",
+                },
+            )
+            _release_update_reservation(app, operation.operation_id)
+        await _update_card_for_app(
+            app,
+            message_id,
+            render_update_job_card(job, title=app[CARD_TITLE_KEY]),
+            delivery.get("bot_id"),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _fail_reserved_update_job(operation.operation_id)
+        _release_update_reservation(app, operation.operation_id)
+        unavailable = replace(
+            operation.update_inspection,
+            ready=False,
+            reason_code="maintenance_runtime_unavailable",
+        )
+        await _update_card_for_app(
+            app,
+            message_id,
+            render_update_inspection_card(
+                unavailable,
+                {},
+                {},
+                title=app[CARD_TITLE_KEY],
+            ),
+            delivery.get("bot_id"),
+        )
+
+
+def _fail_reserved_update_job(operation_id: str) -> None:
+    try:
+        paths = maintenance_paths()
+        job = load_job(paths.jobs / f"{operation_id}.json")
+        if job.phase not in {"succeeded", "failed", "cancelled"}:
+            transition_job(
+                job.path,
+                expected_phase=job.phase,
+                phase="failed",
+                result={
+                    "error_code": "preflight_evidence_changed",
+                    "recovery_boundary": "no_mutation",
+                    "status": "failed",
+                },
+            )
+    except Exception:
+        pass
+
+
+def _release_update_reservation(
+    app: web.Application,
+    operation_id: str,
+) -> None:
+    paths = maintenance_paths()
+    try:
+        set_gateway_external_drain(
+            app[OPERATIONS_HERMES_ROOT_KEY],
+            active=False,
+        )
+    except Exception:
+        pass
+    try:
+        release_drain_lease(paths, owner_id=operation_id)
+    except Exception:
+        pass
+    try:
+        discard_job_credentials(paths, job_id=operation_id)
+    except Exception:
+        pass
 
 
 def _schedule_operations_diagnosis(
@@ -2192,7 +2764,7 @@ async def _events(request: web.Request) -> web.Response:
 
 def _normalize_hfc_command(value: Any) -> str:
     command = str(value or "").strip().lower()
-    if command in {"status", "doctor", "monitor"}:
+    if command in {"status", "doctor", "monitor", "update"}:
         return command
     return "help"
 

@@ -2,7 +2,9 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.1.4`. It fixes Issue #171's Windows manifestless legacy-owned-hook migration gap while preserving fail-closed handling for outside-block edits, mismatched backups, symlinks, and unparseable source. V3.9.1 was released on 2026-07-11; full automation, build, CI, the reporter's official Windows-flow retest, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.2.0`. It routes only a bare `/update` from a Feishu private chat through an evidence-bound confirmation card, then uses an independent runtime outside the Hermes checkout to run the official updater and restore the same HFC version, hooks, and services. Group, non-Feishu, alias, and parameterized commands keep Hermes' original path. Full automation, build, CI, real private-chat acceptance, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+
+V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
 ## Ready
 
@@ -38,7 +40,7 @@ Current release candidate: `4.1.4`. It fixes Issue #171's Windows manifestless l
 - Feishu/Lark WebSocket long-connection deployments dynamically gain native `send_slash_confirm(...)` and `send_model_picker(...)` card support; button clicks route through `_on_card_action_trigger` back into Hermes' original handlers.
 - When WebSocket-native cards are available, the sidecar `interaction.requested` pre-card is skipped so the same slash command does not show both a sidecar choice card and a native button card.
 - No-argument `/model` selection can use a Feishu-only `send_model_picker(...)` card, call Hermes's callback, and update the same command card with the result.
-- `/update` remains Hermes' background upgrade command and does not render an interactive command card; Hermes native text fallback remains available when the sidecar or final command-card update fails.
+- V4.2.0 intercepts only a bare `/update` in a Feishu private chat: after read-only inspection it shows a 120-second maintenance confirmation, then an independent runtime runs `hermes update --yes`, reinstalls the same HFC version, and restores the hook, sidecar, and Gateway. Group, non-Feishu, alias, and parameterized commands retain Hermes' original path. Run `maintenance status` first.
 - Terminal events ACK Hermes quickly while slow Feishu PATCH calls complete in the background, preventing duplicate native replies after interrupts or update backlogs.
 - `load_config()` reads a `.env` file next to the selected config file while preserving real process environment variables as the highest-precedence source.
 - `install.sh` imports only Feishu/sidecar variables from `.env`, avoiding execution of unrelated values such as paths with spaces.
@@ -144,6 +146,14 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.2.0 Release Gates
+
+- Read-only inspection, 120-second confirmation binding, cancel/expiry/replay/cross-operator rejection, and the dedicated maintenance card for a bare private-chat `/update`: **automated coverage passed**.
+- Exact-wheel provisioning, durable job/journal/lock, official `hermes update --yes`, same-version HFC reinstall, hook/service restoration, and `maintenance status/resume`: **automated coverage passed**.
+- Unrelated tracked changes, incomplete Git state, artifact/version drift, and failed final verification stop; untracked files remain and no custom Git rollback runs: **automated coverage passed**.
+- Full pytest reported **`2304 passed, 4 skipped`** on Python 3.9 and **`2303 passed, 5 skipped`** on Python 3.12; `git diff --check`, wheel/sdist, clean Python 3.12 `site-packages` package/distribution/CLI provenance, and real `maintenance provision/status` independent-runtime and runner-import checks: **local candidate gate passed**.
+- PR CI, real Feishu private-chat card acceptance, exact merge SHA, public tag/install, and Release assets: **verified during release**.
 
 ## V4.1.4 Release Gates
 
