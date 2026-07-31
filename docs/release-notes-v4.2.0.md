@@ -28,4 +28,3 @@
 3. 验证取消不会执行更新。
 4. 再次确认更新，观察原卡片完成全部阶段。
 5. 完成后运行 `doctor --explain`，确认 HFC 版本、`site-packages` 导入来源、hook 与 sidecar/Gateway 状态。
-

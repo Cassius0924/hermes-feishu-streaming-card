@@ -15,4 +15,3 @@
 - Confirmation is bound to the initiator, chat, profile, update target, local evidence, and a 120-second expiry.
 - The workflow never adds `--force`, `--force-venv`, or `--no-backup`, and never performs a custom Git reset, checkout, stash, or rollback.
 - Untracked files are preserved. Unrelated tracked changes, incomplete Git operations, artifact drift, or final verification failures stop the workflow.
-
