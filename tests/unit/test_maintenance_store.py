@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import stat
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -11,11 +12,19 @@ from hermes_feishu_card.maintenance_store import (
     MaintenanceRefused,
     acquire_update_lock,
     create_job,
+    consume_job_credentials,
+    discard_job_credentials,
+    discard_unstarted_job,
     file_sha256,
     load_job,
     load_verified_artifact,
+    load_active_drain_lease,
     maintenance_paths,
     prune_jobs,
+    release_drain_lease,
+    require_drain_lease,
+    reserve_drain_lease,
+    stage_job_credentials,
     stage_wheel_artifact,
     transition_job,
 )
@@ -75,6 +84,7 @@ def _create_job(tmp_path: Path, artifact: ArtifactMetadata, **overrides):
         "pre_update_version": "0.19.1",
         "pre_update_head": "abc123",
         "target_fingerprint": "target-1",
+        "target_head": "d" * 40,
         "artifact": artifact,
     }
     values.update(overrides)
@@ -148,6 +158,7 @@ def test_transition_job_is_atomic_and_compare_and_swap(tmp_path, verified_artifa
     assert updated.phase == "draining"
     assert updated.updated_at == 110.0
     assert updated.attempts == {"draining": 1}
+    assert updated.revision == 1
     with pytest.raises(MaintenanceRefused, match="job phase changed"):
         transition_job(
             job.path,
@@ -170,7 +181,9 @@ def test_job_round_trip_omits_secrets_and_raw_output(tmp_path, verified_artifact
     assert "tenant_token" not in serialized
     assert "transport_secret" not in serialized
     assert "raw_output" not in payload
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
+    assert payload["target_head"] == "d" * 40
+    assert payload["revision"] == 0
     if os.name != "nt":
         assert stat.S_IMODE(job.path.stat().st_mode) == 0o600
 
@@ -202,6 +215,120 @@ def test_update_lock_is_exclusive(tmp_path):
                 raise AssertionError("lock must not be acquired twice")
 
 
+def test_update_lock_rejects_symlink_target(tmp_path):
+    paths = maintenance_paths(tmp_path / "state")
+    paths.root.mkdir(parents=True)
+    target = tmp_path / "outside.lock"
+    target.write_text("keep\n", encoding="utf-8")
+    try:
+        paths.lock.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(MaintenanceRefused, match="lock must not be a symlink"):
+        with acquire_update_lock(paths, job_id="job-1"):
+            raise AssertionError("symlink lock must not be acquired")
+    assert target.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_transition_job_is_interprocess_compare_and_swap(tmp_path, verified_artifact):
+    job = _create_job(tmp_path, verified_artifact)
+
+    def transition(phase):
+        try:
+            return transition_job(
+                job.path,
+                expected_phase="locking",
+                phase=phase,
+            ).phase
+        except MaintenanceRefused:
+            return "refused"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(transition, ("draining", "failed")))
+
+    assert results.count("refused") == 1
+    assert load_job(job.path).revision == 1
+
+
+def test_only_unstarted_job_can_be_discarded(tmp_path, verified_artifact):
+    job = _create_job(tmp_path, verified_artifact)
+    assert discard_unstarted_job(job.path) is True
+    assert not job.path.exists()
+
+    started = _create_job(tmp_path, verified_artifact)
+    transition_job(started.path, expected_phase="locking", phase="draining")
+    with pytest.raises(MaintenanceRefused, match="cannot be discarded"):
+        discard_unstarted_job(started.path)
+
+
+def test_drain_lease_is_durable_exclusive_and_owner_bound(tmp_path):
+    paths = maintenance_paths(tmp_path / "state")
+
+    lease = reserve_drain_lease(
+        paths,
+        owner_id="job-1",
+        now=lambda: 100.0,
+        ttl_seconds=60.0,
+    )
+
+    assert lease.owner_id == "job-1"
+    assert load_active_drain_lease(paths, now=lambda: 120.0) == lease
+    assert require_drain_lease(paths, owner_id="job-1", now=lambda: 120.0) == lease
+    with pytest.raises(MaintenanceRefused, match="maintenance drain already reserved"):
+        reserve_drain_lease(paths, owner_id="job-2", now=lambda: 120.0)
+    with pytest.raises(MaintenanceRefused, match="drain lease owner mismatch"):
+        require_drain_lease(paths, owner_id="job-2", now=lambda: 120.0)
+
+    assert release_drain_lease(paths, owner_id="job-2") is False
+    assert release_drain_lease(paths, owner_id="job-1") is True
+    assert load_active_drain_lease(paths, now=lambda: 120.0) is None
+
+
+def test_expired_drain_lease_can_be_replaced(tmp_path):
+    paths = maintenance_paths(tmp_path / "state")
+    reserve_drain_lease(
+        paths,
+        owner_id="job-old",
+        now=lambda: 100.0,
+        ttl_seconds=10.0,
+    )
+
+    assert load_active_drain_lease(paths, now=lambda: 111.0) is None
+    replacement = reserve_drain_lease(
+        paths,
+        owner_id="job-new",
+        now=lambda: 111.0,
+        ttl_seconds=10.0,
+    )
+    assert replacement.owner_id == "job-new"
+
+
+def test_job_credentials_are_private_allowlisted_and_consumed_once(tmp_path):
+    paths = maintenance_paths(tmp_path / "state")
+    path = stage_job_credentials(
+        paths,
+        job_id="job-1",
+        environment={
+            "FEISHU_APP_ID": "cli_test",
+            "FEISHU_APP_SECRET": "secret-test-only",
+            "UNSAFE_VALUE": "must-not-be-stored",
+        },
+    )
+
+    assert path is not None
+    assert "UNSAFE_VALUE" not in path.read_text(encoding="utf-8")
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert consume_job_credentials(paths, job_id="job-1") == {
+        "FEISHU_APP_ID": "cli_test",
+        "FEISHU_APP_SECRET": "secret-test-only",
+    }
+    assert not path.exists()
+    assert consume_job_credentials(paths, job_id="job-1") == {}
+    assert discard_job_credentials(paths, job_id="job-1") is False
+
+
 def test_prune_jobs_keeps_five_recent_and_removes_jobs_older_than_seven_days(
     tmp_path, verified_artifact
 ):
@@ -220,6 +347,7 @@ def test_prune_jobs_keeps_five_recent_and_removes_jobs_older_than_seven_days(
             pre_update_version="0.19.1",
             pre_update_head=f"head-{index}",
             target_fingerprint=f"target-{index}",
+            target_head="d" * 40,
             artifact=verified_artifact,
             job_id=f"job-{index}",
             now=lambda index=index: float(index * 100),
@@ -246,3 +374,66 @@ def test_prune_jobs_keeps_five_recent_and_removes_jobs_older_than_seven_days(
     prune_jobs(paths, now=700.0 + 604_801.0, max_terminal=5)
 
     assert list(paths.jobs.glob("*.json")) == []
+
+
+def test_prune_jobs_removes_terminal_and_orphan_credential_snapshots(
+    tmp_path, verified_artifact
+):
+    paths = maintenance_paths(tmp_path / "state")
+    live = create_job(
+        paths,
+        hermes_root=tmp_path / "hermes",
+        config_path=tmp_path / "config.yaml",
+        env_file=None,
+        profile_id="default",
+        chat_id="oc_live",
+        card_message_id="om_live",
+        operator_hash="sha256:operator",
+        pre_update_version="0.19.1",
+        pre_update_head="a" * 40,
+        target_fingerprint="b" * 64,
+        target_head="c" * 40,
+        artifact=verified_artifact,
+        job_id="job-live",
+    )
+    terminal = create_job(
+        paths,
+        hermes_root=tmp_path / "hermes",
+        config_path=tmp_path / "config.yaml",
+        env_file=None,
+        profile_id="default",
+        chat_id="oc_terminal",
+        card_message_id="om_terminal",
+        operator_hash="sha256:operator",
+        pre_update_version="0.19.1",
+        pre_update_head="a" * 40,
+        target_fingerprint="b" * 64,
+        target_head="c" * 40,
+        artifact=verified_artifact,
+        job_id="job-terminal",
+    )
+    terminal = transition_job(
+        terminal.path,
+        expected_phase="locking",
+        phase="failed",
+        result={"error_code": "test", "recovery_boundary": "no_mutation"},
+    )
+    environment = {
+        "FEISHU_APP_ID": "cli_test",
+        "FEISHU_APP_SECRET": "secret-test-only",
+    }
+    live_credentials = stage_job_credentials(
+        paths, job_id=live.job_id, environment=environment
+    )
+    terminal_credentials = stage_job_credentials(
+        paths, job_id=terminal.job_id, environment=environment
+    )
+    orphan_credentials = stage_job_credentials(
+        paths, job_id="job-orphan", environment=environment
+    )
+
+    prune_jobs(paths)
+
+    assert live_credentials is not None and live_credentials.exists()
+    assert terminal_credentials is not None and not terminal_credentials.exists()
+    assert orphan_credentials is not None and not orphan_credentials.exists()

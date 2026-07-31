@@ -1849,17 +1849,19 @@ def test_compress_handler_wrapper_is_idempotent_and_non_feishu_bypasses_card():
 
 
 @pytest.mark.parametrize(
-    ("platform", "chat_type", "args"),
+    ("platform", "chat_type", "args", "command"),
     [
-        ("telegram", "private", ""),
-        ("feishu", "group", ""),
-        ("feishu", "private", "--yes"),
+        ("telegram", "private", "", "update"),
+        ("feishu", "group", "", "update"),
+        ("feishu", "private", "--yes", "update"),
+        ("feishu", "private", "", "upgrade"),
     ],
 )
 def test_update_command_wrapper_preserves_original_outside_exact_private_bare_command(
     platform,
     chat_type,
     args,
+    command,
     monkeypatch,
 ):
     requests = []
@@ -1887,6 +1889,7 @@ def test_update_command_wrapper_preserves_original_outside_exact_private_bare_co
             chat_type=chat_type,
             chat_id="oc_private",
         ),
+        get_command=lambda: command,
         get_command_args=lambda: args,
     )
 
@@ -1928,6 +1931,7 @@ def test_update_command_wrapper_routes_exact_private_bare_command_and_fails_clos
             chat_id="oc_private",
         ),
         sender_id=SimpleNamespace(open_id="ou_owner"),
+        get_command=lambda: "update",
         get_command_args=lambda: "",
     )
 
@@ -1966,6 +1970,7 @@ def test_update_command_wrapper_requires_private_operator_identity(monkeypatch):
             chat_type="private",
             chat_id="oc_private",
         ),
+        get_command=lambda: "update",
         get_command_args=lambda: "",
     )
 
@@ -1975,6 +1980,86 @@ def test_update_command_wrapper_requires_private_operator_identity(monkeypatch):
     assert "无法确认操作者" in result
     assert runner.original_calls == 0
     assert requests == []
+
+
+def test_maintenance_admission_fence_blocks_new_gateway_work(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_feishu_card.maintenance_store import (
+        maintenance_paths,
+        release_drain_lease,
+        reserve_drain_lease,
+    )
+
+    monkeypatch.setenv("HERMES_FEISHU_CARD_STATE_DIR", str(tmp_path / "state"))
+    paths = maintenance_paths()
+    reserve_drain_lease(paths, owner_id="job-1")
+
+    class Adapter:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, chat_id, content, **kwargs):
+            self.sent.append((chat_id, content, kwargs))
+
+    adapter = Adapter()
+    source = SimpleNamespace(chat_id="oc_private", platform="feishu")
+
+    class Runner:
+        adapters = {"feishu": adapter}
+        _profile_adapters = {}
+        _running_agents = {"active": object()}
+        _external_drain_active = True
+
+        def _active_work_count(self):
+            return 3
+
+        def _adapter_for_source(self, current_source):
+            assert current_source is source
+            return adapter
+
+    runner = Runner()
+    local_vars = {"self": runner, "event": SimpleNamespace(source=source), "source": source}
+
+    assert asyncio.run(
+        hook_runtime.maintenance_admission_from_hermes_locals(local_vars)
+    ) is True
+    assert adapter.sent and "维护升级" in adapter.sent[0][1]
+    assert hook_runtime.gateway_active_session_count() == 3
+    assert hook_runtime.gateway_external_drain_active() is True
+    assert hook_runtime.gateway_active_work_snapshot() == (3, True)
+
+    assert release_drain_lease(paths, owner_id="job-1") is True
+    assert asyncio.run(
+        hook_runtime.maintenance_admission_from_hermes_locals(local_vars)
+    ) is False
+
+
+def test_gateway_drain_home_requires_runtime_home_to_match_checkout(
+    tmp_path,
+    monkeypatch,
+):
+    gateway_source = tmp_path / "home" / "hermes-agent" / "gateway" / "run.py"
+    gateway_source.parent.mkdir(parents=True)
+    gateway_source.write_text("# fixture\n", encoding="utf-8")
+    monkeypatch.setitem(
+        sys.modules,
+        "gateway.run",
+        SimpleNamespace(__file__=str(gateway_source)),
+    )
+    current_home = [gateway_source.parents[2]]
+    monkeypatch.setattr(
+        hook_runtime.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(
+            get_process_hermes_home=lambda: current_home[0]
+        ),
+    )
+
+    assert hook_runtime.gateway_drain_home_verified() is True
+    current_home[0] = tmp_path / "home" / "profiles" / "secondary"
+    assert hook_runtime.gateway_drain_home_verified() is False
 
 
 def test_manual_compress_original_exception_is_not_swallowed():

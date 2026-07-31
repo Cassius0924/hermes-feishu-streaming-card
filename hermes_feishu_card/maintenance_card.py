@@ -68,7 +68,11 @@ _INSPECTION_REASON_COPY = {
     "unrelated_tracked_changes": "Hermes 工作树存在不属于 HFC 的已跟踪改动。",
     "update_check_timeout": "Hermes 更新检查超时。",
     "update_check_failed": "Hermes 更新检查失败。",
+    "update_target_unavailable": "无法绑定 Hermes 更新目标提交。",
+    "update_target_diverged": "当前 Hermes 与 origin/main 已分叉，拒绝自动更新。",
+    "no_update_available": "当前已是 origin/main 最新版本。",
     "maintenance_runtime_unavailable": "独立维护环境尚未就绪。",
+    "gateway_runtime_unavailable": "Gateway 运行状态尚未提供可验证的任务计数。",
 }
 
 _RECOVERY_COMMAND = "hermes-feishu-card maintenance status"
@@ -99,22 +103,23 @@ def render_update_inspection_card(
         if inspection.requires_drain
         else "- 当前没有需要等待的运行任务。"
     )
-    target = inspection.target_summary or "更新目标已确认"
+    target = inspection.target_summary or "当前更新快照已确认"
     content = "\n".join(
         [
             "**确认更新 Hermes**",
             "",
             f"- Hermes：`{inspection.current_version or 'unknown'}`",
-            f"- 更新目标：{target}",
+            f"- 当前更新快照：{target}",
             f"- HFC：`{inspection.hfc_version}`（保持不变）",
             "- 钩子与维护包：已验证",
             drain_line,
             "",
-            "确认后会暂时停止卡片服务，并在更新完成后自动恢复。",
+            "确认会授权官方 updater 在执行时重新获取最新 `origin/main`；",
+            "若远端在此期间变化，流程会先恢复服务，再把目标变化明确报告为失败。",
         ]
     )
     card = _base_card(title, "确认更新 Hermes", "blue", content)
-    card["elements"].append(
+    card["body"]["elements"].append(
         {
             "tag": "column_set",
             "element_id": "hfc_update_confirmation",
@@ -253,12 +258,14 @@ def _base_card(
             "subtitle": {"tag": "plain_text", "content": status_title[:80]},
             "template": template,
         },
-        "elements": [
-            {
-                "tag": "markdown",
-                "content": content,
-            }
-        ],
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": content,
+                }
+            ]
+        },
     }
 
 

@@ -3300,6 +3300,12 @@ def _render_hfc_command_hook_block(indent: str, newline: str):
         f"{indent}try:{newline}",
         (
             f"{inner_indent}from hermes_feishu_card.hook_runtime "
+            f"import maintenance_admission_from_hermes_locals as _hfc_enforce_maintenance_admission{newline}"
+        ),
+        f"{inner_indent}if await _hfc_enforce_maintenance_admission(locals()):{newline}",
+        f"{deeper_indent}return None{newline}",
+        (
+            f"{inner_indent}from hermes_feishu_card.hook_runtime "
             f"import handle_hfc_command_from_hermes_locals as _hfc_handle_command{newline}"
         ),
         f"{inner_indent}_hfc_command_message_id = None{newline}",

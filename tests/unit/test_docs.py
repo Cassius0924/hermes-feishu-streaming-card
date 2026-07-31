@@ -2136,8 +2136,8 @@ def test_v4021_release_docs_record_content_integrity_and_real_feishu_acceptance(
     assert 'HFC_VERSION: "${HFC_VERSION:-v4.2.0}"' in compose
     for doc in (readme, readme_en, install_doc, guide, guide_en):
         assert "HFC_VERSION=v4.2.0" in doc
-    assert "`v4.1.4`（Compose 示例）" in guide
-    assert "The Compose example defaults `HFC_VERSION` to `v4.1.4`." in guide_en
+    assert "`v4.2.0`（Compose 示例）" in guide
+    assert "The Compose example defaults `HFC_VERSION` to `v4.2.0`." in guide_en
     for doc in (guide, guide_en):
         assert re.search(
             r"(?:Compose|Compose 示例).*v4\.0\.(?:0|[1-9]|1[0-9]|20)(?!\d)"
@@ -2147,8 +2147,8 @@ def test_v4021_release_docs_record_content_integrity_and_real_feishu_acceptance(
         ) is None
     assert "| [v4.0.21](release-notes-v4.0.21.md) | 2026-07-28 |" in guide
     assert "| [v4.0.21](release-notes-v4.0.21.en.md) | 2026-07-28 |" in guide_en
-    assert "当前发布候选为 `4.1.4`" in readiness
-    assert "Current release candidate: `4.1.4`" in readiness_en
+    assert "当前发布候选为 `4.2.0`" in readiness
+    assert "Current release candidate: `4.2.0`" in readiness_en
     assert "## V4.0.21 发布门禁" in readiness
     assert "## V4.0.21 Release Gates" in readiness_en
     assert "真实飞书图片验收：**已通过（2026-07-28）**" in readiness
@@ -2381,7 +2381,7 @@ def test_v411_release_docs_define_upgrade_recovery_safety_contract():
     assert "docs/release-notes-v4.1.1.md" in changelog
     assert "docs/release-notes-v4.1.1.md" in readme
     assert "docs/release-notes-v4.1.1.en.md" in readme_en
-    assert "HFC_VERSION: v4.1.4" in workflow
+    assert "HFC_VERSION: v4.2.0" in workflow
     assert "### V4.1.1：升级恢复安全热修（已发布）" in todo
     assert "### V4.1.0：投递策略与运行安全（已发布）" in todo
 
@@ -2437,10 +2437,10 @@ def test_v412_release_docs_define_gateway_restart_race_contract():
     assert "docs/release-notes-v4.1.2.md" in changelog
     assert "docs/release-notes-v4.1.2.md" in readme
     assert "docs/release-notes-v4.1.2.en.md" in readme_en
-    assert "HFC_VERSION: v4.1.4" in workflow
+    assert "HFC_VERSION: v4.2.0" in workflow
     assert "### V4.1.2：Gateway 重启竞态热修（已发布）" in todo
-    assert "当前发布候选为 `4.1.4`" in readiness
-    assert "Current release candidate: `4.1.4`" in readiness_en
+    assert "当前发布候选为 `4.2.0`" in readiness
+    assert "Current release candidate: `4.2.0`" in readiness_en
 
     for text in (notes, notes_en, controls, event_flow, acceptance):
         assert "runtime_heartbeat_stale" in text or "heartbeat stale" in text
@@ -2491,11 +2491,11 @@ def test_v414_release_docs_define_manifestless_legacy_migration_candidate():
     assert "docs/release-notes-v4.1.4.md" in readme
     assert "docs/release-notes-v4.1.4.en.md" in readme_en
     assert "HFC_VERSION=v4.2.0" in install_doc
-    assert "HFC_VERSION: v4.1.4" in workflow
+    assert "HFC_VERSION: v4.2.0" in workflow
     assert 'HFC_VERSION: "${HFC_VERSION:-v4.2.0}"' in compose
-    assert "### V4.1.4：Windows 旧版 manifest 迁移热修（发布候选）" in todo
-    assert "当前发布候选为 `4.1.4`" in readiness
-    assert "Current release candidate: `4.1.4`" in readiness_en
+    assert "### V4.1.4：Windows 旧版 manifest 迁移热修（已发布）" in todo
+    assert "当前发布候选为 `4.2.0`" in readiness
+    assert "Current release candidate: `4.2.0`" in readiness_en
     assert "## V4.1.4 发布门禁" in readiness
     assert "## V4.1.4 Release Gates" in readiness_en
     assert "从 V4.1.3 升级到 V4.1.4" in migration
@@ -2549,10 +2549,10 @@ def test_v413_release_docs_define_combined_upgrade_compatibility_candidate():
     assert "docs/release-notes-v4.1.3.md" in readme
     assert "docs/release-notes-v4.1.3.en.md" in readme_en
     assert "HFC_VERSION=v4.2.0" in install_doc
-    assert "HFC_VERSION: v4.1.4" in workflow
+    assert "HFC_VERSION: v4.2.0" in workflow
     assert "### V4.1.3：升级恢复与 TurnRunner 兼容性热修（已发布）" in todo
-    assert "当前发布候选为 `4.1.4`" in readiness
-    assert "Current release candidate: `4.1.4`" in readiness_en
+    assert "当前发布候选为 `4.2.0`" in readiness
+    assert "Current release candidate: `4.2.0`" in readiness_en
     assert "## V4.1.3 发布门禁" in readiness
     assert "## V4.1.3 Release Gates" in readiness_en
 
@@ -2802,3 +2802,69 @@ def test_all_command_feedback_card_lifecycle_is_documented():
     readiness = read_doc("docs/release-readiness.md")
     assert "所有非空文本反馈" in readiness
     assert "重启前反馈进入命令卡" in readiness
+
+
+def test_v420_docs_define_private_update_maintenance_release():
+    changelog = read_doc("CHANGELOG.md")
+    readme = read_doc("README.md")
+    readme_en = read_doc("README.en.md")
+    install_doc = read_doc("README-install.md")
+    guide = read_doc("docs/user-guide.md")
+    guide_en = read_doc("docs/user-guide.en.md")
+    readiness = read_doc("docs/release-readiness.md")
+    readiness_en = read_doc("docs/release-readiness.en.md")
+    notes = read_doc("docs/release-notes-v4.2.0.md")
+    notes_en = read_doc("docs/release-notes-v4.2.0.en.md")
+    event_flow = read_doc("docs/wiki/event-flow.md")
+    maintenance_guide = read_doc("docs/wiki/maintenance-guide.md")
+    todo = read_doc("TODO.md")
+    workflow = read_doc(".github/workflows/tests.yml")
+
+    assert "## V4.2.0" in changelog
+    assert "docs/release-notes-v4.2.0.md" in changelog
+    assert "docs/release-notes-v4.2.0.md" in readme
+    assert "docs/release-notes-v4.2.0.en.md" in readme_en
+    assert "From V4.2.0" in install_doc
+    assert "## V4.2.0 飞书私聊安全升级" in guide
+    assert "## V4.2.0 Safe Private-Chat Updates" in guide_en
+    assert "当前发布候选为 `4.2.0`" in readiness
+    assert "Current release candidate: `4.2.0`" in readiness_en
+    assert "## V4.2.0 发布门禁" in readiness
+    assert "## V4.2.0 Release Gates" in readiness_en
+    assert "### V4.2.0：飞书私聊安全升级（发布候选）" in todo
+    assert "HFC_VERSION: v4.2.0" in workflow
+
+    for text in (install_doc, guide, guide_en, readiness, readiness_en, notes, notes_en):
+        assert "maintenance status" in text
+        assert "/update" in text
+
+    assert "仅拦截飞书私聊中的裸 `/update`" in notes
+    assert "Only an exact bare `/update` in a Feishu private chat" in notes_en
+    assert "群聊、非飞书、别名和带参数调用仍进入 Hermes 原处理器" in notes
+    assert "Group, non-Feishu, alias, and parameterized commands" in notes_en
+    assert "连续两次新 heartbeat" in notes
+    assert "two newer heartbeats" in notes_en
+    assert "执行时重新 fetch 最新 `origin/main`" in notes
+    assert "fetch the latest `origin/main` at execution time" in notes_en
+    assert "单次 `_active_work_count()` 采样" in notes
+    assert "one `_active_work_count()` sample" in notes_en
+    assert "一次性私有凭据快照" in notes
+    assert "one-use private credential snapshot" in notes_en
+    assert "完整依赖" in notes
+    assert "full wheel dependencies" in notes_en
+    assert "schema v2 heartbeat" in event_flow
+    assert "drain lease" in event_flow
+    assert "schema v2" in maintenance_guide
+
+    assets = (
+        "hermes-feishu-card-v4.2.0-macos.tar.gz",
+        "hermes-feishu-card-v4.2.0-linux.tar.gz",
+        "hermes-feishu-card-v4.2.0-windows.zip",
+        "hermes-feishu-card-v4.2.0-checksums.txt",
+    )
+    for text in (notes, notes_en):
+        for asset in assets:
+            assert asset in text
+
+    assert "候选版本说明；本实现分支不会自行发布" not in notes
+    assert "Candidate release notes. This implementation branch" not in notes_en

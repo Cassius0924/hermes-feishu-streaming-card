@@ -132,6 +132,53 @@ def test_maintenance_status_reports_unavailable_without_mutating(
     assert "runtime_python_missing" in captured.out
 
 
+def test_maintenance_resume_launches_real_independent_runner(
+    monkeypatch, tmp_path, capsys
+):
+    job_path = tmp_path / "maintenance" / "jobs" / "job-1.json"
+    job = SimpleNamespace(
+        path=job_path,
+        artifact_version=PACKAGE_VERSION,
+        hermes_root=tmp_path / "hermes",
+    )
+    artifact = SimpleNamespace(version=PACKAGE_VERSION)
+    runtime = SimpleNamespace(available=True, reason_code="ready")
+    launch = SimpleNamespace(
+        started=True,
+        reason_code="started",
+        manager="systemd-user",
+    )
+    calls = []
+    monkeypatch.setattr(cli_module, "load_job", lambda path: job)
+    monkeypatch.setattr(
+        cli_module,
+        "maintenance_paths",
+        lambda root=None: calls.append(("paths", root)) or "paths",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_verified_artifact",
+        lambda paths, expected_version: artifact,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "inspect_runtime",
+        lambda paths, current, hermes_root: runtime,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "launch_job",
+        lambda status, current: calls.append(("launch", status, current)) or launch,
+    )
+
+    code = main(["maintenance", "resume", "--job", str(job_path)])
+
+    assert code == 0
+    assert calls[0] == ("paths", job_path.parent.parent)
+    assert calls[-1] == ("launch", runtime, job)
+    assert "maintenance: started" in capsys.readouterr().out
+
+
 def test_status_reports_runtime_readiness_and_fails_when_degraded(
     monkeypatch, capsys
 ):

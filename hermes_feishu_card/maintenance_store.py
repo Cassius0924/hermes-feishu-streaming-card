@@ -18,7 +18,9 @@ from .process import state_dir
 
 
 ARTIFACT_SCHEMA_VERSION = 1
-JOB_SCHEMA_VERSION = 1
+JOB_SCHEMA_VERSION = 2
+DRAIN_SCHEMA_VERSION = 1
+JOB_CREDENTIAL_SCHEMA_VERSION = 1
 ARTIFACT_METADATA_NAME = "artifact.json"
 UPDATE_PHASES = frozenset(
     {
@@ -49,6 +51,7 @@ _SAFE_RESULT_KEYS = frozenset(
         "recovery_boundary",
         "service_status",
         "status",
+        "target_validation",
     }
 )
 _MAX_STRING_CHARS = 4096
@@ -66,6 +69,7 @@ class MaintenancePaths:
     artifacts: Path
     jobs: Path
     lock: Path
+    drain: Path
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,14 @@ class ArtifactMetadata:
     metadata_path: Path
     source_kind: str
     created_at: float
+
+
+@dataclass(frozen=True)
+class DrainLease:
+    schema_version: int
+    owner_id: str
+    created_at: float
+    expires_at: float
 
 
 @dataclass(frozen=True)
@@ -104,6 +116,11 @@ class UpdateJob:
     updated_at: float
     result: dict[str, object]
     bot_id: str = "default"
+    target_head: str = ""
+    revision: int = 0
+    pre_sidecar_pid: int = 0
+    pre_runtime_id_hash: str = ""
+    pre_runtime_sequence: int = 0
 
 
 def maintenance_paths(root: Path | None = None) -> MaintenancePaths:
@@ -118,7 +135,168 @@ def maintenance_paths(root: Path | None = None) -> MaintenancePaths:
         artifacts=selected / "artifacts",
         jobs=selected / "jobs",
         lock=selected / "update.lock",
+        drain=selected / "drain.json",
     )
+
+
+def reserve_drain_lease(
+    paths: MaintenancePaths,
+    *,
+    owner_id: str,
+    now: Callable[[], float] = time.time,
+    ttl_seconds: float = 6 * 60 * 60,
+) -> DrainLease:
+    _prepare_paths(paths)
+    owner = _bounded_string(owner_id, "drain lease owner")
+    ttl = float(ttl_seconds)
+    if not (0 < ttl <= 24 * 60 * 60):
+        raise MaintenanceRefused("drain lease ttl is invalid")
+    timestamp = float(now())
+    with _acquire_job_lock(paths.drain):
+        active = load_active_drain_lease(paths, now=lambda: timestamp)
+        if active is not None:
+            if active.owner_id != owner:
+                raise MaintenanceRefused("maintenance drain already reserved")
+            return active
+        lease = DrainLease(
+            schema_version=DRAIN_SCHEMA_VERSION,
+            owner_id=owner,
+            created_at=timestamp,
+            expires_at=timestamp + ttl,
+        )
+        _atomic_write_json(paths.drain, _drain_payload(lease))
+        return lease
+
+
+def load_active_drain_lease(
+    paths: MaintenancePaths,
+    *,
+    now: Callable[[], float] = time.time,
+) -> DrainLease | None:
+    path = paths.drain
+    if path.is_symlink():
+        raise MaintenanceRefused("drain lease must not be a symlink")
+    if not path.exists():
+        return None
+    payload = _load_json_file(path, label="drain lease")
+    if set(payload) != {"schema_version", "owner_id", "created_at", "expires_at"}:
+        raise MaintenanceRefused("drain lease schema fields are invalid")
+    if payload.get("schema_version") != DRAIN_SCHEMA_VERSION:
+        raise MaintenanceRefused("drain lease schema unsupported")
+    created_at = _safe_timestamp(payload.get("created_at"), "drain lease")
+    expires_at = _safe_timestamp(payload.get("expires_at"), "drain lease")
+    if expires_at <= created_at:
+        raise MaintenanceRefused("drain lease expiry is invalid")
+    lease = DrainLease(
+        schema_version=DRAIN_SCHEMA_VERSION,
+        owner_id=_required_string(payload, "owner_id", "drain lease"),
+        created_at=created_at,
+        expires_at=expires_at,
+    )
+    return lease if lease.expires_at > float(now()) else None
+
+
+def require_drain_lease(
+    paths: MaintenancePaths,
+    *,
+    owner_id: str,
+    now: Callable[[], float] = time.time,
+) -> DrainLease:
+    lease = load_active_drain_lease(paths, now=now)
+    if lease is None:
+        raise MaintenanceRefused("maintenance drain lease is unavailable")
+    if lease.owner_id != _bounded_string(owner_id, "drain lease owner"):
+        raise MaintenanceRefused("drain lease owner mismatch")
+    return lease
+
+
+def release_drain_lease(paths: MaintenancePaths, *, owner_id: str) -> bool:
+    owner = _bounded_string(owner_id, "drain lease owner")
+    if not paths.root.exists():
+        return False
+    _prepare_paths(paths)
+    with _acquire_job_lock(paths.drain):
+        lease = load_active_drain_lease(paths, now=lambda: 0.0)
+        if lease is None or lease.owner_id != owner:
+            return False
+        if paths.drain.is_symlink():
+            raise MaintenanceRefused("drain lease must not be a symlink")
+        paths.drain.unlink()
+        return True
+
+
+def stage_job_credentials(
+    paths: MaintenancePaths,
+    *,
+    job_id: str,
+    environment: Mapping[str, str],
+) -> Path | None:
+    selected_job_id = _safe_job_id(job_id)
+    values = {
+        key: value
+        for key in ("FEISHU_APP_ID", "FEISHU_APP_SECRET")
+        if isinstance((value := environment.get(key)), str) and value.strip()
+    }
+    if not values:
+        return None
+    _prepare_paths(paths)
+    path = paths.jobs / f"{selected_job_id}.credentials.json"
+    if path.exists() or path.is_symlink():
+        raise MaintenanceRefused("job credential snapshot already exists")
+    _atomic_write_json(
+        path,
+        {
+            "schema_version": JOB_CREDENTIAL_SCHEMA_VERSION,
+            "job_id": selected_job_id,
+            "environment": values,
+        },
+    )
+    return path
+
+
+def load_job_credentials(paths: MaintenancePaths, *, job_id: str) -> dict[str, str]:
+    selected_job_id = _safe_job_id(job_id)
+    path = paths.jobs / f"{selected_job_id}.credentials.json"
+    if not path.exists() and not path.is_symlink():
+        return {}
+    if path.is_symlink():
+        raise MaintenanceRefused("job credential snapshot must not be a symlink")
+    _require_private_file(path, "job credential snapshot")
+    payload = _load_json_file(path, label="job credential snapshot")
+    if set(payload) != {"schema_version", "job_id", "environment"}:
+        raise MaintenanceRefused("job credential snapshot schema fields are invalid")
+    if payload.get("schema_version") != JOB_CREDENTIAL_SCHEMA_VERSION:
+        raise MaintenanceRefused("job credential snapshot schema unsupported")
+    if payload.get("job_id") != selected_job_id:
+        raise MaintenanceRefused("job credential snapshot owner mismatch")
+    raw_environment = payload.get("environment")
+    if not isinstance(raw_environment, dict) or not raw_environment:
+        raise MaintenanceRefused("job credential snapshot is invalid")
+    values: dict[str, str] = {}
+    for key, value in raw_environment.items():
+        if key not in {"FEISHU_APP_ID", "FEISHU_APP_SECRET"}:
+            raise MaintenanceRefused("job credential snapshot key is invalid")
+        values[key] = _bounded_string(value, "job credential value")
+    return values
+
+
+def consume_job_credentials(paths: MaintenancePaths, *, job_id: str) -> dict[str, str]:
+    values = load_job_credentials(paths, job_id=job_id)
+    if values:
+        discard_job_credentials(paths, job_id=job_id)
+    return values
+
+
+def discard_job_credentials(paths: MaintenancePaths, *, job_id: str) -> bool:
+    selected_job_id = _safe_job_id(job_id)
+    path = paths.jobs / f"{selected_job_id}.credentials.json"
+    if path.is_symlink():
+        raise MaintenanceRefused("job credential snapshot must not be a symlink")
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def file_sha256(path: Path) -> str:
@@ -241,7 +419,11 @@ def create_job(
     pre_update_version: str,
     pre_update_head: str,
     target_fingerprint: str,
+    target_head: str,
     artifact: ArtifactMetadata,
+    pre_sidecar_pid: int = 0,
+    pre_runtime_id_hash: str = "",
+    pre_runtime_sequence: int = 0,
     bot_id: str = "default",
     job_id: str | None = None,
     now: Callable[[], float] = time.time,
@@ -252,13 +434,9 @@ def create_job(
     )
     if verified_artifact.sha256 != artifact.sha256:
         raise MaintenanceRefused("artifact hash mismatch")
-    selected_job_id = (
-        _bounded_string(job_id, "job id")
-        if job_id is not None
-        else secrets.token_urlsafe(18)
+    selected_job_id = _safe_job_id(
+        job_id if job_id is not None else secrets.token_urlsafe(18)
     )
-    if not all(char.isalnum() or char in {"-", "_"} for char in selected_job_id):
-        raise MaintenanceRefused("job id is invalid")
     job_path = paths.jobs / f"{selected_job_id}.json"
     if job_path.exists() or job_path.is_symlink():
         raise MaintenanceRefused("job id collision")
@@ -292,6 +470,15 @@ def create_job(
         updated_at=timestamp,
         result={},
         bot_id=_bounded_string(bot_id, "bot id"),
+        target_head=_commit_id(target_head, "target head"),
+        revision=0,
+        pre_sidecar_pid=_safe_nonnegative_int(pre_sidecar_pid, "pre-sidecar pid"),
+        pre_runtime_id_hash=_optional_sha256(
+            pre_runtime_id_hash, "pre-runtime id hash"
+        ),
+        pre_runtime_sequence=_safe_nonnegative_int(
+            pre_runtime_sequence, "pre-runtime sequence"
+        ),
     )
     _atomic_write_json(job.path, _job_payload(job))
     return job
@@ -320,6 +507,7 @@ def load_job(path: Path, *, require_private: bool = True) -> UpdateJob:
         "pre_update_version",
         "pre_update_head",
         "target_fingerprint",
+        "target_head",
         "artifact_version",
         "artifact_sha256",
         "artifact_path",
@@ -328,6 +516,10 @@ def load_job(path: Path, *, require_private: bool = True) -> UpdateJob:
         "updated_at",
         "result",
         "bot_id",
+        "revision",
+        "pre_sidecar_pid",
+        "pre_runtime_id_hash",
+        "pre_runtime_sequence",
     }
     if set(payload) != expected_keys:
         raise MaintenanceRefused("job schema fields are invalid")
@@ -373,6 +565,19 @@ def load_job(path: Path, *, require_private: bool = True) -> UpdateJob:
         updated_at=_safe_timestamp(payload.get("updated_at"), "job"),
         result=result,
         bot_id=_required_string(payload, "bot_id", "job"),
+        target_head=_commit_id(
+            _required_string(payload, "target_head", "job"), "target head"
+        ),
+        revision=_safe_revision(payload.get("revision")),
+        pre_sidecar_pid=_safe_nonnegative_int(
+            payload.get("pre_sidecar_pid"), "pre-sidecar pid"
+        ),
+        pre_runtime_id_hash=_optional_sha256(
+            payload.get("pre_runtime_id_hash"), "pre-runtime id hash"
+        ),
+        pre_runtime_sequence=_safe_nonnegative_int(
+            payload.get("pre_runtime_sequence"), "pre-runtime sequence"
+        ),
     )
 
 
@@ -386,26 +591,42 @@ def transition_job(
 ) -> UpdateJob:
     if phase not in UPDATE_PHASES:
         raise MaintenanceRefused("job phase is invalid")
-    current = load_job(path)
-    if current.phase != expected_phase:
-        raise MaintenanceRefused("job phase changed")
-    attempts = dict(current.attempts)
-    attempts[phase] = attempts.get(phase, 0) + 1
-    safe_result = _safe_result(dict(result) if result is not None else current.result)
-    updated = UpdateJob(
-        **{
-            **current.__dict__,
-            "phase": phase,
-            "attempts": attempts,
-            "updated_at": float(now()),
-            "result": safe_result,
-        }
-    )
-    latest = load_job(path)
-    if latest.phase != expected_phase or latest.updated_at != current.updated_at:
-        raise MaintenanceRefused("job phase changed")
-    _atomic_write_json(current.path, _job_payload(updated))
-    return updated
+    with _acquire_job_lock(Path(path)):
+        current = load_job(path)
+        if current.phase != expected_phase:
+            raise MaintenanceRefused("job phase changed")
+        attempts = dict(current.attempts)
+        attempts[phase] = attempts.get(phase, 0) + 1
+        safe_result = _safe_result(
+            dict(result) if result is not None else current.result
+        )
+        updated = UpdateJob(
+            **{
+                **current.__dict__,
+                "phase": phase,
+                "attempts": attempts,
+                "updated_at": float(now()),
+                "result": safe_result,
+                "revision": current.revision + 1,
+            }
+        )
+        _atomic_write_json(current.path, _job_payload(updated))
+        return updated
+
+
+def discard_unstarted_job(path: Path) -> bool:
+    selected = Path(path).expanduser()
+    with _acquire_job_lock(selected):
+        current = load_job(selected)
+        if (
+            current.phase != "locking"
+            or current.revision != 0
+            or current.attempts
+            or current.result
+        ):
+            raise MaintenanceRefused("started maintenance job cannot be discarded")
+        selected.unlink()
+        return True
 
 
 @contextmanager
@@ -416,7 +637,7 @@ def acquire_update_lock(
 ) -> Iterator[Path]:
     _prepare_paths(paths)
     safe_job_id = _bounded_string(job_id, "job id")
-    descriptor = os.open(paths.lock, os.O_RDWR | os.O_CREAT, 0o600)
+    descriptor = _open_private_lock_file(paths.lock, "update lock")
     try:
         if os.name == "nt":
             import msvcrt
@@ -454,6 +675,64 @@ def acquire_update_lock(
         os.close(descriptor)
 
 
+@contextmanager
+def _acquire_job_lock(path: Path) -> Iterator[Path]:
+    selected = Path(path).expanduser()
+    lock_path = selected.with_suffix(selected.suffix + ".lock")
+    descriptor = _open_private_lock_file(lock_path, "job lock")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield lock_path
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(descriptor)
+
+
+def _open_private_lock_file(path: Path, label: str) -> int:
+    if path.is_symlink():
+        raise MaintenanceRefused(f"{label} must not be a symlink")
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise MaintenanceRefused(f"{label} is unavailable") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise MaintenanceRefused(f"{label} must be a regular file")
+        getuid = getattr(os, "getuid", None)
+        if callable(getuid) and info.st_uid != getuid():
+            raise MaintenanceRefused(f"{label} owner is invalid")
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
 def prune_jobs(
     paths: MaintenancePaths,
     *,
@@ -466,13 +745,22 @@ def prune_jobs(
         raise ValueError("max_terminal must be non-negative")
     current_time = time.time() if now is None else float(now)
     terminal: list[UpdateJob] = []
+    jobs_by_id: dict[str, UpdateJob] = {}
     for path in paths.jobs.glob("*.json"):
+        if path.name.endswith(".credentials.json"):
+            continue
         try:
             job = load_job(path)
         except MaintenanceRefused:
             continue
+        jobs_by_id[job.job_id] = job
         if job.phase in TERMINAL_UPDATE_PHASES:
             terminal.append(job)
+    for credential_path in paths.jobs.glob("*.credentials.json"):
+        job_id = credential_path.name[: -len(".credentials.json")]
+        job = jobs_by_id.get(job_id)
+        if job is None or job.phase in TERMINAL_UPDATE_PHASES:
+            _unlink_regular_job(credential_path)
     terminal.sort(key=lambda item: (item.updated_at, item.job_id), reverse=True)
     retained = 0
     for job in terminal:
@@ -617,6 +905,51 @@ def _bounded_string(value: object, label: str) -> str:
     return normalized
 
 
+def _commit_id(value: object, label: str) -> str:
+    normalized = _bounded_string(value, label).lower()
+    if len(normalized) not in {40, 64} or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise MaintenanceRefused(f"{label} is invalid")
+    return normalized
+
+
+def _safe_job_id(value: object) -> str:
+    selected = _bounded_string(value, "job id")
+    if not all(character.isalnum() or character in {"-", "_"} for character in selected):
+        raise MaintenanceRefused("job id is invalid")
+    return selected
+
+
+def _safe_revision(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not (0 <= value <= 10_000):
+        raise MaintenanceRefused("job revision is invalid")
+    return value
+
+
+def _safe_nonnegative_int(value: object, label: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= 2**63 - 1
+    ):
+        raise MaintenanceRefused(f"{label} is invalid")
+    return value
+
+
+def _optional_sha256(value: object, label: str) -> str:
+    if value == "":
+        return ""
+    if not isinstance(value, str):
+        raise MaintenanceRefused(f"{label} is invalid")
+    normalized = value.strip().lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise MaintenanceRefused(f"{label} is invalid")
+    return normalized
+
+
 def _absolute_path(value: Path, label: str) -> Path:
     selected = Path(value).expanduser()
     if not selected.is_absolute():
@@ -693,6 +1026,7 @@ def _job_payload(job: UpdateJob) -> dict[str, object]:
         "pre_update_version": job.pre_update_version,
         "pre_update_head": job.pre_update_head,
         "target_fingerprint": job.target_fingerprint,
+        "target_head": job.target_head,
         "artifact_version": job.artifact_version,
         "artifact_sha256": job.artifact_sha256,
         "artifact_path": str(job.artifact_path),
@@ -701,6 +1035,19 @@ def _job_payload(job: UpdateJob) -> dict[str, object]:
         "updated_at": job.updated_at,
         "result": dict(job.result),
         "bot_id": job.bot_id,
+        "revision": job.revision,
+        "pre_sidecar_pid": job.pre_sidecar_pid,
+        "pre_runtime_id_hash": job.pre_runtime_id_hash,
+        "pre_runtime_sequence": job.pre_runtime_sequence,
+    }
+
+
+def _drain_payload(lease: DrainLease) -> dict[str, object]:
+    return {
+        "schema_version": lease.schema_version,
+        "owner_id": lease.owner_id,
+        "created_at": lease.created_at,
+        "expires_at": lease.expires_at,
     }
 
 

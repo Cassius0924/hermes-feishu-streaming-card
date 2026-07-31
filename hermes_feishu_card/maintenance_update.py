@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -17,10 +18,13 @@ from .maintenance_store import (
     MaintenanceRefused,
     UpdateJob,
     acquire_update_lock,
+    discard_job_credentials,
     file_sha256,
     load_job,
     load_verified_artifact,
     maintenance_paths,
+    release_drain_lease,
+    require_drain_lease,
     transition_job,
 )
 
@@ -46,6 +50,16 @@ _RUNTIME_IMPORT_PROBE = (
     "import json, pathlib, hermes_feishu_card; "
     "print(json.dumps({'version': hermes_feishu_card.__version__, "
     "'location': str(pathlib.Path(hermes_feishu_card.__file__).resolve())}))"
+)
+_ENGAGE_GATEWAY_DRAIN_CODE = (
+    "import pathlib,sys; "
+    "from gateway.drain_control import write_drain_request; "
+    "write_drain_request(principal='hfc-update', home=pathlib.Path(sys.argv[1]))"
+)
+_RELEASE_GATEWAY_DRAIN_CODE = (
+    "import pathlib,sys; "
+    "from gateway.drain_control import clear_drain_request; "
+    "clear_drain_request(home=pathlib.Path(sys.argv[1]))"
 )
 _TERMINAL_PHASES = frozenset({"succeeded", "failed", "cancelled"})
 
@@ -76,6 +90,7 @@ class UpdateInspection:
     maintenance_ready: bool
     changed_paths: tuple[str, ...]
     created_at: float
+    target_head: str = ""
 
     @property
     def fingerprint(self) -> str:
@@ -110,6 +125,7 @@ def inspect_update(
         current_head: str = "",
         target_summary: str = "",
         target_fingerprint: str = "",
+        target_head: str = "",
         hook_state: str = "",
         hook_fingerprint: str = "",
         changed_paths: tuple[str, ...] = (),
@@ -130,6 +146,7 @@ def inspect_update(
             maintenance_ready=artifact.version == hfc_version,
             changed_paths=tuple(_safe_relative_path(item) for item in changed_paths),
             created_at=created_at,
+            target_head=_safe_commit_id(target_head),
         )
 
     if not hfc_version or artifact.version != hfc_version:
@@ -275,9 +292,90 @@ def inspect_update(
             hook_state=hook_state,
             hook_fingerprint=hook_fingerprint,
         )
-    normalized_target = _safe_short(update_result.stdout, 240)
+    fetch_result = runner(
+        ("git", "-C", str(root), "fetch", "--quiet", "origin", "main"),
+        UPDATE_CHECK_TIMEOUT_SECONDS,
+    )
+    if fetch_result.timed_out or fetch_result.returncode != 0:
+        return result(
+            False,
+            "update_target_unavailable",
+            current_version=version,
+            current_head=current_head,
+            hook_state=hook_state,
+            hook_fingerprint=hook_fingerprint,
+        )
+    target_result = runner(
+        ("git", "-C", str(root), "rev-parse", "--verify", "origin/main"),
+        20.0,
+    )
+    target_head = _first_line(target_result.stdout)
+    if (
+        target_result.timed_out
+        or target_result.returncode != 0
+        or not _is_commit_id(target_head)
+    ):
+        return result(
+            False,
+            "update_target_unavailable",
+            current_version=version,
+            current_head=current_head,
+            hook_state=hook_state,
+            hook_fingerprint=hook_fingerprint,
+        )
+    if target_head.lower() == current_head.lower():
+        return result(
+            False,
+            "no_update_available",
+            current_version=version,
+            current_head=current_head,
+            target_summary="origin/main is already installed",
+            target_head=target_head,
+            hook_state=hook_state,
+            hook_fingerprint=hook_fingerprint,
+        )
+    ancestry = runner(
+        (
+            "git",
+            "-C",
+            str(root),
+            "merge-base",
+            "--is-ancestor",
+            current_head,
+            target_head,
+        ),
+        20.0,
+    )
+    if ancestry.timed_out or ancestry.returncode != 0:
+        return result(
+            False,
+            "update_target_diverged",
+            current_version=version,
+            current_head=current_head,
+            target_head=target_head,
+            hook_state=hook_state,
+            hook_fingerprint=hook_fingerprint,
+        )
+    summary_result = runner(
+        (
+            "git",
+            "-C",
+            str(root),
+            "log",
+            "-1",
+            "--format=%h %s",
+            target_head,
+        ),
+        20.0,
+    )
+    normalized_target = (
+        _safe_short(summary_result.stdout, 220)
+        if not summary_result.timed_out and summary_result.returncode == 0
+        else target_head[:12]
+    )
+    normalized_target = f"origin/main {normalized_target}".strip()
     target_fingerprint = hashlib.sha256(
-        _normalized_output(update_result.stdout).encode("utf-8")
+        ("origin/main\0" + target_head.lower()).encode("utf-8")
     ).hexdigest()
     return result(
         True,
@@ -286,6 +384,7 @@ def inspect_update(
         current_head=current_head,
         target_summary=normalized_target,
         target_fingerprint=target_fingerprint,
+        target_head=target_head,
         hook_state=hook_state,
         hook_fingerprint=hook_fingerprint,
     )
@@ -298,6 +397,7 @@ def inspection_fingerprint(inspection: UpdateInspection) -> str:
         "current_version": inspection.current_version,
         "current_head": inspection.current_head,
         "target_fingerprint": inspection.target_fingerprint,
+        "target_head": inspection.target_head,
         "hfc_version": inspection.hfc_version,
         "artifact_sha256": inspection.artifact_sha256,
         "hook_state": inspection.hook_state,
@@ -358,7 +458,88 @@ def detect_runtime_python(hermes_root: Path) -> Path | None:
     return None
 
 
+def set_gateway_external_drain(
+    hermes_root: Path,
+    *,
+    active: bool,
+    run: CommandRunner | None = None,
+) -> bool:
+    root = Path(hermes_root).expanduser().resolve(strict=False)
+    runtime_python = detect_runtime_python(root)
+    if runtime_python is None:
+        return False
+    result = (run or run_command)(
+        (
+            str(runtime_python),
+            "-I",
+            "-c",
+            _ENGAGE_GATEWAY_DRAIN_CODE if active else _RELEASE_GATEWAY_DRAIN_CODE,
+            str(root.parent),
+        ),
+        30.0,
+    )
+    return not result.timed_out and result.returncode == 0
+
+
 def run_job(
+    job_path: Path,
+    *,
+    run: CommandRunner | None = None,
+    fetch_health: HealthFetcher | None = None,
+    publish: JobPublisher | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    maintenance_python: Path | None = None,
+    drain_timeout_seconds: float = 180.0,
+    update_timeout_seconds: float = 3600.0,
+) -> UpdateJob:
+    publisher = publish or (lambda current: True)
+    result: UpdateJob | None = None
+    try:
+        result = _run_job(
+            job_path,
+            run=run,
+            fetch_health=fetch_health,
+            publish=publisher,
+            sleep=sleep,
+            monotonic=monotonic,
+            maintenance_python=maintenance_python,
+            drain_timeout_seconds=drain_timeout_seconds,
+            update_timeout_seconds=update_timeout_seconds,
+        )
+    except MaintenanceRefused:
+        current = load_job(job_path)
+        result = _fail_job(
+            current,
+            "update_lock_unavailable",
+            "no_mutation",
+            publisher,
+        )
+    finally:
+        if result is not None and result.phase in _TERMINAL_PHASES:
+            paths = maintenance_paths(result.path.parent.parent)
+            try:
+                release_drain_lease(paths, owner_id=result.job_id)
+            except (MaintenanceRefused, OSError):
+                pass
+            try:
+                discard_job_credentials(paths, job_id=result.job_id)
+            except (MaintenanceRefused, OSError):
+                pass
+            try:
+                set_gateway_external_drain(
+                    result.hermes_root,
+                    active=False,
+                    run=run,
+                )
+            except Exception:
+                pass
+    if result is None:
+        raise MaintenanceRefused("maintenance job did not produce a result")
+    return result
+
+
+def _run_job(
     job_path: Path,
     *,
     run: CommandRunner | None = None,
@@ -384,6 +565,37 @@ def run_job(
         current = load_job(current.path)
         if current.phase in _TERMINAL_PHASES:
             return current
+        try:
+            require_drain_lease(paths, owner_id=current.job_id)
+        except MaintenanceRefused:
+            return _fail_job(
+                current,
+                "drain_lease_unavailable",
+                "no_mutation",
+                publisher,
+            )
+        if (
+            current.pre_sidecar_pid <= 0
+            or not current.pre_runtime_id_hash
+            or current.pre_runtime_sequence < 1
+        ):
+            return _fail_job(
+                current,
+                "confirmation_runtime_evidence_missing",
+                "no_mutation",
+                publisher,
+            )
+        if not set_gateway_external_drain(
+            current.hermes_root,
+            active=True,
+            run=runner,
+        ):
+            return _fail_job(
+                current,
+                "gateway_drain_unavailable",
+                "no_mutation",
+                publisher,
+            )
         try:
             artifact = load_verified_artifact(
                 paths,
@@ -429,6 +641,7 @@ def run_job(
                 not inspection.ready
                 or inspection.current_head != current.pre_update_head
                 or inspection.target_fingerprint != current.target_fingerprint
+                or inspection.target_head != current.target_head
                 or inspection.hfc_version != current.artifact_version
                 or inspection.artifact_sha256 != current.artifact_sha256
             ):
@@ -470,6 +683,28 @@ def run_job(
                 return current
 
         if current.phase == "restoring_hooks":
+            gateway_stop = runner(
+                ("hermes", "gateway", "stop", "--all"),
+                120.0,
+            )
+            if gateway_stop.timed_out or gateway_stop.returncode != 0:
+                return _fail_job(
+                    current,
+                    "gateway_stop_failed",
+                    "old_hfc_or_manual",
+                    publisher,
+                )
+            if not set_gateway_external_drain(
+                current.hermes_root,
+                active=False,
+                run=runner,
+            ):
+                return _fail_job(
+                    current,
+                    "gateway_drain_release_failed",
+                    "old_hfc_or_manual",
+                    publisher,
+                )
             stop = runner(
                 tuple(
                     _cli_command(
@@ -567,12 +802,18 @@ def run_job(
                         "updater_result_classified",
                         publisher,
                     )
-            current = _advance_job(
-                current,
-                "reinstalling_hfc",
-                publisher,
-                require_delivery=False,
+            current = transition_job(
+                current.path,
+                expected_phase="updating_hermes",
+                phase="reinstalling_hfc",
+                result={
+                    "actual_head": actual_head,
+                    "target_validation": (
+                        "exact" if actual_head == current.target_head else "mismatch"
+                    ),
+                },
             )
+            _publish_job(publisher, current)
 
         if current.phase == "reinstalling_hfc":
             post_detection = _supported_full_detection(current.hermes_root)
@@ -728,6 +969,10 @@ def run_job(
                 health_fetcher,
                 sleep=sleep,
                 monotonic=monotonic,
+                expected_version=current.artifact_version,
+                expected_python_identity=_python_executable_identity(runtime_python),
+                previous_pid=current.pre_sidecar_pid,
+                previous_runtime_hash=current.pre_runtime_id_hash,
             )
             if health is None:
                 return _fail_job(
@@ -755,10 +1000,20 @@ def run_job(
                 "service_status": "ready",
                 "status": "succeeded",
             }
+            target_mismatch = current.result.get("target_validation") == "mismatch"
+            if target_mismatch:
+                result.update(
+                    {
+                        "actual_head": actual_head or "unknown",
+                        "error_code": "post_update_target_mismatch",
+                        "recovery_boundary": "new_hfc_restored",
+                        "status": "failed",
+                    }
+                )
             current = transition_job(
                 current.path,
                 expected_phase="verifying",
-                phase="succeeded",
+                phase="failed" if target_mismatch else "succeeded",
                 result=result,
             )
             _publish_job(publisher, current)
@@ -766,11 +1021,35 @@ def run_job(
 
 
 def _git_operation_incomplete(root: Path) -> bool:
-    git_dir = root / ".git"
+    git_marker = root / ".git"
+    git_dir = git_marker
+    if git_marker.is_file() and not git_marker.is_symlink():
+        try:
+            marker = git_marker.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return True
+        prefix = "gitdir:"
+        if not marker.lower().startswith(prefix):
+            return True
+        candidate = Path(marker[len(prefix) :].strip()).expanduser()
+        git_dir = candidate if candidate.is_absolute() else root / candidate
+        git_dir = git_dir.resolve(strict=False)
     return any(
         (git_dir / name).exists() or (git_dir / name).is_symlink()
         for name in ("MERGE_HEAD", "rebase-merge", "rebase-apply")
     )
+
+
+def _is_commit_id(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    return len(normalized) in {40, 64} and all(
+        character in "0123456789abcdef" for character in normalized
+    )
+
+
+def _safe_commit_id(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if _is_commit_id(normalized) else ""
 
 
 def _publish_job(publisher: JobPublisher, job: UpdateJob) -> bool:
@@ -838,10 +1117,16 @@ def _safe_health(fetch: HealthFetcher) -> dict[str, object]:
 
 
 def _active_maintenance_sessions(health: dict[str, object]) -> int:
-    value = health.get("maintenance_active_sessions", 0)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return 0
-    return value
+    values = (
+        health.get("maintenance_active_sessions", 0),
+        health.get("gateway_active_sessions", 0),
+    )
+    counts = [
+        value
+        for value in values
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    ]
+    return max(counts, default=0)
 
 
 def _wait_for_drain(
@@ -852,10 +1137,43 @@ def _wait_for_drain(
     monotonic: Callable[[], float],
 ) -> bool:
     deadline = monotonic() + max(0.0, timeout_seconds)
+    zero_sequence: int | None = None
     while True:
         health = _safe_health(fetch)
-        if health and _active_maintenance_sessions(health) == 0:
-            return True
+        readiness = health.get("readiness")
+        drain = health.get("maintenance_drain")
+        sequence = readiness.get("last_sequence") if isinstance(readiness, dict) else None
+        heartbeat_age = (
+            readiness.get("last_seen_age_seconds")
+            if isinstance(readiness, dict)
+            else None
+        )
+        gateway_active = health.get("gateway_active_sessions")
+        evidence_ready = (
+            isinstance(drain, dict)
+            and drain.get("active") is True
+            and drain.get("valid") is True
+            and isinstance(readiness, dict)
+            and readiness.get("status") == "ready"
+            and isinstance(sequence, int)
+            and not isinstance(sequence, bool)
+            and sequence >= 1
+            and isinstance(heartbeat_age, int)
+            and not isinstance(heartbeat_age, bool)
+            and 0 <= heartbeat_age <= 30
+            and isinstance(gateway_active, int)
+            and not isinstance(gateway_active, bool)
+            and gateway_active >= 0
+            and readiness.get("admission_draining") is True
+            and readiness.get("active_work_count_complete") is True
+            and readiness.get("drain_home_verified") is True
+        )
+        if evidence_ready and _active_maintenance_sessions(health) == 0:
+            if zero_sequence is not None and sequence > zero_sequence:
+                return True
+            zero_sequence = sequence
+        else:
+            zero_sequence = None
         if monotonic() >= deadline:
             return False
         sleep(min(1.0, max(0.0, deadline - monotonic())))
@@ -866,23 +1184,67 @@ def _wait_for_ready_health(
     *,
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
+    expected_version: str,
+    expected_python_identity: str,
+    previous_pid: int,
+    previous_runtime_hash: str,
     timeout_seconds: float = 120.0,
 ) -> dict[str, object] | None:
     deadline = monotonic() + timeout_seconds
     while True:
         health = _safe_health(fetch)
         readiness = health.get("readiness")
+        process_pid = health.get("process_pid")
+        runtime_hash = (
+            readiness.get("runtime_id_hash") if isinstance(readiness, dict) else None
+        )
+        sequence = readiness.get("last_sequence") if isinstance(readiness, dict) else None
+        heartbeat_age = (
+            readiness.get("last_seen_age_seconds")
+            if isinstance(readiness, dict)
+            else None
+        )
         ready = (
             health.get("status") == "healthy"
             and isinstance(readiness, dict)
             and readiness.get("status") == "ready"
-            and readiness.get("runtime_ready") is True
+            and health.get("package_version") == expected_version
+            and health.get("python_identity") == expected_python_identity
+            and isinstance(process_pid, int)
+            and not isinstance(process_pid, bool)
+            and process_pid > 0
+            and process_pid != previous_pid
+            and isinstance(runtime_hash, str)
+            and len(runtime_hash) == 64
+            and runtime_hash != previous_runtime_hash
+            and isinstance(sequence, int)
+            and not isinstance(sequence, bool)
+            and sequence >= 1
+            and isinstance(heartbeat_age, int)
+            and not isinstance(heartbeat_age, bool)
+            and 0 <= heartbeat_age <= 30
+            and readiness.get("admission_draining") is False
+            and readiness.get("active_work_count_complete") is True
+            and readiness.get("drain_home_verified") is True
         )
         if ready:
             return health
         if monotonic() >= deadline:
             return None
         sleep(min(1.0, max(0.0, deadline - monotonic())))
+
+
+def _python_executable_identity(executable: Path) -> str:
+    path = Path(executable).expanduser()
+    try:
+        canonical_parent = path.parent.resolve(strict=False)
+    except (OSError, RuntimeError):
+        canonical_parent = path.parent.absolute()
+    canonical = os.path.normcase(str(canonical_parent / path.name))
+    material = b"hermes-feishu-streaming-card:python-executable:v1\0" + os.fsencode(
+        canonical
+    )
+    return f"python-sha256:{hashlib.sha256(material).hexdigest()}"
 
 
 def _cli_command(

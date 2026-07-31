@@ -33,6 +33,11 @@ def _payload(**changes):
         "package_version": "4.1.0",
     }
     payload.update(changes)
+    if payload.get("schema_version") == "2":
+        payload.setdefault("active_sessions", 0)
+        payload.setdefault("admission_draining", False)
+        payload.setdefault("active_work_count_complete", True)
+        payload.setdefault("drain_home_verified", True)
     return payload
 
 
@@ -49,12 +54,30 @@ def test_runtime_control_event_accepts_only_bounded_safe_fields():
     assert event.event == "runtime.hello"
     assert event.sequence == 1
 
+    current = RuntimeControlEvent.from_dict(
+        _payload(
+            schema_version="2",
+            active_sessions=3,
+            admission_draining=True,
+            active_work_count_complete=True,
+            drain_home_verified=True,
+        )
+    )
+    assert current.active_sessions == 3
+    assert current.admission_draining is True
+    assert current.active_work_count_complete is True
+    assert current.drain_home_verified is True
+
     for changes in (
         {"event": "message.completed"},
         {"sequence": -1},
         {"runtime_id": "short"},
         {"package_version": "v" * 129},
         {"local_path": "/private/secret"},
+        {"schema_version": "2", "active_sessions": -1},
+        {"schema_version": "2", "admission_draining": "yes"},
+        {"schema_version": "2", "active_work_count_complete": "yes"},
+        {"schema_version": "2", "drain_home_verified": "yes"},
     ):
         with pytest.raises(RuntimeControlValidationError):
             RuntimeControlEvent.from_dict(_payload(**changes))
@@ -133,6 +156,10 @@ def test_emitter_rereads_transport_secret_and_increments_sequence():
         "runtime.hello",
         "runtime.heartbeat",
     ]
+    assert [call[1]["active_sessions"] for call in calls] == [0, 0]
+    assert [call[1]["admission_draining"] for call in calls] == [False, False]
+    assert [call[1]["active_work_count_complete"] for call in calls] == [False, False]
+    assert [call[1]["drain_home_verified"] for call in calls] == [False, False]
     assert calls[0][2] != calls[1][2]
     assert all(call[0].endswith("/runtime/events") for call in calls)
 
@@ -260,6 +287,12 @@ def test_supervisor_has_independent_liveness_readiness_state_machine():
         "generation_match": False,
         "restart_required": False,
         "last_seen_age_seconds": None,
+        "runtime_id_hash": "",
+        "last_sequence": 0,
+        "active_sessions": None,
+        "admission_draining": None,
+        "active_work_count_complete": None,
+        "drain_home_verified": None,
     }
 
     clock[0] = 31.0
@@ -936,5 +969,8 @@ def test_existing_startup_adapter_call_starts_runtime_control_without_new_patch(
         {
             "event_url": "http://127.0.0.1:18765/events",
             "package_version": hook_runtime.__version__,
+            "active_work_snapshot_provider": hook_runtime.gateway_active_work_snapshot,
+            "admission_draining_provider": hook_runtime.gateway_external_drain_active,
+            "drain_home_verified_provider": hook_runtime.gateway_drain_home_verified,
         }
     ]

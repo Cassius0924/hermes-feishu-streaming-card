@@ -59,6 +59,8 @@ class ProvisionHarness:
         self.commands.append(normalized)
         if normalized[1:3] == ("-m", "venv"):
             self.python_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.python_path.is_symlink():
+                self.python_path.unlink()
             self.python_path.write_text("#!python\n", encoding="utf-8")
             self.python_path.chmod(0o700)
             return CommandResult(normalized, 0, "", "")
@@ -101,15 +103,42 @@ def test_provision_runtime_uses_private_venv_and_exact_wheel(
 
     assert status.available is True
     assert status.package_version == artifact.version
-    assert status.python_path == harness.python_path.resolve(strict=False)
+    assert status.python_path == harness.python_path.absolute()
     assert status.package_location == harness.package_location.resolve(strict=False)
-    assert "--no-deps" in harness.pip_argv
+    assert "--clear" in harness.commands[0]
+    assert "--no-deps" not in harness.pip_argv
     assert "--force-reinstall" in harness.pip_argv
     assert str(artifact.wheel_path) in harness.pip_argv
     metadata = paths.runtime / "runtime.json"
     assert json.loads(metadata.read_text())["artifact_sha256"] == "a" * 64
     if os.name != "nt":
         assert stat.S_IMODE(metadata.stat().st_mode) == 0o600
+
+
+def test_inspect_runtime_accepts_standard_venv_python_symlink_outside_hermes(
+    tmp_path, artifact
+):
+    paths = maintenance_paths(tmp_path / "state")
+    paths.runtime.mkdir(parents=True)
+    harness = ProvisionHarness(paths)
+    harness.python_path.parent.mkdir(parents=True, exist_ok=True)
+    host_python = tmp_path / "host-python"
+    host_python.write_text("#!python\n", encoding="utf-8")
+    harness.python_path.symlink_to(host_python)
+    harness.package_location.parent.mkdir(parents=True, exist_ok=True)
+    harness.package_location.write_text("__version__='4.2.0'\n", encoding="utf-8")
+
+    status = inspect_runtime(
+        paths,
+        artifact,
+        hermes_root=tmp_path / "hermes",
+        python_path=harness.python_path,
+        run=harness,
+    )
+
+    assert status.available is True
+    assert status.python_path == harness.python_path.absolute()
+    assert harness.python_path.is_symlink()
 
 
 def test_inspect_runtime_rejects_python_inside_hermes(tmp_path, artifact):
@@ -289,6 +318,7 @@ def test_launch_job_detaches_without_shell(status, job):
         status,
         job,
         systemd_user_available=lambda: False,
+        detached_lifecycle_safe=lambda: True,
         popen=popen,
     )
 
@@ -301,6 +331,51 @@ def test_launch_job_detaches_without_shell(status, job):
     assert popen.kwargs["stderr"] is not None
     if os.name != "nt":
         assert popen.kwargs["start_new_session"] is True
+
+
+def test_launch_job_refuses_unsafe_linux_detach(status, job, monkeypatch):
+    monkeypatch.setattr("hermes_feishu_card.maintenance_process.sys.platform", "linux")
+    popen = PopenHarness()
+
+    launch = launch_job(
+        status,
+        job,
+        systemd_user_available=lambda: False,
+        popen=popen,
+    )
+
+    assert launch.started is False
+    assert launch.manager == "unavailable"
+    assert launch.reason_code == "independent_manager_unavailable"
+    assert popen.argv == ()
+
+
+def test_runtime_probe_imports_actual_maintenance_runner(tmp_path, artifact):
+    paths = maintenance_paths(tmp_path / "state")
+    python_path = paths.runtime / "venv" / "bin" / "python"
+    python_path.parent.mkdir(parents=True)
+    python_path.write_text("#!python\n", encoding="utf-8")
+    package_location = (
+        paths.runtime
+        / "venv/lib/python3.12/site-packages/hermes_feishu_card/__init__.py"
+    )
+
+    def runner(argv, timeout):
+        assert "hermes_feishu_card.maintenance_runner" in argv[-1]
+        return CommandResult(
+            tuple(argv),
+            0,
+            json.dumps({"version": "4.2.0", "location": str(package_location)}),
+            "",
+        )
+
+    assert inspect_runtime(
+        paths,
+        artifact,
+        hermes_root=tmp_path / "hermes",
+        python_path=python_path,
+        run=runner,
+    ).available is True
 
 
 def test_launch_job_refuses_unavailable_or_version_mismatched_runtime(status, job):

@@ -787,6 +787,7 @@ class OperationStore:
         callback_chat_id: str,
         callback_profile_id: str,
         callback_evidence_fingerprint: str,
+        reserve_update: Callable[[str], None] | None = None,
     ) -> OperationRecord:
         with self._lock:
             claims, record = self._verify_token_locked(token)
@@ -813,6 +814,16 @@ class OperationStore:
                 raise OperationRejected("update evidence changed")
             if record.state != "awaiting_confirmation":
                 raise OperationRejected("invalid update transition")
+            if action == "confirm_update":
+                if any(
+                    item.operation_id != record.operation_id
+                    and item.kind == "update"
+                    and item.state == "locking"
+                    for item in self._records.values()
+                ):
+                    raise OperationRejected("another update is in progress")
+                if reserve_update is not None:
+                    reserve_update(record.operation_id)
             record.state = "locking" if action == "confirm_update" else "cancelled"
             return record
 

@@ -24,7 +24,7 @@ from .operations_transport import read_transport_root_secret
 RUNTIME_TIMESTAMP_HEADER = "X-HFC-Runtime-Timestamp"
 RUNTIME_NONCE_HEADER = "X-HFC-Runtime-Nonce"
 RUNTIME_SIGNATURE_HEADER = "X-HFC-Runtime-Signature"
-RUNTIME_HOOK_GENERATION = "hfc-runtime-control-v1"
+RUNTIME_HOOK_GENERATION = "hfc-runtime-control-v2"
 
 _ROOT_SECRET_BYTES = 32
 _PROOF_MAX_AGE_SECONDS = 5
@@ -46,6 +46,12 @@ _RUNTIME_EVENT_FIELDS = frozenset(
         "package_version",
     }
 )
+_RUNTIME_EVENT_FIELDS_V2 = _RUNTIME_EVENT_FIELDS | {
+    "active_sessions",
+    "admission_draining",
+    "active_work_count_complete",
+    "drain_home_verified",
+}
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _NO_PROXY_OPENER = request.build_opener(request.ProxyHandler({}))
@@ -355,19 +361,30 @@ class RuntimeControlEvent:
     created_at: float
     hook_generation: str
     package_version: str
+    active_sessions: int | None = None
+    admission_draining: bool | None = None
+    active_work_count_complete: bool | None = None
+    drain_home_verified: bool | None = None
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeControlEvent":
-        if not isinstance(payload, Mapping) or set(payload) != _RUNTIME_EVENT_FIELDS:
+        if not isinstance(payload, Mapping):
             raise RuntimeControlValidationError("invalid runtime control event")
         schema_version = payload.get("schema_version")
+        expected_fields = (
+            _RUNTIME_EVENT_FIELDS_V2
+            if schema_version == "2"
+            else _RUNTIME_EVENT_FIELDS
+        )
+        if set(payload) != expected_fields:
+            raise RuntimeControlValidationError("invalid runtime control event")
         event = payload.get("event")
         runtime_id = payload.get("runtime_id")
         sequence = payload.get("sequence")
         created_at = payload.get("created_at")
         hook_generation = payload.get("hook_generation")
         package_version = payload.get("package_version")
-        if schema_version != "1" or event not in _RUNTIME_EVENTS:
+        if schema_version not in {"1", "2"} or event not in _RUNTIME_EVENTS:
             raise RuntimeControlValidationError("invalid runtime control event")
         if (
             not isinstance(runtime_id, str)
@@ -392,18 +409,46 @@ class RuntimeControlEvent:
                 or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
             ):
                 raise RuntimeControlValidationError("invalid runtime control event")
+        active_sessions = payload.get("active_sessions")
+        if schema_version == "2" and (
+            isinstance(active_sessions, bool)
+            or not isinstance(active_sessions, int)
+            or not 0 <= active_sessions <= 1_000_000
+        ):
+            raise RuntimeControlValidationError("invalid runtime control event")
+        admission_draining = payload.get("admission_draining")
+        if schema_version == "2" and not isinstance(admission_draining, bool):
+            raise RuntimeControlValidationError("invalid runtime control event")
+        active_work_count_complete = payload.get("active_work_count_complete")
+        if schema_version == "2" and not isinstance(
+            active_work_count_complete, bool
+        ):
+            raise RuntimeControlValidationError("invalid runtime control event")
+        drain_home_verified = payload.get("drain_home_verified")
+        if schema_version == "2" and not isinstance(drain_home_verified, bool):
+            raise RuntimeControlValidationError("invalid runtime control event")
         return cls(
-            schema_version="1",
+            schema_version=schema_version,
             event=event,
             runtime_id=runtime_id,
             sequence=sequence,
             created_at=float(created_at),
             hook_generation=hook_generation,
             package_version=package_version,
+            active_sessions=(active_sessions if schema_version == "2" else None),
+            admission_draining=(
+                admission_draining if schema_version == "2" else None
+            ),
+            active_work_count_complete=(
+                active_work_count_complete if schema_version == "2" else None
+            ),
+            drain_home_verified=(
+                drain_home_verified if schema_version == "2" else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "event": self.event,
             "runtime_id": self.runtime_id,
@@ -412,6 +457,12 @@ class RuntimeControlEvent:
             "hook_generation": self.hook_generation,
             "package_version": self.package_version,
         }
+        if self.schema_version == "2":
+            payload["active_sessions"] = self.active_sessions
+            payload["admission_draining"] = self.admission_draining
+            payload["active_work_count_complete"] = self.active_work_count_complete
+            payload["drain_home_verified"] = self.drain_home_verified
+        return payload
 
 
 def sign_runtime_request(
@@ -531,6 +582,9 @@ class RuntimeControlEmitter:
         secret_reader: Callable[[], bytes | None] = read_transport_root_secret,
         poster: Callable[[str, bytes, dict[str, str], float], bool] | None = None,
         timeout_seconds: float = 1.0,
+        active_work_snapshot_provider: Callable[[], tuple[int, bool]] | None = None,
+        admission_draining_provider: Callable[[], bool] | None = None,
+        drain_home_verified_provider: Callable[[], bool] | None = None,
     ):
         self.runtime_url = runtime_events_url(event_url)
         self.hook_generation = _bounded_text(hook_generation, "hook generation")
@@ -547,6 +601,15 @@ class RuntimeControlEmitter:
         self._secret_reader = secret_reader
         self._poster = poster or _post_runtime_request
         self._timeout_seconds = timeout_seconds
+        self._active_work_snapshot_provider = (
+            active_work_snapshot_provider or (lambda: (0, False))
+        )
+        self._admission_draining_provider = (
+            admission_draining_provider or (lambda: False)
+        )
+        self._drain_home_verified_provider = (
+            drain_home_verified_provider or (lambda: False)
+        )
         self._sequence = 0
         self._lock = threading.Lock()
 
@@ -558,15 +621,24 @@ class RuntimeControlEmitter:
                 self._sequence += 1
                 sequence = self._sequence
             created_at = float(self._now())
+            active_sessions, active_work_count_complete = (
+                self._active_work_snapshot_provider()
+            )
+            admission_draining = self._admission_draining_provider()
+            drain_home_verified = self._drain_home_verified_provider()
             event = RuntimeControlEvent.from_dict(
                 {
-                    "schema_version": "1",
+                    "schema_version": "2",
                     "event": event_name,
                     "runtime_id": self.runtime_id,
                     "sequence": sequence,
                     "created_at": created_at,
                     "hook_generation": self.hook_generation,
                     "package_version": self.package_version,
+                    "active_sessions": active_sessions,
+                    "admission_draining": admission_draining,
+                    "active_work_count_complete": active_work_count_complete,
+                    "drain_home_verified": drain_home_verified,
                 }
             )
             body = json.dumps(
@@ -625,6 +697,10 @@ class RuntimeIntegritySupervisor:
         self._runtime_id = ""
         self._last_sequence = 0
         self._generation_match = False
+        self._active_sessions: int | None = None
+        self._admission_draining: bool | None = None
+        self._active_work_count_complete: bool | None = None
+        self._drain_home_verified: bool | None = None
         self._restart_required = False
         self._manual_review_required = False
         self._pre_repair_runtime_hash = ""
@@ -670,6 +746,10 @@ class RuntimeIntegritySupervisor:
                 )
             )
             self._generation_match = generation_match
+            self._active_sessions = event.active_sessions
+            self._admission_draining = event.admission_draining
+            self._active_work_count_complete = event.active_work_count_complete
+            self._drain_home_verified = event.drain_home_verified
             if (
                 event.event == "runtime.hello"
                 and generation_match
@@ -769,6 +849,12 @@ class RuntimeIntegritySupervisor:
             restart_required = self._restart_required
             manual_review_required = self._manual_review_required
             control_auth_unavailable = self._control_auth_unavailable
+            runtime_id_hash = _runtime_id_hash(self._runtime_id)
+            last_sequence = self._last_sequence
+            active_sessions = self._active_sessions
+            admission_draining = self._admission_draining
+            active_work_count_complete = self._active_work_count_complete
+            drain_home_verified = self._drain_home_verified
 
         if self.mode == "off":
             status = "disabled"
@@ -809,6 +895,12 @@ class RuntimeIntegritySupervisor:
             "generation_match": generation_match,
             "restart_required": restart_required,
             "last_seen_age_seconds": age,
+            "runtime_id_hash": runtime_id_hash,
+            "last_sequence": last_sequence,
+            "active_sessions": active_sessions,
+            "admission_draining": admission_draining,
+            "active_work_count_complete": active_work_count_complete,
+            "drain_home_verified": drain_home_verified,
         }
 
 
@@ -824,6 +916,9 @@ def start_runtime_control(
     package_version: str,
     hook_generation: str = RUNTIME_HOOK_GENERATION,
     interval_seconds: float = 15.0,
+    active_work_snapshot_provider: Callable[[], tuple[int, bool]] | None = None,
+    admission_draining_provider: Callable[[], bool] | None = None,
+    drain_home_verified_provider: Callable[[], bool] | None = None,
 ) -> bool:
     global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD
     try:
@@ -836,6 +931,9 @@ def start_runtime_control(
                 event_url=event_url,
                 hook_generation=hook_generation,
                 package_version=package_version,
+                active_work_snapshot_provider=active_work_snapshot_provider,
+                admission_draining_provider=admission_draining_provider,
+                drain_home_verified_provider=drain_home_verified_provider,
             )
             stop_event = threading.Event()
             thread = threading.Thread(

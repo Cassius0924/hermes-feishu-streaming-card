@@ -2,14 +2,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 from pathlib import Path
 import sys
 from typing import Any
 
 from .config import load_config
 from .maintenance_card import FeishuJobPublisher
-from .maintenance_store import MaintenanceRefused, load_job
-from .maintenance_update import run_job
+from .maintenance_store import (
+    MaintenanceRefused,
+    consume_job_credentials,
+    discard_job_credentials,
+    load_job,
+    maintenance_paths,
+    release_drain_lease,
+    transition_job,
+)
+from .maintenance_update import run_job, set_gateway_external_drain
 from .process import fetch_health
 from .runner import NoopFeishuClient, build_feishu_client
 
@@ -18,8 +27,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="hfc-maintenance-runner")
     parser.add_argument("--job", required=True)
     args = parser.parse_args(argv)
+    job = None
+    paths = None
     try:
         job = load_job(Path(args.job), require_private=True)
+        paths = maintenance_paths(job.path.parent.parent)
+        for key, value in consume_job_credentials(
+            paths,
+            job_id=job.job_id,
+        ).items():
+            os.environ[key] = value
         config = (
             load_config(job.config_path, env_file=job.env_file)
             if job.env_file is not None
@@ -37,7 +54,36 @@ def main(argv: list[str] | None = None) -> int:
             publish=lambda current: asyncio.run(publisher.publish(current)),
             maintenance_python=Path(sys.executable),
         )
+        discard_job_credentials(paths, job_id=job.job_id)
     except (MaintenanceRefused, OSError, ValueError):
+        if job is not None and paths is not None:
+            try:
+                current = load_job(job.path)
+                if current.phase not in {"succeeded", "failed", "cancelled"}:
+                    transition_job(
+                        current.path,
+                        expected_phase=current.phase,
+                        phase="failed",
+                        result={
+                            "error_code": "runner_initialization_failed",
+                            "recovery_boundary": "no_mutation",
+                            "status": "failed",
+                        },
+                    )
+            except Exception:
+                pass
+            try:
+                release_drain_lease(paths, owner_id=job.job_id)
+            except Exception:
+                pass
+            try:
+                set_gateway_external_drain(job.hermes_root, active=False)
+            except Exception:
+                pass
+            try:
+                discard_job_credentials(paths, job_id=job.job_id)
+            except Exception:
+                pass
         return 1
     return 0 if result.phase == "succeeded" else 1
 

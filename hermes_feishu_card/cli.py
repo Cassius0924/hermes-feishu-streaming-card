@@ -71,14 +71,19 @@ from hermes_feishu_card.integrity import (
     build_runtime_integrity_fence_binding,
     sanitize_integrity_snapshot,
 )
-from hermes_feishu_card.maintenance_process import inspect_runtime, provision_runtime
+from hermes_feishu_card.maintenance_process import (
+    inspect_runtime,
+    launch_job,
+    provision_runtime,
+)
 from hermes_feishu_card.maintenance_store import (
     MaintenanceRefused,
+    load_job,
     load_verified_artifact,
     maintenance_paths,
+    stage_job_credentials,
     stage_wheel_artifact,
 )
-from hermes_feishu_card.maintenance_update import run_job
 from hermes_feishu_card.runtime_control import (
     acknowledge_runtime_integrity_review,
     inspect_runtime_integrity_review,
@@ -563,9 +568,36 @@ def _run_maintenance(args: argparse.Namespace) -> int:
             print(f"python: {status.python_path}")
             return 0 if status.available else 1
         if command in {"run", "resume"}:
-            result = run_job(Path(args.job).expanduser())
-            print(f"maintenance: {result.phase}")
-            return 0 if result.phase == "succeeded" else 1
+            job = load_job(Path(args.job).expanduser())
+            paths = maintenance_paths(job.path.parent.parent)
+            artifact = load_verified_artifact(
+                paths,
+                expected_version=job.artifact_version,
+            )
+            status = inspect_runtime(
+                paths,
+                artifact,
+                hermes_root=job.hermes_root,
+            )
+            if not status.available:
+                print(f"maintenance: unavailable ({status.reason_code})")
+                return 1
+            if all(
+                str(os.environ.get(key) or "").strip()
+                for key in ("FEISHU_APP_ID", "FEISHU_APP_SECRET")
+            ):
+                stage_job_credentials(
+                    paths,
+                    job_id=job.job_id,
+                    environment=os.environ,
+                )
+            launched = launch_job(status, job)
+            print(
+                "maintenance: "
+                + ("started" if launched.started else launched.reason_code)
+            )
+            print(f"manager: {launched.manager}")
+            return 0 if launched.started else 1
     except (MaintenanceRefused, OSError, ValueError) as exc:
         print(f"maintenance: unavailable ({exc})", file=sys.stderr)
         return 1

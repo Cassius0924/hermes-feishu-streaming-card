@@ -8,6 +8,7 @@ from hermes_feishu_card.maintenance_store import ArtifactMetadata
 from hermes_feishu_card.maintenance_update import (
     CommandResult,
     inspect_update,
+    set_gateway_external_drain,
 )
 
 
@@ -27,12 +28,21 @@ class CommandHarness:
             stdout="3 updates available; target upstream/f3cda0ce\n",
             stderr="",
         )
+        self.target_head = "e" * 40 + "\n"
 
     def __call__(self, argv, timeout):
         normalized = tuple(str(value) for value in argv)
         self.commands.append(normalized)
         if normalized[-2:] == ("rev-parse", "HEAD"):
             return CommandResult(normalized, 0, self.git_head, "")
+        if normalized[-3:] == ("rev-parse", "--verify", "origin/main"):
+            return CommandResult(normalized, 0, self.target_head, "")
+        if normalized[-4:] == ("fetch", "--quiet", "origin", "main"):
+            return CommandResult(normalized, 0, "", "")
+        if "merge-base" in normalized:
+            return CommandResult(normalized, 0, "", "")
+        if "log" in normalized and "--format=%h %s" in normalized:
+            return CommandResult(normalized, 0, "e123456 target commit\n", "")
         if "status" in normalized:
             return CommandResult(normalized, 0, self.git_status, "")
         if normalized == ("hermes", "update", "--check"):
@@ -112,6 +122,25 @@ def _inspect(clean_hermes, artifact, runner, *, active_sessions=0):
     )
 
 
+def test_gateway_external_drain_uses_hermes_runtime_and_home(tmp_path):
+    root = tmp_path / "home" / "hermes-agent"
+    python = root / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!python\n", encoding="utf-8")
+    commands = []
+
+    def runner(argv, timeout):
+        commands.append((tuple(argv), timeout))
+        return CommandResult(tuple(argv), 0, "", "")
+
+    assert set_gateway_external_drain(root, active=True, run=runner) is True
+    assert set_gateway_external_drain(root, active=False, run=runner) is True
+    assert all(command[0][0] == str(python) for command in commands)
+    assert all(command[0][-1] == str(root.parent) for command in commands)
+    assert "write_drain_request" in commands[0][0][3]
+    assert "clear_drain_request" in commands[1][0][3]
+
+
 def test_inspect_update_runs_only_read_only_commands(
     clean_hermes, artifact
 ):
@@ -131,10 +160,31 @@ def test_inspect_update_runs_only_read_only_commands(
             "--untracked-files=no",
         ),
         ("hermes", "update", "--check"),
+        ("git", "-C", str(clean_hermes), "fetch", "--quiet", "origin", "main"),
+        ("git", "-C", str(clean_hermes), "rev-parse", "--verify", "origin/main"),
+        (
+            "git",
+            "-C",
+            str(clean_hermes),
+            "merge-base",
+            "--is-ancestor",
+            "a" * 40,
+            "e" * 40,
+        ),
+        (
+            "git",
+            "-C",
+            str(clean_hermes),
+            "log",
+            "-1",
+            "--format=%h %s",
+            "e" * 40,
+        ),
     ]
     assert inspection.current_version == "0.19.1"
     assert inspection.current_head == "a" * 40
-    assert inspection.target_summary == "3 updates available; target upstream/f3cda0ce"
+    assert inspection.target_summary == "origin/main e123456 target commit"
+    assert inspection.target_head == "e" * 40
     assert inspection.hfc_version == "4.2.0"
     assert inspection.hook_state == "installed"
     assert inspection.maintenance_ready is True
@@ -164,6 +214,36 @@ def test_inspect_update_allows_untracked_files(clean_hermes, artifact):
 
     assert inspection.ready is True
     assert "notes.local.md" not in inspection.changed_paths
+
+
+def test_inspect_update_uses_origin_apply_target_not_upstream_summary(
+    clean_hermes,
+    artifact,
+):
+    runner = CommandHarness(clean_hermes)
+    runner.update_result = replace(
+        runner.update_result,
+        stdout="99 upstream commits available\n",
+    )
+
+    inspection = _inspect(clean_hermes, artifact, runner)
+
+    assert inspection.ready is True
+    assert inspection.target_head == "e" * 40
+    assert "upstream" not in inspection.target_summary
+
+
+def test_inspect_update_reports_noop_when_origin_target_is_current(
+    clean_hermes,
+    artifact,
+):
+    runner = CommandHarness(clean_hermes)
+    runner.target_head = runner.git_head
+
+    inspection = _inspect(clean_hermes, artifact, runner)
+
+    assert inspection.ready is False
+    assert inspection.reason_code == "no_update_available"
 
 
 @pytest.mark.parametrize(

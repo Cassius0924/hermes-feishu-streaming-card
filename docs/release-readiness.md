@@ -2,7 +2,9 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.1.4`。它修复 Issue #171 的 Windows manifestless legacy-owned-hook 迁移缺口，同时保持块外用户改动、backup 不一致、symlink 与不可解析源码 fail-closed。V3.9.1 已于 2026-07-11 发布；完整自动化、构建、CI、报告者 Windows 官方流程复测、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.2.0`。它让飞书私聊中的裸 `/update` 先通过证据绑定确认卡，再由 Hermes checkout 外的独立维护 runtime 运行官方 updater 并恢复同版本 HFC、hook 和服务；群聊、非飞书、别名与带参数命令保持 Hermes 原路径。完整自动化、构建、CI、真实飞书私聊验收、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+
+V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
 ## 已具备
 
@@ -38,7 +40,7 @@
 - Feishu/Lark WebSocket 长连接部署会动态获得原生 `send_slash_confirm(...)` 和 `send_model_picker(...)` 卡片能力；按钮点击经 `_on_card_action_trigger` 回到 Hermes 原 handler。
 - WebSocket 原生卡片可用时跳过 sidecar `interaction.requested` 预交互，避免同一 slash 命令同时出现 sidecar 选项卡和原生按钮卡。
 - `/model` 无参数选择可通过 Feishu-only `send_model_picker(...)` 卡片呈现；选择后回调 Hermes 并更新同一张命令卡片。
-- `/update` 保持 Hermes 后台升级命令语义，重启前反馈进入命令卡，重启后状态继续由 `system.notice` 承载；命令卡 create/PATCH 失败时，对应反馈逐条退回 Hermes 原生文本路径。
+- V4.2.0 仅接管飞书私聊中的裸 `/update`：只读预检后显示 120 秒维护确认卡，确认后由独立 runtime 运行 `hermes update --yes`、重装同版本 HFC 并恢复 hook/sidecar/Gateway；群聊、非飞书、别名与参数化命令继续使用 Hermes 原路径。使用前运行 `maintenance status`。
 - terminal 事件会快速 ACK Hermes，慢 Feishu PATCH 在后台完成，避免中断或更新堆积后触发重复原生答复。
 - `load_config()` 会读取 config 同目录 `.env`，真实环境变量仍保持最高优先级。
 - `install.sh` 白名单读取 `.env` 中的飞书/sidecar 变量，不会执行带空格路径等无关配置。
@@ -144,6 +146,14 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.2.0 发布门禁
+
+- 私聊裸 `/update` 的只读预检、120 秒确认绑定、取消/过期/重复/跨用户拒绝和专用维护卡：**自动化通过**。
+- 独立 runtime 的 exact-wheel provision、durable job/journal/lock、官方 `hermes update --yes`、同版本 HFC 重装、hook 与服务恢复、`maintenance status/resume`：**自动化通过**。
+- 非 HFC tracked 改动、Git 未完成状态、artifact/version 漂移和最终验证失败均停止；untracked 文件保留，不执行自定义 Git 回滚：**自动化通过**。
+- 完整 pytest **`2302 passed, 5 skipped`**、`git diff --check`、wheel/sdist、干净 Python 3.12 `site-packages` package/distribution/CLI provenance，以及真实 `maintenance provision/status` 独立 runtime 与 runner import：**本地候选门禁通过**。
+- PR CI、真实飞书私聊卡片、exact merge SHA、public tag/install 与 Release assets：**发布流程中验证**。
 
 ## V4.1.4 发布门禁
 

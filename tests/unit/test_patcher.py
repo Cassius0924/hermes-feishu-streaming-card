@@ -1878,6 +1878,16 @@ def test_queued_complete_patch_tolerates_interleaved_stream_confirmation():
     ast.parse(patched)
 
 
+def test_hfc_command_patch_enforces_maintenance_admission_before_commands():
+    block = "".join(patcher._render_hfc_command_hook_block("    ", "\n"))
+
+    admission = block.index("maintenance_admission_from_hermes_locals")
+    command = block.index("handle_hfc_command_from_hermes_locals")
+    assert admission < command
+    assert "if await _hfc_enforce_maintenance_admission(locals()):" in block
+    ast.parse("async def patched(self, event):\n" + block)
+
+
 _EXACT_BASE_SOURCE = '''class BasePlatformAdapter:
     async def _process_message_background(self, event, session_key):
         delivery_attempted = False

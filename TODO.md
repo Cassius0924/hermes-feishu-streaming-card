@@ -2,18 +2,27 @@
 
 当前 active runtime 是 `hermes_feishu_card/`。legacy adapter、dual mode、旧 `sidecar/`、旧 `patch/` 和 `installer_v2.py` 不是 active runtime，仅保留作历史参考。
 
-## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4
+## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0
 
 详细路线见 [docs/superpowers/specs/2026-06-30-v3-8-design.md](docs/superpowers/specs/2026-06-30-v3-8-design.md) 和 [docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md](docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md)。
 
-### V4.1.4：Windows 旧版 manifest 迁移热修（发布候选）
+### V4.2.0：飞书私聊安全升级（发布候选）
+
+- [x] 私聊裸 `/update` 使用 120 秒、发起者/会话/profile/目标证据绑定的确认卡；群聊、非飞书、别名和带参数命令保持 Hermes 原路径。
+- [x] 独立维护 runtime 在 Hermes checkout 外运行官方 `hermes update --yes`，从私有缓存重装同一 HFC wheel，并恢复 hook、sidecar 与 Gateway。
+- [x] durable job store、journal、锁、重入恢复、卡片阶段更新和 `maintenance provision/status/run/resume` 本机恢复入口均有回归。
+- [x] 非 HFC tracked 改动、Git 未完成操作、artifact/版本漂移或最终验证失败均停止；不使用 force flag、自定义 reset/checkout/stash/rollback。
+- [x] 完整 pytest、`git diff --check`、wheel/sdist 与隔离 `site-packages` provenance。
+- [ ] PR CI、真实飞书私聊卡片验收、exact merge SHA、public tag/install 与 Release assets。
+
+### V4.1.4：Windows 旧版 manifest 迁移热修（已发布）
 
 - [x] 从公开 v4.0.14 `site-packages` 复现 manifestless legacy owned hook 在 v4.1.3 被拒绝。
 - [x] gateway lenient removal 与 backup 逐字一致时进入 official install 事务；Cron/Base 使用严格独立校验。
 - [x] 无 directory-fd 的 Windows 等价路径、Unicode + CRLF、Hermes v0.19.0 required Base 与 optional Cron 聚焦回归。
 - [x] `--no-repair`、Cron/Base 目标缺失、owned marker 外用户改动、并发编辑、backup 不一致与 symlink 继续 fail-closed。
 - [x] 完整 pytest `2221 passed, 5 skipped`、`git diff --check`、wheel/sdist 与隔离 Python 3.12 `site-packages` provenance。
-- [ ] PR CI、Issue #171 Windows 官方流程复测、exact merge、public tag/install 与 Release assets。
+- [x] PR CI、exact merge、public tag/install 与 Release assets。
 
 ### V4.1.3：升级恢复与 TurnRunner 兼容性热修（已发布）
 
@@ -24,7 +33,7 @@
 - [x] Issue #169 在 Hermes `1a3a9de` 的 `TurnRunner` seam 中恢复 stable tool、answer、thinking、clarify、approval 与 status hook；doctor 根据真实可注入性 fail-closed。
 - [x] 合并候选完整自动化 `2207 passed, 4 skipped` 与 `git diff --check`。
 - [x] wheel/sdist 构建与隔离 Python 3.12 `site-packages` 包版本、distribution、CLI entry point provenance。
-- [ ] CI、Issue #158 Ubuntu 真实 upstream update 与 Issue #169 最新 Hermes 官方流程复测、exact merge、public tag/install 与 Release assets。
+- [x] CI、exact merge、public tag/install 与 Release assets。
 
 ### V4.1.2：Gateway 重启竞态热修（已发布）
 
@@ -307,7 +316,7 @@
 - [x] `/new`、`/reset`、`/undo` 以及 `/model <model>` 高成本模型确认走独立三按钮卡片，点击后执行 Hermes 原 handler，并把结果更新回同一张命令卡片。
 - [x] `/model` 无参数选择器走独立模型选择卡片；用户选择后调用 Hermes 原 `on_model_selected` callback，并在同一卡片展示切换结果。
 - [x] sidecar 不可用、卡片未发送或配置为文本模式时保留 Hermes 原生 text fallback。
-- [x] `/update` 不做交互卡片；后续单独评估后台升级完成/失败通知是否可靠送达飞书。
+- [x] 当时的 V3.8.3 边界：`/update` 不做交互卡片；该边界已由 V4.2.0 的“仅飞书私聊裸命令”维护确认卡替代。
 - [x] 真实 Hermes + Feishu 本地 smoke：重启 Gateway 后 `/new` 已出现 Feishu/Lark WebSocket 原生按钮卡；原生卡片可用时跳过 sidecar 预交互，避免重复选择卡。
 
 ### V3.8.4：Feishu WebSocket 命令卡片热修（已完成）
@@ -325,9 +334,9 @@
 - [x] 修正 `destructive_slash_confirm: false` 或已始终允许时 `/new` 直通执行结果退回灰色原生文本的问题。
 - [x] 在 patcher 的 command-card hook 中传入当前 `event`，让 hook runtime 能识别独立 slash command 的返回结果。
 - [x] Feishu adapter `send()` 只对 `/new`、`/reset`、`/clear`、`/undo`、`/stop` 和直接 `/model <model>` 的结果做一次性卡片化。
-- [x] `/update` 保持 Hermes 后台升级命令，不纳入命令结果卡片化。
+- [x] 当时的 V3.8.5 边界：`/update` 保持 Hermes 后台升级命令，不纳入通用命令结果卡片化；V4.2.0 后私聊裸命令走专用维护卡。
 - [x] 移除 card action 后额外调用 direct interactive `message.update` 的路径，改由 Feishu callback response 更新原卡片。
-- [x] 补齐 `/new` 直通结果卡片、一次性上下文、`/update` 保持普通路径和 V3.8.4 hook block 升级兼容测试。
+- [x] 补齐 `/new` 直通结果卡片、一次性上下文、V3.8.5 的 `/update` 普通路径和 V3.8.4 hook block 升级兼容测试。
 
 ### V3.8.6：Docker / Hermes v0.18.0 兼容补丁（已完成）
 

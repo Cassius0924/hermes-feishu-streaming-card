@@ -96,12 +96,15 @@ def test_ready_inspection_card_has_confirm_and_cancel_only(inspection):
     )
 
     values = _callback_values(card)
+    assert set(card) == {"schema", "config", "header", "body"}
+    assert isinstance(card["body"]["elements"], list)
     assert [item["operation_action"] for item in values] == [
         "confirm_update",
         "cancel_update",
     ]
     serialized = json.dumps(card, ensure_ascii=False)
     assert "确认更新 Hermes" in serialized
+    assert "重新获取最新" in serialized
     assert "Hermes：`0.19.1`" in serialized
     assert "HFC：`4.2.0`（保持不变）" in serialized
     assert "当前有 2 个任务" in serialized
@@ -151,6 +154,8 @@ def test_job_card_has_no_buttons_and_no_private_state(job, phase):
 
     card = render_update_job_card(current)
 
+    assert set(card) == {"schema", "config", "header", "body"}
+    assert isinstance(card["body"]["elements"], list)
     assert _callback_values(card) == []
     serialized = json.dumps(card, ensure_ascii=False)
     assert "/Users/" not in serialized

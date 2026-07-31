@@ -64,6 +64,16 @@ V3.8.2 起，最终答案保留在主内容区，pre-tool answer 会按“正文
 | 多机器人、多群聊、多 profile 难确认路由 | `bindings.chats`、`group_rules` 安全诊断、profile-aware session key、`/health.routing` 诊断 |
 | sidecar 或 hook 出问题难定位 | `doctor`、runtime import 检查、`/health` metrics、fail-closed installer、restore/uninstall |
 
+## V4.2.0 飞书私聊安全升级
+
+在飞书私聊发送精确的裸 `/update` 时，HFC 会先只读检查 Hermes 版本、Git 工作树、managed hook、当前 `origin/main` 快照、当前任务和已缓存的同版本维护 wheel，再显示 120 秒有效的确认卡。确认即授权官方 `hermes update --yes` 在执行时重新 fetch 最新 `origin/main`；若远端在确认后推进，流程会先重装同一 HFC 版本、恢复 hook、sidecar 和 Gateway，再在原卡片将快照变化报告为失败。只有 runtime 能以单次聚合采样证明 turn/cron/API 计数完整，并证明实际 `HERMES_HOME` 与 checkout marker 目录一致时，卡片自动更新才可用。
+
+- 仅飞书私聊的裸 `/update` 进入维护卡；群聊、非飞书、别名和带参数命令仍由 Hermes 原处理器负责。
+- 非 HFC tracked 改动、未完成 Git 操作、维护 artifact 漂移或验证失败会停止流程；untracked 文件保留，不执行自定义 Git 回滚。
+- setup 会在 Hermes checkout 外 provision 独立 runtime。使用前运行 `hermes-feishu-card maintenance status`，异常时可用 `maintenance resume` 从 durable journal 恢复。
+
+完整边界和验收步骤见 [V4.2.0 发布说明](release-notes-v4.2.0.md)。
+
 ## V4.1.0 投递策略、内容保护与运行安全
 
 V4.1.1 在不改变下述投递体验的前提下修复升级恢复：首次 heartbeat 等待不写持久化 fence；`integrity acknowledge-review` 受双 plan 检查、stopped sidecar、无 pidfile、target binding 与 CAS snapshot 约束；setup 以隔离 Python 复检 Hermes venv，并按 `/health` 的 package/Python identity 决定是否重启。detached 进程通过 token 认证自停，不再按数字 PID/PGID 强制 kill。完整恢复顺序见 [V4.1 安全控制与排障](wiki/v4.1-safety-controls.md)。
@@ -220,7 +230,7 @@ V3.8.10 把 TODO 中的群聊能力拆清楚：Hermes Gateway 继续负责真实
 
 - **chat binding 自动提示**：在群内发送 `/hfc status` 时，如果当前群还没有出现在 `bindings.chats`，卡片会提示正在使用 fallback/default bot，并给出 `hermes-feishu-card bots bind-chat ...` 命令。
 - **白名单与 @ 触发边界**：`bindings.group_rules` 只用于安全诊断和展示计数，不泄漏真实 chat/user id；真实 @bot 和 allowlist 准入仍由 Hermes Feishu adapter 控制。
-- **群内 slash command 行为差异**：`/new`、`/model`、`/reset` 等独立命令先通过 Hermes 群聊准入，再使用独立命令卡片；`/update` 继续保持 Hermes 后台升级流程。
+- **群内 slash command 行为差异**：`/new`、`/model`、`/reset` 等独立命令先通过 Hermes 群聊准入，再使用独立命令卡片；群内 `/update` 继续保持 Hermes 原生后台升级流程，V4.2.0 的维护确认卡仅用于私聊裸命令。
 - **工具详情增强**：工具 timeline 会尽量显示参数摘要、耗时和失败原因，方便从卡片里判断慢工具、失败工具和输入是否正确。
 
 完整发布说明见 [V3.8.10 release notes](release-notes-v3.8.10.md)。
@@ -271,7 +281,7 @@ V3.8.6 修复 issue #70 的 Docker 容器安装场景：Hermes v0.18.0 / `v2026.
 
 ## V3.8.5 命令结果反馈卡片补丁
 
-V3.8.5 补齐 V3.8.4 的“始终允许/无需确认”路径：当 Hermes 直接执行 `/new`、`/reset`、`/clear`、`/undo`、`/stop` 或直接 `/model <model>` 后，执行结果也会以 Feishu/Lark interactive card 回复，而不是退回灰色原生文本。`/model` 切换后的反馈继续稳定留在绿色卡片里，`/update` 仍保持 Hermes 后台升级命令，不弹交互卡片。
+V3.8.5 补齐 V3.8.4 的“始终允许/无需确认”路径：当 Hermes 直接执行 `/new`、`/reset`、`/clear`、`/undo`、`/stop` 或直接 `/model <model>` 后，执行结果也会以 Feishu/Lark interactive card 回复，而不是退回灰色原生文本。`/model` 切换后的反馈继续稳定留在绿色卡片里。当时 `/update` 仍保持 Hermes 后台升级命令；V4.2.0 起仅私聊裸命令改走专用维护确认卡。
 
 - **直通结果卡片化**：patcher 会把当前 `event` 传给 hook runtime，Feishu adapter `send()` 能识别独立 slash command 的返回结果。
 - **交互更新更干净**：按钮/下拉点击后只依赖 Feishu callback response 更新原卡片，不再额外调用飞书不支持的 interactive `message.update`。
@@ -286,7 +296,7 @@ V3.8.4 修正 V3.8.3 在本地/private sidecar 场景下只能退回灰色文本
 - **WebSocket 原生确认卡片**：插件动态补上 Feishu adapter 的 `send_slash_confirm(...)`，按钮点击由 `_on_card_action_trigger` 进入 `tools.slash_confirm.resolve(...)`。
 - **WebSocket 原生模型选择卡片**：当 Hermes 请求 Feishu adapter 的 `send_model_picker(...)` 时，插件会补上 Feishu-only picker，选择模型后回写同一张命令卡片。
 - **不重复弹选择卡**：WebSocket 原生卡片可用时会跳过 sidecar 预交互，`/new` 不再同时出现 sidecar 选项卡和原生按钮卡。
-- **`/update` 不弹卡片**：`/update` 仍按 Hermes 后台升级命令处理，不做交互按钮卡片，避免把升级流程误当成用户确认。
+- **当时的 `/update` 边界**：V3.8.4 不给 `/update` 增加按钮卡；V4.2.0 起仅飞书私聊裸命令使用有证据绑定的维护确认卡，其他路径不变。
 - **安全 fallback**：Feishu 原生卡片不可用、sidecar 不可用、卡片应用失败、超时或完成态更新失败时，继续交给 Hermes 原生文本路径，避免命令卡死。
 
 完整发布说明见 [V3.8.4 release notes](release-notes-v3.8.4.md)；上一版独立命令卡片基础说明见 [V3.8.3 release notes](release-notes-v3.8.3.md)。
@@ -510,7 +520,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.1.4`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.2.0`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -803,6 +813,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
+| [v4.2.0](release-notes-v4.2.0.md) | 2026-07-31 | 飞书私聊裸 `/update` 使用证据绑定确认卡与独立维护 runtime，运行官方 updater 后恢复同版本 HFC、hook、sidecar 和 Gateway |
 | [v4.1.4](release-notes-v4.1.4.md) | 2026-07-31 | Issue #171：在旧版 owned hook 与干净 backup 可逐字互证时，Windows 官方 install/setup 可安全重建缺失 manifest；用户块外改动和不一致证据继续拒绝 |
 | [v4.1.3](release-notes-v4.1.3.md) | 2026-07-29 | Issue #158：同一 Hermes target 的已验证 plan 过渡可通过官方 acknowledgement 原子收敛，doctor 给出明确迁移/确认命令 |
 | [v4.1.2](release-notes-v4.1.2.md) | 2026-07-29 | 修复 stale heartbeat 二次 restart fence，并消除同一工具调用被 stable callback 与 legacy progress path 重复记录 |

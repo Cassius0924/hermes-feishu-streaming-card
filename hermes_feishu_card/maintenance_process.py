@@ -21,6 +21,7 @@ PROVISION_TIMEOUT_SECONDS = 300.0
 PROBE_TIMEOUT_SECONDS = 20.0
 _PROBE_CODE = (
     "import json, pathlib, hermes_feishu_card; "
+    "import hermes_feishu_card.maintenance_runner; "
     "print(json.dumps({'version': hermes_feishu_card.__version__, "
     "'location': str(pathlib.Path(hermes_feishu_card.__file__).resolve())}))"
 )
@@ -65,6 +66,7 @@ def provision_runtime(
                 str(host_python or Path(sys.executable)),
                 "-m",
                 "venv",
+                "--clear",
                 str(venv_root),
             ),
             PROVISION_TIMEOUT_SECONDS,
@@ -82,7 +84,6 @@ def provision_runtime(
             "-m",
             "pip",
             "install",
-            "--no-deps",
             "--force-reinstall",
             str(artifact.wheel_path),
         ),
@@ -126,14 +127,15 @@ def inspect_runtime(
     run: CommandRunner | None = None,
 ) -> MaintenanceRuntimeStatus:
     runner = run or run_command
-    selected_python = (
+    selected_path = (
         Path(python_path).expanduser()
         if python_path is not None
         else _runtime_python(paths.runtime / "venv")
-    ).resolve(strict=False)
+    )
+    selected_python = Path(os.path.abspath(str(selected_path)))
     resolved_runtime = paths.runtime.expanduser().resolve(strict=False)
     resolved_hermes = Path(hermes_root).expanduser().resolve(strict=False)
-    if not _is_below(selected_python, resolved_runtime) or _is_below(
+    if not _is_below_lexical(selected_python, resolved_runtime) or _is_below(
         selected_python, resolved_hermes
     ):
         return _runtime_unavailable(
@@ -141,7 +143,7 @@ def inspect_runtime(
             artifact,
             "runtime_not_independent",
         )
-    if selected_python.is_symlink() or not selected_python.is_file():
+    if not selected_python.is_file():
         return _runtime_unavailable(
             selected_python,
             artifact,
@@ -216,6 +218,7 @@ def launch_job(
     *,
     run: CommandRunner | None = None,
     systemd_user_available: Callable[[], bool] | None = None,
+    detached_lifecycle_safe: Callable[[], bool] | None = None,
     popen: Callable[..., Any] = subprocess.Popen,
 ) -> LaunchResult:
     if not status.available:
@@ -257,6 +260,16 @@ def launch_job(
                 if not result.timed_out and result.returncode == 0
                 else "systemd_start_failed"
             ),
+        )
+
+    lifecycle_safe = detached_lifecycle_safe or _detached_lifecycle_safe
+    if sys.platform.startswith("linux") and not lifecycle_safe():
+        return LaunchResult(
+            started=False,
+            manager="unavailable",
+            argv=runner_command,
+            pid=None,
+            reason_code="independent_manager_unavailable",
         )
 
     kwargs: dict[str, object] = {
@@ -337,6 +350,16 @@ def _is_below(path: Path, parent: Path) -> bool:
         return False
 
 
+def _is_below_lexical(path: Path, parent: Path) -> bool:
+    try:
+        Path(os.path.abspath(str(path))).relative_to(
+            Path(os.path.abspath(str(parent)))
+        )
+        return True
+    except ValueError:
+        return False
+
+
 def _atomic_runtime_metadata(path: Path, payload: dict[str, object]) -> None:
     if path.is_symlink():
         raise ValueError("runtime metadata must not be a symlink")
@@ -379,6 +402,11 @@ def _systemd_user_available() -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0
+
+
+def _detached_lifecycle_safe() -> bool:
+    """Linux requires a positively-owned external manager for update jobs."""
+    return not sys.platform.startswith("linux")
 
 
 def _validate_job_launch_path(path: Path) -> None:
