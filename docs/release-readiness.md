@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.1.3`。它修复 Issue #158 的同 target integrity fence binding 收敛、合入 PR #168 的原生 answer-delta callback 选择，并修复 Issue #169 中 Hermes `TurnRunner` 重构导致的 tool/streaming/interaction hook 丢失与 doctor 误报。V3.9.1 已于 2026-07-11 发布；V4.1.3 的合并候选自动化、构建、CI、Issue #158 Ubuntu 真实复测、Issue #169 最新 Hermes 真实复测、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.1.4`。它修复 Issue #171 的 Windows manifestless legacy-owned-hook 迁移缺口，同时保持块外用户改动、backup 不一致、symlink 与不可解析源码 fail-closed。V3.9.1 已于 2026-07-11 发布；完整自动化、构建、CI、报告者 Windows 官方流程复测、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 ## 已具备
 
@@ -144,6 +144,13 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.1.4 发布门禁
+
+- 从公开 v4.0.14 `site-packages` 生成的普通 Gateway、Hermes v0.19.0 required exact Base 与 optional Cron 三类状态中移走 manifest，V4.1.4 官方 install 必须输出 `manifest: rebuilt` / `install ok`，doctor 回到 `installed`：**本地隔离复现通过**。
+- Unicode 注释 + 全 CRLF 源码、Windows 原生相对路径与无 directory-fd 的 portable install 路径必须通过；不把这些因素误写为根因：**隔离旧包样本与等价分支通过，真实 Windows 待报告者确认**。
+- 只有 legacy owned blocks lenient removal 与干净 Gateway backup 逐字一致、Cron/Base 严格 removal 分别与 backup 一致时才能迁移；`--no-repair`、目标缺失、owned block 外用户改动和写入/rollback 前并发编辑必须保持现场并拒绝：**安全边界回归通过**。
+- 完整 pytest **`2221 passed, 5 skipped`**、`git diff --check`、wheel/sdist、隔离 Python 3.12 `site-packages` package/distribution/CLI provenance：**本地通过**；PR CI、Issue #171 Windows 官方流程复测、exact merge SHA、public tag/install 与 Release assets：**待完成**。
 
 ## V4.1.3 发布门禁
 

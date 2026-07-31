@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.1.4 — 2026-07-31
+
+See also: [docs/release-notes-v4.1.4.md](docs/release-notes-v4.1.4.md)
+
+### Fixed
+- Official `install` / `setup` can migrate a manifestless legacy owned Gateway hook when lenient removal restores the clean backup byte-for-byte, including the portable install path used on Windows (Issue #171).
+- Optional Cron and required exact Base evidence are validated independently; a missing legacy Base hook is added through the current manifest-v2 install transaction.
+- User edits outside owned blocks, mismatched backups, symlinks, missing targets, and invalid source remain fail-closed.
+
 ## V4.1.3 — 2026-07-30
 
 See also: [docs/release-notes-v4.1.3.md](docs/release-notes-v4.1.3.md)

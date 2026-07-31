@@ -344,6 +344,132 @@ def test_atomic_write_uses_portable_fallback_without_dirfd_support(
     assert not list(tmp_path.glob(".config.yaml.*.tmp"))
 
 
+def test_portable_existing_write_does_not_use_unbound_replace(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "config.yaml"
+    target.write_text("before\n", encoding="utf-8")
+    replace_called = False
+
+    def unexpected_replace(*_args, **_kwargs):
+        nonlocal replace_called
+        replace_called = True
+        raise AssertionError("portable existing write must stay on the bound handle")
+
+    monkeypatch.setattr(cli.os, "replace", unexpected_replace)
+
+    cli._atomic_write_text_portable(target, "after\n")
+
+    assert not replace_called
+    assert target.read_text(encoding="utf-8") == "after\n"
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ("short_write", "ftruncate", "fsync", "post_write_verification"),
+)
+def test_portable_existing_write_restores_original_after_mid_write_failure(
+    tmp_path, monkeypatch, failure_stage
+):
+    target = tmp_path / "config.yaml"
+    original = b"ORIGINAL-CONTENT\n"
+    target.write_bytes(original)
+    expected_snapshot = cli._portable_target_state(target)[0]
+    assert expected_snapshot is not None
+
+    if failure_stage == "short_write":
+        original_write = cli.os.write
+        write_calls = 0
+
+        def fail_after_short_write(fd, payload):
+            nonlocal write_calls
+            write_calls += 1
+            if write_calls == 1:
+                return original_write(fd, payload[:4])
+            if write_calls == 2:
+                raise OSError("simulated write failure")
+            return original_write(fd, payload)
+
+        monkeypatch.setattr(cli.os, "write", fail_after_short_write)
+    elif failure_stage == "ftruncate":
+        original_ftruncate = cli.os.ftruncate
+        truncate_calls = 0
+
+        def fail_first_truncate(fd, length):
+            nonlocal truncate_calls
+            truncate_calls += 1
+            if truncate_calls == 1:
+                raise OSError("simulated truncate failure")
+            return original_ftruncate(fd, length)
+
+        monkeypatch.setattr(cli.os, "ftruncate", fail_first_truncate)
+    elif failure_stage == "fsync":
+        original_fsync = cli.os.fsync
+        fsync_calls = 0
+
+        def fail_first_fsync(fd):
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 1:
+                raise OSError("simulated fsync failure")
+            return original_fsync(fd)
+
+        monkeypatch.setattr(cli.os, "fsync", fail_first_fsync)
+    else:
+        original_verify = cli._verify_portable_exclusive_bytes
+        verify_calls = 0
+
+        def fail_first_verification(fd, path, identity, payload):
+            nonlocal verify_calls
+            verify_calls += 1
+            if verify_calls == 1:
+                raise ValueError("simulated post-write verification failure")
+            return original_verify(fd, path, identity, payload)
+
+        monkeypatch.setattr(
+            cli, "_verify_portable_exclusive_bytes", fail_first_verification
+        )
+
+    with pytest.raises((OSError, ValueError)):
+        cli._atomic_write_text_portable(
+            target,
+            "REPLACEMENT-CONTENT-WITH-MORE-BYTES\n",
+            expected_before=expected_snapshot,
+        )
+
+    assert target.read_bytes() == original
+    assert cli._portable_target_state(target)[0] == expected_snapshot
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows sharing semantics")
+def test_portable_windows_exclusive_handle_blocks_concurrent_writer(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "config.yaml"
+    target.write_text("before\n", encoding="utf-8")
+    original_open = cli._open_portable_exclusive_fd
+    competing_write_blocked = False
+
+    def open_and_probe(path, *, create):
+        nonlocal competing_write_blocked
+        fd = original_open(path, create=create)
+        try:
+            path.write_text("CONCURRENT_EDIT\n", encoding="utf-8")
+        except OSError:
+            competing_write_blocked = True
+        else:
+            os.close(fd)
+            pytest.fail("Windows exclusive handle allowed a competing writer")
+        return fd
+
+    monkeypatch.setattr(cli, "_open_portable_exclusive_fd", open_and_probe)
+
+    cli._atomic_write_text_portable(target, "after\n")
+
+    assert competing_write_blocked
+    assert target.read_text(encoding="utf-8") == "after\n"
+
+
 def test_restore_transaction_fails_closed_without_dirfd_support(
     tmp_path, monkeypatch
 ):
@@ -3334,6 +3460,244 @@ def test_repair_rebuilds_missing_manifest_for_owned_patch(tmp_path):
     assert manifest_path(hermes_dir).exists()
     reinstall = run_cli("install", "--hermes-dir", str(hermes_dir), "--yes")
     assert reinstall.returncode == 0, reinstall.stderr
+
+
+def test_reinstall_migrates_manifestless_legacy_owned_patch(tmp_path):
+    hermes_dir = copy_hermes(tmp_path)
+
+    install_result = run_cli("install", "--hermes-dir", str(hermes_dir), "--yes")
+    assert install_result.returncode == 0, install_result.stderr
+    current_patched = run_py(hermes_dir).read_text(encoding="utf-8")
+    legacy_patched = current_patched.replace(
+        "_hfc_stable_tool_callbacks = False\n",
+        "_hfc_stable_tool_callbacks = False  # v4.0.x generated body\n",
+        1,
+    )
+    assert legacy_patched != current_patched
+    assert patcher.remove_patch_lenient(legacy_patched) == backup_path(
+        hermes_dir
+    ).read_text(encoding="utf-8")
+    run_py(hermes_dir).write_text(legacy_patched, encoding="utf-8")
+    manifest_path(hermes_dir).unlink()
+
+    result = run_cli("install", "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert "manifest: rebuilt" in result.stdout
+    assert run_py(hermes_dir).read_text(encoding="utf-8") == current_patched
+    assert manifest_path(hermes_dir).exists()
+
+
+def test_reinstall_migrates_manifestless_legacy_patch_without_dirfd_support(
+    tmp_path, monkeypatch, capsys
+):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    current_patched = run_py(hermes_dir).read_text(encoding="utf-8")
+    legacy_patched = current_patched.replace(
+        "_hfc_stable_tool_callbacks = False\n",
+        "_hfc_stable_tool_callbacks = False  # v4.0.x generated body\n",
+        1,
+    )
+    run_py(hermes_dir).write_text(legacy_patched, encoding="utf-8")
+    manifest_path(hermes_dir).unlink()
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "_cli_dirfd_binding_supported", lambda: False)
+
+    result = cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"])
+
+    captured = capsys.readouterr()
+    assert result == 0, captured.err
+    assert "manifest: rebuilt" in captured.out
+    assert run_py(hermes_dir).read_text(encoding="utf-8") == current_patched
+    assert manifest_path(hermes_dir).exists()
+
+
+def test_reinstall_refuses_manifestless_legacy_patch_with_outside_edit(tmp_path):
+    hermes_dir = copy_hermes(tmp_path)
+
+    install_result = run_cli("install", "--hermes-dir", str(hermes_dir), "--yes")
+    assert install_result.returncode == 0, install_result.stderr
+    current_patched = run_py(hermes_dir).read_text(encoding="utf-8")
+    edited = current_patched.replace(
+        "_hfc_stable_tool_callbacks = False\n",
+        "_hfc_stable_tool_callbacks = False  # v4.0.x generated body\n",
+        1,
+    )
+    edited += "\nUSER_EDIT = True\n"
+    run_py(hermes_dir).write_text(edited, encoding="utf-8")
+    manifest_path(hermes_dir).unlink()
+    original_backup = backup_path(hermes_dir).read_text(encoding="utf-8")
+
+    result = run_cli("install", "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert run_py(hermes_dir).read_text(encoding="utf-8") == edited
+    assert backup_path(hermes_dir).read_text(encoding="utf-8") == original_backup
+    assert not manifest_path(hermes_dir).exists()
+
+
+def test_reinstall_no_repair_refuses_manifestless_legacy_owned_patch(tmp_path):
+    hermes_dir = copy_hermes(tmp_path)
+
+    install_result = run_cli("install", "--hermes-dir", str(hermes_dir), "--yes")
+    assert install_result.returncode == 0, install_result.stderr
+    current_patched = run_py(hermes_dir).read_text(encoding="utf-8")
+    legacy_patched = current_patched.replace(
+        "_hfc_stable_tool_callbacks = False\n",
+        "_hfc_stable_tool_callbacks = False  # v4.0.x generated body\n",
+        1,
+    )
+    run_py(hermes_dir).write_text(legacy_patched, encoding="utf-8")
+    manifest_path(hermes_dir).unlink()
+
+    result = run_cli(
+        "install",
+        "--no-repair",
+        "--hermes-dir",
+        str(hermes_dir),
+        "--yes",
+    )
+
+    assert result.returncode != 0
+    assert run_py(hermes_dir).read_text(encoding="utf-8") == legacy_patched
+    assert not manifest_path(hermes_dir).exists()
+
+
+def test_reinstall_refuses_manifestless_legacy_patch_with_missing_cron_target(
+    tmp_path,
+):
+    hermes_dir = copy_hermes(tmp_path)
+    cron_target = hermes_dir / "cron" / "scheduler.py"
+    cron_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(CRON_FIXTURE, cron_target)
+
+    install_result = run_cli("install", "--hermes-dir", str(hermes_dir), "--yes")
+    assert install_result.returncode == 0, install_result.stderr
+    current_patched = run_py(hermes_dir).read_text(encoding="utf-8")
+    legacy_patched = current_patched.replace(
+        "_hfc_stable_tool_callbacks = False\n",
+        "_hfc_stable_tool_callbacks = False  # v4.0.x generated body\n",
+        1,
+    )
+    run_py(hermes_dir).write_text(legacy_patched, encoding="utf-8")
+    manifest_path(hermes_dir).unlink()
+    cron_backup = cli._backup_path(cron_target)
+    assert cron_backup.exists()
+    cron_target.unlink()
+
+    result = run_cli("install", "--hermes-dir", str(hermes_dir), "--yes")
+
+    assert result.returncode != 0
+    assert run_py(hermes_dir).read_text(encoding="utf-8") == legacy_patched
+    assert cron_backup.exists()
+    assert not cron_target.exists()
+    assert not manifest_path(hermes_dir).exists()
+
+
+def test_reinstall_refuses_manifestless_legacy_patch_with_missing_base_target(
+    tmp_path,
+):
+    hermes_dir = make_exact_019_hermes(tmp_path)
+
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    current_patched = run_py(hermes_dir).read_text(encoding="utf-8")
+    legacy_patched = current_patched.replace(
+        "_hfc_stable_tool_callbacks = False\n",
+        "_hfc_stable_tool_callbacks = False  # v4.0.x generated body\n",
+        1,
+    )
+    run_py(hermes_dir).write_text(legacy_patched, encoding="utf-8")
+    manifest_path(hermes_dir).unlink()
+    exact_base = base_path(hermes_dir)
+    exact_base_backup = base_backup_path(hermes_dir)
+    assert exact_base_backup.exists()
+    exact_base.unlink()
+
+    result = cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"])
+
+    assert result != 0
+    assert run_py(hermes_dir).read_text(encoding="utf-8") == legacy_patched
+    assert exact_base_backup.exists()
+    assert not exact_base.exists()
+    assert not manifest_path(hermes_dir).exists()
+
+
+def test_manifestless_portable_install_refuses_concurrent_gateway_edit(
+    tmp_path, monkeypatch, capsys
+):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    current_patched = run_py(hermes_dir).read_text(encoding="utf-8")
+    legacy_patched = current_patched.replace(
+        "_hfc_stable_tool_callbacks = False\n",
+        "_hfc_stable_tool_callbacks = False  # v4.0.x generated body\n",
+        1,
+    )
+    run_py(hermes_dir).write_text(legacy_patched, encoding="utf-8")
+    manifest_path(hermes_dir).unlink()
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "_cli_dirfd_binding_supported", lambda: False)
+    original_atomic_write = cli._atomic_write_text_portable
+    injected = False
+
+    def edit_before_write(path, contents, **kwargs):
+        nonlocal injected
+        if path == run_py(hermes_dir) and not injected:
+            injected = True
+            path.write_text(legacy_patched + "\nUSER_EDIT = True\n", encoding="utf-8")
+        return original_atomic_write(path, contents, **kwargs)
+
+    monkeypatch.setattr(cli, "_atomic_write_text_portable", edit_before_write)
+
+    result = cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"])
+
+    captured = capsys.readouterr()
+    assert result != 0, captured.out
+    assert "USER_EDIT = True" in run_py(hermes_dir).read_text(encoding="utf-8")
+    assert not manifest_path(hermes_dir).exists()
+
+
+def test_manifestless_portable_rollback_preserves_concurrent_gateway_edit(
+    tmp_path, monkeypatch, capsys
+):
+    hermes_dir = copy_hermes(tmp_path)
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    current_patched = run_py(hermes_dir).read_text(encoding="utf-8")
+    legacy_patched = current_patched.replace(
+        "_hfc_stable_tool_callbacks = False\n",
+        "_hfc_stable_tool_callbacks = False  # v4.0.x generated body\n",
+        1,
+    )
+    run_py(hermes_dir).write_text(legacy_patched, encoding="utf-8")
+    manifest_path(hermes_dir).unlink()
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "_cli_dirfd_binding_supported", lambda: False)
+    original_atomic_write = cli._atomic_write_text_portable
+    gateway_written = False
+
+    def fail_after_gateway_write(path, contents, **kwargs):
+        nonlocal gateway_written
+        if path == manifest_path(hermes_dir) and gateway_written:
+            run_py(hermes_dir).write_text(
+                current_patched + "\nCONCURRENT_EDIT = True\n",
+                encoding="utf-8",
+            )
+            raise OSError("simulated manifest write failure")
+        result = original_atomic_write(path, contents, **kwargs)
+        if path == run_py(hermes_dir):
+            gateway_written = True
+        return result
+
+    monkeypatch.setattr(cli, "_atomic_write_text_portable", fail_after_gateway_write)
+
+    result = cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"])
+
+    captured = capsys.readouterr()
+    assert result != 0, captured.out
+    assert "CONCURRENT_EDIT = True" in run_py(hermes_dir).read_text(encoding="utf-8")
+    assert backup_path(hermes_dir).exists()
+    assert not manifest_path(hermes_dir).exists()
 
 
 def test_repair_recreates_missing_backup_from_owned_patch(tmp_path):

@@ -3022,11 +3022,59 @@ def _run_install(args: argparse.Namespace) -> int:
     accept_hermes_upgrade = bool(
         getattr(args, "accept_hermes_upgrade", False)
     )
+    no_repair = bool(getattr(args, "no_repair", False))
+    run_py = detection.run_py
+    backup_path = _backup_path(run_py)
+    cron_evidence_py = detection.cron_py
+    cron_evidence_backup_path = (
+        _backup_path(cron_evidence_py) if cron_evidence_py is not None else None
+    )
+    cron_py = detection.cron_py if detection.cron_py_exists else None
+    cron_backup_path = _backup_path(cron_py) if cron_py is not None else None
+    base_evidence_py = detection.base_py
+    base_evidence_backup_path = (
+        _backup_path(base_evidence_py) if base_evidence_py is not None else None
+    )
+    base_py = detection.base_py if detection.base_required else None
+    base_backup_path = _backup_path(base_py) if base_py is not None else None
+    manifest_path = _manifest_path(detection.root)
+    manifestless_owned_upgrade = False
+    if backup_path.exists() and not manifest_path.exists() and not no_repair:
+        try:
+            _validate_existing_install_state(
+                run_py,
+                backup_path,
+                manifest_path,
+                cron_py=cron_evidence_py,
+                cron_backup_path=cron_evidence_backup_path,
+                base_py=base_evidence_py,
+                base_backup_path=base_evidence_backup_path,
+                allow_manifestless_owned_upgrade=True,
+            )
+            if (
+                not detection.base_required
+                and base_evidence_py is not None
+                and base_evidence_backup_path is not None
+                and _managed_restore_evidence_exists(
+                    base_evidence_py,
+                    base_evidence_backup_path,
+                    remove_owned_patch=remove_base_patch,
+                )
+            ):
+                raise ValueError(
+                    "install state incomplete; unexpected exact Base ownership "
+                    "evidence without manifest"
+                )
+        except (OSError, UnicodeError, ValueError):
+            pass
+        else:
+            manifestless_owned_upgrade = True
+
     recovery_plan = plan_recovery(
         detection,
         accept_hermes_upgrade=accept_hermes_upgrade,
     )
-    if recovery_plan.actions:
+    if recovery_plan.actions and not manifestless_owned_upgrade:
         if not recovery_plan.executable:
             print(
                 "error: "
@@ -3037,7 +3085,7 @@ def _run_install(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        if not getattr(args, "no_repair", False):
+        if not no_repair:
             try:
                 recovery_result = execute_recovery(
                     detection,
@@ -3050,13 +3098,6 @@ def _run_install(args: argparse.Namespace) -> int:
             for action in recovery_result.actions:
                 print(action)
 
-    run_py = detection.run_py
-    backup_path = _backup_path(run_py)
-    cron_py = detection.cron_py if detection.cron_py_exists else None
-    cron_backup_path = _backup_path(cron_py) if cron_py is not None else None
-    base_py = detection.base_py if detection.base_required else None
-    base_backup_path = _backup_path(base_py) if base_py is not None else None
-    manifest_path = _manifest_path(detection.root)
     original: str | None = None
     cron_original: str | None = None
     base_original: str | None = None
@@ -3076,9 +3117,21 @@ def _run_install(args: argparse.Namespace) -> int:
         if cron_py is not None and cron_backup_path is not None:
             install_paths["cron scheduler"] = cron_py
             install_paths["cron backup"] = cron_backup_path
+        elif (
+            cron_evidence_py is not None
+            and cron_evidence_backup_path is not None
+        ):
+            install_paths["cron scheduler"] = cron_evidence_py
+            install_paths["cron backup"] = cron_evidence_backup_path
         if base_py is not None and base_backup_path is not None:
             install_paths["exact Base"] = base_py
             install_paths["exact Base backup"] = base_backup_path
+        elif (
+            base_evidence_py is not None
+            and base_evidence_backup_path is not None
+        ):
+            install_paths["exact Base"] = base_evidence_py
+            install_paths["exact Base backup"] = base_evidence_backup_path
         install_identities, install_directory_identities = _snapshot_restore_evidence(
             detection.root, install_paths
         )
@@ -3107,10 +3160,11 @@ def _run_install(args: argparse.Namespace) -> int:
             run_py,
             backup_path,
             manifest_path,
-            cron_py=cron_py,
-            cron_backup_path=cron_backup_path,
-            base_py=base_py,
-            base_backup_path=base_backup_path,
+            cron_py=cron_evidence_py,
+            cron_backup_path=cron_evidence_backup_path,
+            base_py=base_evidence_py,
+            base_backup_path=base_evidence_backup_path,
+            allow_manifestless_owned_upgrade=manifestless_owned_upgrade,
         )
         run_backup_source = (
             _read_restore_text(
@@ -3174,40 +3228,40 @@ def _run_install(args: argparse.Namespace) -> int:
             base_backup_path=base_backup_path,
             base_source=base_backup_source,
         )
+        changes: list[tuple[Path, str]] = []
+        if (
+            base_py is not None
+            and base_backup_path is not None
+            and not base_backup_existed
+        ):
+            changes.append((base_backup_path, base_backup_source or ""))
+        if not backup_existed:
+            changes.append((backup_path, run_backup_source))
+        if (
+            cron_py is not None
+            and cron_backup_path is not None
+            and not cron_backup_existed
+        ):
+            changes.append((cron_backup_path, cron_backup_source or ""))
+        # The Base contract must exist before run.py can stage exact completion.
+        if (
+            base_py is not None
+            and base_patched is not None
+            and base_original is not None
+            and base_patched != base_original
+        ):
+            changes.append((base_py, base_patched))
+        if patched != original:
+            changes.append((run_py, patched))
+        if (
+            cron_py is not None
+            and cron_patched is not None
+            and cron_original is not None
+            and cron_patched != cron_original
+        ):
+            changes.append((cron_py, cron_patched))
+        changes.append((manifest_path, manifest_contents))
         if transactional_install:
-            changes: list[tuple[Path, str]] = []
-            if (
-                base_py is not None
-                and base_backup_path is not None
-                and not base_backup_existed
-            ):
-                changes.append((base_backup_path, base_backup_source or ""))
-            if not backup_existed:
-                changes.append((backup_path, run_backup_source))
-            if (
-                cron_py is not None
-                and cron_backup_path is not None
-                and not cron_backup_existed
-            ):
-                changes.append((cron_backup_path, cron_backup_source or ""))
-            # The Base contract must exist before run.py can stage exact completion.
-            if (
-                base_py is not None
-                and base_patched is not None
-                and base_original is not None
-                and base_patched != base_original
-            ):
-                changes.append((base_py, base_patched))
-            if patched != original:
-                changes.append((run_py, patched))
-            if (
-                cron_py is not None
-                and cron_patched is not None
-                and cron_original is not None
-                and cron_patched != cron_original
-            ):
-                changes.append((cron_py, cron_patched))
-            changes.append((manifest_path, manifest_contents))
             _write_targets_transactionally(
                 changes,
                 expected_identities=install_identities,
@@ -3215,55 +3269,15 @@ def _run_install(args: argparse.Namespace) -> int:
                 preserve_earlier_writes_on_rollback_failure=True,
             )
         else:
-            if base_py is not None and base_backup_path is not None and not base_backup_existed:
-                _atomic_write_text(base_backup_path, base_backup_source or "")
-            if not backup_existed:
-                _atomic_write_text(backup_path, run_backup_source)
-            if cron_py is not None and cron_backup_path is not None and not cron_backup_existed:
-                _atomic_write_text(cron_backup_path, cron_backup_source or "")
-            if (
-                base_py is not None
-                and base_patched is not None
-                and base_original is not None
-                and base_patched != base_original
-            ):
-                _atomic_write_text(base_py, base_patched)
-            if patched != original:
-                _atomic_write_text(run_py, patched)
-            if (
-                cron_py is not None
-                and cron_patched is not None
-                and cron_original is not None
-                and cron_patched != cron_original
-            ):
-                _atomic_write_text(cron_py, cron_patched)
-            _atomic_write_text(manifest_path, manifest_contents)
+            _write_targets_portably(
+                changes,
+                expected_identities=install_identities,
+                expected_directories=install_directory_identities,
+                preserve_earlier_writes_on_rollback_failure=True,
+            )
     except (OSError, UnicodeError, ValueError) as exc:
-        if not transactional_install:
-            try:
-                _rollback_install(
-                    run_py,
-                    original,
-                    backup_path,
-                    backup_existed,
-                    manifest_path,
-                    manifest_existed,
-                    cron_py=cron_py,
-                    cron_original=cron_original,
-                    cron_backup_path=cron_backup_path,
-                    cron_backup_existed=cron_backup_existed,
-                    base_py=base_py,
-                    base_original=base_original,
-                    base_backup_path=base_backup_path,
-                    base_backup_existed=base_backup_existed,
-                )
-            except (OSError, UnicodeError, ValueError) as rollback_exc:
-                print(f"error: {exc}; {rollback_exc}", file=sys.stderr)
-                return 1
         message = str(exc)
-        if transactional_install and message.startswith(
-            "restore transaction rollback failed"
-        ):
+        if message.startswith("restore transaction rollback failed"):
             message = message.replace(
                 "restore transaction rollback failed",
                 "install rollback failed",
@@ -3272,6 +3286,8 @@ def _run_install(args: argparse.Namespace) -> int:
         print(f"error: {message}", file=sys.stderr)
         return 1
 
+    if manifestless_owned_upgrade:
+        print("manifest: rebuilt")
     print("install ok")
     if gateway_restart_required:
         print("gateway.restart_required: hermes gateway start")
@@ -4077,6 +4093,101 @@ def _write_targets_transactionally(
                 pass
 
 
+def _portable_target_state(
+    path: Path,
+) -> tuple[_RestoreEvidenceSnapshot | None, str | None, int | None]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None, None, None
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError("refusing to replace a symbolic link")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("refusing to replace a non-regular file")
+    identity = (metadata.st_dev, metadata.st_ino)
+    contents = _read_restore_text(path, identity)
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        _restore_text_sha256(contents),
+    ), contents, stat.S_IMODE(metadata.st_mode)
+
+
+def _write_targets_portably(
+    changes: list[tuple[Path, str]],
+    *,
+    expected_identities: dict[Path, _RestoreEvidenceSnapshot | None],
+    expected_directories: dict[Path, _RestoreIdentity | None],
+    preserve_earlier_writes_on_rollback_failure: bool = False,
+) -> None:
+    current_identities = dict(expected_identities)
+    previous_states: dict[Path, tuple[str | None, int | None]] = {}
+
+    def assert_directories_unchanged(path: Path) -> None:
+        _assert_restore_directory_ancestry_unchanged(
+            path, expected_directories
+        )
+
+    _assert_restore_evidence_set_unchanged(current_identities)
+    for path, _contents in changes:
+        assert_directories_unchanged(path)
+        snapshot, previous, previous_mode = _portable_target_state(path)
+        if snapshot != current_identities.get(path):
+            raise ValueError("refusing to replace a changed target")
+        previous_states[path] = previous, previous_mode
+
+    written: list[Path] = []
+    post_write_snapshots: dict[Path, _RestoreEvidenceSnapshot] = {}
+    try:
+        for path, contents in changes:
+            _assert_restore_evidence_set_unchanged(current_identities)
+            assert_directories_unchanged(path)
+            post_write = _atomic_write_text_portable(
+                path,
+                contents,
+                expected_before=current_identities.get(path),
+            )
+            current_identities[path] = post_write
+            post_write_snapshots[path] = post_write
+            written.append(path)
+            assert_directories_unchanged(path)
+        _assert_restore_evidence_set_unchanged(current_identities)
+    except (OSError, UnicodeError, ValueError) as exc:
+        rollback_failed = False
+        for path in reversed(written):
+            previous, previous_mode = previous_states[path]
+            post_write = post_write_snapshots[path]
+            try:
+                assert_directories_unchanged(path)
+                if previous is None:
+                    _assert_restore_evidence_unchanged(path, post_write)
+                    # Without directory-relative handles, deleting a newly
+                    # created path cannot be bound to the verified inode.
+                    # Preserve owned evidence for manual recovery instead of
+                    # risking deletion of a concurrent replacement.
+                    raise ValueError(
+                        "portable rollback preserved newly created evidence"
+                    )
+                else:
+                    restored = _atomic_write_text_portable(
+                        path,
+                        previous,
+                        mode=previous_mode,
+                        expected_before=post_write,
+                    )
+                    current_identities[path] = restored
+                assert_directories_unchanged(path)
+            except (OSError, UnicodeError, ValueError):
+                rollback_failed = True
+                if preserve_earlier_writes_on_rollback_failure:
+                    break
+        if rollback_failed:
+            raise ValueError(
+                "restore transaction rollback failed; manual review required"
+            ) from exc
+        raise
+
+
 def _snapshot_transaction_write(
     path: Path, expected_contents: str
 ) -> _RestoreEvidenceSnapshot:
@@ -4327,6 +4438,7 @@ def _validate_existing_install_state(
     base_py: Path | None = None,
     base_backup_path: Path | None = None,
     require_base_manifest: bool = False,
+    allow_manifestless_owned_upgrade: bool = False,
 ) -> None:
     backup_exists = backup_path.exists()
     manifest_exists = manifest_path.exists()
@@ -4343,10 +4455,34 @@ def _validate_existing_install_state(
         return
 
     if backup_exists and not manifest_exists:
-        raise ValueError(
-            "install state incomplete; manifest missing; "
-            "restore or remove patch before installing"
+        if not allow_manifestless_owned_upgrade:
+            raise ValueError(
+                "install state incomplete; manifest missing; "
+                "restore or remove patch before installing"
+            )
+        if run_py.is_symlink() or backup_path.is_symlink():
+            raise ValueError(
+                "install state incomplete; manifest missing; "
+                "restore or remove patch before installing"
+            )
+        backup_text = _read_text_preserve_newlines(backup_path)
+        _validate_backup_contains_original(backup_text, "install")
+        if not _current_matches_backup_lenient(run_py, backup_path):
+            raise ValueError(
+                "install state incomplete; manifest missing; "
+                "restore or remove patch before installing"
+            )
+        _validate_cron_install_state_without_manifest(
+            cron_py,
+            cron_backup_path,
+            allow_owned_backup=True,
         )
+        _validate_base_install_state_without_manifest(
+            base_py,
+            base_backup_path,
+            allow_owned_backup=True,
+        )
+        return
 
     if not backup_exists:
         manifest = _read_manifest(manifest_path)
@@ -4529,11 +4665,34 @@ def _validate_restorable_install_state(
 
 
 def _validate_cron_install_state_without_manifest(
-    cron_py: Path | None, cron_backup_path: Path | None
+    cron_py: Path | None,
+    cron_backup_path: Path | None,
+    *,
+    allow_owned_backup: bool = False,
 ) -> None:
     if cron_py is None:
         return
     if cron_backup_path is not None and cron_backup_path.exists():
+        if (
+            not allow_owned_backup
+            or cron_py.is_symlink()
+            or cron_backup_path.is_symlink()
+            or not cron_py.exists()
+        ):
+            raise ValueError(
+                "install state incomplete; cron backup exists without manifest; "
+                "restore or remove patch before installing"
+            )
+        current_cron = _read_text_preserve_newlines(cron_py)
+        backup_cron = _read_text_preserve_newlines(cron_backup_path)
+        try:
+            backup_clean = remove_cron_patch(backup_cron) == backup_cron
+            current_matches = remove_cron_patch(current_cron) == backup_cron
+        except ValueError:
+            backup_clean = False
+            current_matches = False
+        if backup_clean and current_matches:
+            return
         raise ValueError(
             "install state incomplete; cron backup exists without manifest; "
             "restore or remove patch before installing"
@@ -4549,11 +4708,34 @@ def _validate_cron_install_state_without_manifest(
 
 
 def _validate_base_install_state_without_manifest(
-    base_py: Path | None, base_backup_path: Path | None
+    base_py: Path | None,
+    base_backup_path: Path | None,
+    *,
+    allow_owned_backup: bool = False,
 ) -> None:
     if base_py is None:
         return
     if base_backup_path is not None and base_backup_path.exists():
+        if (
+            not allow_owned_backup
+            or base_py.is_symlink()
+            or base_backup_path.is_symlink()
+            or not base_py.exists()
+        ):
+            raise ValueError(
+                "install state incomplete; exact Base backup exists without manifest; "
+                "restore or remove patch before installing"
+            )
+        current_base = _read_text_preserve_newlines(base_py)
+        backup_base = _read_text_preserve_newlines(base_backup_path)
+        try:
+            backup_clean = remove_base_patch(backup_base) == backup_base
+            current_matches = remove_base_patch(current_base) == backup_base
+        except ValueError:
+            backup_clean = False
+            current_matches = False
+        if backup_clean and current_matches:
+            return
         raise ValueError(
             "install state incomplete; exact Base backup exists without manifest; "
             "restore or remove patch before installing"
@@ -4780,7 +4962,12 @@ def _atomic_write_text(
                 "secure bound write requires directory-relative filesystem "
                 "operations on this platform"
             )
-        return _atomic_write_text_portable(path, contents, mode=mode)
+        return _atomic_write_text_portable(
+            path,
+            contents,
+            mode=mode,
+            expected_before=_expected_before,
+        )
     owns_binding = _binding is None
     binding = _binding if _binding is not None else _bind_cli_target(path)
     if binding.path != path:
@@ -4854,25 +5041,195 @@ def _atomic_write_text_portable(
     contents: str,
     *,
     mode: int | None = None,
+    expected_before: _RestoreEvidenceSnapshot | None | object = _CLI_SNAPSHOT_UNSET,
 ) -> _RestoreEvidenceSnapshot:
-    if path.is_symlink():
-        raise ValueError("refusing to replace a symbolic link")
-    preserved_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
-    temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    current_snapshot, _current_contents, preserved_mode = _portable_target_state(path)
+    selected_expected = (
+        current_snapshot
+        if expected_before is _CLI_SNAPSHOT_UNSET
+        else expected_before
+    )
+    if current_snapshot != selected_expected:
+        raise ValueError("refusing to replace a changed target")
+
+    create = selected_expected is None
+    fd = _open_portable_exclusive_fd(path, create=create)
     try:
-        with temp_path.open("x", encoding="utf-8", newline="") as handle:
-            handle.write(contents)
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("refusing to replace a non-regular file")
+        opened_identity = (opened.st_dev, opened.st_ino)
+        current_path = path.lstat()
+        if (
+            stat.S_ISLNK(current_path.st_mode)
+            or not stat.S_ISREG(current_path.st_mode)
+            or (current_path.st_dev, current_path.st_ino) != opened_identity
+        ):
+            raise ValueError("refusing to replace a changed target")
+
+        if create:
+            opened_snapshot = None
+            original_payload = None
+        else:
+            os.lseek(fd, 0, os.SEEK_SET)
+            original_bytes = bytearray()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                original_bytes.extend(chunk)
+            original_payload = bytes(original_bytes)
+            original_text = original_payload.decode("utf-8")
+            opened_snapshot = (
+                opened.st_dev,
+                opened.st_ino,
+                _restore_text_sha256(original_text),
+            )
+        if opened_snapshot != selected_expected:
+            raise ValueError("refusing to replace a changed target")
+
+        encoded = contents.encode("utf-8")
         selected_mode = mode if mode is not None else preserved_mode
-        os.chmod(temp_path, selected_mode if selected_mode is not None else 0o600)
-        if path.is_symlink():
-            raise ValueError("refusing to replace a symbolic link")
-        os.replace(temp_path, path)
-        return _snapshot_transaction_write(path, contents)
-    finally:
         try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            _write_portable_exclusive_bytes(fd, encoded, selected_mode)
+            committed = _verify_portable_exclusive_bytes(
+                fd, path, opened_identity, encoded
+            )
+        except (OSError, UnicodeError, ValueError) as exc:
+            if original_payload is None:
+                raise ValueError(
+                    "restore transaction rollback failed; manual review required"
+                ) from exc
+            try:
+                _write_portable_exclusive_bytes(
+                    fd, original_payload, preserved_mode
+                )
+                _verify_portable_exclusive_bytes(
+                    fd, path, opened_identity, original_payload
+                )
+            except (OSError, UnicodeError, ValueError) as rollback_exc:
+                raise ValueError(
+                    "restore transaction rollback failed; manual review required"
+                ) from rollback_exc
+            raise
+        return (
+            committed.st_dev,
+            committed.st_ino,
+            _restore_text_sha256(contents),
+        )
+    finally:
+        os.close(fd)
+
+
+def _write_portable_exclusive_bytes(
+    fd: int, payload: bytes, mode: int | None
+) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    written = 0
+    while written < len(payload):
+        count = os.write(fd, payload[written:])
+        if count <= 0:
+            raise OSError("portable write made no progress")
+        written += count
+    os.ftruncate(fd, len(payload))
+    if mode is not None and hasattr(os, "fchmod"):
+        os.fchmod(fd, mode)
+    os.fsync(fd)
+
+
+def _verify_portable_exclusive_bytes(
+    fd: int,
+    path: Path,
+    expected_identity: _RestoreIdentity,
+    expected_payload: bytes,
+) -> os.stat_result:
+    committed = os.fstat(fd)
+    if (
+        not stat.S_ISREG(committed.st_mode)
+        or (committed.st_dev, committed.st_ino) != expected_identity
+    ):
+        raise ValueError("portable write lost target ownership")
+    os.lseek(fd, 0, os.SEEK_SET)
+    committed_bytes = bytearray()
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        committed_bytes.extend(chunk)
+    if bytes(committed_bytes) != expected_payload:
+        raise ValueError("portable write verification failed")
+    committed_path = path.lstat()
+    if (
+        stat.S_ISLNK(committed_path.st_mode)
+        or not stat.S_ISREG(committed_path.st_mode)
+        or (committed_path.st_dev, committed_path.st_ino) != expected_identity
+    ):
+        raise ValueError("portable write lost target ownership")
+    return committed
+
+
+def _open_portable_exclusive_fd(path: Path, *, create: bool) -> int:
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        generic_read = 0x80000000
+        generic_write = 0x40000000
+        create_new = 1
+        open_existing = 3
+        file_attribute_normal = 0x00000080
+        file_flag_open_reparse_point = 0x00200000
+        handle = create_file(
+            str(path),
+            generic_read | generic_write,
+            0,
+            None,
+            create_new if create else open_existing,
+            file_attribute_normal | file_flag_open_reparse_point,
+            None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return msvcrt.open_osfhandle(
+                handle,
+                os.O_RDWR | getattr(os, "O_BINARY", 0),
+            )
+        except Exception:
+            close_handle(handle)
+            raise
+
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    if create:
+        flags |= os.O_CREAT | os.O_EXCL
+    fd = os.open(path, flags, 0o600)
+    try:
+        try:
+            import fcntl
+        except ImportError:
+            return fd
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def _bind_cli_target(path: Path) -> _CliTargetBinding:

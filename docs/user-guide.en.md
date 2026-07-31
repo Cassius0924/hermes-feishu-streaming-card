@@ -481,14 +481,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.1.3`.
+The Compose example defaults `HFC_VERSION` to `v4.1.4`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.1.3
+export HFC_VERSION=v4.1.4
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -731,6 +731,7 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.1.4](release-notes-v4.1.4.en.md) | 2026-07-31 | Issue #171: official Windows install/setup can rebuild a missing manifest when legacy owned hooks and clean backups match byte-for-byte; outside-block edits and inconsistent evidence remain refused |
 | [v4.1.3](release-notes-v4.1.3.en.md) | 2026-07-29 | Issue #158: verified same-Hermes-target plan transitions converge through the official atomic acknowledgement path, with explicit migration/review commands from doctor |
 | [v4.1.2](release-notes-v4.1.2.en.md) | 2026-07-29 | Fixes the stale-heartbeat second-restart race and duplicate recording of one tool call by stable and legacy progress paths |
 | [v4.1.1](release-notes-v4.1.1.en.md) | 2026-07-28 | Upgrade-recovery hotfix: heartbeat waiting without a fence, constrained review acknowledgement, fail-closed legacy pidfile/process handling, and Hermes-venv/running-identity alignment during setup |

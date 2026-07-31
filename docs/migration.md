@@ -82,6 +82,19 @@ hermes-feishu-card integrity acknowledge-review \
 
 旧版 `0644` pidfile 只有位于当前用户拥有的私有 `0700` state dir、形状与 identity 均严格匹配时才能原 inode 收紧为 `0600`；其他情况 fail-closed。
 
+## 从 V4.1.3 升级到 V4.1.4
+
+V4.1.4 修复 Issue #171 的 Windows 旧版安装迁移缺口。若 `.hermes_feishu_card_manifest` 缺失，但旧版 owned Gateway hook 与 `.hermes_feishu_card.bak` 仍在，重新运行官方 `install` / `setup`。安装器只在旧 hook 去除 owned blocks 后与 backup 逐字一致、backup 是可解析干净源码、Cron/Base 证据也分别一致时重建 manifest 并升级 hook。
+
+不要手工创建 manifest，不要直接调用内部 `apply_patch()`。Unicode 注释、CRLF 与 Windows 原生路径分隔符不是该问题的已复现根因。owned marker 外存在用户改动、backup 不一致、symlink 或源码不可解析时仍会 fail-closed，应先保留文件并人工审查。
+
+```bash
+hermes-feishu-card doctor --config CONFIG --hermes-dir HERMES_DIR --explain
+hermes-feishu-card install --hermes-dir HERMES_DIR --yes
+```
+
+Windows PowerShell 按官方 `install.ps1` / `setup` 流程安装 V4.1.4。看到 `manifest: rebuilt` 与 `install ok` 后，重启 Hermes Gateway，再确认 doctor 的 install state 为 `installed`。
+
 ## 从 V4.1.2 升级到 V4.1.3
 
 V4.1.3 修复 Issue #158 中真实 Hermes upstream 更新后的恢复收敛问题：官方 `install` 重新注入 hook 后，当前 integrity plan fingerprint 会变化，而旧 manual-review fence 仍绑定升级前 plan。`integrity acknowledge-review` 现在可在双重验证当前 installed plan、双重确认 sidecar 已停止、旧新 binding 指向同一 Hermes target 且 fence CAS 未变化时，原子更新 plan binding 并解除 manual-review。不同 target、残留 pidfile/health、dirty 或不可验证 plan、未知 legacy fence 仍拒绝；已有非空 restart hash 继续保留，直到新 matching `runtime.hello` 自行解除 restart fence。

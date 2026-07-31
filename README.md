@@ -140,7 +140,7 @@ Hermes `v2026.4.23` 起的旧版和 Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.1.3
+export HFC_VERSION=v4.1.4
 bash install-docker.sh
 ```
 
@@ -181,6 +181,7 @@ bash install-docker.sh
 ![飞书话题内卡片连续更新与思考工具 timeline 展示](docs/assets/feishu-topic-card-showcase-v389.png)
 | 版本 | 重点 |
 |---|---|
+| [v4.1.4](docs/release-notes-v4.1.4.md) | 修复 Issue #171：Windows 上旧版 owned hook 与 backup 存在、manifest 缺失时，官方 install/setup 可在逐字验证 gateway、cron 与 exact Base 证据后安全重建 manifest；块外改动继续 fail-closed |
 | [v4.1.3](docs/release-notes-v4.1.3.md) | 修复 Issue #158 的同 target fence binding 收敛；合入 PR #168 的原生 delta 回调选择；修复 Issue #169 中 Hermes `TurnRunner` 重构造成的 tool/streaming/interaction hook 丢失与 doctor 误报 |
 | [v4.1.2](docs/release-notes-v4.1.2.md) | 修复 Gateway 重启时 stale heartbeat 写入二次 restart fence 的竞态，并消除稳定 tool callback 与旧 progress path 对同一次工具调用的重复记录；延续 [v4.1.1](docs/release-notes-v4.1.1.md) 的安全边界 |
 | [v4.1.0](docs/release-notes-v4.1.0.md) | 按会话精确选择原生/卡片投递；第 6 张及后续表格默认无损 compact；认证 runtime 完整性监控与 strict repair；四种显式 sidecar manager，`auto` 不提权 |
@@ -196,8 +197,7 @@ bash install-docker.sh
 | [v4.0.12](docs/release-notes-v4.0.12.md) | Issue #133：上下文压缩阶段可见、正文/思考/工具/提示/footer 字号可配置；Issue #136：selected env 凭据加载与显式 degraded Noop 诊断 |
 | [v4.0.11](docs/release-notes-v4.0.11.md) | 修复 Issue #135：初始卡片使用稳定 UUID 有界重试，并按 `delivered/not_sent/unknown` 安全选择抑制、原文回退或通用提示 |
 | [v4.0.10](docs/release-notes-v4.0.10.md) | 收紧 sidecar 事件传输边界：非回环监听必须显式授权并启用 HMAC-SHA256 防伪与防重放，本机回环安装保持兼容 |
-| [v4.0.9](docs/release-notes-v4.0.9.md) | 修复 Issue #130：不再替换已连接 Lark WebSocket 的 live event handler，只在 WS 线程更新卡片回调，避免断连与 Gateway 重启循环 |
-| [v4.0.8](docs/release-notes-v4.0.8.md) | 修复 Issue #127：cron 卡片接管正文后继续使用 Hermes 原生链路上传附件，不再只显示文件名 |
+| [v4.0.9](docs/release-notes-v4.0.9.md) / [v4.0.8](docs/release-notes-v4.0.8.md) | 修复 Issue #130 的 live WebSocket handler 身份与 Issue #127 的 cron 原生附件投递 |
 | [v4.0.7](docs/release-notes-v4.0.7.md) | Linux/systemd sidecar 使用独立可重启 user service，升级时优先选择 Hermes venv Python；合入 PR #124 修复自我改进通知误占下一轮卡片 |
 | [v4.0.6](docs/release-notes-v4.0.6.md) | 修复 Hermes 0.18.x 完成 hook、队列完成 hook，以及无灰色原生输出且可正确收束的 background 通知卡片；新增显式且 fail-closed 的 Hermes 升级恢复 |
 | [v4.0.5](docs/release-notes-v4.0.5.md) | 修复升级后 Gateway venv 仍加载旧插件的问题；安装器会比较 runtime 版本、自动同步并在安装后复核版本与路径 |

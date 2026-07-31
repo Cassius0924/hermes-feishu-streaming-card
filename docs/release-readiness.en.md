@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.1.3`. It fixes same-target integrity fence-binding convergence from Issue #158, includes PR #168's native answer-delta callback selection, and fixes the tool/streaming/interaction hook loss plus false doctor report after Hermes' `TurnRunner` refactor from Issue #169. V3.9.1 was released on 2026-07-11; combined-candidate automation, build, CI, the Issue #158 Ubuntu retest, the Issue #169 latest-Hermes retest, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.1.4`. It fixes Issue #171's Windows manifestless legacy-owned-hook migration gap while preserving fail-closed handling for outside-block edits, mismatched backups, symlinks, and unparseable source. V3.9.1 was released on 2026-07-11; full automation, build, CI, the reporter's official Windows-flow retest, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 ## Ready
 
@@ -144,6 +144,13 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.1.4 Release Gates
+
+- Remove the manifest from regular Gateway, Hermes v0.19.0 required exact Base, and optional Cron states produced by the public v4.0.14 package imported from `site-packages`; V4.1.4 official install must print `manifest: rebuilt` / `install ok` and doctor must return to `installed`: **passed isolated local reproduction**.
+- Unicode comments plus all-CRLF source, native Windows relative paths, and the no-directory-fd portable install path must pass without being mislabeled as the root cause: **isolated old-package fixtures and the equivalent branch passed; reporter's real Windows confirmation pending**.
+- Migration is allowed only when lenient legacy Gateway block removal exactly matches the clean backup and strict Cron/Base removal independently matches each backup; `--no-repair`, missing targets, outside-block edits, and concurrent edits before write/rollback must preserve evidence and refuse: **safety-boundary regression passed**.
+- Full pytest **`2221 passed, 5 skipped`**, `git diff --check`, wheel/sdist, and isolated Python 3.12 `site-packages` package/distribution/CLI provenance: **passed locally**; PR CI, Issue #171 official Windows-flow retest, exact merge SHA, public tag/install, and Release assets: **pending**.
 
 ## V4.1.3 Release Gates
 

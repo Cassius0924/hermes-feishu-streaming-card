@@ -2,11 +2,20 @@
 
 当前 active runtime 是 `hermes_feishu_card/`。legacy adapter、dual mode、旧 `sidecar/`、旧 `patch/` 和 `installer_v2.py` 不是 active runtime，仅保留作历史参考。
 
-## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3
+## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4
 
 详细路线见 [docs/superpowers/specs/2026-06-30-v3-8-design.md](docs/superpowers/specs/2026-06-30-v3-8-design.md) 和 [docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md](docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md)。
 
-### V4.1.3：升级恢复与 TurnRunner 兼容性热修（发布候选）
+### V4.1.4：Windows 旧版 manifest 迁移热修（发布候选）
+
+- [x] 从公开 v4.0.14 `site-packages` 复现 manifestless legacy owned hook 在 v4.1.3 被拒绝。
+- [x] gateway lenient removal 与 backup 逐字一致时进入 official install 事务；Cron/Base 使用严格独立校验。
+- [x] 无 directory-fd 的 Windows 等价路径、Unicode + CRLF、Hermes v0.19.0 required Base 与 optional Cron 聚焦回归。
+- [x] `--no-repair`、Cron/Base 目标缺失、owned marker 外用户改动、并发编辑、backup 不一致与 symlink 继续 fail-closed。
+- [x] 完整 pytest `2221 passed, 5 skipped`、`git diff --check`、wheel/sdist 与隔离 Python 3.12 `site-packages` provenance。
+- [ ] PR CI、Issue #171 Windows 官方流程复测、exact merge、public tag/install 与 Release assets。
+
+### V4.1.3：升级恢复与 TurnRunner 兼容性热修（已发布）
 
 - [x] 同一 Hermes target 的旧/新 plan binding 只在双重 current-plan、双重 sidecar-stopped 与 snapshot CAS 校验后原子迁移。
 - [x] 不同 target、状态漂移、残留进程和不可验证 plan 继续 fail-closed；独立 restart/hash fence 保留。
