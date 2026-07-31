@@ -510,7 +510,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.1.3`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.1.4`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -518,7 +518,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.1.3
+export HFC_VERSION=v4.1.4
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -803,6 +803,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
+| [v4.1.4](release-notes-v4.1.4.md) | 2026-07-31 | Issue #171：在旧版 owned hook 与干净 backup 可逐字互证时，Windows 官方 install/setup 可安全重建缺失 manifest；用户块外改动和不一致证据继续拒绝 |
 | [v4.1.3](release-notes-v4.1.3.md) | 2026-07-29 | Issue #158：同一 Hermes target 的已验证 plan 过渡可通过官方 acknowledgement 原子收敛，doctor 给出明确迁移/确认命令 |
 | [v4.1.2](release-notes-v4.1.2.md) | 2026-07-29 | 修复 stale heartbeat 二次 restart fence，并消除同一工具调用被 stable callback 与 legacy progress path 重复记录 |
 | [v4.1.1](release-notes-v4.1.1.md) | 2026-07-28 | 升级恢复热修：heartbeat 等待不写 fence、受约束的 review acknowledgement、legacy pidfile/process fail-closed、setup 对齐 Hermes venv 与运行 identity |

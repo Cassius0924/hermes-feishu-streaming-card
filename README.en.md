@@ -141,7 +141,7 @@ For an existing Hermes container:
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.1.3
+export HFC_VERSION=v4.1.4
 bash install-docker.sh
 ```
 
@@ -182,6 +182,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ![Feishu topic reply card continuity and reasoning/tool timeline showcase](docs/assets/feishu-topic-card-showcase-v389.png)
 | Version | Highlights |
 |---|---|
+| [v4.1.4](docs/release-notes-v4.1.4.en.md) | Fixes Issue #171: on Windows, official install/setup can rebuild a missing manifest for a legacy owned hook only after byte-for-byte gateway, cron, and exact Base evidence checks; edits outside owned blocks still fail closed |
 | [v4.1.3](docs/release-notes-v4.1.3.en.md) | Fixes the same-target fence-binding convergence gap from Issue #158, includes PR #168's native delta-callback selection, and restores tool/streaming/interaction hooks plus truthful doctor detection after Hermes' `TurnRunner` refactor from Issue #169 |
 | [v4.1.2](docs/release-notes-v4.1.2.en.md) | Fixes the stale-heartbeat second-restart race and removes duplicate recording of one tool call by the stable callback and legacy progress paths, while retaining the [v4.1.1](docs/release-notes-v4.1.1.en.md) safety boundary |
 | [v4.1.0](docs/release-notes-v4.1.0.en.md) | Exact per-chat card/native policy, lossless compaction after five tables, authenticated runtime integrity with strict repair, and four explicit sidecar managers with no privilege escalation from `auto` |
@@ -197,8 +198,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 | [v4.0.12](docs/release-notes-v4.0.12.en.md) | Issue #133 adds visible context-compaction phases and configurable body/reasoning/tool/notice/footer text sizes; Issue #136 loads selected-env credentials and exposes degraded Noop delivery |
 | [v4.0.11](docs/release-notes-v4.0.11.en.md) | Fixes Issue #135 with stable-UUID bounded initial delivery retries and safe `delivered/not_sent/unknown` notice fallback semantics |
 | [v4.0.10](docs/release-notes-v4.0.10.en.md) | Hardens sidecar event transport: non-loopback listeners require explicit opt-in plus HMAC-SHA256 anti-forgery/replay proofs, while loopback installs stay compatible |
-| [v4.0.9](docs/release-notes-v4.0.9.en.md) | Fixes Issue #130 by preserving the connected Lark WebSocket event handler and updating only its card callback on the WS thread, preventing disconnect/crash-loop behavior |
-| [v4.0.8](docs/release-notes-v4.0.8.en.md) | Fixes Issue #127 so cron cards own the text while Hermes native delivery still uploads the actual attachment instead of showing only its name |
+| [v4.0.9](docs/release-notes-v4.0.9.en.md) / [v4.0.8](docs/release-notes-v4.0.8.en.md) | Fixes Issue #130's live WebSocket handler identity and Issue #127's native cron attachment delivery |
 | [v4.0.7](docs/release-notes-v4.0.7.en.md) | Isolates the Linux/systemd sidecar in a restartable user service, prefers Hermes venv Python during upgrades, and includes PR #124's orphaned self-improvement notice fix |
 | [v4.0.6](docs/release-notes-v4.0.6.en.md) | Fixes Hermes 0.18.x terminal/queued completion hooks and terminal background notice cards without gray native output, with explicit fail-closed recovery after Hermes source upgrades |
 | [v4.0.5](docs/release-notes-v4.0.5.en.md) | Fixes upgrades that left the Gateway venv loading an older plugin; the installer compares runtime versions, synchronizes when needed, and verifies the installed version and path |

@@ -82,6 +82,19 @@ An empty `pre_repair_runtime_hash` means runtime identity cannot prove a process
 
 A legacy `0644` pidfile can be tightened in place to `0600` only inside a current-user-owned private `0700` state directory with a strictly matching shape and identity. Every other case fails closed.
 
+## Upgrading From V4.1.3 To V4.1.4
+
+V4.1.4 fixes the Windows legacy-install migration gap from Issue #171. If `.hermes_feishu_card_manifest` is missing while an older owned Gateway hook and `.hermes_feishu_card.bak` remain, rerun official `install` / `setup`. The installer rebuilds the manifest and upgrades the hook only when removing owned blocks restores the backup byte-for-byte, the backup is parseable clean source, and Cron/Base evidence independently matches.
+
+Do not hand-create a manifest or call internal `apply_patch()` APIs. Unicode comments, CRLF, and native Windows path separators are not the reproduced root cause. An edit outside owned markers, a mismatched backup, a symlink, or unparseable source still fails closed and requires preserved files plus manual review.
+
+```bash
+hermes-feishu-card doctor --config CONFIG --hermes-dir HERMES_DIR --explain
+hermes-feishu-card install --hermes-dir HERMES_DIR --yes
+```
+
+On Windows PowerShell, install V4.1.4 through the official `install.ps1` / `setup` flow. After `manifest: rebuilt` and `install ok`, restart Hermes Gateway and confirm that doctor reports install state `installed`.
+
 ## Upgrading From V4.1.2 To V4.1.3
 
 V4.1.3 fixes the recovery convergence gap reproduced in Issue #158 after a real Hermes upstream update. Once official `install` reinjects the hook, the current integrity-plan fingerprint changes while the old manual-review fence remains bound to the pre-upgrade plan. `integrity acknowledge-review` can now atomically update that plan binding and clear manual review only after two verified-current-installed-plan checks, two stopped-sidecar checks, an unchanged fence CAS snapshot, and an exact match between the old and current Hermes target identity. A different target, remaining pidfile/health, dirty or unverifiable plan, or unknown legacy fence still fails closed. A non-empty restart hash remains until a new matching `runtime.hello` clears the independent restart fence.

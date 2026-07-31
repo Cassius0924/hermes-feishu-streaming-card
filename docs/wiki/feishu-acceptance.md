@@ -2,6 +2,14 @@
 
 自动化测试不能完全证明 Feishu/Lark 客户端体验。涉及卡片 UX、topic、系统提示、命令卡片的版本，发布前需要真实飞书 smoke。
 
+## V4.1.4 Windows 旧版安装迁移验收
+
+- 在 Windows 10 / Hermes v0.19.0 上保留 Issue #171 的原始 `gateway/run.py`、`.hermes_feishu_card.bak` 与 optional Cron，不再手工创建 manifest 或调用内部 `apply_patch()`。
+- 通过官方 PowerShell `install.ps1` / `setup` 安装候选；必须看到 `manifest: rebuilt` 与 `install ok`，required exact Base backup/hook 和 `manifest_version: 2` 同步建立。
+- 重启 Hermes Gateway 后运行 doctor，install state 必须为 `installed`；sidecar/Gateway runtime package 必须来自 Hermes venv 的 `site-packages` 且版本为 4.1.4。
+- 发送一轮普通流式回答和一轮工具调用，确认卡片进入完成态、工具只出现一次、无匹配原生灰字重复。该真实飞书复测由 Issue #171 报告者确认前，不标记为已通过。
+- 另用 owned marker 外增加无敏感信息测试行的隔离副本确认安装拒绝且文件不变；不要在真实 Hermes 工作树制造用户改动。
+
 ## V4.1.3 升级恢复、TurnRunner 与 V4.1 安全控制验收
 
 - heartbeat fence：verified `installed` plan 在 startup grace 内外等待首次 heartbeat，或 Gateway 正常重启造成 heartbeat stale，均不得出现持久化 fence 或 repair mutation；新 matching `runtime.hello` 到达后应一次恢复 ready。
