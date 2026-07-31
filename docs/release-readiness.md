@@ -152,7 +152,7 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - 私聊裸 `/update` 的只读预检、120 秒确认绑定、取消/过期/重复/跨用户拒绝和专用维护卡：**自动化通过**。
 - 独立 runtime 的 exact-wheel provision、durable job/journal/lock、官方 `hermes update --yes`、同版本 HFC 重装、hook 与服务恢复、`maintenance status/resume`：**自动化通过**。
 - 非 HFC tracked 改动、Git 未完成状态、artifact/version 漂移和最终验证失败均停止；untracked 文件保留，不执行自定义 Git 回滚：**自动化通过**。
-- Python 3.9 与 3.12 完整 pytest 均为 **`2302 passed, 5 skipped`**；`git diff --check`、wheel/sdist、干净 Python 3.12 `site-packages` package/distribution/CLI provenance，以及真实 `maintenance provision/status` 独立 runtime 与 runner import：**本地候选门禁通过**。
+- 完整 pytest：Python 3.9 为 **`2304 passed, 4 skipped`**，Python 3.12 为 **`2303 passed, 5 skipped`**；`git diff --check`、wheel/sdist、干净 Python 3.12 `site-packages` package/distribution/CLI provenance，以及真实 `maintenance provision/status` 独立 runtime 与 runner import：**本地候选门禁通过**。
 - PR CI、真实飞书私聊卡片、exact merge SHA、public tag/install 与 Release assets：**发布流程中验证**。
 
 ## V4.1.4 发布门禁

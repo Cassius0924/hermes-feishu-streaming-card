@@ -152,7 +152,7 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 - Read-only inspection, 120-second confirmation binding, cancel/expiry/replay/cross-operator rejection, and the dedicated maintenance card for a bare private-chat `/update`: **automated coverage passed**.
 - Exact-wheel provisioning, durable job/journal/lock, official `hermes update --yes`, same-version HFC reinstall, hook/service restoration, and `maintenance status/resume`: **automated coverage passed**.
 - Unrelated tracked changes, incomplete Git state, artifact/version drift, and failed final verification stop; untracked files remain and no custom Git rollback runs: **automated coverage passed**.
-- Full pytest on both Python 3.9 and 3.12 reported **`2302 passed, 5 skipped`**; `git diff --check`, wheel/sdist, clean Python 3.12 `site-packages` package/distribution/CLI provenance, and real `maintenance provision/status` independent-runtime and runner-import checks: **local candidate gate passed**.
+- Full pytest reported **`2304 passed, 4 skipped`** on Python 3.9 and **`2303 passed, 5 skipped`** on Python 3.12; `git diff --check`, wheel/sdist, clean Python 3.12 `site-packages` package/distribution/CLI provenance, and real `maintenance provision/status` independent-runtime and runner-import checks: **local candidate gate passed**.
 - PR CI, real Feishu private-chat card acceptance, exact merge SHA, public tag/install, and Release assets: **verified during release**.
 
 ## V4.1.4 Release Gates

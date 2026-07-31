@@ -773,6 +773,22 @@ def prune_jobs(
 
 
 def _prepare_paths(paths: MaintenancePaths) -> None:
+    configured_state = state_dir().expanduser()
+    default_maintenance_root = (configured_state / "maintenance").resolve(
+        strict=False
+    )
+    if paths.root == default_maintenance_root:
+        if configured_state.is_symlink():
+            raise MaintenanceRefused("state directory must not be a symlink")
+        configured_state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not configured_state.is_dir():
+            raise MaintenanceRefused("state directory is not a directory")
+        try:
+            configured_state.chmod(0o700)
+        except OSError as exc:
+            raise MaintenanceRefused(
+                "state directory permissions could not be secured"
+            ) from exc
     for directory in (paths.root, paths.runtime, paths.artifacts, paths.jobs):
         if directory.is_symlink():
             raise MaintenanceRefused("maintenance directory must not be a symlink")

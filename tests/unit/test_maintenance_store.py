@@ -437,3 +437,17 @@ def test_prune_jobs_removes_terminal_and_orphan_credential_snapshots(
     assert live_credentials is not None and live_credentials.exists()
     assert terminal_credentials is not None and not terminal_credentials.exists()
     assert orphan_credentials is not None and not orphan_credentials.exists()
+
+
+def test_default_maintenance_paths_secure_shared_state_root(
+    tmp_path, monkeypatch
+):
+    shared_state = tmp_path / "shared-state"
+    monkeypatch.setenv("HERMES_FEISHU_CARD_STATE_DIR", str(shared_state))
+    paths = maintenance_paths()
+
+    reserve_drain_lease(paths, owner_id="job-private")
+
+    assert shared_state.is_dir()
+    if os.name != "nt":
+        assert stat.S_IMODE(shared_state.stat().st_mode) == 0o700
