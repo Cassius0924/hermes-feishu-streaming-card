@@ -11,6 +11,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -70,6 +71,14 @@ from hermes_feishu_card.integrity import (
     build_runtime_integrity_fence_binding,
     sanitize_integrity_snapshot,
 )
+from hermes_feishu_card.maintenance_process import inspect_runtime, provision_runtime
+from hermes_feishu_card.maintenance_store import (
+    MaintenanceRefused,
+    load_verified_artifact,
+    maintenance_paths,
+    stage_wheel_artifact,
+)
+from hermes_feishu_card.maintenance_update import run_job
 from hermes_feishu_card.runtime_control import (
     acknowledge_runtime_integrity_review,
     inspect_runtime_integrity_review,
@@ -170,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_integrity(args)
     if args.command == "chats":
         return _run_chats(args)
+    if args.command == "maintenance":
+        return _run_maintenance(args)
     if args.command == "install":
         return _run_install(args)
     if args.command == "repair":
@@ -327,6 +338,25 @@ def _build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--profile-id")
     chats_list = chat_subparsers.add_parser("list")
     chats_list.add_argument("--config", required=True)
+
+    maintenance = subparsers.add_parser(
+        "maintenance",
+        help="provision or inspect the independent Hermes update runtime",
+    )
+    maintenance_subparsers = maintenance.add_subparsers(dest="maintenance_command")
+    maintenance_provision = maintenance_subparsers.add_parser("provision")
+    maintenance_provision.add_argument("--hermes-dir", required=True)
+    maintenance_provision.add_argument("--wheel", required=True)
+    maintenance_provision.add_argument("--root")
+    maintenance_status = maintenance_subparsers.add_parser("status")
+    maintenance_status.add_argument(
+        "--hermes-dir",
+        default=str(Path.home() / ".hermes" / "hermes-agent"),
+    )
+    maintenance_status.add_argument("--root")
+    for command in ("run", "resume"):
+        maintenance_run = maintenance_subparsers.add_parser(command)
+        maintenance_run.add_argument("--job", required=True)
     chats_list.add_argument("--profile-id")
 
     for command in ("install", "repair", "restore", "uninstall"):
@@ -438,6 +468,8 @@ def _run_setup(args: argparse.Namespace) -> int:
     if install_code != 0:
         return install_code
 
+    _provision_setup_maintenance(Path(args.hermes_dir).expanduser())
+
     try:
         runtime_python, runtime_identity = _resolve_start_runtime_identity(
             verified_hermes_root
@@ -482,6 +514,113 @@ def _run_setup(args: argparse.Namespace) -> int:
     print(f"manager: {status.get('manager', 'unknown')}")
     print("setup ok")
     return 0
+
+
+def _run_maintenance(args: argparse.Namespace) -> int:
+    command = str(getattr(args, "maintenance_command", "") or "")
+    try:
+        if command == "provision":
+            paths = maintenance_paths(
+                Path(args.root).expanduser() if args.root else None
+            )
+            artifact = stage_wheel_artifact(
+                paths,
+                Path(args.wheel).expanduser(),
+                expected_version=PACKAGE_VERSION,
+                source_kind="cli_provision",
+            )
+            status = provision_runtime(
+                paths,
+                artifact,
+                hermes_root=Path(args.hermes_dir).expanduser(),
+            )
+            print(
+                "maintenance: "
+                + ("ready" if status.available else status.reason_code)
+            )
+            if status.available:
+                print(f"version: {status.package_version}")
+                print(f"python: {status.python_path}")
+                return 0
+            return 1
+        if command == "status":
+            paths = maintenance_paths(
+                Path(args.root).expanduser() if args.root else None
+            )
+            artifact = load_verified_artifact(
+                paths, expected_version=PACKAGE_VERSION
+            )
+            status = inspect_runtime(
+                paths,
+                artifact,
+                hermes_root=Path(args.hermes_dir).expanduser(),
+            )
+            print(
+                "maintenance: "
+                + ("ready" if status.available else status.reason_code)
+            )
+            print(f"version: {status.package_version or 'unavailable'}")
+            print(f"python: {status.python_path}")
+            return 0 if status.available else 1
+        if command in {"run", "resume"}:
+            result = run_job(Path(args.job).expanduser())
+            print(f"maintenance: {result.phase}")
+            return 0 if result.phase == "succeeded" else 1
+    except (MaintenanceRefused, OSError, ValueError) as exc:
+        print(f"maintenance: unavailable ({exc})", file=sys.stderr)
+        return 1
+    print("maintenance command is required", file=sys.stderr)
+    return 2
+
+
+def _provision_setup_maintenance(hermes_root: Path) -> bool:
+    spec = _runtime_install_spec()
+    if not spec:
+        print("maintenance: unavailable (exact install spec missing)")
+        return False
+    try:
+        with tempfile.TemporaryDirectory(prefix="hfc-maintenance-wheel-") as temp:
+            destination = Path(temp)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "wheel",
+                    "--no-deps",
+                    "--wheel-dir",
+                    str(destination),
+                    spec,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            wheels = sorted(destination.glob("*.whl"))
+            if completed.returncode != 0 or len(wheels) != 1:
+                print("maintenance: unavailable (wheel preparation failed)")
+                return False
+            paths = maintenance_paths()
+            artifact = stage_wheel_artifact(
+                paths,
+                wheels[0],
+                expected_version=PACKAGE_VERSION,
+                source_kind="setup_install_spec",
+            )
+            status = provision_runtime(
+                paths,
+                artifact,
+                hermes_root=hermes_root,
+            )
+            if not status.available:
+                print(f"maintenance: unavailable ({status.reason_code})")
+                return False
+            print("maintenance: ready")
+            return True
+    except (MaintenanceRefused, OSError, subprocess.SubprocessError, ValueError):
+        print("maintenance: unavailable (provisioning failed)")
+        return False
 
 
 def _has_feishu_credentials(

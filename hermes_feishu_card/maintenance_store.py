@@ -103,6 +103,7 @@ class UpdateJob:
     created_at: float
     updated_at: float
     result: dict[str, object]
+    bot_id: str = "default"
 
 
 def maintenance_paths(root: Path | None = None) -> MaintenancePaths:
@@ -241,6 +242,7 @@ def create_job(
     pre_update_head: str,
     target_fingerprint: str,
     artifact: ArtifactMetadata,
+    bot_id: str = "default",
     job_id: str | None = None,
     now: Callable[[], float] = time.time,
 ) -> UpdateJob:
@@ -289,6 +291,7 @@ def create_job(
         created_at=timestamp,
         updated_at=timestamp,
         result={},
+        bot_id=_bounded_string(bot_id, "bot id"),
     )
     _atomic_write_json(job.path, _job_payload(job))
     return job
@@ -324,6 +327,7 @@ def load_job(path: Path, *, require_private: bool = True) -> UpdateJob:
         "created_at",
         "updated_at",
         "result",
+        "bot_id",
     }
     if set(payload) != expected_keys:
         raise MaintenanceRefused("job schema fields are invalid")
@@ -368,6 +372,7 @@ def load_job(path: Path, *, require_private: bool = True) -> UpdateJob:
         created_at=_safe_timestamp(payload.get("created_at"), "job"),
         updated_at=_safe_timestamp(payload.get("updated_at"), "job"),
         result=result,
+        bot_id=_required_string(payload, "bot_id", "job"),
     )
 
 
@@ -695,6 +700,7 @@ def _job_payload(job: UpdateJob) -> dict[str, object]:
         "created_at": job.created_at,
         "updated_at": job.updated_at,
         "result": dict(job.result),
+        "bot_id": job.bot_id,
     }
 
 

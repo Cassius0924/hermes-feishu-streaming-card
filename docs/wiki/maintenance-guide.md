@@ -141,3 +141,20 @@
 - 保持 hook fail-open，但对已识别且已接管的 Feishu 卡片消息要抑制重复原生文本。
 - 真实 Feishu 凭据、chat id、token 不进入仓库。
 - 截图入库前脱敏；优先展示项目能力，不展示私人内容。
+# Hermes update maintenance
+
+Use `hermes-feishu-card maintenance status` before testing the private
+`/update` flow. `setup` provisions the independent runtime from the exact HFC
+install spec; an explicit wheel can be staged with:
+
+```bash
+hermes-feishu-card maintenance provision \
+  --hermes-dir ~/.hermes/hermes-agent \
+  --wheel /absolute/path/to/hermes_feishu_streaming_card-X.Y.Z-py3-none-any.whl
+```
+
+The job journal and cached wheel live under the private HFC state directory.
+Never hand-edit a job, copy secrets into it, or bypass a failed evidence check.
+If a job stops, inspect it with `maintenance status`; only resume the exact
+existing job file. Recovery deliberately uses the official Hermes updater and
+HFC patcher and does not implement a custom Git rollback.

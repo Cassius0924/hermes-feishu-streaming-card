@@ -1384,6 +1384,7 @@ async def _run_update_job_launch(
             pre_update_head=current.current_head,
             target_fingerprint=current.target_fingerprint,
             artifact=artifact,
+            bot_id=str(delivery.get("bot_id") or "default"),
         )
         launched = await _run_operations_mutation(
             app,

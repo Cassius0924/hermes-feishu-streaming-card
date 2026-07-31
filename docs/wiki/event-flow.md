@@ -266,3 +266,19 @@ profile 路由由 setup 的显式参数、进程环境变量、选定 env file�
 - `cleanup_*` metrics
 
 如果 Feishu UI 出现灰色重复文本，同时 `/health` 显示卡片成功更新，应优先查 hook runtime 的 native fallback suppression。
+# Private `/update` maintenance flow
+
+An exact bare `/update` from a verified Feishu private chat is handled as a
+maintenance operation, not as an ordinary model turn. The hook submits an
+authenticated `/commands` request, the sidecar performs read-only inspection,
+and the confirmation card carries an initiator-, chat-, profile-, and
+evidence-bound token that expires after 120 seconds.
+
+After confirmation, the sidecar rechecks the evidence, persists a private job
+journal, and launches the independent maintenance runtime. That runtime waits
+for active card sessions, restores HFC-owned hooks, runs only
+`hermes update --yes`, reinstalls the cached exact HFC wheel, reapplies hooks,
+starts services, and verifies version, import origin, health, and hook state.
+Once the sidecar stops, the maintenance process updates the original Feishu
+card directly. Group, non-Feishu, alias, and parameterized update commands
+remain on Hermes' native path.

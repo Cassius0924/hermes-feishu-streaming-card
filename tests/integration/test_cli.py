@@ -55,6 +55,83 @@ def test_status_reports_process_state(capsys):
     assert "running" in captured.out.lower() or "stopped" in captured.out.lower()
 
 
+def test_maintenance_provision_stages_exact_wheel_and_runtime(
+    monkeypatch, tmp_path, capsys
+):
+    staged = SimpleNamespace(version=PACKAGE_VERSION, sha256="a" * 64)
+    runtime = SimpleNamespace(
+        available=True,
+        reason_code="ready",
+        python_path=tmp_path / "maintenance-python",
+        package_version=PACKAGE_VERSION,
+    )
+    calls = []
+    monkeypatch.setattr(cli_module, "maintenance_paths", lambda root=None: "paths")
+    monkeypatch.setattr(
+        cli_module,
+        "stage_wheel_artifact",
+        lambda paths, wheel, expected_version, source_kind: calls.append(
+            (paths, wheel, expected_version, source_kind)
+        )
+        or staged,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "provision_runtime",
+        lambda paths, artifact, hermes_root: runtime,
+    )
+
+    code = main(
+        [
+            "maintenance",
+            "provision",
+            "--hermes-dir",
+            str(tmp_path / "hermes"),
+            "--wheel",
+            str(tmp_path / "hfc.whl"),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert code == 0
+    assert calls[0][2] == PACKAGE_VERSION
+    assert "maintenance: ready" in output
+
+
+def test_maintenance_status_reports_unavailable_without_mutating(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr(cli_module, "maintenance_paths", lambda root=None: "paths")
+    monkeypatch.setattr(
+        cli_module,
+        "load_verified_artifact",
+        lambda paths, expected_version: SimpleNamespace(version=PACKAGE_VERSION),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "inspect_runtime",
+        lambda paths, artifact, hermes_root: SimpleNamespace(
+            available=False,
+            reason_code="runtime_python_missing",
+            python_path=tmp_path / "missing",
+            package_version="",
+        ),
+    )
+
+    code = main(
+        [
+            "maintenance",
+            "status",
+            "--hermes-dir",
+            str(tmp_path / "hermes"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "runtime_python_missing" in captured.out
+
+
 def test_status_reports_runtime_readiness_and_fails_when_degraded(
     monkeypatch, capsys
 ):

@@ -346,3 +346,17 @@ V3.8.9 notice suppress smoke: please run terminal command date, then reply exact
 ```
 
 截图入库前需要遮挡私人头像、姓名、chat id、群名和不适合公开的上下文。
+# Private `/update` acceptance
+
+- Verify `maintenance status` is ready before opening Feishu.
+- A private bare `/update` produces one confirmation card; a group command or
+  `/update --yes` remains native Hermes behavior.
+- A different operator cannot confirm, an expired or repeated click is
+  rejected, and cancel performs no mutation.
+- With active work, the card shows draining before mutation. The same card then
+  shows hook restoration, Hermes update, exact HFC reinstall, service startup,
+  verification, and success.
+- After success, `doctor --explain` must report the expected HFC version,
+  `site-packages` import origin, installed hooks, and ready sidecar/Gateway.
+- Any tracked non-HFC edit or incomplete Git operation must show unavailable
+  and leave Hermes unchanged. Untracked user files must remain intact.

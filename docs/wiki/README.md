@@ -50,3 +50,9 @@
 仓库内 wiki 是公开、可随项目发布的维护资料；Bailey 的 Obsidian LLM Wiki 是长期检索层，会保存项目总览、维护规则和跨项目复用经验。
 
 当本目录新增稳定知识时，同步到 Bailey 的 Obsidian LLM Wiki 镜像；仓库文档不记录本机绝对路径。
+# v4.2 maintenance update
+
+The private Feishu `/update` workflow is documented in
+[`event-flow.md`](event-flow.md), operated through
+[`maintenance-guide.md`](maintenance-guide.md), and verified with the
+[`feishu-acceptance.md`](feishu-acceptance.md) checklist.

@@ -68,6 +68,7 @@ _INSPECTION_REASON_COPY = {
     "unrelated_tracked_changes": "Hermes 工作树存在不属于 HFC 的已跟踪改动。",
     "update_check_timeout": "Hermes 更新检查超时。",
     "update_check_failed": "Hermes 更新检查失败。",
+    "maintenance_runtime_unavailable": "独立维护环境尚未就绪。",
 }
 
 _RECOVERY_COMMAND = "hermes-feishu-card maintenance status"

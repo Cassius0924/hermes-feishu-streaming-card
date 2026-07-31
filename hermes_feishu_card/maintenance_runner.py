@@ -26,6 +26,7 @@ def main(argv: list[str] | None = None) -> int:
             else load_config(job.config_path)
         )
         profile_config = _profile_config(config, job.profile_id)
+        profile_config = _bot_profile_config(profile_config, job.bot_id)
         client = build_feishu_client(profile_config)
         if isinstance(client, NoopFeishuClient):
             raise MaintenanceRefused("Feishu credentials are unavailable")
@@ -57,6 +58,31 @@ def _profile_config(
             merged[section] = {**merged[section], **value}
         else:
             merged[section] = value
+    return merged
+
+
+def _bot_profile_config(
+    config: dict[str, Any],
+    bot_id: str,
+) -> dict[str, Any]:
+    selected = str(bot_id or "default").strip()
+    bots = config.get("bots")
+    items = bots.get("items") if isinstance(bots, dict) else None
+    bot = items.get(selected) if isinstance(items, dict) else None
+    if bot is None and selected == "default":
+        return config
+    if not isinstance(bot, dict):
+        raise MaintenanceRefused("maintenance bot is unavailable")
+    app_id = str(bot.get("app_id") or "").strip()
+    app_secret = str(bot.get("app_secret") or "").strip()
+    if not app_id or not app_secret:
+        raise MaintenanceRefused("maintenance bot credentials are unavailable")
+    merged = dict(config)
+    feishu = dict(merged.get("feishu") or {})
+    for key in ("app_id", "app_secret", "base_url", "timeout_seconds"):
+        if key in bot:
+            feishu[key] = bot[key]
+    merged["feishu"] = feishu
     return merged
 
 
