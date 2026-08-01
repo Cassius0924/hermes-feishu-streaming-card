@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.2.2 — 2026-08-01
+
+See also: [docs/release-notes-v4.2.2.md](docs/release-notes-v4.2.2.md)
+
+### Fixed
+- Feishu/Lark WebSocket `/update` confirmation actions now asynchronously PATCH the original confirmation card after the callback has been acknowledged.
+- Cancel now renders the durable terminal `已取消更新` state on the original card instead of leaving an apparently clickable confirmation card behind.
+- Confirm publishes the locking/preparing transition before the independent maintenance updater starts, keeping the visible card aligned with the durable operation state.
+
+### Safety
+- The native card-action callback still returns its empty acknowledgement immediately; Feishu API work stays outside the callback deadline.
+- Cancel never schedules the updater, and confirm schedules it only after the transition-card update attempt. Existing initiator, chat, profile, expiry, preflight, drain, and fail-closed checks are unchanged.
+
 ## V4.2.1 — 2026-07-31
 
 See also: [docs/release-notes-v4.2.1.md](docs/release-notes-v4.2.1.md)

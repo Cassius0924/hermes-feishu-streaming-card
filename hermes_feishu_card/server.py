@@ -1000,11 +1000,6 @@ def _update_operation_action(
         transitioned.state,
         title=app[CARD_TITLE_KEY],
     )
-    follow_up = (
-        (lambda: _schedule_update_job(app, transitioned))
-        if transitioned.state == "locking"
-        else None
-    )
     return _AfterEofJsonResponse(
         {
             "ok": True,
@@ -1019,7 +1014,7 @@ def _update_operation_action(
             },
             "card": card,
         },
-        follow_up,
+        lambda: _schedule_update_operation_transition(app, transitioned),
     )
 
 
@@ -1508,6 +1503,41 @@ def _schedule_update_job(app: web.Application, operation: OperationRecord) -> No
     _track_operations_task(
         app, asyncio.create_task(_run_update_job_launch(app, operation))
     )
+
+
+def _schedule_update_operation_transition(
+    app: web.Application,
+    operation: OperationRecord,
+) -> None:
+    _track_operations_task(
+        app,
+        asyncio.create_task(_publish_update_operation_transition(app, operation)),
+    )
+
+
+async def _publish_update_operation_transition(
+    app: web.Application,
+    operation: OperationRecord,
+) -> None:
+    try:
+        inspection = operation.update_inspection
+        delivery = app[OPERATIONS_DELIVERIES_KEY].get(operation.operation_id)
+        if inspection is not None and isinstance(delivery, dict):
+            message_id = str(delivery.get("message_id") or "").strip()
+            if message_id:
+                await _update_card_for_app(
+                    app,
+                    message_id,
+                    render_update_operation_card(
+                        inspection,
+                        operation.state,
+                        title=app[CARD_TITLE_KEY],
+                    ),
+                    delivery.get("bot_id"),
+                )
+    finally:
+        if operation.state == "locking":
+            _schedule_update_job(app, operation)
 
 
 async def _run_update_job_launch(
