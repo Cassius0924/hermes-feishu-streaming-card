@@ -16,6 +16,7 @@ from hermes_feishu_card.maintenance_store import (
     ArtifactMetadata,
     UpdateJob,
     maintenance_paths,
+    stage_job_credentials,
 )
 from hermes_feishu_card.maintenance_update import CommandResult
 
@@ -294,6 +295,27 @@ def test_launch_job_uses_systemd_user_when_available(status, job):
         str(job.path),
     )
     assert calls == [launch.argv]
+
+
+def test_systemd_launch_never_places_proxy_value_in_argv(status, job):
+    proxy_value = "http://127.0.0.1:7897"
+    paths = maintenance_paths(job.path.parent.parent)
+    staged = stage_job_credentials(
+        paths,
+        job_id=job.job_id,
+        environment={"HTTPS_PROXY": proxy_value},
+    )
+    assert staged is not None
+
+    launch = launch_job(
+        status,
+        job,
+        run=lambda argv, timeout: CommandResult(tuple(argv), 0, "", ""),
+        systemd_user_available=lambda: True,
+    )
+
+    assert all(proxy_value not in value for value in launch.argv)
+    assert proxy_value not in job.path.read_text(encoding="utf-8")
 
 
 class FakeProcess:

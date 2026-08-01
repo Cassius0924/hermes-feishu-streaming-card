@@ -1,4 +1,5 @@
 from dataclasses import replace
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +9,8 @@ from hermes_feishu_card.maintenance_store import ArtifactMetadata
 from hermes_feishu_card.maintenance_update import (
     CommandResult,
     inspect_update,
+    resolve_hermes_command_binding,
+    run_hermes_command,
     set_gateway_external_drain,
 )
 
@@ -30,7 +33,7 @@ class CommandHarness:
         )
         self.target_head = "e" * 40 + "\n"
 
-    def __call__(self, argv, timeout):
+    def __call__(self, argv, timeout, *, cwd=None, env=None):
         normalized = tuple(str(value) for value in argv)
         self.commands.append(normalized)
         if normalized[-2:] == ("rev-parse", "HEAD"):
@@ -45,7 +48,7 @@ class CommandHarness:
             return CommandResult(normalized, 0, "e123456 target commit\n", "")
         if "status" in normalized:
             return CommandResult(normalized, 0, self.git_status, "")
-        if normalized == ("hermes", "update", "--check"):
+        if normalized[-2:] == ("update", "--check"):
             return replace(self.update_result, argv=normalized)
         raise AssertionError(f"unexpected command: {normalized}")
 
@@ -61,6 +64,12 @@ def clean_hermes(tmp_path):
         "patched\n", encoding="utf-8"
     )
     (root / "cron" / "scheduler.py").write_text("patched\n", encoding="utf-8")
+    runtime = root / "venv" / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("#!python\n", encoding="utf-8")
+    runtime.chmod(0o700)
     return root
 
 
@@ -122,6 +131,113 @@ def _inspect(clean_hermes, artifact, runner, *, active_sessions=0):
     )
 
 
+def test_hermes_command_binding_ignores_path_decoy(tmp_path):
+    root = tmp_path / "custom" / "hermes-agent"
+    runtime = root / "venv" / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("#!python\n", encoding="utf-8")
+
+    binding = resolve_hermes_command_binding(root)
+
+    assert binding.runtime_python == runtime.resolve(strict=False)
+    assert binding.argv_prefix == (
+        str(runtime.resolve(strict=False)),
+        "-I",
+        "-m",
+        "hermes_cli.main",
+    )
+
+
+def test_bound_hermes_command_sets_exact_root_home_and_cwd(tmp_path):
+    root = tmp_path / "custom" / "hermes-agent"
+    runtime = root / "venv" / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("#!python\n", encoding="utf-8")
+    runtime.chmod(0o700)
+    captured = {}
+
+    def runner(argv, timeout, *, cwd=None, env=None):
+        captured.update(
+            argv=tuple(argv),
+            timeout=timeout,
+            cwd=cwd,
+            env=dict(env or {}),
+        )
+        return CommandResult(tuple(argv), 0, "", "")
+
+    binding = resolve_hermes_command_binding(root)
+    result = run_hermes_command(
+        binding,
+        ("gateway", "stop", "--all"),
+        120.0,
+        run=runner,
+        base_environment={
+            "PATH": "/decoy/bin",
+            "FEISHU_APP_SECRET": "must-not-leak",
+        },
+        proxy_environment={"HTTPS_PROXY": "http://127.0.0.1:7897"},
+    )
+
+    assert result.returncode == 0
+    assert captured["argv"][:4] == (
+        str(runtime.resolve(strict=False)),
+        "-I",
+        "-m",
+        "hermes_cli.main",
+    )
+    assert captured["argv"][4:] == ("gateway", "stop", "--all")
+    assert captured["cwd"] == root.resolve(strict=False)
+    assert captured["env"]["HERMES_DIR"] == str(root.resolve(strict=False))
+    assert captured["env"]["HERMES_HOME"] == str(root.parent.resolve(strict=False))
+    assert captured["env"]["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+    assert "FEISHU_APP_SECRET" not in captured["env"]
+
+
+def test_binding_bound_drain_uses_runtime_python_and_hides_home_from_argv(tmp_path):
+    root = tmp_path / "custom" / "hermes-agent"
+    runtime = root / "venv" / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("#!python\n", encoding="utf-8")
+    runtime.chmod(0o700)
+    captured = {}
+
+    def runner(argv, timeout, *, cwd=None, env=None):
+        captured.update(argv=tuple(argv), cwd=cwd, env=dict(env or {}))
+        return CommandResult(tuple(argv), 0, "", "")
+
+    proxy_value = "http://127.0.0.1:7897"
+    assert set_gateway_external_drain(
+        root,
+        active=True,
+        run=runner,
+        proxy_environment={"HTTPS_PROXY": proxy_value},
+    )
+
+    assert captured["argv"][:3] == (
+        str(runtime.resolve(strict=False)),
+        "-I",
+        "-c",
+    )
+    assert "hermes_cli.main" not in captured["argv"]
+    assert all(
+        str(root.resolve(strict=False)) not in value
+        for value in captured["argv"][1:]
+    )
+    assert all(
+        str(root.parent.resolve(strict=False)) not in value
+        for value in captured["argv"][1:]
+    )
+    assert all(proxy_value not in value for value in captured["argv"])
+    assert captured["cwd"] == root.resolve(strict=False)
+    assert captured["env"]["HERMES_HOME"] == str(root.parent.resolve(strict=False))
+
+
 def test_gateway_external_drain_uses_hermes_runtime_and_home(tmp_path):
     root = tmp_path / "home" / "hermes-agent"
     python = root / "venv" / "bin" / "python"
@@ -129,14 +245,13 @@ def test_gateway_external_drain_uses_hermes_runtime_and_home(tmp_path):
     python.write_text("#!python\n", encoding="utf-8")
     commands = []
 
-    def runner(argv, timeout):
+    def runner(argv, timeout, *, cwd=None, env=None):
         commands.append((tuple(argv), timeout))
         return CommandResult(tuple(argv), 0, "", "")
 
     assert set_gateway_external_drain(root, active=True, run=runner) is True
     assert set_gateway_external_drain(root, active=False, run=runner) is True
     assert all(command[0][0] == str(python) for command in commands)
-    assert all(command[0][-1] == str(root.parent) for command in commands)
     assert "write_drain_request" in commands[0][0][3]
     assert "clear_drain_request" in commands[1][0][3]
 
@@ -159,7 +274,18 @@ def test_inspect_update_runs_only_read_only_commands(
             "--porcelain=v1",
             "--untracked-files=no",
         ),
-        ("hermes", "update", "--check"),
+        (
+            str(
+                clean_hermes
+                / "venv"
+                / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            ),
+            "-I",
+            "-m",
+            "hermes_cli.main",
+            "update",
+            "--check",
+        ),
         ("git", "-C", str(clean_hermes), "fetch", "--quiet", "origin", "main"),
         ("git", "-C", str(clean_hermes), "rev-parse", "--verify", "origin/main"),
         (
@@ -203,7 +329,7 @@ def test_inspect_update_refuses_unrelated_tracked_change(
     assert inspection.ready is False
     assert inspection.reason_code == "unrelated_tracked_changes"
     assert inspection.changed_paths == ("gateway/unrelated.py",)
-    assert ("hermes", "update", "--check") not in runner.commands
+    assert not any(command[-2:] == ("update", "--check") for command in runner.commands)
 
 
 def test_inspect_update_allows_untracked_files(clean_hermes, artifact):

@@ -81,6 +81,7 @@ from hermes_feishu_card.maintenance_store import (
     load_job,
     load_verified_artifact,
     maintenance_paths,
+    sanitize_job_environment,
     stage_job_credentials,
     stage_wheel_artifact,
 )
@@ -582,14 +583,12 @@ def _run_maintenance(args: argparse.Namespace) -> int:
             if not status.available:
                 print(f"maintenance: unavailable ({status.reason_code})")
                 return 1
-            if all(
-                str(os.environ.get(key) or "").strip()
-                for key in ("FEISHU_APP_ID", "FEISHU_APP_SECRET")
-            ):
+            environment = sanitize_job_environment(os.environ)
+            if environment:
                 stage_job_credentials(
                     paths,
                     job_id=job.job_id,
-                    environment=os.environ,
+                    environment=environment,
                 )
             launched = launch_job(status, job)
             print(

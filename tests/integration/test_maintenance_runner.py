@@ -155,6 +155,11 @@ class CommandHarness:
             " M cron/scheduler.py\n"
         )
         self.mutations = []
+        self.commands = []
+        self.command_contexts = []
+        self.hermes_mutations = []
+        self.default_hermes_mutations = []
+        self.rebuild_runtime = False
         self.fail_at = ""
         self.hermes_update_calls = 0
         self.pinned_install_calls = 0
@@ -181,8 +186,10 @@ class CommandHarness:
             encoding="utf-8",
         )
 
-    def __call__(self, argv, timeout):
+    def __call__(self, argv, timeout, *, cwd=None, env=None):
         command = tuple(str(value) for value in argv)
+        self.commands.append(command)
+        self.command_contexts.append((command, cwd, dict(env or {})))
         if (
             command[0] == str(self.runtime_python)
             and command[1:3] == ("-I", "-c")
@@ -201,11 +208,17 @@ class CommandHarness:
             return CommandResult(command, 0, "e123456 target commit\n", "")
         if "status" in command and command[:2] == ("git", "-C"):
             return CommandResult(command, 0, self.git_status, "")
-        if command == ("hermes", "update", "--check"):
+        if command[-2:] == ("update", "--check"):
             return CommandResult(command, 0, UPDATE_CHECK_TEXT + "\n", "")
         if command[-3:] == ("maintenance", "drain", "--status"):
             return CommandResult(command, 0, '{"active_sessions": 0}', "")
-        if command == ("hermes", "gateway", "stop", "--all"):
+        if command[-3:] == ("gateway", "stop", "--all"):
+            target = (
+                self.default_hermes_mutations
+                if command[0] == "hermes"
+                else self.hermes_mutations
+            )
+            target.append("gateway-stop")
             return self._mutation("gateway-stop", command)
         if "hermes_feishu_card.cli" in command and "stop" in command:
             return self._mutation("sidecar-stop", command)
@@ -215,12 +228,38 @@ class CommandHarness:
                 self.fixture.state["hook"] = "clean"
                 self.git_status = ""
             return result
-        if command == ("hermes", "update", "--yes"):
+        if command[-2:] == ("update", "--yes"):
+            target = (
+                self.default_hermes_mutations
+                if command[0] == "hermes"
+                else self.hermes_mutations
+            )
+            target.append("hermes-update")
             self.hermes_update_calls += 1
             result = self._mutation("hermes-update", command)
             if result.returncode == 0:
                 self.actual_head = "e" * 40
                 self.fixture.state["version"] = "0.19.2"
+                if self.rebuild_runtime:
+                    self.runtime_python.unlink(missing_ok=True)
+                    self.runtime_python = (
+                        self.fixture.root
+                        / ".venv"
+                        / (
+                            "Scripts/python.exe"
+                            if os.name == "nt"
+                            else "bin/python"
+                        )
+                    )
+                    self.package_location = (
+                        self.fixture.root
+                        / ".venv"
+                        / "lib"
+                        / "python3.12"
+                        / "site-packages"
+                        / "hermes_feishu_card"
+                        / "__init__.py"
+                    )
                 self.runtime_python.parent.mkdir(parents=True, exist_ok=True)
                 self.runtime_python.write_text("#!python\n", encoding="utf-8")
                 self.runtime_python.chmod(0o700)
@@ -257,7 +296,13 @@ class CommandHarness:
             and "start" in command
         ):
             return self._mutation("sidecar-start", command)
-        if command == ("hermes", "gateway", "restart"):
+        if command[-2:] == ("gateway", "restart"):
+            target = (
+                self.default_hermes_mutations
+                if command[0] == "hermes"
+                else self.hermes_mutations
+            )
+            target.append("gateway-restart")
             return self._mutation("gateway-restart", command)
         if command[0] == str(self.runtime_python) and command[1:3] == ("-I", "-c"):
             return CommandResult(
@@ -357,6 +402,80 @@ def test_supervisor_restores_updates_reinstalls_and_verifies(maintenance_fixture
         "verifying",
         "succeeded",
     ]
+
+
+def test_binding_is_re_resolved_after_updater_rebuilds_venv(maintenance_fixture):
+    commands = CommandHarness(maintenance_fixture)
+    old_runtime = commands.runtime_python
+    commands.rebuild_runtime = True
+    health = HealthHarness(old_runtime)
+
+    def fetch_health():
+        health.runtime_python = commands.runtime_python
+        return health()
+
+    result = run_job(
+        maintenance_fixture.job.path,
+        run=commands,
+        fetch_health=fetch_health,
+        publish=lambda current: True,
+        sleep=lambda _delay: None,
+        maintenance_python=Path("/maintenance/bin/python"),
+    )
+
+    assert result.phase == "succeeded"
+    assert commands.runtime_python != old_runtime
+    restart = next(
+        command
+        for command in commands.commands
+        if command[-2:] == ("gateway", "restart")
+    )
+    assert restart[0] == str(commands.runtime_python.resolve(strict=False))
+
+
+def test_custom_root_upgrade_never_mutates_default_hermes(
+    maintenance_fixture,
+    tmp_path,
+):
+    default_root = tmp_path / "default" / "hermes-agent"
+    default_root.mkdir(parents=True)
+    default_marker = default_root / "HEAD"
+    default_marker.write_bytes(b"default-head-before\n")
+    before_default = default_marker.read_bytes()
+    commands = CommandHarness(maintenance_fixture)
+
+    result = run_job(
+        maintenance_fixture.job.path,
+        run=commands,
+        fetch_health=HealthHarness(commands.runtime_python),
+        publish=lambda current: True,
+        sleep=lambda _delay: None,
+        maintenance_python=Path("/maintenance/bin/python"),
+        base_environment={"PATH": str(default_root / "bin")},
+        proxy_environment={"HTTPS_PROXY": "http://127.0.0.1:7897"},
+    )
+
+    assert result.phase == "succeeded"
+    assert commands.hermes_mutations == [
+        "gateway-stop",
+        "hermes-update",
+        "gateway-restart",
+    ]
+    assert commands.default_hermes_mutations == []
+    assert default_marker.read_bytes() == before_default
+    bound_contexts = [
+        (command, cwd, env)
+        for command, cwd, env in commands.command_contexts
+        if command[-3:] == ("gateway", "stop", "--all")
+        or command[-2:] in {("update", "--yes"), ("gateway", "restart")}
+    ]
+    assert all(cwd == maintenance_fixture.root.resolve(strict=False) for _, cwd, _ in bound_contexts)
+    assert all(
+        env["HERMES_DIR"] == str(maintenance_fixture.root.resolve(strict=False))
+        and env["HERMES_HOME"]
+        == str(maintenance_fixture.root.parent.resolve(strict=False))
+        for _, _, env in bound_contexts
+    )
 
 
 def test_card_failure_before_mutation_aborts_without_commands(maintenance_fixture):

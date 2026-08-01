@@ -98,6 +98,7 @@ from .maintenance_card import (
 from .maintenance_process import inspect_runtime, launch_job
 from .maintenance_store import (
     MaintenanceRefused,
+    PROXY_ENVIRONMENT_KEYS,
     create_job,
     discard_job_credentials,
     discard_unstarted_job,
@@ -107,6 +108,7 @@ from .maintenance_store import (
     maintenance_paths,
     release_drain_lease,
     reserve_drain_lease,
+    sanitize_job_environment,
     stage_job_credentials,
     transition_job,
 )
@@ -1064,23 +1066,31 @@ def _reserve_update_job_for_operation(
         pre_runtime_id_hash=str(runtime_snapshot.get("runtime_id_hash") or ""),
         pre_runtime_sequence=int(runtime_snapshot.get("last_sequence") or 0),
     )
+    environment = sanitize_job_environment(os.environ)
+    proxy_environment = {
+        key: value
+        for key, value in environment.items()
+        if key in PROXY_ENVIRONMENT_KEYS
+    }
     try:
         reserve_drain_lease(paths, owner_id=owner_id)
         if not set_gateway_external_drain(
             app[OPERATIONS_HERMES_ROOT_KEY],
             active=True,
+            proxy_environment=proxy_environment,
         ):
             raise MaintenanceRefused("gateway drain unavailable")
         stage_job_credentials(
             paths,
             job_id=owner_id,
-            environment=os.environ,
+            environment=environment,
         )
     except Exception:
         try:
             set_gateway_external_drain(
                 app[OPERATIONS_HERMES_ROOT_KEY],
                 active=False,
+                proxy_environment=proxy_environment,
             )
         except Exception:
             pass
@@ -1408,6 +1418,12 @@ async def _inspect_update_for_app(app: web.Application) -> UpdateInspection:
         artifact,
         hermes_root=app[OPERATIONS_HERMES_ROOT_KEY],
     )
+    environment = sanitize_job_environment(os.environ)
+    proxy_environment = {
+        key: value
+        for key, value in environment.items()
+        if key in PROXY_ENVIRONMENT_KEYS
+    }
     inspection = await _run_operations_mutation(
         app,
         inspect_update,
@@ -1415,6 +1431,7 @@ async def _inspect_update_for_app(app: web.Application) -> UpdateInspection:
         artifact=artifact,
         installed_hfc_version=app[PACKAGE_VERSION_KEY],
         active_sessions=active_sessions,
+        proxy_environment=proxy_environment,
     )
     if not runtime.available:
         return replace(

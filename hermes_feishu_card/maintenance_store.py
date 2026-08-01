@@ -58,6 +58,25 @@ _SAFE_RESULT_KEYS = frozenset(
 )
 _MAX_STRING_CHARS = 4096
 _EXPECTED_DISTRIBUTION = "hermes-feishu-streaming-card"
+PROXY_ENVIRONMENT_KEYS = frozenset(
+    {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    }
+)
+JOB_ENVIRONMENT_KEYS = frozenset(
+    {
+        "FEISHU_APP_ID",
+        "FEISHU_APP_SECRET",
+        *PROXY_ENVIRONMENT_KEYS,
+    }
+)
 
 
 class MaintenanceRefused(ValueError):
@@ -249,11 +268,7 @@ def stage_job_credentials(
     environment: Mapping[str, str],
 ) -> Path | None:
     selected_job_id = _safe_job_id(job_id)
-    values = {
-        key: value
-        for key in ("FEISHU_APP_ID", "FEISHU_APP_SECRET")
-        if isinstance((value := environment.get(key)), str) and value.strip()
-    }
+    values = sanitize_job_environment(environment)
     if not values:
         return None
     _prepare_paths(paths)
@@ -291,10 +306,22 @@ def load_job_credentials(paths: MaintenancePaths, *, job_id: str) -> dict[str, s
         raise MaintenanceRefused("job credential snapshot is invalid")
     values: dict[str, str] = {}
     for key, value in raw_environment.items():
-        if key not in {"FEISHU_APP_ID", "FEISHU_APP_SECRET"}:
+        if key not in JOB_ENVIRONMENT_KEYS:
             raise MaintenanceRefused("job credential snapshot key is invalid")
         values[key] = _bounded_string(value, "job credential value")
     return values
+
+
+def sanitize_job_environment(
+    environment: Mapping[str, str],
+) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in environment.items()
+        if key in JOB_ENVIRONMENT_KEYS
+        and isinstance(value, str)
+        and value.strip()
+    }
 
 
 def consume_job_credentials(paths: MaintenancePaths, *, job_id: str) -> dict[str, str]:

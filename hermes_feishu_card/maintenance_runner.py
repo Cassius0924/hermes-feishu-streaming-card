@@ -5,13 +5,14 @@ import asyncio
 import os
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Mapping
 
 from .config import load_config
 from .maintenance_card import FeishuJobPublisher
 from .maintenance_store import (
     MaintenancePaths,
     MaintenanceRefused,
+    PROXY_ENVIRONMENT_KEYS,
     TERMINAL_UPDATE_PHASES,
     UpdateLockBusy,
     UpdateLockLease,
@@ -45,6 +46,8 @@ def _terminalize_owned_runner_failure(
     lease: UpdateLockLease,
     *,
     error_code: str,
+    base_environment: Mapping[str, str],
+    proxy_environment: Mapping[str, str],
 ) -> UpdateJob:
     current = load_job(job_path)
     require_update_lock_lease(
@@ -68,7 +71,11 @@ def _terminalize_owned_runner_failure(
         job_id=current.job_id,
         lease=lease,
     )
-    _cleanup_terminal_owned_job(current)
+    _cleanup_terminal_owned_job(
+        current,
+        base_environment=base_environment,
+        proxy_environment=proxy_environment,
+    )
     return current
 
 
@@ -85,15 +92,23 @@ def main(argv: list[str] | None = None) -> int:
     try:
         try:
             with acquire_update_lock(paths, job_id=job.job_id) as lease:
+                base_environment = dict(os.environ)
+                proxy_environment: dict[str, str] = {}
                 try:
                     environment = consume_job_credentials(
                         paths,
                         job_id=job.job_id,
                     )
+                    proxy_environment = {
+                        key: value
+                        for key, value in environment.items()
+                        if key in PROXY_ENVIRONMENT_KEYS
+                    }
                     for key in ("FEISHU_APP_ID", "FEISHU_APP_SECRET"):
                         value = environment.get(key)
                         if value:
                             os.environ[key] = value
+                    base_environment = dict(os.environ)
                     config = (
                         load_config(job.config_path, env_file=job.env_file)
                         if job.env_file is not None
@@ -115,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
                         job.path,
                         lease,
                         error_code="runner_initialization_failed",
+                        base_environment=base_environment,
+                        proxy_environment=proxy_environment,
                     )
                 else:
                     try:
@@ -126,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
                                 publisher.publish(current)
                             ),
                             maintenance_python=Path(sys.executable),
+                            base_environment=base_environment,
+                            proxy_environment=proxy_environment,
                         )
                     except (MaintenanceRefused, OSError, ValueError):
                         result = _terminalize_owned_runner_failure(
@@ -133,6 +152,8 @@ def main(argv: list[str] | None = None) -> int:
                             job.path,
                             lease,
                             error_code="runner_state_machine_exception",
+                            base_environment=base_environment,
+                            proxy_environment=proxy_environment,
                         )
         except UpdateLockBusy:
             return 0

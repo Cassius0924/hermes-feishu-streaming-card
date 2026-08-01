@@ -21,6 +21,7 @@ from hermes_feishu_card.maintenance_store import (
     load_verified_artifact,
     load_active_drain_lease,
     maintenance_paths,
+    load_job_credentials,
     prune_jobs,
     release_drain_lease,
     require_drain_lease,
@@ -349,6 +350,27 @@ def test_job_credentials_are_private_allowlisted_and_consumed_once(tmp_path):
     assert not path.exists()
     assert consume_job_credentials(paths, job_id="job-1") == {}
     assert discard_job_credentials(paths, job_id="job-1") is False
+
+
+def test_job_environment_is_private_allowlisted_and_one_shot(tmp_path):
+    paths = maintenance_paths(tmp_path / "state")
+    staged = stage_job_credentials(
+        paths,
+        job_id="job-1",
+        environment={
+            "HTTPS_PROXY": "http://127.0.0.1:7897",
+            "UNSAFE_VALUE": "drop-me",
+        },
+    )
+
+    assert staged is not None
+    assert load_job_credentials(paths, job_id="job-1") == {
+        "HTTPS_PROXY": "http://127.0.0.1:7897"
+    }
+    assert consume_job_credentials(paths, job_id="job-1") == {
+        "HTTPS_PROXY": "http://127.0.0.1:7897"
+    }
+    assert not staged.exists()
 
 
 def test_prune_jobs_keeps_five_recent_and_removes_jobs_older_than_seven_days(
