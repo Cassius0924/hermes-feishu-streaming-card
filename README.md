@@ -153,7 +153,7 @@ bash install-docker.sh
 | `HFC_ENV_FILE` | `/opt/data/.env` |
 | `HFC_VERSION` | `latest` |
 
-`docker-compose.example.yml` 是适配示例，不是官方镜像。V3.8.6 起，Docker/source-stripped Hermes 缺少 `VERSION` 和 `.git` 时也会用 Gateway anchors 兜底判断 `gateway_run_013_plus`。
+`docker-compose.example.yml` 是适配示例，不是官方镜像。V3.8.6 起，Docker/source-stripped Hermes 缺少 `VERSION` 和 `.git` 时也会用 Gateway anchors 兜底判断 `gateway_run_013_plus`。`latest` 会先解析为 GitHub 最新稳定 Release 的精确 `vX.Y.Z` tag，再用该固定 ref 安装；查询失败、响应无效或 tag 校验失败会在凭证提示、pip、setup、doctor 和 Docker 状态变更前停止。显式 release tag 保持固定且不访问 Release API；只有显式 `--version main`（PowerShell 为 `-Version main`）才选择移动的开发分支。
 
 ## 常用命令
 
@@ -278,7 +278,3 @@ Hermes Gateway
 ## License
 
 MIT License，详见 [LICENSE](LICENSE)。
-
-## 安装版本解析
-
-`latest` 会先解析为 GitHub 最新稳定 Release 的精确 `vX.Y.Z` tag，再用该固定 ref 安装；查询失败、响应无效或 tag 校验失败会在凭证提示、pip、setup、doctor 和 Docker 状态变更前停止。显式 release tag 保持固定且不访问 Release API；只有显式 `--version main`（PowerShell 为 `-Version main`）才选择移动的开发分支。

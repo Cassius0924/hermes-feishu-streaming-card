@@ -154,7 +154,7 @@ Defaults:
 | `HFC_ENV_FILE` | `/opt/data/.env` |
 | `HFC_VERSION` | `latest` |
 
-`docker-compose.example.yml` is an integration example, not an official image. Since V3.8.6, Docker/source-stripped Hermes roots without `VERSION` or `.git` can fall back to Gateway anchors and still choose `gateway_run_013_plus`.
+`docker-compose.example.yml` is an integration example, not an official image. Since V3.8.6, Docker/source-stripped Hermes roots without `VERSION` or `.git` can fall back to Gateway anchors and still choose `gateway_run_013_plus`. `latest` resolves once to the exact `vX.Y.Z` tag of the latest stable GitHub Release and installs that pinned ref. Lookup, response, or tag-validation failure stops before credential prompting, pip, setup, doctor, or Docker state mutation. An explicit release tag stays pinned and bypasses the Release API; only explicit `--version main` (PowerShell: `-Version main`) opts into the moving development branch.
 
 ## Common Commands
 
@@ -281,7 +281,3 @@ Windows non-loopback startup is rejected when state-directory ACL privacy cannot
 ## License
 
 MIT License. See [LICENSE](LICENSE).
-
-## Installer version resolution
-
-`latest` resolves once to the exact `vX.Y.Z` tag of the latest stable GitHub Release and installs that pinned ref. Lookup, response, or tag-validation failure stops before credential prompting, pip, setup, doctor, or Docker state mutation. An explicit release tag stays pinned and bypasses the Release API; only explicit `--version main` (PowerShell: `-Version main`) opts into the moving development branch.
