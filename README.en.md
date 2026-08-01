@@ -141,7 +141,7 @@ For an existing Hermes container:
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.3
+export HFC_VERSION=v4.2.4
 bash install-docker.sh
 ```
 
@@ -181,6 +181,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ![Feishu topic reply card continuity and reasoning/tool timeline showcase](docs/assets/feishu-topic-card-showcase-v389.png)
 | Version | Highlights |
 |---|---|
+| [v4.2.4](docs/release-notes-v4.2.4.en.md) | Fixes consecutive Feishu/Lark topic replies quoting the same message overwriting the first reply card; every new message opens an independent card while in-turn streaming still resolves through the reply alias |
 | [v4.2.3](docs/release-notes-v4.2.3.en.md) | Preserves `update_evidence_fingerprint` when the WebSocket hook forwards `/update` actions, allowing the sidecar to complete evidence-bound confirm/cancel transitions while missing or mismatched evidence remains fail-closed |
 | [v4.2.2](docs/release-notes-v4.2.2.en.md) | Fixes `/update` confirmation actions that changed durable state without PATCHing the original card; cancel now renders a terminal state and never starts the updater, while confirm shows preparation before scheduling maintenance |
 | [v4.2.1](docs/release-notes-v4.2.1.en.md) | Registers the live Gateway runner before the first runtime heartbeat, so the first bare private-chat `/update` after restart has complete active-work evidence; missing evidence remains fail-closed |
@@ -264,10 +265,9 @@ This remains a sidecar-only design: Hermes keeps only installer-owned, detectabl
 - [zayn-0101](https://github.com/zayn-0101) - [PR #77](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/77) cron `deliver=origin/all` routing-intent card delivery fix
 - [Zanetach](https://github.com/Zanetach) - [PR #84](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/84) / @Zanetach: card progress-status routing and `.env` allowlist expansion for profile environment support (V3.9.0)
 - [colinaaa](https://github.com/colinaaa) - [PR #93](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/93) reliable terminal cards for interrupted tasks; [PR #97](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/97) completed-answer preservation (V3.9.1)
-- [charles5g](https://github.com/charles5g) - [PR #98](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/98) asynchronous model-picker callbacks and original-card status updates (V3.9.1)
 - [wjiemin49-ux](https://github.com/wjiemin49-ux) - [PR #52](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/52) diagnosis and direction for loopback health checks bypassing proxies (adopted in V3.9.1)
 - [colinaaa](https://github.com/colinaaa) - [Issue #94](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/94) requirements, interaction flow, and security boundary for the native bare `/resume` picker (V3.10.0)
-- [charles5g](https://github.com/charles5g) / jackmim - [PR #98](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/98) semantic model-footer color concept; mainline adds HTML escaping and preserves layout (V3.10.0)
+- [charles5g](https://github.com/charles5g) / jackmim - [PR #98](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/98) asynchronous model-picker callbacks, original-card status updates, and semantic model-footer color concept; mainline adds HTML escaping and preserves layout (V3.9.1–V3.10.0)
 - [tianqiii](https://github.com/tianqiii) - [Issue #107](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/107) requirements, Hermes-native API direction, and display format for the Codex subscription-quota footer (V4.0.2)
 - [sthnow](https://github.com/sthnow) - [Issue #110](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/110) reproduction, root-cause analysis, and expected boundary for literal `MEDIA:` text inside Markdown code (V4.0.4)
 - [zkyken](https://github.com/zkyken) - [Issue #112](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/112) logs, bound-callback diagnosis, and fix direction for non-functional lark SDK interaction buttons (V4.0.4)

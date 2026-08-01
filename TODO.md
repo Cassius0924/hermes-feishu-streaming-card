@@ -2,18 +2,26 @@
 
 当前 active runtime 是 `hermes_feishu_card/`。legacy adapter、dual mode、旧 `sidecar/`、旧 `patch/` 和 `installer_v2.py` 不是 active runtime，仅保留作历史参考。
 
-## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3
+## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3 / V4.2.4
 
 详细路线见 [docs/superpowers/specs/2026-06-30-v3-8-design.md](docs/superpowers/specs/2026-06-30-v3-8-design.md) 和 [docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md](docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md)。
 
-### V4.2.3：更新回调证据转发热修（发布候选）
+### V4.2.4：话题引用回复独立卡片热修（发布候选）
+
+- [x] Issue #175 与 PR #177 定位连续引用同一消息时 `message.started` 复用 reply anchor，导致 session key 碰撞并覆盖旧卡。
+- [x] hook 使用真实入站 message ID，sidecar 对新 turn 跳过 reply alias；同一轮 delta/tool alias 关联保持不变。
+- [x] 新增真实 HTTP `/events` 回归，验证两次引用回复各创建一张卡，第二轮 delta 只更新第二张卡。
+- [x] 完整 pytest `2311 passed, 5 skipped`、`git diff --check`、sdist/wheel 与干净 `site-packages` provenance。
+- [ ] PR CI、exact merge、public tag/install 与 Release assets。
+
+### V4.2.3：更新回调证据转发热修（已发布）
 
 - [x] 真实飞书点击、Gateway 日志与 sidecar metrics 联合定位 WebSocket hook 遗漏 `update_evidence_fingerprint`。
 - [x] 新增 executor-facing 回归，先观察缺失字段失败，再以最小修改保留证据指纹。
 - [x] hook/runtime/server/Feishu SDK 相关矩阵 `670 passed, 1 skipped`。
 - [x] 完整 pytest `2309 passed, 5 skipped`、`git diff --check`、sdist/wheel 与干净 Python 3.12 `site-packages` provenance。
 - [x] 本机候选经官方 setup 安装后，真实飞书取消使原卡进入终态；sidecar update 成功，Hermes HEAD 与 update log 不变，无 updater 进程。
-- [ ] PR CI、exact merge、public tag/install、Release assets 与正式 tag 真实飞书复验。
+- [x] PR CI、exact merge、public tag/install 与 Release assets；正式 tag 真实飞书复验未记录，保留为运行环境验收项。
 
 ### V4.2.2：更新确认卡终态写回热修（已发布）
 
