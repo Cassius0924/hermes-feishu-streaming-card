@@ -5973,6 +5973,9 @@ def _hfc_handle_operations_select_action(
     token = str(action_value.get("token") or "").strip()
     transport_lineage_id = str(action_value.get("transport_lineage_id") or "").strip()
     profile_scope = str(action_value.get("profile_scope") or "").strip()
+    update_evidence_fingerprint = str(
+        action_value.get("update_evidence_fingerprint") or ""
+    ).strip()
     chat_id = _hfc_action_chat_id(data)
     if not operation_action or not token or not chat_id:
         _hfc_info("operations.select ignored: missing action/token/chat")
@@ -5998,6 +6001,10 @@ def _hfc_handle_operations_select_action(
         forwarded_value["profile_scope"] = profile_scope
     if transport_lineage_id:
         forwarded_value["transport_lineage_id"] = transport_lineage_id
+    if update_evidence_fingerprint:
+        forwarded_value["update_evidence_fingerprint"] = (
+            update_evidence_fingerprint
+        )
     sidecar_payload = {
         "adapter_transport_proof": {
             "timestamp": timestamp,

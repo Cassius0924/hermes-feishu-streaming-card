@@ -72,6 +72,8 @@ An exact bare `/update` in a Feishu private chat first performs read-only checks
 - Unrelated tracked changes, incomplete Git operations, maintenance-artifact drift, or failed verification stop the workflow. Untracked files are preserved and no custom Git rollback runs.
 - Setup provisions the independent runtime outside the Hermes checkout. Run `hermes-feishu-card maintenance status` before use; `maintenance resume` recovers from the durable journal when required.
 - V4.2.1 registers the live Gateway runner before runtime control starts, so the first heartbeat after restart proves the complete aggregate and the first bare private-chat `/update` needs no unrelated warm-up message.
+- V4.2.2 asynchronously PATCHes the original confirmation card after the button callback is acknowledged: cancel reaches a terminal state without starting the updater, while confirm shows locking/preparation before scheduling independent maintenance.
+- V4.2.3 forwards the update evidence fingerprint, `update_evidence_fingerprint`, unchanged through the WebSocket hook to the sidecar, so confirm/cancel reach the existing evidence-bound transition logic; missing or mismatched evidence remains fail-closed.
 
 See the [V4.2.0 release notes](release-notes-v4.2.0.en.md) for the complete boundary and acceptance steps.
 
@@ -492,14 +494,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.2.1`.
+The Compose example defaults `HFC_VERSION` to `v4.2.3`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.1
+export HFC_VERSION=v4.2.3
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -742,6 +744,8 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.2.3](release-notes-v4.2.3.en.md) | 2026-08-01 | The WebSocket hook preserves `/update` evidence fingerprints so the sidecar can complete evidence-bound confirm/cancel transitions; missing or mismatched evidence remains fail-closed |
+| [v4.2.2](release-notes-v4.2.2.en.md) | 2026-08-01 | `/update` confirm/cancel asynchronously PATCH the original card after fast acknowledgement; cancel is terminal with no updater, and confirm publishes preparation before maintenance starts |
 | [v4.2.1](release-notes-v4.2.1.en.md) | 2026-07-31 | Registers the live runner at Gateway startup so the first heartbeat carries complete active-work evidence and the first private-chat `/update` after restart is not refused |
 | [v4.2.0](release-notes-v4.2.0.en.md) | 2026-07-31 | A bare private-chat `/update` uses an evidence-bound confirmation and independent maintenance runtime to run the official updater and restore the same HFC version, hooks, sidecar, and Gateway |
 | [v4.1.4](release-notes-v4.1.4.en.md) | 2026-07-31 | Issue #171: official Windows install/setup can rebuild a missing manifest when legacy owned hooks and clean backups match byte-for-byte; outside-block edits and inconsistent evidence remain refused |

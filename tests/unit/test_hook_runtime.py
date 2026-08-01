@@ -10160,6 +10160,76 @@ def test_operations_select_acks_before_daemon_forward_and_remembers_successor_tr
     )
 
 
+def test_operations_select_forwards_update_evidence_fingerprint(monkeypatch):
+    class FakeP2Response:
+        def __init__(self):
+            self.card = None
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        def _allow_group_message(self, sender_id, chat_id, is_bot=False):
+            return True
+
+    class CapturedDispatcher:
+        def __init__(self):
+            self.tasks = []
+
+        def submit(self, task):
+            self.tasks.append(task)
+            return True
+
+    DummyFeishuAdapter.__module__ = hook_runtime.__name__
+    monkeypatch.setattr(
+        hook_runtime, "P2CardActionTriggerResponse", FakeP2Response, raising=False
+    )
+    dispatcher = CapturedDispatcher()
+    monkeypatch.setattr(
+        hook_runtime, "_OPERATIONS_ACTION_DISPATCHER", dispatcher
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "load_runtime_config",
+        lambda: SimpleNamespace(event_url="http://127.0.0.1:8765/events"),
+    )
+    posted = []
+    monkeypatch.setattr(
+        hook_runtime,
+        "_post_json_sync_response",
+        lambda url, payload, timeout: posted.append((url, payload, timeout))
+        or {"ok": True},
+    )
+    token = _operation_token()
+    hook_runtime._remember_operation_transport(
+        "operation-1", "process-local-secret", "work"
+    )
+    fingerprint = "e" * 64
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            action=SimpleNamespace(
+                value={
+                    "hfc_action": "operations.select",
+                    "operation_action": "confirm_update",
+                    "token": token,
+                    "profile_scope": "opaque-scope",
+                    "update_evidence_fingerprint": fingerprint,
+                }
+            ),
+            context=SimpleNamespace(open_chat_id="oc_private"),
+            operator=SimpleNamespace(open_id="ou_owner"),
+        )
+    )
+
+    response = hook_runtime._hfc_on_feishu_card_action_trigger(
+        DummyFeishuAdapter(), data
+    )
+    dispatcher.tasks[0]()
+
+    forwarded_value = posted[0][1]["event"]["action"]["value"]
+    assert forwarded_value["update_evidence_fingerprint"] == fingerprint
+    assert response.card is None
+
+
 def test_operations_select_slow_forward_does_not_delay_callback(monkeypatch):
     class FakeP2Response:
         def __init__(self):

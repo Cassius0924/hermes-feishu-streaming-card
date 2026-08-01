@@ -54,6 +54,16 @@ turn/cron/API aggregate immediately, and the first bare private-chat `/update`
 does not require an unrelated warm-up message. Missing aggregate evidence still
 fails closed.
 
+V4.2.2 keeps the native card-action callback fast while asynchronously PATCHing
+the original `/update` confirmation card. Cancel now becomes a visible terminal
+`已取消更新` state and never launches the updater; confirm first shows the
+locking/preparing transition, then schedules the independent maintenance job.
+
+V4.2.3 forwards the update evidence fingerprint through the Feishu/Lark
+WebSocket hook to the sidecar. Confirm and cancel therefore reach the existing
+evidence-bound transition logic; missing or mismatched evidence remains
+fail-closed.
+
 From V3.8.4, those standalone command cards also work in Feishu/Lark WebSocket
 long-connection deployments by patching the Feishu adapter's native interactive
 card action path; local/private sidecars no longer have to fall back to gray
@@ -269,7 +279,7 @@ a privileged container, or mount host system-service directories.
 ```
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.1
+export HFC_VERSION=v4.2.3
 bash install-docker.sh
 ```
 
