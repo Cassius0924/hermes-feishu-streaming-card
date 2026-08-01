@@ -10,6 +10,7 @@ import pytest
 from hermes_feishu_card.maintenance_store import (
     ArtifactMetadata,
     MaintenanceRefused,
+    UpdateLockLease,
     acquire_update_lock,
     create_job,
     consume_job_credentials,
@@ -23,6 +24,7 @@ from hermes_feishu_card.maintenance_store import (
     prune_jobs,
     release_drain_lease,
     require_drain_lease,
+    require_update_lock_lease,
     reserve_drain_lease,
     stage_job_credentials,
     stage_wheel_artifact,
@@ -213,6 +215,26 @@ def test_update_lock_is_exclusive(tmp_path):
         with pytest.raises(MaintenanceRefused, match="update already in progress"):
             with acquire_update_lock(paths, job_id="job-2"):
                 raise AssertionError("lock must not be acquired twice")
+
+
+def test_forged_and_stale_same_job_lock_leases_are_rejected(tmp_path):
+    paths = maintenance_paths(tmp_path / "state")
+    with acquire_update_lock(paths, job_id="job-1") as real:
+        forged = UpdateLockLease(
+            job_id=real.job_id,
+            path=real.path,
+            _owner_token=real._owner_token,
+        )
+        with pytest.raises(MaintenanceRefused, match="not active"):
+            require_update_lock_lease(
+                paths,
+                job_id="job-1",
+                lease=forged,
+            )
+        stale = real
+
+    with pytest.raises(MaintenanceRefused, match="not active"):
+        require_update_lock_lease(paths, job_id="job-1", lease=stale)
 
 
 def test_update_lock_rejects_symlink_target(tmp_path):

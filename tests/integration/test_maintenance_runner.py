@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 import zipfile
@@ -8,12 +9,18 @@ import zipfile
 import pytest
 
 import hermes_feishu_card.maintenance_runner as maintenance_runner_module
+import hermes_feishu_card.maintenance_update as maintenance_update_module
 from hermes_feishu_card.maintenance_store import (
+    MaintenanceRefused,
+    UpdateLockLease,
+    acquire_update_lock,
     create_job,
     load_active_drain_lease,
     load_job,
     maintenance_paths,
+    require_update_lock_lease,
     reserve_drain_lease,
+    stage_job_credentials,
     stage_wheel_artifact,
     transition_job,
 )
@@ -505,6 +512,170 @@ def test_repeated_terminal_run_is_idempotent(maintenance_fixture):
     assert commands.mutations == []
 
 
+def test_contending_run_job_preserves_active_job_and_fences(
+    maintenance_fixture,
+    monkeypatch,
+):
+    paths = maintenance_fixture.paths
+    job = maintenance_fixture.job
+    credential_path = stage_job_credentials(
+        paths,
+        job_id=job.job_id,
+        environment={"FEISHU_APP_ID": "test", "FEISHU_APP_SECRET": "test"},
+    )
+    assert credential_path is not None
+    before_job = job.path.read_bytes()
+    before_credentials = credential_path.read_bytes()
+    marker = {"active": True, "calls": []}
+
+    def external_drain(_root, *, active, run=None):
+        marker["calls"].append(active)
+        marker["active"] = active
+        return True
+
+    monkeypatch.setattr(
+        "hermes_feishu_card.maintenance_update.set_gateway_external_drain",
+        external_drain,
+    )
+    commands = CommandHarness(maintenance_fixture)
+    with acquire_update_lock(paths, job_id=job.job_id):
+        result = run_job(
+            job.path,
+            run=commands,
+            fetch_health=HealthHarness(commands.runtime_python),
+            publish=lambda current: True,
+        )
+
+    assert job.path.read_bytes() == before_job
+    assert credential_path.read_bytes() == before_credentials
+    assert result.phase == "locking"
+    assert load_active_drain_lease(paths).owner_id == job.job_id
+    assert marker == {"active": True, "calls": []}
+    assert commands.mutations == []
+
+
+def test_duplicate_runner_does_not_consume_job_environment(maintenance_fixture):
+    job = maintenance_fixture.job
+    path = stage_job_credentials(
+        maintenance_fixture.paths,
+        job_id=job.job_id,
+        environment={"FEISHU_APP_ID": "id", "FEISHU_APP_SECRET": "secret"},
+    )
+    assert path is not None
+    before_job = job.path.read_bytes()
+    before_environment = path.read_bytes()
+
+    with acquire_update_lock(maintenance_fixture.paths, job_id=job.job_id):
+        return_code = maintenance_runner_module.main(["--job", str(job.path)])
+
+    assert return_code == 0
+    assert job.path.read_bytes() == before_job
+    assert path.read_bytes() == before_environment
+
+
+def test_terminal_cleanup_runs_before_update_lock_release(
+    maintenance_fixture,
+    monkeypatch,
+):
+    commands = CommandHarness(maintenance_fixture)
+    paths = maintenance_fixture.paths
+    original_release = maintenance_update_module.release_drain_lease
+    observed = []
+    with acquire_update_lock(paths, job_id="job-1") as lease:
+
+        def checked_release(selected_paths, *, owner_id):
+            require_update_lock_lease(
+                selected_paths,
+                job_id=owner_id,
+                lease=lease,
+            )
+            observed.append("owned")
+            return original_release(selected_paths, owner_id=owner_id)
+
+        monkeypatch.setattr(
+            maintenance_update_module,
+            "release_drain_lease",
+            checked_release,
+        )
+        result = run_job(
+            maintenance_fixture.job.path,
+            lock_lease=lease,
+            run=commands,
+            fetch_health=HealthHarness(commands.runtime_python),
+            publish=lambda current: True,
+            sleep=lambda _delay: None,
+            maintenance_python=Path("/maintenance/bin/python"),
+        )
+
+    assert result.phase == "succeeded"
+    assert observed == ["owned"]
+
+
+def test_runner_invalid_lock_path_fails_without_owned_cleanup(
+    maintenance_fixture,
+    monkeypatch,
+):
+    job = maintenance_fixture.job
+    before_job = job.path.read_bytes()
+    cleanup_calls = []
+
+    @contextmanager
+    def invalid_lock(*_args, **_kwargs):
+        raise MaintenanceRefused("update lock path is invalid")
+        yield
+
+    monkeypatch.setattr(
+        maintenance_runner_module,
+        "acquire_update_lock",
+        invalid_lock,
+    )
+    monkeypatch.setattr(
+        maintenance_runner_module,
+        "_cleanup_terminal_owned_job",
+        lambda *_args, **_kwargs: cleanup_calls.append(True),
+    )
+
+    assert maintenance_runner_module.main(["--job", str(job.path)]) == 1
+    assert job.path.read_bytes() == before_job
+    assert cleanup_calls == []
+
+
+def test_runner_state_machine_exception_uses_persisted_phase_boundary(
+    maintenance_fixture,
+    monkeypatch,
+):
+    job = transition_job(
+        maintenance_fixture.job.path,
+        expected_phase="locking",
+        phase="updating_hermes",
+    )
+    cleanup_calls = []
+
+    def raise_state_machine_error(*_args, **_kwargs):
+        raise OSError("journal write failed after updater classification")
+
+    monkeypatch.setattr(
+        maintenance_runner_module,
+        "run_job",
+        raise_state_machine_error,
+    )
+    monkeypatch.setattr(
+        maintenance_runner_module,
+        "_cleanup_terminal_owned_job",
+        lambda current, **_kwargs: cleanup_calls.append(current.phase),
+    )
+
+    assert maintenance_runner_module.main(["--job", str(job.path)]) == 1
+    failed = load_job(job.path)
+    assert failed.phase == "failed"
+    assert failed.result == {
+        "error_code": "runner_state_machine_exception",
+        "recovery_boundary": "updater_result_classified",
+        "status": "failed",
+    }
+    assert cleanup_calls == ["failed"]
+
+
 def test_runner_initialization_failure_terminalizes_job_and_releases_fence(
     maintenance_fixture,
     monkeypatch,
@@ -515,7 +686,7 @@ def test_runner_initialization_failure_terminalizes_job_and_releases_fence(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad config")),
     )
     monkeypatch.setattr(
-        maintenance_runner_module,
+        maintenance_update_module,
         "set_gateway_external_drain",
         lambda *_args, **_kwargs: True,
     )

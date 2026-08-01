@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -15,7 +16,10 @@ from .install.detect import detect_hermes
 from .install.recovery import plan_recovery
 from .maintenance_store import (
     ArtifactMetadata,
+    MaintenancePaths,
     MaintenanceRefused,
+    UpdateLockBusy,
+    UpdateLockLease,
     UpdateJob,
     acquire_update_lock,
     discard_job_credentials,
@@ -25,6 +29,7 @@ from .maintenance_store import (
     maintenance_paths,
     release_drain_lease,
     require_drain_lease,
+    require_update_lock_lease,
     transition_job,
 )
 
@@ -484,6 +489,7 @@ def set_gateway_external_drain(
 def run_job(
     job_path: Path,
     *,
+    lock_lease: Optional[UpdateLockLease] = None,
     run: CommandRunner | None = None,
     fetch_health: HealthFetcher | None = None,
     publish: JobPublisher | None = None,
@@ -493,55 +499,124 @@ def run_job(
     drain_timeout_seconds: float = 180.0,
     update_timeout_seconds: float = 3600.0,
 ) -> UpdateJob:
-    publisher = publish or (lambda current: True)
+    current = load_job(job_path)
+    paths = maintenance_paths(current.path.parent.parent)
+    options = {
+        "run": run,
+        "fetch_health": fetch_health,
+        "publish": publish,
+        "sleep": sleep,
+        "monotonic": monotonic,
+        "maintenance_python": maintenance_python,
+        "drain_timeout_seconds": drain_timeout_seconds,
+        "update_timeout_seconds": update_timeout_seconds,
+    }
+    if lock_lease is None:
+        try:
+            with acquire_update_lock(paths, job_id=current.job_id) as acquired:
+                return _run_job_owned(
+                    current.path,
+                    lock_lease=acquired,
+                    **options,
+                )
+        except UpdateLockBusy:
+            return load_job(current.path)
+    require_update_lock_lease(
+        paths,
+        job_id=current.job_id,
+        lease=lock_lease,
+    )
+    return _run_job_owned(
+        current.path,
+        lock_lease=lock_lease,
+        **options,
+    )
+
+
+def _run_job_owned(
+    job_path: Path,
+    *,
+    lock_lease: UpdateLockLease,
+    run: CommandRunner | None = None,
+    fetch_health: HealthFetcher | None = None,
+    publish: JobPublisher | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    maintenance_python: Path | None = None,
+    drain_timeout_seconds: float = 180.0,
+    update_timeout_seconds: float = 3600.0,
+) -> UpdateJob:
+    current = load_job(job_path)
+    paths = maintenance_paths(current.path.parent.parent)
+    require_update_lock_lease(
+        paths,
+        job_id=current.job_id,
+        lease=lock_lease,
+    )
     result: UpdateJob | None = None
     try:
-        result = _run_job(
-            job_path,
+        result = _run_state_machine(
+            current.path,
+            lock_lease=lock_lease,
             run=run,
             fetch_health=fetch_health,
-            publish=publisher,
+            publish=publish,
             sleep=sleep,
             monotonic=monotonic,
             maintenance_python=maintenance_python,
             drain_timeout_seconds=drain_timeout_seconds,
             update_timeout_seconds=update_timeout_seconds,
         )
-    except MaintenanceRefused:
-        current = load_job(job_path)
-        result = _fail_job(
-            current,
-            "update_lock_unavailable",
-            "no_mutation",
-            publisher,
-        )
+        return result
     finally:
         if result is not None and result.phase in _TERMINAL_PHASES:
-            paths = maintenance_paths(result.path.parent.parent)
-            try:
-                release_drain_lease(paths, owner_id=result.job_id)
-            except (MaintenanceRefused, OSError):
-                pass
-            try:
-                discard_job_credentials(paths, job_id=result.job_id)
-            except (MaintenanceRefused, OSError):
-                pass
-            try:
-                set_gateway_external_drain(
-                    result.hermes_root,
-                    active=False,
-                    run=run,
-                )
-            except Exception:
-                pass
-    if result is None:
-        raise MaintenanceRefused("maintenance job did not produce a result")
-    return result
+            require_update_lock_lease(
+                paths,
+                job_id=result.job_id,
+                lease=lock_lease,
+            )
+            _cleanup_terminal_owned_job(result, run=run)
 
 
-def _run_job(
+def _cleanup_terminal_owned_job(
+    result: UpdateJob,
+    *,
+    run: CommandRunner | None = None,
+) -> None:
+    paths = maintenance_paths(result.path.parent.parent)
+    try:
+        release_drain_lease(paths, owner_id=result.job_id)
+    except (MaintenanceRefused, OSError):
+        pass
+    try:
+        discard_job_credentials(paths, job_id=result.job_id)
+    except (MaintenanceRefused, OSError):
+        pass
+    try:
+        set_gateway_external_drain(
+            result.hermes_root,
+            active=False,
+            run=run,
+        )
+    except Exception:
+        pass
+
+
+@contextmanager
+def _verified_update_lock_scope(
+    paths: MaintenancePaths,
+    *,
+    job_id: str,
+    lease: UpdateLockLease,
+):
+    require_update_lock_lease(paths, job_id=job_id, lease=lease)
+    yield lease
+
+
+def _run_state_machine(
     job_path: Path,
     *,
+    lock_lease: UpdateLockLease,
     run: CommandRunner | None = None,
     fetch_health: HealthFetcher | None = None,
     publish: JobPublisher | None = None,
@@ -561,7 +636,11 @@ def _run_job(
     if current.phase in _TERMINAL_PHASES:
         return current
     paths = maintenance_paths(current.path.parent.parent)
-    with acquire_update_lock(paths, job_id=current.job_id):
+    with _verified_update_lock_scope(
+        paths,
+        job_id=current.job_id,
+        lease=lock_lease,
+    ):
         current = load_job(current.path)
         if current.phase in _TERMINAL_PHASES:
             return current
