@@ -281,3 +281,7 @@ Windows non-loopback startup is rejected when state-directory ACL privacy cannot
 ## License
 
 MIT License. See [LICENSE](LICENSE).
+
+## Installer version resolution
+
+`latest` resolves once to the exact `vX.Y.Z` tag of the latest stable GitHub Release and installs that pinned ref. Lookup, response, or tag-validation failure stops before credential prompting, pip, setup, doctor, or Docker state mutation. An explicit release tag stays pinned and bypasses the Release API; only explicit `--version main` (PowerShell: `-Version main`) opts into the moving development branch.

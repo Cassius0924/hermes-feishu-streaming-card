@@ -2,6 +2,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,113 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def make_release_test_python(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$FAKE_PYTHON_LOG"
+if [ "$1" = "-I" ] && [ "$2" = "-c" ]; then
+  exec "$REAL_PYTHON" "$@"
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def make_release_test_curl(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$FAKE_CURL_LOG"
+output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) output="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ "${FAKE_CURL_EXIT:-0}" != "0" ]; then
+  exit "$FAKE_CURL_EXIT"
+fi
+cp "$FAKE_CURL_BODY" "$output"
+printf '%s' "${FAKE_CURL_STATUS:-200}"
+""",
+        encoding="utf-8",
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def run_release_installer(
+    tmp_path: Path,
+    script_name: str,
+    *,
+    version: str,
+    response: str = '{"tag_name":"v4.2.4"}',
+    http_status: str = "200",
+    curl_exit: str = "0",
+    local_source: Path | None = None,
+):
+    hermes_dir = tmp_path / "hermes"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text(
+        "# gateway\n", encoding="utf-8"
+    )
+    runtime_python = make_release_test_python(
+        hermes_dir / "venv" / "bin" / "python"
+    )
+    fake_bin = tmp_path / "fake-bin"
+    make_release_test_curl(fake_bin / "curl")
+    response_file = tmp_path / "release.json"
+    response_file.write_text(response, encoding="utf-8")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    env_file = data_dir / ".env"
+    env_file.write_text(
+        "FEISHU_APP_ID=cli_release\nFEISHU_APP_SECRET=release_secret\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_CURL_BODY": str(response_file),
+            "FAKE_CURL_EXIT": curl_exit,
+            "FAKE_CURL_LOG": str(tmp_path / "curl.log"),
+            "FAKE_CURL_STATUS": http_status,
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "REAL_PYTHON": sys.executable,
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(data_dir / "config.yaml"),
+            "HFC_ENV_FILE": str(env_file),
+            "HFC_VERSION": version,
+            "HFC_NO_PROMPT": "1",
+            "HFC_SKIP_START": "1",
+            "HFC_PYTHON": str(runtime_python),
+            "PYTHON": str(runtime_python),
+        }
+    )
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    if local_source is None:
+        env.pop("HFC_INSTALL_SOURCE", None)
+    else:
+        env["HFC_INSTALL_SOURCE"] = str(local_source)
+        env["HFC_TEST_NOOP_DELIVERY"] = "1"
+    result = subprocess.run(
+        ["bash", script_name],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result, tmp_path / "python.log", tmp_path / "curl.log", data_dir / "state"
 
 
 def test_install_sh_prefers_hermes_venv_python(tmp_path):
@@ -75,6 +183,93 @@ exit 0
     assert not system_marker.exists()
 
 
+def test_install_sh_latest_resolves_release_tag_and_pins_spec(tmp_path):
+    result, python_log, curl_log, _state_dir = run_release_installer(
+        tmp_path,
+        "install.sh",
+        version="latest",
+        response='{"tag_name":"v4.2.4"}',
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    log = python_log.read_text(encoding="utf-8")
+    spec = "git+https://github.com/baileyh8/hermes-feishu-streaming-card.git@v4.2.4"
+    assert f"-m pip install --upgrade {spec}" in log
+    assert curl_log.read_text(encoding="utf-8").count("releases/latest") == 1
+
+
+@pytest.mark.parametrize(
+    ("http_status", "curl_exit", "error_text"),
+    [
+        ("200", "7", "latest release lookup failed"),
+        ("429", "0", "latest release lookup returned HTTP 429"),
+    ],
+)
+def test_install_sh_latest_fails_closed_on_api_error(
+    tmp_path,
+    http_status,
+    curl_exit,
+    error_text,
+):
+    result, python_log, _curl_log, _state_dir = run_release_installer(
+        tmp_path,
+        "install.sh",
+        version="latest",
+        http_status=http_status,
+        curl_exit=curl_exit,
+    )
+
+    assert result.returncode != 0
+    assert error_text in result.stderr
+    log = python_log.read_text(encoding="utf-8") if python_log.exists() else ""
+    assert "-m pip" not in log
+    assert "hermes_feishu_card.cli" not in log
+
+
+def test_install_sh_latest_fails_closed_on_rate_limit(tmp_path):
+    result, python_log, _curl_log, _state_dir = run_release_installer(
+        tmp_path,
+        "install.sh",
+        version="latest",
+        http_status="403",
+    )
+
+    assert result.returncode != 0
+    assert "latest release lookup returned HTTP 403" in result.stderr
+    log = python_log.read_text(encoding="utf-8") if python_log.exists() else ""
+    assert "-m pip" not in log
+    assert "hermes_feishu_card.cli" not in log
+
+
+def test_install_sh_latest_rejects_malformed_release_json(tmp_path):
+    result, python_log, _curl_log, _state_dir = run_release_installer(
+        tmp_path,
+        "install.sh",
+        version="latest",
+        response='{"tag_name":"v4.2.4-rc1"}',
+    )
+
+    assert result.returncode != 0
+    assert "latest release tag was invalid" in result.stderr
+    log = python_log.read_text(encoding="utf-8")
+    assert "-m pip" not in log
+    assert "hermes_feishu_card.cli" not in log
+
+
+def test_install_sh_explicit_ref_bypasses_release_api(tmp_path):
+    result, python_log, curl_log, _state_dir = run_release_installer(
+        tmp_path,
+        "install.sh",
+        version="main",
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    log = python_log.read_text(encoding="utf-8")
+    spec = "git+https://github.com/baileyh8/hermes-feishu-streaming-card.git@main"
+    assert f"-m pip install --upgrade {spec}" in log
+    assert not curl_log.exists()
+
+
 def test_install_sh_reads_dotenv_without_sourcing_unknown_keys(tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text(
@@ -99,7 +294,7 @@ if [ "$1" = "-m" ] && [ "$2" = "ensurepip" ]; then
   exit 0
 fi
 if [ "$1" = "-m" ] && [ "$2" = "hermes_feishu_card.cli" ]; then
-  if [ "${HFC_INSTALL_SPEC:-}" != "git+https://github.com/baileyh8/hermes-feishu-streaming-card.git" ]; then
+  if [ "${HFC_INSTALL_SPEC:-}" != "git+https://github.com/baileyh8/hermes-feishu-streaming-card.git@main" ]; then
     echo "HFC_INSTALL_SPEC was not exported" >&2
     exit 4
   fi
@@ -911,51 +1106,81 @@ def test_install_docker_sh_prefers_hermes_venv_python3(tmp_path):
     assert not system_python_marker.exists()
 
 
-def test_install_docker_sh_uses_latest_without_pin(tmp_path):
-    hermes_dir = tmp_path / "opt" / "hermes"
-    data_dir = tmp_path / "opt" / "data"
-    (hermes_dir / "gateway").mkdir(parents=True)
-    (hermes_dir / "gateway" / "run.py").write_text("# gateway\n", encoding="utf-8")
-    env_file = data_dir / ".env"
-    data_dir.mkdir(parents=True)
-    env_file.write_text(
-        "FEISHU_APP_ID=cli_docker\nFEISHU_APP_SECRET=docker_secret\n",
-        encoding="utf-8",
+def test_install_docker_sh_latest_resolves_to_pinned_release_tag(tmp_path):
+    result, python_log, curl_log, _state_dir = run_release_installer(
+        tmp_path,
+        "install-docker.sh",
+        version="latest",
+        response='{"tag_name":"v4.2.4"}',
     )
-    runtime_python = make_fake_docker_python(hermes_dir / "venv" / "bin" / "python")
+    assert result.returncode == 0, result.stderr + result.stdout
+    log = python_log.read_text(encoding="utf-8")
+    spec = "git+https://github.com/baileyh8/hermes-feishu-streaming-card.git@v4.2.4"
+    assert f"-m pip install --upgrade {spec}" in log
+    assert curl_log.read_text(encoding="utf-8").count("releases/latest") == 1
 
-    env = os.environ.copy()
-    env.update(
-        {
-            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
-            "HERMES_DIR": str(hermes_dir),
-            "HFC_CONFIG": str(data_dir / "config.yaml"),
-            "HFC_ENV_FILE": str(env_file),
-            "HFC_VERSION": "latest",
-            "HFC_SKIP_START": "1",
-            "PYTHON": str(runtime_python),
-        }
+
+def test_install_docker_sh_latest_fails_closed_without_running_pip_or_setup(
+    tmp_path,
+):
+    result, python_log, _curl_log, state_dir = run_release_installer(
+        tmp_path,
+        "install-docker.sh",
+        version="latest",
+        http_status="429",
     )
-    env.pop("HFC_PYTHON", None)
-    env.pop("FEISHU_APP_ID", None)
-    env.pop("FEISHU_APP_SECRET", None)
 
-    result = subprocess.run(
-        ["bash", "install-docker.sh"],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
+    assert result.returncode != 0
+    assert "no package was installed" in result.stderr
+    log = python_log.read_text(encoding="utf-8") if python_log.exists() else ""
+    assert "-m pip" not in log
+    assert "hermes_feishu_card.cli" not in log
+    assert not state_dir.exists()
+
+
+def test_install_docker_sh_explicit_release_stays_pinned_without_api(tmp_path):
+    result, python_log, curl_log, _state_dir = run_release_installer(
+        tmp_path,
+        "install-docker.sh",
+        version="v4.2.4",
     )
 
     assert result.returncode == 0, result.stderr + result.stdout
-    log = (tmp_path / "python.log").read_text(encoding="utf-8")
-    spec = "git+https://github.com/baileyh8/hermes-feishu-streaming-card.git"
-    assert f"-m pip install --upgrade {spec}" in log
-    assert f"{spec}@" not in log
-    assert "@v" not in log
-    assert "@main" not in log
+    spec = "git+https://github.com/baileyh8/hermes-feishu-streaming-card.git@v4.2.4"
+    assert f"-m pip install --upgrade {spec}" in python_log.read_text(
+        encoding="utf-8"
+    )
+    assert not curl_log.exists()
+
+
+def test_install_docker_sh_explicit_main_uses_named_moving_ref(tmp_path):
+    result, python_log, curl_log, _state_dir = run_release_installer(
+        tmp_path,
+        "install-docker.sh",
+        version="main",
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    spec = "git+https://github.com/baileyh8/hermes-feishu-streaming-card.git@main"
+    assert f"-m pip install --upgrade {spec}" in python_log.read_text(
+        encoding="utf-8"
+    )
+    assert not curl_log.exists()
+
+
+def test_install_docker_sh_local_source_bypasses_release_resolution(tmp_path):
+    result, python_log, curl_log, _state_dir = run_release_installer(
+        tmp_path,
+        "install-docker.sh",
+        version="latest",
+        local_source=ROOT,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    log = python_log.read_text(encoding="utf-8")
+    assert f"-m pip install --upgrade {ROOT}" in log
+    assert "git+https://" not in log
+    assert not curl_log.exists()
 
 
 def test_install_docker_sh_retries_externally_managed_python(tmp_path):
@@ -1368,6 +1593,43 @@ def test_install_powershell_declares_and_forwards_profile_parameters():
         assert argument in script
     assert '$args += "--no-repair"' in script
     assert "UNKNOWN_KEY" not in script
+
+
+def test_install_powershell_latest_resolves_release_tag_and_pins_spec():
+    script = (ROOT / "install.ps1").read_text(encoding="utf-8")
+
+    assert 'return "git+https://github.com/$Repo.git@$ResolvedVersion"' in script
+    assert "^v[0-9]+\\.[0-9]+\\.[0-9]+$" in script
+    assert "-InstallSpec $ResolvedInstallSpec" in script
+
+
+def test_install_powershell_latest_fails_closed_on_api_error():
+    script = (ROOT / "install.ps1").read_text(encoding="utf-8")
+    catch_block = script.split("} catch {", 1)[1].split("}", 1)[0]
+
+    assert "latest release lookup failed" in catch_block
+    assert 'return "main"' not in catch_block
+    assert "no package was installed" in catch_block
+
+
+def test_install_powershell_latest_rejects_malformed_release_json():
+    script = (ROOT / "install.ps1").read_text(encoding="utf-8")
+
+    assert "$tag -notmatch '^v[0-9]+\\.[0-9]+\\.[0-9]+$'" in script
+    assert "latest release response was invalid" in script
+
+
+def test_install_powershell_explicit_ref_bypasses_release_api():
+    script = (ROOT / "install.ps1").read_text(encoding="utf-8")
+    resolver = script.split("function Resolve-HfcVersion", 1)[1].split(
+        "$HfcAllowedEnvKeys", 1
+    )[0]
+
+    assert resolver.index('if ($Version -ne "latest")') < resolver.index(
+        "Invoke-RestMethod"
+    )
+    assert "return $Version" in resolver
+    assert ".Contains('..')" in resolver
 
 
 def test_install_powershell_env_parser_has_safe_dotenv_contract():

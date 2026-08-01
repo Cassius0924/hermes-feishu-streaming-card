@@ -91,3 +91,7 @@ When migrating from legacy/dual historical installs, read [migration.en.md](migr
 If the sidecar is unavailable, times out, or returns an error, the Hermes hook lets Hermes continue with native text replies. Card failure is a plugin failure, not an Agent workflow failure.
 
 Hook import or emit exceptions also remain fail-open, but should not be fully silent. From V3.6.2, injected hook blocks write `[hermes-feishu-card] hook failed: ...` to Hermes stderr so runtime venv, import, or sidecar emit problems are diagnosable from Gateway logs.
+
+## Remote version resolution
+
+Installer `latest` means “resolve the latest stable release once” and must become an exact `vX.Y.Z` Git ref. Release API, JSON, or tag-validation failure fails closed before credential prompting, pip, doctor, setup, or Docker state writes. An explicit release tag remains pinned and bypasses the API; only explicit `--version main` selects the moving development branch.

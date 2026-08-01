@@ -93,3 +93,7 @@ python3 -m hermes_feishu_card.cli uninstall --hermes-dir ~/.hermes/hermes-agent 
 sidecar 不可用、超时或返回错误时，Hermes hook 应让 Hermes 继续原生文本回复。卡片不可用是插件故障，不应升级为 Agent 主流程故障。
 
 hook import 或 emit 异常同样保持 fail-open，但不应完全静默。V3.6.2 起，注入的 hook block 会向 Hermes stderr 写入 `[hermes-feishu-card] hook failed: ...`，便于从 Gateway 日志定位 runtime venv、import 或 sidecar emit 问题。
+
+## 远程版本解析
+
+安装脚本中的 `latest` 只表示“解析一次最新稳定 Release”：成功后必须变成精确 `vX.Y.Z` Git ref。Release API 查询、JSON 解析或 tag 校验失败时，脚本会在凭证提示、pip、doctor、setup 和 Docker 状态写入前 fail closed。显式 release tag 保持固定并跳过 API；只有显式 `--version main` 才选择移动的开发分支。

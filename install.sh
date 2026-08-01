@@ -60,22 +60,67 @@ quote_env_value() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+validate_explicit_ref() {
+  case "$1" in
+    ""|/*|*..*|*[!A-Za-z0-9._/-]*)
+      fail "invalid explicit version ref; no package was installed"
+      ;;
+  esac
+}
+
 resolve_version() {
+  local python_bin="$1"
   if [ "$VERSION" != "latest" ]; then
+    validate_explicit_ref "$VERSION"
     printf '%s\n' "$VERSION"
     return
   fi
-  if have curl; then
-    local tag
-    tag="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-      | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-      | head -n 1 || true)"
-    if [ -n "$tag" ]; then
-      printf '%s\n' "$tag"
-      return
-    fi
+  have curl || fail "latest release lookup requires curl; no package was installed; retry later or set an explicit vX.Y.Z"
+
+  local response_file
+  local http_status
+  local tag
+  response_file="$(mktemp)"
+  if ! http_status="$(curl \
+      --silent --show-error --location \
+      --connect-timeout 5 --max-time 15 \
+      --output "$response_file" \
+      --write-out '%{http_code}' \
+      "https://api.github.com/repos/$REPO/releases/latest")"; then
+    rm -f "$response_file"
+    fail "latest release lookup failed; no package was installed; retry later or set an explicit vX.Y.Z"
   fi
-  printf 'main\n'
+  if [ "$http_status" != "200" ]; then
+    rm -f "$response_file"
+    fail "latest release lookup returned HTTP $http_status; no package was installed; retry later or set an explicit vX.Y.Z"
+  fi
+  if ! tag="$("$python_bin" -I -c '
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+tag = payload.get("tag_name") if isinstance(payload, dict) else None
+if not isinstance(tag, str):
+    raise SystemExit(2)
+sys.stdout.write(tag)
+' "$response_file" 2>/dev/null)"; then
+    rm -f "$response_file"
+    fail "latest release response was invalid; no package was installed; retry later or set an explicit vX.Y.Z"
+  fi
+  rm -f "$response_file"
+  case "$tag" in
+    v[0-9]*.[0-9]*.[0-9]*) ;;
+    *) fail "latest release tag was invalid; no package was installed; retry later or set an explicit vX.Y.Z" ;;
+  esac
+  "$python_bin" -I -c \
+    'import re,sys; raise SystemExit(0 if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", sys.argv[1]) else 2)' \
+    "$tag" 2>/dev/null \
+    || fail "latest release tag was invalid; no package was installed; retry later or set an explicit vX.Y.Z"
+  printf '%s\n' "$tag"
+}
+
+build_install_spec() {
+  local resolved="$1"
+  printf 'git+https://github.com/%s.git@%s\n' "$REPO" "$resolved"
 }
 
 load_env_file() {
@@ -202,17 +247,13 @@ configure_pip_user_flag() {
 }
 
 install_package() {
+  local spec="$1"
+  local resolved_version="$2"
   have "$PYTHON_BIN" || fail "$PYTHON_BIN was not found. Install Python 3.9+ first."
   export PIP_ROOT_USER_ACTION="${PIP_ROOT_USER_ACTION:-ignore}"
   "$PYTHON_BIN" -m pip --version >/dev/null 2>&1 || "$PYTHON_BIN" -m ensurepip --upgrade >/dev/null
-  local tag
-  tag="$(resolve_version)"
-  local spec="git+https://github.com/$REPO.git"
-  if [ -n "$tag" ] && [ "$tag" != "main" ]; then
-    spec="$spec@$tag"
-  fi
   export HFC_INSTALL_SPEC="$spec"
-  log "installing $REPO@$tag"
+  log "installing $REPO@$resolved_version"
   local pip_args=(install --upgrade)
   case "$PIP_USER_FLAG" in
     ""|"0"|"false"|"False") ;;
@@ -284,6 +325,12 @@ main() {
   HERMES_DIR="$(expand_path "$HERMES_DIR")"
   CONFIG_PATH="$(expand_path "$CONFIG_PATH")"
   detect_python
+  have "$PYTHON_BIN" || fail "$PYTHON_BIN was not found. Install Python 3.9+ first."
+  local resolved_version
+  local resolved_install_spec
+  resolved_version="$(resolve_version "$PYTHON_BIN")"
+  resolved_install_spec="$(build_install_spec "$resolved_version")"
+  VERSION="$resolved_version"
   configure_pip_user_flag
 
   export HFC_CONFIG="$CONFIG_PATH"
@@ -293,7 +340,7 @@ main() {
   export HERMES_FEISHU_CARD_EVENT_URL="$EVENT_URL"
   export HFC_NO_REPAIR="$NO_REPAIR"
   prompt_credentials
-  install_package
+  install_package "$resolved_install_spec" "$resolved_version"
   run_setup
 
   log "done"

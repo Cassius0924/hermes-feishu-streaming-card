@@ -936,3 +936,7 @@ python3 -m pytest -q
 ## License
 
 MIT License，详见 [LICENSE](../LICENSE)。
+
+## 安装版本解析
+
+`latest` 会一次性解析为 GitHub 最新稳定 Release 的精确 `vX.Y.Z` tag，并固定安装该 ref。查询、JSON 解析或 tag 校验失败会在凭证提示、pip、doctor、setup 和 Docker 状态写入前停止；显式 release tag 不访问 Release API，只有显式 `--version main` 才选择移动的开发分支。

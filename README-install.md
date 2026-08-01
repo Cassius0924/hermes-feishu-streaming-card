@@ -328,3 +328,7 @@ python3 -m hermes_feishu_card.cli doctor --config ~/.hermes/config.yaml --hermes
 
 The installer stores missing Feishu credentials in a local `.env` file next to
 the selected config path. Do not commit this file.
+
+### Installer version resolution
+
+`latest` resolves once through the GitHub latest stable release API and installs the pinned `vX.Y.Z` Git ref. If lookup, JSON parsing, or tag validation fails, the installer stops before pip, setup, doctor, credentials, or Docker state mutation. An explicit release tag stays pinned and bypasses the release API; `--version main` (PowerShell: `-Version main`) is the only opt-in moving development branch.
