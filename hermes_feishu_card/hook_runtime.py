@@ -22,7 +22,7 @@ import sys
 from types import CodeType, SimpleNamespace
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 import weakref
 from urllib import error as urlerror
 from urllib import parse
@@ -139,6 +139,8 @@ SUPPORTED_RUNTIME_EVENTS = {
     "interaction.failed",
 }
 
+_CANONICAL_TURN_ATTR = "_hfc_turn_id"
+
 
 @dataclass(frozen=True)
 class RuntimeConfig:
@@ -175,6 +177,7 @@ class _PolicyIdentity:
     chat_id: str
     conversation_id: str
     message_id: str
+    turn_id: str
     scope_key: tuple[str, str, str, str]
     turn_key: tuple[str, str, str, str]
     is_new_turn: bool
@@ -696,12 +699,14 @@ def _policy_identity(
         or _first_attr_string(gateway_event_obj, ("message_id", "msg_id"))
         or ""
     )
+    turn_id = _turn_id_for_runtime_event(event_name, local_vars) or ""
+    canonical_id = turn_id or message_id
     endpoint = _summary_base_url(config.event_url)
     scope_key = (endpoint, profile_id, chat_id, conversation_id)
     with _POLICY_LOCK:
         active_turn = _ACTIVE_POLICY_TURNS.get(scope_key)
-    if message_id:
-        turn_token = f"message:{message_id}"
+    if canonical_id:
+        turn_token = f"message:{canonical_id}"
     elif event_name != "message.started" and active_turn is not None:
         turn_token = active_turn[3]
     else:
@@ -731,6 +736,7 @@ def _policy_identity(
         chat_id=chat_id,
         conversation_id=conversation_id,
         message_id=message_id,
+        turn_id=turn_id,
         scope_key=scope_key,
         turn_key=turn_key,
         is_new_turn=is_new_turn,
@@ -746,6 +752,8 @@ def _policy_payload(identity: _PolicyIdentity) -> dict[str, str]:
     }
     if identity.message_id:
         payload["message_id"] = identity.message_id
+    if identity.turn_id:
+        payload["turn_id"] = identity.turn_id
     return payload
 
 
@@ -935,18 +943,23 @@ def _policy_event_locals(
     gate: _PolicyGateResult,
 ) -> dict[str, Any]:
     identity = gate.identity
-    if identity is None or not identity.is_new_turn:
+    if identity is None:
         return local_vars
-    return {**local_vars, "_hfc_policy_new_turn": True}
+    updates: dict[str, Any] = {}
+    if identity.turn_id:
+        updates["turn_id"] = identity.turn_id
+    if identity.is_new_turn:
+        updates["_hfc_policy_new_turn"] = True
+    return {**local_vars, **updates} if updates else local_vars
 
 
 def _discard_pending_deltas_for_local_vars(local_vars: dict[str, Any]) -> None:
-    message_id = _message_id_from_local_vars(local_vars)
-    if not message_id:
+    canonical_id = _canonical_id_from_local_vars(local_vars)
+    if not canonical_id:
         return
     with _PENDING_DELTAS_LOCK:
         for key, pending in list(_PENDING_DELTAS.items()):
-            if _pending_message_id(key, pending) == message_id:
+            if _pending_message_id(key, pending) == canonical_id:
                 _PENDING_DELTAS.pop(key, None)
 
 
@@ -1012,6 +1025,8 @@ def _delta_coalesce_identity(
     )
     if not message_id:
         return None
+    turn_id = _turn_id_for_runtime_event(event_name, local_vars) or ""
+    canonical_id = turn_id or message_id
     text = _first_raw_string(local_vars, ("text", "delta", "delta_text", "content"))
     if text is None:
         text = _first_attr_raw_string(message_obj, ("text", "content"))
@@ -1024,8 +1039,11 @@ def _delta_coalesce_identity(
         except RuntimeError:
             return None
     profile_id, _profile_source = _profile_identity(local_vars, source_obj, message_obj)
-    key = (id(loop), config.event_url, message_id, event_name, profile_id)
-    return key, loop, _delta_base_locals(local_vars), str(text)
+    key = (id(loop), config.event_url, canonical_id, event_name, profile_id)
+    base_locals = _delta_base_locals(
+        {**local_vars, **({"turn_id": turn_id} if turn_id else {})}
+    )
+    return key, loop, base_locals, str(text)
 
 
 def _delta_base_locals(local_vars: dict[str, Any]) -> dict[str, Any]:
@@ -1042,6 +1060,7 @@ def _delta_base_locals(local_vars: dict[str, Any]) -> dict[str, Any]:
         "message_id",
         "msg_id",
         "event_message_id",
+        "turn_id",
         "created_at",
         "profile_id",
         "hermes_profile",
@@ -1083,18 +1102,18 @@ async def flush_pending_deltas_for_message(message_id: str) -> None:
 
 
 async def _flush_pending_deltas_for_local_vars(local_vars: dict[str, Any]) -> None:
-    message_id = _message_id_from_local_vars(local_vars)
-    if message_id:
-        await flush_pending_deltas_for_message(message_id)
+    canonical_id = _canonical_id_from_local_vars(local_vars)
+    if canonical_id:
+        await flush_pending_deltas_for_message(canonical_id)
 
 
 def _has_pending_deltas_for_local_vars(local_vars: dict[str, Any]) -> bool:
-    message_id = _message_id_from_local_vars(local_vars)
-    if not message_id:
+    canonical_id = _canonical_id_from_local_vars(local_vars)
+    if not canonical_id:
         return False
     with _PENDING_DELTAS_LOCK:
         return any(
-            _pending_message_id(key, pending) == message_id
+            _pending_message_id(key, pending) == canonical_id
             for key, pending in _PENDING_DELTAS.items()
         )
 
@@ -1110,6 +1129,13 @@ def _message_id_from_local_vars(local_vars: dict[str, Any]) -> str | None:
         gateway_event_obj, ("message_id", "msg_id")
     )
     return message_id
+
+
+def _canonical_id_from_local_vars(local_vars: dict[str, Any]) -> Optional[str]:
+    return (
+        _turn_id_for_runtime_event("", local_vars)
+        or _message_id_from_local_vars(local_vars)
+    )
 
 
 def _pending_message_id(
@@ -7378,11 +7404,11 @@ async def _post_json_ordered_response(
 
 
 def _send_lock(url: str, payload: dict[str, Any]) -> asyncio.Lock | None:
-    message_id = payload.get("message_id")
-    if not isinstance(message_id, str) or not message_id:
+    canonical_id = payload.get("turn_id") or payload.get("message_id")
+    if not isinstance(canonical_id, str) or not canonical_id:
         return None
     loop = asyncio.get_running_loop()
-    key = (id(loop), url, message_id)
+    key = (id(loop), url, canonical_id)
     with _SEND_LOCKS_GUARD:
         lock = _SEND_LOCKS.get(key)
         if lock is None:
@@ -7639,7 +7665,11 @@ def _build_event(
         )
         if message_id is None:
             return None
-    sequence = _peek_next_sequence(message_id) if preview else _next_sequence(message_id)
+    turn_id = _turn_id_for_runtime_event(event_name, local_vars) or ""
+    sequence_id = turn_id or message_id
+    sequence = (
+        _peek_next_sequence(sequence_id) if preview else _next_sequence(sequence_id)
+    )
     event_data = _event_data(event_name, local_vars, source_obj, message_obj)
     if thread_id:
         event_data.setdefault("thread_id", thread_id)
@@ -7655,6 +7685,8 @@ def _build_event(
         "created_at": created_at,
         "data": event_data,
     }
+    if turn_id:
+        payload["turn_id"] = turn_id
     if is_terminal_event:
         if not preview:
             if (
@@ -8302,6 +8334,38 @@ def _first_string(source: dict[str, Any], names: tuple[str, ...]) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def _turn_id_for_runtime_event(
+    event_name: str,
+    local_vars: dict[str, Any],
+) -> Optional[str]:
+    explicit = _first_string(local_vars, ("turn_id",))
+    source_obj = local_vars.get("source")
+    handler_event = local_vars.get("event")
+    handler_message_id = None
+    if event_name in {"message.started", "message.completed", "message.failed"}:
+        handler_message_id = _first_attr_string(
+            handler_event,
+            ("message_id", "msg_id"),
+        )
+
+    candidate = explicit or handler_message_id
+    if candidate is not None:
+        if event_name == "message.started" and source_obj is not None:
+            try:
+                setattr(source_obj, _CANONICAL_TURN_ATTR, candidate)
+            except Exception:
+                pass
+        return candidate
+
+    if source_obj is None:
+        return None
+    try:
+        bound = getattr(source_obj, _CANONICAL_TURN_ATTR, None)
+    except Exception:
+        return None
+    return bound.strip() if isinstance(bound, str) and bound.strip() else None
 
 
 def _first_raw_string(source: dict[str, Any], names: tuple[str, ...]) -> str | None:

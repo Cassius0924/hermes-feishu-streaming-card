@@ -8386,6 +8386,85 @@ def test_build_event_increments_sequence_per_message():
     assert second["sequence"] == 1
 
 
+def test_quoted_turn_uses_one_sequence_across_started_stream_and_terminal():
+    source = SimpleNamespace(platform="feishu", chat_id="oc_quoted")
+    handler_event = SimpleNamespace(message_id="om_turn_a")
+    started = hook_runtime.build_event(
+        "message.started",
+        {
+            "source": source,
+            "event": handler_event,
+            "message_id": "om_turn_a",
+            "conversation_id": "omt_topic",
+        },
+    )
+    delta = hook_runtime.build_event(
+        "answer.delta",
+        {
+            "source": source,
+            "message_id": "om_shared_quote",
+            "conversation_id": "omt_topic",
+            "text": "first",
+        },
+    )
+    completed = hook_runtime.build_event(
+        "message.completed",
+        {
+            "source": source,
+            "event": handler_event,
+            "message_id": "om_shared_quote",
+            "conversation_id": "omt_topic",
+            "answer": "done",
+        },
+    )
+
+    assert [started["turn_id"], delta["turn_id"], completed["turn_id"]] == [
+        "om_turn_a",
+        "om_turn_a",
+        "om_turn_a",
+    ]
+    assert [started["sequence"], delta["sequence"], completed["sequence"]] == [
+        0,
+        1,
+        2,
+    ]
+
+
+def test_source_that_rejects_private_binding_uses_legacy_identity():
+    class SlottedSource:
+        __slots__ = ("platform", "chat_id")
+
+        def __init__(self):
+            self.platform = "feishu"
+            self.chat_id = "oc_slotted"
+
+    source = SlottedSource()
+    started = hook_runtime.build_event(
+        "message.started",
+        {
+            "source": source,
+            "event": SimpleNamespace(message_id="om_real"),
+            "message_id": "om_real",
+        },
+    )
+    delta = hook_runtime.build_event(
+        "answer.delta",
+        {"source": source, "message_id": "om_quote", "text": "x"},
+    )
+
+    assert started["turn_id"] == "om_real"
+    assert "turn_id" not in delta
+    assert delta["message_id"] == "om_quote"
+    assert delta["sequence"] == 0
+
+
+def test_turn_id_raw_terminal_locals_use_bound_turn_before_reply_anchor():
+    source = SimpleNamespace(_hfc_turn_id="om_turn_a")
+    raw_locals = {"source": source, "message_id": "om_shared_quote"}
+
+    assert hook_runtime._canonical_id_from_local_vars(raw_locals) == "om_turn_a"
+
+
 def test_build_event_allocates_unique_sequences_across_threads(monkeypatch):
     class SlowSequenceStore(dict):
         def get(self, key, default=None):
@@ -8421,6 +8500,81 @@ class SenderProbe:
 async def drain_tasks():
     await asyncio.sleep(0)
     await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_quoted_turn_send_lock_and_delta_queue_use_canonical_turn_id(monkeypatch):
+    sender = SenderProbe()
+    monkeypatch.setattr(hook_runtime, "_post_json", sender)
+    monkeypatch.setenv("HERMES_FEISHU_CARD_DELTA_COALESCE_MS", "1000")
+    source = SimpleNamespace(
+        platform="feishu",
+        chat_id="oc_quote",
+        _hfc_turn_id="om_turn",
+    )
+    loop = asyncio.get_running_loop()
+
+    assert hook_runtime.emit_from_hermes_locals_threadsafe(
+        {
+            "_hfc_loop": loop,
+            "source": source,
+            "message_id": "om_quote",
+            "text": "x",
+        },
+        "answer.delta",
+    )
+    await drain_tasks()
+    await hook_runtime.flush_pending_deltas_for_message("om_turn")
+
+    assert len(sender.payloads) == 1
+    payload = sender.payloads[0][1]
+    assert payload["turn_id"] == "om_turn"
+    assert payload["sequence"] == 0
+    assert hook_runtime._send_lock("http://sidecar.test/events", payload) is (
+        hook_runtime._send_lock(
+            "http://sidecar.test/events",
+            {**payload, "message_id": "different-anchor"},
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn_id_raw_locals_drive_pending_presence_flush_and_discard():
+    loop = object()
+    key = (
+        id(loop),
+        "http://sidecar.test/events",
+        "om_turn_a",
+        "answer.delta",
+        "default",
+    )
+    pending = hook_runtime._PendingDelta(
+        event_name="answer.delta",
+        event_url="http://sidecar.test/events",
+        timeout_seconds=1.0,
+        loop=loop,
+        base_locals={},
+        text_parts=[],
+    )
+    raw_locals = {
+        "source": SimpleNamespace(_hfc_turn_id="om_turn_a"),
+        "message_id": "om_shared_quote",
+    }
+
+    try:
+        with hook_runtime._PENDING_DELTAS_LOCK:
+            hook_runtime._PENDING_DELTAS[key] = pending
+        assert hook_runtime._has_pending_deltas_for_local_vars(raw_locals)
+        await hook_runtime._flush_pending_deltas_for_local_vars(raw_locals)
+        with hook_runtime._PENDING_DELTAS_LOCK:
+            assert key not in hook_runtime._PENDING_DELTAS
+            hook_runtime._PENDING_DELTAS[key] = pending
+        hook_runtime._discard_pending_deltas_for_local_vars(raw_locals)
+        with hook_runtime._PENDING_DELTAS_LOCK:
+            assert key not in hook_runtime._PENDING_DELTAS
+    finally:
+        with hook_runtime._PENDING_DELTAS_LOCK:
+            hook_runtime._PENDING_DELTAS.pop(key, None)
 
 
 @pytest.mark.asyncio
@@ -9434,6 +9588,38 @@ async def test_policy_failure_is_native_and_card_decision_is_pinned_for_turn(mon
         "message.started",
     )
     assert len(calls) == 2
+
+
+async def test_quoted_turn_policy_decision_is_pinned_to_canonical_turn_id(monkeypatch):
+    calls = []
+
+    def policy(_url, _payload, _timeout):
+        calls.append(True)
+        return {"ok": True, "disposition": "card", "ttl_ms": 0}
+
+    posted = []
+
+    async def post(_url, payload, _timeout):
+        posted.append(payload)
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", policy)
+    monkeypatch.setattr(hook_runtime, "_post_json_response", post)
+    source = SimpleNamespace(platform="feishu", chat_id="oc_quote")
+    handler_event = SimpleNamespace(message_id="om_turn")
+
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {"source": source, "event": handler_event, "message_id": "om_turn"},
+        "message.started",
+    )
+    assert await hook_runtime.emit_from_hermes_locals_async(
+        {"source": source, "message_id": "om_quote", "text": "x"},
+        "answer.delta",
+    )
+
+    assert calls == [True]
+    assert [item["turn_id"] for item in posted] == ["om_turn", "om_turn"]
+    assert [item["sequence"] for item in posted] == [0, 1]
 
 
 async def test_completed_topic_message_id_is_requeried_for_the_next_started_turn(

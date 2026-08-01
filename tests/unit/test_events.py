@@ -23,6 +23,34 @@ def test_parses_valid_event():
     assert event.sequence == 2
 
 
+def test_parses_optional_turn_id_and_exposes_canonical_turn_id():
+    payload = valid_payload(event="answer.delta", sequence=1)
+    payload["data"] = {"text": "x"}
+    payload["message_id"] = "om_anchor"
+    payload["turn_id"] = "  om_turn  "
+
+    event = SidecarEvent.from_dict(payload)
+
+    assert event.turn_id == "om_turn"
+    assert event.canonical_turn_id == "om_turn"
+
+
+def test_missing_turn_id_falls_back_to_message_id():
+    event = SidecarEvent.from_dict(valid_payload(event="answer.delta", sequence=1))
+
+    assert event.turn_id == ""
+    assert event.canonical_turn_id == event.message_id
+
+
+@pytest.mark.parametrize("value", [None, 123, [], {}])
+def test_rejects_non_string_turn_id(value):
+    payload = valid_payload()
+    payload["turn_id"] = value
+
+    with pytest.raises(EventValidationError, match="turn_id"):
+        SidecarEvent.from_dict(payload)
+
+
 def test_event_exposes_optional_exact_display_status():
     payload = valid_payload(event="message.completed")
     payload["data"] = {"answer": "稍后继续", "display_status": "in_progress"}
