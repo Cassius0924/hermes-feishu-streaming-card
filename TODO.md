@@ -12,7 +12,8 @@
 - [x] 新增 executor-facing 回归，先观察缺失字段失败，再以最小修改保留证据指纹。
 - [x] hook/runtime/server/Feishu SDK 相关矩阵 `670 passed, 1 skipped`。
 - [x] 完整 pytest `2309 passed, 5 skipped`、`git diff --check`、sdist/wheel 与干净 Python 3.12 `site-packages` provenance。
-- [ ] PR CI、exact merge、public tag/install、Release assets 与真实飞书取消终态验收。
+- [x] 本机候选经官方 setup 安装后，真实飞书取消使原卡进入终态；sidecar update 成功，Hermes HEAD 与 update log 不变，无 updater 进程。
+- [ ] PR CI、exact merge、public tag/install、Release assets 与正式 tag 真实飞书复验。
 
 ### V4.2.2：更新确认卡终态写回热修（已发布）
 

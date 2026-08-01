@@ -152,6 +152,7 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - WebSocket hook 必须将 card value 中的 `update_evidence_fingerprint` 原样转发给 sidecar；缺失字段的回归测试先红后绿：**通过**。
 - 相关 hook/runtime/server/Feishu SDK 矩阵：**`670 passed, 1 skipped`**。完整 pytest：**`2309 passed, 5 skipped`**；`git diff --check`、sdist/wheel 与干净 Python 3.12 `site-packages` 包/distribution/CLI provenance：**本地候选门禁通过**。PR CI、exact merge SHA、public tag/install、Release assets 与真实飞书确认/取消：**待发布流程验证**。
 - 真实验收必须观察 sidecar update attempt、原卡状态转换，并证明取消不会启动 updater；不得只以按钮被点击或 Gateway 收到 action 作为通过依据。
+- 本机候选真实飞书取消验收：**通过（2026-08-01）**。新卡显示 HFC 4.2.3，原卡进入“已取消更新 / 未执行 Hermes 更新”；sidecar 为 `feishu_update_attempts=1`、`successes=1`、`failures=0`，Hermes HEAD 未变化，`update.log` 仍停在 2026-07-31 15:01:52，且无 updater/maintenance run 进程。正式 tag 安装后仍需复验。
 
 ## V4.2.2 发布门禁
 

@@ -21,7 +21,7 @@ V4.2.3 fixes the WebSocket callback evidence-forwarding gap found during real Fe
 
 - The related hook/runtime/server/Feishu SDK matrix passed: `670 passed, 1 skipped`.
 - Full pytest passed: `2309 passed, 5 skipped`. `git diff --check`, sdist/wheel, and clean Python 3.12 `site-packages` package/distribution/CLI provenance also passed. PR CI and exact-merge-SHA testing continue in the release gate.
-- Before and after the public release, real Feishu acceptance creates a fresh private-chat `/update` card and clicks Cancel. It must observe a sidecar update attempt, the original card reaching its terminal cancelled state, an unchanged Hermes version and Git HEAD, and no updater start.
+- Candidate acceptance created a fresh private-chat `/update` card and clicked Cancel: the sidecar update succeeded, the original card reached “cancelled / Hermes update not executed”, Hermes Git HEAD and `update.log` were unchanged, and no updater process existed. Repeat the same acceptance after installing the public tag.
 
 ## Install
 

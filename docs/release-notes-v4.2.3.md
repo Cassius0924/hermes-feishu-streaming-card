@@ -21,7 +21,7 @@ V4.2.3 修复 V4.2.2 真实飞书验收发现的 WebSocket 回调证据转发缺
 
 - hook/runtime/server/Feishu SDK 相关矩阵已通过：`670 passed, 1 skipped`。
 - 完整 pytest 已通过：`2309 passed, 5 skipped`；`git diff --check`、sdist/wheel 与干净 Python 3.12 `site-packages` 包/distribution/CLI provenance 也已通过。PR CI 与精确 merge SHA 会在发布门禁中继续复验。
-- 正式发布前后均在真实飞书私聊重新创建 `/update` 卡并点击取消，要求观察 sidecar update attempt、原卡进入“已取消更新”终态、Hermes 版本与 Git HEAD 不变、updater 未启动。
+- 候选包已在真实飞书私聊创建新的 `/update` 卡并点击取消：sidecar update 成功，原卡进入“已取消更新 / 未执行 Hermes 更新”终态，Hermes Git HEAD 与 `update.log` 未变化，且无 updater 进程。正式 tag 安装后再重复同一验收。
 
 ## 安装
 

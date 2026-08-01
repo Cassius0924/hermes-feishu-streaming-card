@@ -152,6 +152,7 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 - The WebSocket hook must forward `update_evidence_fingerprint` unchanged from the card value to the sidecar; the missing-field regression was observed red before the fix and green afterward: **passed**.
 - The related hook/runtime/server/Feishu SDK matrix reports **`670 passed, 1 skipped`**. Full pytest reports **`2309 passed, 5 skipped`**; `git diff --check`, sdist/wheel, and clean Python 3.12 `site-packages` package/distribution/CLI provenance: **local candidate gate passed**. PR CI, exact merge SHA, public tag/install, Release assets, and real Feishu confirm/cancel: **pending release-flow verification**.
 - Real acceptance must observe a sidecar update attempt, the original-card transition, and proof that cancel did not start the updater; a click or Gateway action log alone is insufficient.
+- Local-candidate real Feishu cancellation acceptance: **passed (2026-08-01)**. The new card reported HFC 4.2.3 and the original card reached “cancelled / Hermes update not executed”; sidecar reported `feishu_update_attempts=1`, `successes=1`, and `failures=0`, Hermes HEAD was unchanged, `update.log` remained at 2026-07-31 15:01:52, and no updater or maintenance-run process existed. Repeat after installing the public tag.
 
 ## V4.2.2 Release Gates
 
