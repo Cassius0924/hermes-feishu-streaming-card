@@ -2433,7 +2433,14 @@ def _render_hook_block_without_commands(
                 ),
                 f"{inner_indent}_hfc_started_message_id = None{newline}",
                 f"{inner_indent}try:{newline}",
-                f"{deeper_indent}_hfc_started_message_id = self._reply_anchor_for_event(event){newline}",
+                # Use the REAL incoming message id for message.started so every
+                # new user message opens its own card session. The reply anchor
+                # (topic root / quoted message) must NOT be used here: in Feishu
+                # threads, consecutive quoted replies to the same message would
+                # otherwise share one message_id and overwrite the same card.
+                # Stream events still carry the reply anchor, and the sidecar
+                # resolves them back to this session via the reply_to alias.
+                f"{deeper_indent}_hfc_started_message_id = getattr(event, \"message_id\", None) or self._reply_anchor_for_event(event){newline}",
                 f"{inner_indent}except Exception:{newline}",
                 f"{deeper_indent}_hfc_started_message_id = getattr(event, \"message_id\", None){newline}",
                 f"{inner_indent}_hfc_emit({{**locals(), \"message_id\": _hfc_started_message_id}}){newline}",
@@ -2476,7 +2483,14 @@ def _render_hook_block(indent: str, newline: str, strategy: str = "legacy_gatewa
                 ),
                 f"{inner_indent}_hfc_started_message_id = None{newline}",
                 f"{inner_indent}try:{newline}",
-                f"{deeper_indent}_hfc_started_message_id = self._reply_anchor_for_event(event){newline}",
+                # Use the REAL incoming message id for message.started so every
+                # new user message opens its own card session. The reply anchor
+                # (topic root / quoted message) must NOT be used here: in Feishu
+                # threads, consecutive quoted replies to the same message would
+                # otherwise share one message_id and overwrite the same card.
+                # Stream events still carry the reply anchor, and the sidecar
+                # resolves them back to this session via the reply_to alias.
+                f"{deeper_indent}_hfc_started_message_id = getattr(event, \"message_id\", None) or self._reply_anchor_for_event(event){newline}",
                 f"{inner_indent}except Exception:{newline}",
                 f"{deeper_indent}_hfc_started_message_id = getattr(event, \"message_id\", None){newline}",
                 f"{inner_indent}if _hfc_handle_command({{**locals(), \"message_id\": _hfc_started_message_id}}):{newline}",
