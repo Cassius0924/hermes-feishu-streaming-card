@@ -1,12 +1,26 @@
 from hermes_feishu_card import __version__
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_package_has_version():
-    assert __version__ == "4.2.4"
+    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", __version__)
+
+
+def test_current_release_markers_are_consistent():
+    expected = __version__
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    config = (ROOT / "config.yaml.example").read_text(encoding="utf-8")
+    compose = (ROOT / "docker-compose.example.yml").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+
+    assert f'version = "{expected}"' in pyproject
+    assert f"V{expected} sidecar configuration" in config.splitlines()[0]
+    assert f'HFC_VERSION: "${{HFC_VERSION:-v{expected}}}"' in compose
+    assert f"HFC_VERSION: v{expected}" in workflow
 
 
 def test_console_entrypoint_target_exists():
@@ -18,7 +32,6 @@ def test_console_entrypoint_target_exists():
 def test_pyproject_has_open_source_package_metadata():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
-    assert 'version = "4.2.4"' in pyproject
     assert 'readme = "README.md"' in pyproject
     assert 'keywords = ["Hermes", "Feishu", "Lark", "streaming-card", "sidecar"]' in pyproject
     assert 'classifiers = [' in pyproject
