@@ -141,7 +141,7 @@ For an existing Hermes container:
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.2
+export HFC_VERSION=v4.2.3
 bash install-docker.sh
 ```
 
@@ -177,11 +177,11 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 | `HERMES_FEISHU_CARD_DELTA_COALESCE_MS` | `250` | Max Gateway-side delta coalescing wait |
 | `HERMES_FEISHU_CARD_DELTA_COALESCE_CHARS` | `600` | Flush pending delta when this character budget is reached |
 | `HERMES_FEISHU_CARD_DELTA_COALESCE_MAX_PENDING` | `128` | Pending delta session cap |
-
 ## Latest Releases
 ![Feishu topic reply card continuity and reasoning/tool timeline showcase](docs/assets/feishu-topic-card-showcase-v389.png)
 | Version | Highlights |
 |---|---|
+| [v4.2.3](docs/release-notes-v4.2.3.en.md) | Preserves `update_evidence_fingerprint` when the WebSocket hook forwards `/update` actions, allowing the sidecar to complete evidence-bound confirm/cancel transitions while missing or mismatched evidence remains fail-closed |
 | [v4.2.2](docs/release-notes-v4.2.2.en.md) | Fixes `/update` confirmation actions that changed durable state without PATCHing the original card; cancel now renders a terminal state and never starts the updater, while confirm shows preparation before scheduling maintenance |
 | [v4.2.1](docs/release-notes-v4.2.1.en.md) | Registers the live Gateway runner before the first runtime heartbeat, so the first bare private-chat `/update` after restart has complete active-work evidence; missing evidence remains fail-closed |
 | [v4.2.0](docs/release-notes-v4.2.0.en.md) | A bare `/update` in a Feishu private chat uses a 120-second confirmation and an independent maintenance process to run the official Hermes updater, then restores the same HFC version, hooks, sidecar, and Gateway; group and parameterized commands keep native Hermes behavior |

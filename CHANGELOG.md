@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.2.3 — 2026-08-01
+
+See also: [docs/release-notes-v4.2.3.md](docs/release-notes-v4.2.3.md)
+
+### Fixed
+- Feishu/Lark WebSocket update actions now forward `update_evidence_fingerprint` from the signed card value to the sidecar, so confirm and cancel can pass the existing evidence-bound transition checks.
+- Real card clicks no longer stop at the Gateway hook with an unchanged confirmation card and zero sidecar update attempts.
+
+### Safety
+- The sidecar remains fail-closed: missing or mismatched update evidence is still rejected instead of inferred or weakened.
+- The native card action keeps its fast empty acknowledgement, and cancel still never schedules the updater.
+
 ## V4.2.2 — 2026-08-01
 
 See also: [docs/release-notes-v4.2.2.md](docs/release-notes-v4.2.2.md)

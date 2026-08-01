@@ -73,6 +73,7 @@ V3.8.2 起，最终答案保留在主内容区，pre-tool answer 会按“正文
 - setup 会在 Hermes checkout 外 provision 独立 runtime。使用前运行 `hermes-feishu-card maintenance status`，异常时可用 `maintenance resume` 从 durable journal 恢复。
 - V4.2.1 在 runtime control 启动前登记 live Gateway runner，因此 Gateway 重启后的首个 heartbeat 就能证明完整聚合计数，第一条私聊裸 `/update` 不再需要其他消息预热。
 - V4.2.2 在按钮回调快速 ACK 后异步 PATCH 原确认卡：取消进入“已取消更新”终态且不启动 updater；确认先显示锁定/准备状态，再启动独立维护任务。
+- V4.2.3 让 WebSocket hook 将更新证据指纹 `update_evidence_fingerprint` 原样转发给 sidecar，使确认/取消进入既有的证据绑定状态转换；证据缺失或不匹配仍 fail-closed。
 
 完整边界和验收步骤见 [V4.2.0 发布说明](release-notes-v4.2.0.md)。
 
@@ -522,7 +523,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.2.2`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.2.3`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -530,7 +531,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.2
+export HFC_VERSION=v4.2.3
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -815,6 +816,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
+| [v4.2.3](release-notes-v4.2.3.md) | 2026-08-01 | WebSocket hook 保留 `/update` 动作的证据指纹，使 sidecar 能完成证据绑定的确认/取消状态转换；证据缺失或不匹配仍 fail-closed |
 | [v4.2.2](release-notes-v4.2.2.md) | 2026-08-01 | `/update` 确认/取消在快速 ACK 后异步 PATCH 原卡片；取消进入终态且不启动 updater，确认先显示准备状态再调度维护任务 |
 | [v4.2.1](release-notes-v4.2.1.md) | 2026-07-31 | Gateway 启动即绑定 live runner，首个 heartbeat 提供完整任务计数证据，修复重启后第一条私聊 `/update` 被拒绝 |
 | [v4.2.0](release-notes-v4.2.0.md) | 2026-07-31 | 飞书私聊裸 `/update` 使用证据绑定确认卡与独立维护 runtime，运行官方 updater 后恢复同版本 HFC、hook、sidecar 和 Gateway |

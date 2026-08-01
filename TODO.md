@@ -2,17 +2,25 @@
 
 当前 active runtime 是 `hermes_feishu_card/`。legacy adapter、dual mode、旧 `sidecar/`、旧 `patch/` 和 `installer_v2.py` 不是 active runtime，仅保留作历史参考。
 
-## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2
+## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3
 
 详细路线见 [docs/superpowers/specs/2026-06-30-v3-8-design.md](docs/superpowers/specs/2026-06-30-v3-8-design.md) 和 [docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md](docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md)。
 
-### V4.2.2：更新确认卡终态写回热修（发布候选）
+### V4.2.3：更新回调证据转发热修（发布候选）
+
+- [x] 真实飞书点击、Gateway 日志与 sidecar metrics 联合定位 WebSocket hook 遗漏 `update_evidence_fingerprint`。
+- [x] 新增 executor-facing 回归，先观察缺失字段失败，再以最小修改保留证据指纹。
+- [x] hook/runtime/server/Feishu SDK 相关矩阵 `670 passed, 1 skipped`。
+- [x] 完整 pytest `2309 passed, 5 skipped`、`git diff --check`、sdist/wheel 与干净 Python 3.12 `site-packages` provenance。
+- [ ] PR CI、exact merge、public tag/install、Release assets 与真实飞书取消终态验收。
+
+### V4.2.2：更新确认卡终态写回热修（已发布）
 
 - [x] native card action 保持快速空 ACK，sidecar 在后台 PATCH 原确认卡，不把 Feishu API 延迟带回 callback deadline。
 - [x] 取消写入“已取消更新” terminal card 且绝不调度 updater；确认先尝试写入 locking/准备态再调度维护任务。
 - [x] 聚焦回归与相关 operations/server/hook-runtime 矩阵 `378 passed`。
 - [x] Python 3.9 / 3.12 全量均为 `2307 passed, 5 skipped`；`git diff --check`、wheel/sdist、干净 `site-packages` 与独立 maintenance runtime 通过。
-- [ ] PR CI、exact merge、public tag/install、Release assets 与真实飞书取消终态复测。
+- [x] PR CI、exact merge、public tag/install 与 Release assets；真实飞书复测发现 WebSocket hook 遗漏证据指纹，转入 V4.2.3 热修。
 
 ### V4.2.1：Gateway 首个 heartbeat 任务计数热修（已发布）
 

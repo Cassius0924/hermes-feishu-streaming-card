@@ -140,7 +140,7 @@ Hermes `v2026.4.23` 起的旧版和 Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.2
+export HFC_VERSION=v4.2.3
 bash install-docker.sh
 ```
 
@@ -176,11 +176,11 @@ bash install-docker.sh
 | `HERMES_FEISHU_CARD_DELTA_COALESCE_MS` | `250` | Gateway 内 delta 最大合并等待时间 |
 | `HERMES_FEISHU_CARD_DELTA_COALESCE_CHARS` | `600` | pending delta 达到字符数后立即 flush |
 | `HERMES_FEISHU_CARD_DELTA_COALESCE_MAX_PENDING` | `128` | pending delta session 上限 |
-
 ## 最新版本
 ![飞书话题内卡片连续更新与思考工具 timeline 展示](docs/assets/feishu-topic-card-showcase-v389.png)
 | 版本 | 重点 |
 |---|---|
+| [v4.2.3](docs/release-notes-v4.2.3.md) | 修复 WebSocket hook 转发 `/update` 按钮动作时遗漏 `update_evidence_fingerprint` 的问题，使 sidecar 能完成证据绑定的确认/取消状态转换；缺失或不匹配证据仍 fail-closed |
 | [v4.2.2](docs/release-notes-v4.2.2.md) | 修复 `/update` 确认卡按钮回调只更新服务端状态、未 PATCH 原卡片的问题；取消会进入“已取消更新”终态且绝不启动 updater，确认会先显示准备更新再启动维护任务 |
 | [v4.2.1](docs/release-notes-v4.2.1.md) | 修复 Gateway 重启后首个 heartbeat 未绑定 live runner，确保第一条私聊裸 `/update` 即可获得完整任务计数证据；缺失计数仍 fail-closed |
 | [v4.2.0](docs/release-notes-v4.2.0.md) | 飞书私聊裸 `/update` 经 120 秒确认后，使用独立维护进程运行官方 Hermes updater，并自动恢复同版本 HFC、钩子、sidecar 与 Gateway；群聊和参数化命令保持 Hermes 原行为 |
