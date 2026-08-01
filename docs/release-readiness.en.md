@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.2.2`. It fixes Feishu private-chat `/update` actions that changed durable state without asynchronously PATCHing the original confirmation card: cancel must show a terminal state without starting the updater, while confirm must show locking/preparation before maintenance starts. The callback still ACKs quickly, and existing identity, chat, expiry, preflight, drain, and fail-closed boundaries remain unchanged. Full automation, build, CI, real private-chat acceptance, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.2.3`. A real Feishu click proved the native WebSocket action reached the Gateway, but the V4.2.2 hook dropped `update_evidence_fingerprint` while forwarding the payload, so the sidecar failed closed before the evidence-bound transition. V4.2.3 restores only that field while preserving fast acknowledgement and the identity, chat, expiry, preflight, drain, and evidence-validation boundaries. Full automation, build, CI, real private-chat acceptance, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -147,11 +147,18 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
 
+## V4.2.3 Release Gates
+
+- The WebSocket hook must forward `update_evidence_fingerprint` unchanged from the card value to the sidecar; the missing-field regression was observed red before the fix and green afterward: **passed**.
+- The related hook/runtime/server/Feishu SDK matrix reports **`670 passed, 1 skipped`**. Full pytest reports **`2309 passed, 5 skipped`**; `git diff --check`, sdist/wheel, and clean Python 3.12 `site-packages` package/distribution/CLI provenance: **local candidate gate passed**. PR CI, exact merge SHA, public tag/install, Release assets, and real Feishu confirm/cancel: **pending release-flow verification**.
+- Real acceptance must observe a sidecar update attempt, the original-card transition, and proof that cancel did not start the updater; a click or Gateway action log alone is insufficient.
+- Local-candidate real Feishu cancellation acceptance: **passed (2026-08-01)**. The new card reported HFC 4.2.3 and the original card reached “cancelled / Hermes update not executed”; sidecar reported `feishu_update_attempts=1`, `successes=1`, and `failures=0`, Hermes HEAD was unchanged, `update.log` remained at 2026-07-31 15:01:52, and no updater or maintenance-run process existed. Repeat after installing the public tag.
+
 ## V4.2.2 Release Gates
 
 - The native card action must return its empty acknowledgement first, then let the sidecar asynchronously PATCH the original confirmation card; Feishu API latency must stay outside the callback deadline: **focused regression passed**.
 - Cancel must persist `cancelled`, render the terminal cancellation card, and never schedule the updater; confirm must attempt the locking/preparing card transition before independent maintenance is scheduled: **related operations/server/hook-runtime matrix passed (`378 passed`)**.
-- Full pytest reports **`2307 passed, 5 skipped`** on both Python 3.9 and 3.12; `git diff --check`, wheel/sdist, clean Python 3.12 `site-packages` package/distribution/CLI provenance, and an independent V4.2.2 maintenance runtime: **local candidate gate passed**. PR CI, exact merge SHA, public tag/install, Release assets, and real Feishu cancellation acceptance: **pending release-flow verification**.
+- Full pytest reports **`2307 passed, 5 skipped`** on both Python 3.9 and 3.12; `git diff --check`, wheel/sdist, clean Python 3.12 `site-packages` package/distribution/CLI provenance, PR CI, exact merge SHA, public tag/install, and Release assets: **release flow passed**. The subsequent real Feishu click exposed the dropped WebSocket evidence fingerprint, so terminal cancellation did not complete and is superseded by the V4.2.3 candidate.
 
 ## V4.2.1 Release Gates
 
