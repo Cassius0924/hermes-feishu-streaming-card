@@ -64,6 +64,11 @@ WebSocket hook to the sidecar. Confirm and cancel therefore reach the existing
 evidence-bound transition logic; missing or mismatched evidence remains
 fail-closed.
 
+V4.2.4 gives every new Feishu/Lark topic reply its real incoming message ID.
+Consecutive replies quoting the same message therefore open independent cards
+instead of overwriting the first card; in-turn stream events still resolve
+through the reply alias.
+
 From V3.8.4, those standalone command cards also work in Feishu/Lark WebSocket
 long-connection deployments by patching the Feishu adapter's native interactive
 card action path; local/private sidecars no longer have to fall back to gray
@@ -279,7 +284,7 @@ a privileged container, or mount host system-service directories.
 ```
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.3
+export HFC_VERSION=v4.2.4
 bash install-docker.sh
 ```
 

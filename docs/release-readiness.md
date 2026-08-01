@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.2.3`。真实飞书点击证明 native WebSocket action 已到达 Gateway，但 V4.2.2 hook 转发 payload 时遗漏 `update_evidence_fingerprint`，导致 sidecar 在执行证据绑定状态转换前 fail-closed。V4.2.3 只补回该字段，保留快速 ACK、身份/会话/过期/预检/drain 与证据校验边界。完整自动化、构建、CI、真实飞书私聊验收、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.2.4`。Issue #175 证明飞书/Lark 话题中连续引用同一消息时，旧 hook 会把 reply anchor 当作新 turn 的 message ID，导致多轮共用 session 并覆盖第一张卡。V4.2.4 让 `message.started` 使用真实入站 ID，并仅对新 turn 跳过 reply alias；同一轮后续流式事件仍按 alias 更新本轮卡片。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -147,10 +147,17 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
 
+## V4.2.4 发布门禁
+
+- `message.started` 必须使用真实入站 message ID，每条引用回复创建独立卡片；仅在 ID 缺失时回退 reply anchor：**patcher 单元回归通过**。
+- sidecar 必须只对新 turn 跳过 reply alias；后续 `answer.delta` 等流式事件仍更新本轮新卡：**真实 HTTP `/events` 集成回归通过**。
+- 完整 pytest：**`2311 passed, 5 skipped`**；`git diff --check`、sdist/wheel 与干净隔离 Python `site-packages` 包/distribution/CLI provenance：**本地候选门禁通过**。PR CI、exact merge SHA、public tag/install 与 Release assets：**发布流程中验证**。
+- PR #177 贡献者报告真实飞书话题连续引用场景通过；正式 tag 后的运行环境复测保留为用户侧验收，不用它替代自动化与精确 SHA 门禁。
+
 ## V4.2.3 发布门禁
 
 - WebSocket hook 必须将 card value 中的 `update_evidence_fingerprint` 原样转发给 sidecar；缺失字段的回归测试先红后绿：**通过**。
-- 相关 hook/runtime/server/Feishu SDK 矩阵：**`670 passed, 1 skipped`**。完整 pytest：**`2309 passed, 5 skipped`**；`git diff --check`、sdist/wheel 与干净 Python 3.12 `site-packages` 包/distribution/CLI provenance：**本地候选门禁通过**。PR CI、exact merge SHA、public tag/install、Release assets 与真实飞书确认/取消：**待发布流程验证**。
+- 相关 hook/runtime/server/Feishu SDK 矩阵：**`670 passed, 1 skipped`**。完整 pytest：**`2309 passed, 5 skipped`**；`git diff --check`、sdist/wheel、干净 Python 3.12 `site-packages` provenance、PR CI、exact merge SHA、public tag/install 与 Release assets：**发布链路通过**。
 - 真实验收必须观察 sidecar update attempt、原卡状态转换，并证明取消不会启动 updater；不得只以按钮被点击或 Gateway 收到 action 作为通过依据。
 - 本机候选真实飞书取消验收：**通过（2026-08-01）**。新卡显示 HFC 4.2.3，原卡进入“已取消更新 / 未执行 Hermes 更新”；sidecar 为 `feishu_update_attempts=1`、`successes=1`、`failures=0`，Hermes HEAD 未变化，`update.log` 仍停在 2026-07-31 15:01:52，且无 updater/maintenance run 进程。正式 tag 安装后仍需复验。
 

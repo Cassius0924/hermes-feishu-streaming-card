@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.2.4 — 2026-08-01
+
+See also: [docs/release-notes-v4.2.4.md](docs/release-notes-v4.2.4.md)
+
+### Fixed
+- Consecutive Feishu/Lark topic replies quoting the same message now create independent cards instead of overwriting the first reply card.
+- `message.started` uses the real incoming message ID, with the reply anchor only as a fallback; in-turn streaming deltas and tool events continue to resolve through the reply alias.
+
+### Safety
+- New-turn routing bypasses an active reply alias only for `message.started`; existing session correlation for streaming events is unchanged.
+- Unknown or unsupported event paths remain fail-open, and native duplicate suppression boundaries are unchanged.
+
 ## V4.2.3 — 2026-08-01
 
 See also: [docs/release-notes-v4.2.3.md](docs/release-notes-v4.2.3.md)
