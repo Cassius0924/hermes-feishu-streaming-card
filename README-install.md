@@ -64,6 +64,11 @@ WebSocket hook to the sidecar. Confirm and cancel therefore reach the existing
 evidence-bound transition logic; missing or mismatched evidence remains
 fail-closed.
 
+V4.2.5 hardens quoted-turn identity and the maintenance updater, limits doctor
+to executable integrity actions, and makes installer `latest` resolve to one
+pinned stable release tag or stop before package/setup mutation. Release assets
+now require an exact tested annotated tag.
+
 V4.2.4 gives every new Feishu/Lark topic reply its real incoming message ID.
 Consecutive replies quoting the same message therefore open independent cards
 instead of overwriting the first card; in-turn stream events still resolve
@@ -284,7 +289,7 @@ a privileged container, or mount host system-service directories.
 ```
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.4
+export HFC_VERSION=v4.2.5
 bash install-docker.sh
 ```
 

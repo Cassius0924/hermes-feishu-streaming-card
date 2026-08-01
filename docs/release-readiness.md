@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.2.4`。Issue #175 证明飞书/Lark 话题中连续引用同一消息时，旧 hook 会把 reply anchor 当作新 turn 的 message ID，导致多轮共用 session 并覆盖第一张卡。V4.2.4 让 `message.started` 使用真实入站 ID，并仅对新 turn 跳过 reply alias；同一轮后续流式事件仍按 alias 更新本轮卡片。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.2.5`。本轮审查覆盖 canonical turn 隔离、maintenance 重入/checkout/drain 恢复、doctor 可执行建议、三端 installer 的 stable-tag 解析、公开模板版本一致性和 exact tested annotated-tag Release Assets gate。完整自动化、构建、真实验收、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -146,6 +146,13 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.2.5 发布门禁
+
+- 九个审查 ID 均有命名回归，覆盖 quoted turn、maintenance ownership/binding/drain、doctor action、installer pin 与 config marker。
+- `latest` 解析失败必须在 pip/setup/doctor 和 Docker state mutation 前退出；显式 `main` 是唯一 moving ref。
+- Release Assets 必须按 `resolve-release -> reusable exact-commit tests -> package` 执行，并在 build 前和 upload 前 full reverify annotated tag。
+- 候选完整 pytest、compileall、package provenance、disposable maintenance smoke、真实验收、PR CI、exact merge、public tag/install 与四个 assets：**发布流程中逐项记录**。
 
 ## V4.2.4 发布门禁
 

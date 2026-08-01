@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.2.4`. Issue #175 proved that consecutive Feishu/Lark topic replies quoting the same message could make the old hook reuse the reply anchor as a new turn's message ID, sharing one session and overwriting the first card. V4.2.4 gives `message.started` the real incoming ID and bypasses reply aliases only for a new turn; later in-turn streaming events continue to update the current card through aliases. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.2.5`. This audit covers canonical turn isolation, maintenance reentry/checkout/drain recovery, executable doctor actions, stable-tag resolution across all installers, public-template version consistency, and an exact tested annotated-tag Release Assets gate. Full automation, build, real acceptance, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -146,6 +146,13 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.2.5 Release Gates
+
+- Named regressions cover all nine audit IDs across quoted turns, maintenance ownership/binding/drain, doctor actions, installer pinning, and the config marker.
+- A failed `latest` lookup must stop before pip/setup/doctor and Docker state mutation; explicit `main` is the only moving ref.
+- Release Assets must run `resolve-release -> reusable exact-commit tests -> package`, with full annotated-tag verification before build and again before upload.
+- Candidate full pytest, compileall, package provenance, disposable maintenance smoke, real acceptance, PR CI, exact merge, public tag/install, and all four assets are **recorded only as each release gate completes**.
 
 ## V4.2.4 Release Gates
 
