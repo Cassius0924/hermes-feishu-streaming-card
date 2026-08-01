@@ -5,9 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_feishu_card.maintenance_store import ArtifactMetadata
+from hermes_feishu_card.maintenance_store import (
+    ArtifactMetadata,
+    MaintenanceRefused,
+)
 from hermes_feishu_card.maintenance_update import (
     CommandResult,
+    gateway_drain_required,
     inspect_update,
     resolve_hermes_command_binding,
     run_hermes_command,
@@ -129,6 +133,30 @@ def _inspect(clean_hermes, artifact, runner, *, active_sessions=0):
         run=runner,
         now=lambda: 200.0,
     )
+
+
+@pytest.mark.parametrize(
+    ("phase", "required"),
+    [
+        ("locking", True),
+        ("draining", True),
+        ("restoring_hooks", True),
+        ("updating_hermes", False),
+        ("reinstalling_hfc", False),
+        ("starting_services", False),
+        ("verifying", False),
+        ("succeeded", False),
+        ("failed", False),
+        ("cancelled", False),
+    ],
+)
+def test_gateway_drain_requirement_is_phase_complete(phase, required):
+    assert gateway_drain_required(phase) is required
+
+
+def test_gateway_drain_requirement_rejects_unknown_phase():
+    with pytest.raises(MaintenanceRefused, match="phase is invalid"):
+        gateway_drain_required("unknown")
 
 
 def test_hermes_command_binding_ignores_path_decoy(tmp_path):

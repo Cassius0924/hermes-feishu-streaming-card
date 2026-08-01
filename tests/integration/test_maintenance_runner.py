@@ -160,6 +160,9 @@ class CommandHarness:
         self.hermes_mutations = []
         self.default_hermes_mutations = []
         self.rebuild_runtime = False
+        self.external_drain_active = True
+        self.drain_transitions = []
+        self.semantic_trace = []
         self.fail_at = ""
         self.hermes_update_calls = 0
         self.pinned_install_calls = 0
@@ -195,6 +198,11 @@ class CommandHarness:
             and command[1:3] == ("-I", "-c")
             and "gateway.drain_control" in command[3]
         ):
+            self.external_drain_active = "write_drain_request" in command[3]
+            self.drain_transitions.append(self.external_drain_active)
+            self.semantic_trace.append(
+                ("external_drain", self.external_drain_active)
+            )
             return CommandResult(command, 0, "", "")
         if command[-2:] == ("rev-parse", "HEAD"):
             return CommandResult(command, 0, self.actual_head + "\n", "")
@@ -213,6 +221,9 @@ class CommandHarness:
         if command[-3:] == ("maintenance", "drain", "--status"):
             return CommandResult(command, 0, '{"active_sessions": 0}', "")
         if command[-3:] == ("gateway", "stop", "--all"):
+            self.semantic_trace.append(
+                ("gateway_command", "gateway", "stop", "--all")
+            )
             target = (
                 self.default_hermes_mutations
                 if command[0] == "hermes"
@@ -229,6 +240,7 @@ class CommandHarness:
                 self.git_status = ""
             return result
         if command[-2:] == ("update", "--yes"):
+            self.semantic_trace.append(("gateway_command", "update", "--yes"))
             target = (
                 self.default_hermes_mutations
                 if command[0] == "hermes"
@@ -297,6 +309,9 @@ class CommandHarness:
         ):
             return self._mutation("sidecar-start", command)
         if command[-2:] == ("gateway", "restart"):
+            self.semantic_trace.append(
+                ("gateway_command", "gateway", "restart")
+            )
             target = (
                 self.default_hermes_mutations
                 if command[0] == "hermes"
@@ -326,13 +341,16 @@ class CommandHarness:
 
 
 class HealthHarness:
-    def __init__(self, runtime_python):
+    def __init__(self, runtime_python, commands):
         self.ready = True
         self.sequence = 0
         self.runtime_python = runtime_python
+        self.commands = commands
+        self.admission_samples = []
 
     def __call__(self):
         self.sequence += 1
+        self.admission_samples.append(self.commands.external_drain_active)
         return {
             "status": "healthy" if self.ready else "degraded",
             "maintenance_active_sessions": 0,
@@ -344,7 +362,7 @@ class HealthHarness:
                 "last_sequence": self.sequence,
                 "last_seen_age_seconds": 0,
                 "runtime_id_hash": "2" * 64,
-                "admission_draining": self.sequence <= 3,
+                "admission_draining": self.commands.external_drain_active,
                 "active_work_count_complete": True,
                 "drain_home_verified": True,
             },
@@ -371,7 +389,7 @@ def test_supervisor_restores_updates_reinstalls_and_verifies(maintenance_fixture
     result = run_job(
         maintenance_fixture.job.path,
         run=commands,
-        fetch_health=HealthHarness(commands.runtime_python),
+        fetch_health=HealthHarness(commands.runtime_python, commands),
         publish=lambda current: published.append(current.phase) or True,
         sleep=lambda delay: None,
         maintenance_python=Path("/maintenance/bin/python"),
@@ -408,7 +426,7 @@ def test_binding_is_re_resolved_after_updater_rebuilds_venv(maintenance_fixture)
     commands = CommandHarness(maintenance_fixture)
     old_runtime = commands.runtime_python
     commands.rebuild_runtime = True
-    health = HealthHarness(old_runtime)
+    health = HealthHarness(old_runtime, commands)
 
     def fetch_health():
         health.runtime_python = commands.runtime_python
@@ -447,7 +465,7 @@ def test_custom_root_upgrade_never_mutates_default_hermes(
     result = run_job(
         maintenance_fixture.job.path,
         run=commands,
-        fetch_health=HealthHarness(commands.runtime_python),
+        fetch_health=HealthHarness(commands.runtime_python, commands),
         publish=lambda current: True,
         sleep=lambda _delay: None,
         maintenance_python=Path("/maintenance/bin/python"),
@@ -484,7 +502,7 @@ def test_card_failure_before_mutation_aborts_without_commands(maintenance_fixtur
     result = run_job(
         maintenance_fixture.job.path,
         run=commands,
-        fetch_health=HealthHarness(commands.runtime_python),
+        fetch_health=HealthHarness(commands.runtime_python, commands),
         publish=lambda current: False,
         maintenance_python=Path("/maintenance/bin/python"),
     )
@@ -503,7 +521,7 @@ def test_official_update_failure_never_runs_custom_git_recovery(
     result = run_job(
         maintenance_fixture.job.path,
         run=commands,
-        fetch_health=HealthHarness(commands.runtime_python),
+        fetch_health=HealthHarness(commands.runtime_python, commands),
         publish=lambda current: True,
         maintenance_python=Path("/maintenance/bin/python"),
     )
@@ -559,7 +577,7 @@ def test_resume_after_completed_update_does_not_run_update_again(
     result = run_job(
         maintenance_fixture.job.path,
         run=commands,
-        fetch_health=HealthHarness(commands.runtime_python),
+        fetch_health=HealthHarness(commands.runtime_python, commands),
         publish=lambda current: True,
         maintenance_python=Path("/maintenance/bin/python"),
     )
@@ -567,6 +585,105 @@ def test_resume_after_completed_update_does_not_run_update_again(
     assert result.phase == "succeeded"
     assert commands.hermes_update_calls == 0
     assert commands.pinned_install_calls == 1
+
+
+def _prepare_resumed_updated_fixture(fixture, commands, phase):
+    commands.actual_head = TARGET_HEAD
+    fixture.state["version"] = "0.19.2"
+    if phase in {"updating_hermes", "reinstalling_hfc"}:
+        fixture.state["hook"] = "clean"
+        commands.git_status = ""
+    else:
+        fixture.state["hook"] = "installed"
+    transition_job(
+        fixture.job.path,
+        expected_phase="locking",
+        phase=phase,
+    )
+
+
+def test_resume_from_verifying_releases_drain_before_readiness(
+    maintenance_fixture,
+):
+    commands = CommandHarness(maintenance_fixture)
+    _prepare_resumed_updated_fixture(
+        maintenance_fixture,
+        commands,
+        "verifying",
+    )
+    health = HealthHarness(commands.runtime_python, commands)
+
+    result = run_job(
+        maintenance_fixture.job.path,
+        run=commands,
+        fetch_health=health,
+        publish=lambda current: True,
+        sleep=lambda _delay: None,
+        maintenance_python=Path("/maintenance/bin/python"),
+    )
+
+    assert result.phase == "succeeded"
+    assert commands.drain_transitions[0] is False
+    assert health.admission_samples
+    assert all(sample is False for sample in health.admission_samples)
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["updating_hermes", "reinstalling_hfc", "starting_services"],
+)
+def test_resume_from_each_post_restore_phase_clears_external_drain(
+    maintenance_fixture,
+    phase,
+):
+    commands = CommandHarness(maintenance_fixture)
+    _prepare_resumed_updated_fixture(maintenance_fixture, commands, phase)
+    health = HealthHarness(commands.runtime_python, commands)
+
+    result = run_job(
+        maintenance_fixture.job.path,
+        run=commands,
+        fetch_health=health,
+        publish=lambda current: True,
+        sleep=lambda _delay: None,
+        maintenance_python=Path("/maintenance/bin/python"),
+    )
+
+    assert result.phase == "succeeded"
+    assert commands.drain_transitions[0] is False
+    assert health.admission_samples
+    assert all(sample is False for sample in health.admission_samples)
+
+
+def test_resume_from_restoring_hooks_keeps_drain_until_gateway_stop(
+    maintenance_fixture,
+):
+    commands = CommandHarness(maintenance_fixture)
+    transition_job(
+        maintenance_fixture.job.path,
+        expected_phase="locking",
+        phase="restoring_hooks",
+    )
+
+    result = run_job(
+        maintenance_fixture.job.path,
+        run=commands,
+        fetch_health=HealthHarness(commands.runtime_python, commands),
+        publish=lambda current: True,
+        sleep=lambda _delay: None,
+        maintenance_python=Path("/maintenance/bin/python"),
+    )
+
+    assert result.phase == "succeeded"
+    stop_index = commands.semantic_trace.index(
+        ("gateway_command", "gateway", "stop", "--all")
+    )
+    first_clear_index = next(
+        index
+        for index, entry in enumerate(commands.semantic_trace)
+        if entry == ("external_drain", False)
+    )
+    assert stop_index < first_clear_index
 
 
 def test_resume_rejects_foreign_post_update_head(maintenance_fixture):
@@ -594,7 +711,7 @@ def test_resume_rejects_foreign_post_update_head(maintenance_fixture):
     result = run_job(
         maintenance_fixture.job.path,
         run=commands,
-        fetch_health=HealthHarness(commands.runtime_python),
+        fetch_health=HealthHarness(commands.runtime_python, commands),
         publish=lambda current: True,
         maintenance_python=Path("/maintenance/bin/python"),
     )
@@ -622,7 +739,7 @@ def test_repeated_terminal_run_is_idempotent(maintenance_fixture):
     result = run_job(
         completed.path,
         run=commands,
-        fetch_health=HealthHarness(commands.runtime_python),
+        fetch_health=HealthHarness(commands.runtime_python, commands),
         publish=lambda current: True,
         maintenance_python=Path("/maintenance/bin/python"),
     )
@@ -661,7 +778,7 @@ def test_contending_run_job_preserves_active_job_and_fences(
         result = run_job(
             job.path,
             run=commands,
-            fetch_health=HealthHarness(commands.runtime_python),
+            fetch_health=HealthHarness(commands.runtime_python, commands),
             publish=lambda current: True,
         )
 
@@ -720,7 +837,7 @@ def test_terminal_cleanup_runs_before_update_lock_release(
             maintenance_fixture.job.path,
             lock_lease=lease,
             run=commands,
-            fetch_health=HealthHarness(commands.runtime_python),
+            fetch_health=HealthHarness(commands.runtime_python, commands),
             publish=lambda current: True,
             sleep=lambda _delay: None,
             maintenance_python=Path("/maintenance/bin/python"),

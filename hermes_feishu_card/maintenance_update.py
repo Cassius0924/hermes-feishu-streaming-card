@@ -19,6 +19,8 @@ from .maintenance_store import (
     MaintenancePaths,
     MaintenanceRefused,
     PROXY_ENVIRONMENT_KEYS,
+    TERMINAL_UPDATE_PHASES,
+    UPDATE_PHASES,
     UpdateLockBusy,
     UpdateLockLease,
     UpdateJob,
@@ -68,7 +70,22 @@ _RELEASE_GATEWAY_DRAIN_CODE = (
     "from gateway.drain_control import clear_drain_request; "
     "clear_drain_request(home=pathlib.Path(os.environ['HERMES_HOME']))"
 )
-_TERMINAL_PHASES = frozenset({"succeeded", "failed", "cancelled"})
+_GATEWAY_DRAIN_PHASES = frozenset(
+    {
+        "locking",
+        "draining",
+        "restoring_hooks",
+    }
+)
+_DRAIN_RECONCILIATION_BOUNDARIES = {
+    "locking": "no_mutation",
+    "draining": "no_mutation",
+    "restoring_hooks": "old_hfc_or_manual",
+    "updating_hermes": "updater_result_classified",
+    "reinstalling_hfc": "native_hermes",
+    "starting_services": "service_recovery",
+    "verifying": "service_recovery",
+}
 
 
 @dataclass(frozen=True)
@@ -658,6 +675,33 @@ def set_gateway_external_drain(
     return not result.timed_out and result.returncode == 0
 
 
+def gateway_drain_required(phase: str) -> bool:
+    if phase not in UPDATE_PHASES:
+        raise MaintenanceRefused("maintenance phase is invalid")
+    return phase in _GATEWAY_DRAIN_PHASES
+
+
+def reconcile_gateway_external_drain(
+    job: UpdateJob,
+    *,
+    binding: HermesCommandBinding,
+    run: CommandRunner,
+    base_environment: Mapping[str, str],
+    proxy_environment: Mapping[str, str],
+) -> bool:
+    required = gateway_drain_required(job.phase)
+    if job.phase in TERMINAL_UPDATE_PHASES:
+        return not required
+    return set_gateway_external_drain(
+        job.hermes_root,
+        active=required,
+        run=run,
+        binding=binding,
+        base_environment=base_environment,
+        proxy_environment=proxy_environment,
+    )
+
+
 def run_job(
     job_path: Path,
     *,
@@ -673,6 +717,21 @@ def run_job(
     drain_timeout_seconds: float = 180.0,
     update_timeout_seconds: float = 3600.0,
 ) -> UpdateJob:
+    selected_base_environment = dict(
+        os.environ if base_environment is None else base_environment
+    )
+    proxy_source = (
+        selected_base_environment
+        if proxy_environment is None
+        else proxy_environment
+    )
+    selected_proxy_environment = {
+        key: value
+        for key, value in proxy_source.items()
+        if key in PROXY_ENVIRONMENT_KEYS
+        and isinstance(value, str)
+        and value
+    }
     current = load_job(job_path)
     paths = maintenance_paths(current.path.parent.parent)
     options = {
@@ -682,8 +741,8 @@ def run_job(
         "sleep": sleep,
         "monotonic": monotonic,
         "maintenance_python": maintenance_python,
-        "base_environment": base_environment,
-        "proxy_environment": proxy_environment,
+        "base_environment": selected_base_environment,
+        "proxy_environment": selected_proxy_environment,
         "drain_timeout_seconds": drain_timeout_seconds,
         "update_timeout_seconds": update_timeout_seconds,
     }
@@ -719,8 +778,8 @@ def _run_job_owned(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     maintenance_python: Path | None = None,
-    base_environment: Optional[Mapping[str, str]] = None,
-    proxy_environment: Optional[Mapping[str, str]] = None,
+    base_environment: Mapping[str, str],
+    proxy_environment: Mapping[str, str],
     drain_timeout_seconds: float = 180.0,
     update_timeout_seconds: float = 3600.0,
 ) -> UpdateJob:
@@ -749,7 +808,7 @@ def _run_job_owned(
         )
         return result
     finally:
-        if result is not None and result.phase in _TERMINAL_PHASES:
+        if result is not None and result.phase in TERMINAL_UPDATE_PHASES:
             require_update_lock_lease(
                 paths,
                 job_id=result.job_id,
@@ -767,8 +826,8 @@ def _cleanup_terminal_owned_job(
     result: UpdateJob,
     *,
     run: CommandRunner | None = None,
-    base_environment: Optional[Mapping[str, str]] = None,
-    proxy_environment: Optional[Mapping[str, str]] = None,
+    base_environment: Mapping[str, str],
+    proxy_environment: Mapping[str, str],
 ) -> None:
     paths = maintenance_paths(result.path.parent.parent)
     try:
@@ -812,8 +871,8 @@ def _run_state_machine(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     maintenance_python: Path | None = None,
-    base_environment: Optional[Mapping[str, str]] = None,
-    proxy_environment: Optional[Mapping[str, str]] = None,
+    base_environment: Mapping[str, str],
+    proxy_environment: Mapping[str, str],
     drain_timeout_seconds: float = 180.0,
     update_timeout_seconds: float = 3600.0,
 ) -> UpdateJob:
@@ -824,7 +883,7 @@ def _run_state_machine(
         strict=False
     )
     current = load_job(job_path)
-    if current.phase in _TERMINAL_PHASES:
+    if current.phase in TERMINAL_UPDATE_PHASES:
         return current
     paths = maintenance_paths(current.path.parent.parent)
     with _verified_update_lock_scope(
@@ -833,7 +892,7 @@ def _run_state_machine(
         lease=lock_lease,
     ):
         current = load_job(current.path)
-        if current.phase in _TERMINAL_PHASES:
+        if current.phase in TERMINAL_UPDATE_PHASES:
             return current
         try:
             require_drain_lease(paths, owner_id=current.job_id)
@@ -855,27 +914,32 @@ def _run_state_machine(
                 "no_mutation",
                 publisher,
             )
+        boundary = _DRAIN_RECONCILIATION_BOUNDARIES[current.phase]
         try:
             binding = resolve_hermes_command_binding(current.hermes_root)
-        except MaintenanceRefused:
+        except (MaintenanceRefused, OSError, ValueError):
             return _fail_job(
                 current,
-                "hermes_runtime_missing",
-                "no_mutation",
+                "gateway_drain_binding_unavailable",
+                boundary,
                 publisher,
             )
-        if not set_gateway_external_drain(
-            current.hermes_root,
-            active=True,
-            run=runner,
+        if not reconcile_gateway_external_drain(
+            current,
             binding=binding,
+            run=runner,
             base_environment=base_environment,
             proxy_environment=proxy_environment,
         ):
+            required = gateway_drain_required(current.phase)
             return _fail_job(
                 current,
-                "gateway_drain_unavailable",
-                "no_mutation",
+                (
+                    "gateway_drain_unavailable"
+                    if required
+                    else "gateway_drain_release_failed"
+                ),
+                boundary,
                 publisher,
             )
         try:
@@ -1416,7 +1480,7 @@ def _fail_job(
     recovery_boundary: str,
     publisher: JobPublisher | None,
 ) -> UpdateJob:
-    if current.phase in _TERMINAL_PHASES:
+    if current.phase in TERMINAL_UPDATE_PHASES:
         return current
     try:
         failed = transition_job(
