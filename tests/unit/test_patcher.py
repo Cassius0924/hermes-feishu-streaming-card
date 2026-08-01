@@ -58,7 +58,7 @@ def test_apply_patch_accepts_013_plus_strategy_and_marks_strategy():
     assert patcher.COMPLETE_PATCH_BEGIN in patched
 
 
-def test_apply_patch_013_plus_started_hook_uses_reply_anchor_message_id():
+def test_apply_patch_013_plus_started_hook_uses_real_message_id_with_anchor_fallback():
     content = (
         "class GatewayRunner:\n"
         "    async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):\n"
@@ -77,7 +77,15 @@ def test_apply_patch_013_plus_started_hook_uses_reply_anchor_message_id():
         patched.index(patcher.PATCH_BEGIN) : patched.index(patcher.PATCH_END)
     ]
 
-    assert "_hfc_started_message_id = self._reply_anchor_for_event(event)" in started_block
+    # The started hook must use the REAL incoming message id so every new user
+    # message opens its own card session — even when the user replied to
+    # (quoted) a previous message in a Feishu thread. The reply anchor is only
+    # a fallback when no real message id is available.
+    assert (
+        "_hfc_started_message_id = getattr(event, \"message_id\", None) "
+        "or self._reply_anchor_for_event(event)" in started_block
+    )
+    assert "_hfc_started_message_id = self._reply_anchor_for_event(event)" not in started_block
     assert '"message_id": _hfc_started_message_id' in started_block
     assert "handle_hfc_command_from_hermes_locals as _hfc_handle_command" in started_block
     assert (
