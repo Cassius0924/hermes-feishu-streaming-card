@@ -254,7 +254,7 @@ def test_readme_documents_one_line_install_and_release_packages():
     assert (ROOT / "docs/release-notes-v3.7.0.md").exists()
     assert (ROOT / ".github/workflows/release-assets.yml").exists()
     assert "gh release upload" in workflow
-    assert 'NAME="hermes-feishu-card-${TAG}"' in workflow
+    assert 'NAME="hermes-feishu-card-${RELEASE_TAG}"' in workflow
     assert "${NAME}-macos.tar.gz" in workflow
     assert "${NAME}-linux.tar.gz" in workflow
     assert "${NAME}-windows.zip" in workflow
@@ -2450,6 +2450,19 @@ def test_docs_define_verified_integrity_acknowledgement_boundary():
         assert "重新运行 doctor" in text
     assert "Every other manual-review reason must be repaired" in migration_en
     assert "diagnosed again" in migration_en
+
+
+def test_release_playbook_documents_exact_tag_commit_gate():
+    playbook = read_doc("docs/wiki/release-playbook.md")
+
+    assert "refs/tags/" in playbook
+    assert "annotated tag peel" in playbook
+    assert "reusable" in playbook
+    assert "exact commit" in playbook
+    assert "package job" in playbook
+    assert "full verification" in playbook
+    assert "只创建并推送 tag" in playbook
+    assert "绝不由 release gate 推送 main" in playbook
 
 
 def test_v412_release_docs_define_gateway_restart_race_contract():

@@ -1,6 +1,12 @@
 name: tests
 
 on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: Exact commit to test
+        required: true
+        type: string
   pull_request:
   push:
     branches:
@@ -17,6 +23,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -31,6 +39,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -47,6 +57,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
       - name: Validate published Docker Compose topology
         env:
           FEISHU_APP_ID: cli_test_only
@@ -75,6 +87,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -95,6 +109,9 @@ jobs:
             $errors | ForEach-Object { Write-Error $_.Message }
             exit 1
           }
+      - name: Test Windows installer contract
+        shell: pwsh
+        run: python -m pytest tests/unit/test_install_scripts.py -k "powershell" -q
       - name: Test manifestless legacy migration on Windows
         run: >-
           python -m pytest tests/integration/test_cli_install.py
