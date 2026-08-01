@@ -3104,7 +3104,7 @@ def _session_key(event: SidecarEvent) -> str:
     When profiles are active, uses composite key profile_id:message_id.
     Otherwise uses message_id directly (backward compatible).
     """
-    return _session_key_for_message_id(event, event.message_id)
+    return _session_key_for_message_id(event, event.canonical_turn_id)
 
 
 def _policy_profile_id(event: SidecarEvent) -> str | None:
@@ -3148,7 +3148,7 @@ def _native_handoff_identity(event: SidecarEvent) -> str:
         profile_id=profile_id,
         chat_id=event.chat_id,
         conversation_id=event.conversation_id,
-        message_id=event.message_id,
+        message_id=event.canonical_turn_id,
     )
 
 
@@ -3493,6 +3493,8 @@ def _active_session_key(app: web.Application, session_key: str) -> str | None:
 
 def _resolve_session_key(app: web.Application, event: SidecarEvent) -> str:
     direct_key = _session_key(event)
+    if event.turn_id:
+        return direct_key
     active_key = _active_session_key(app, direct_key)
     if active_key is not None:
         return active_key

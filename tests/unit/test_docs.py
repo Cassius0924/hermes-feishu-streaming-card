@@ -560,6 +560,26 @@ def test_event_protocol_documents_card_status_labels():
     assert "reply API" in event_protocol
 
 
+def test_event_protocol_documents_optional_turn_id_and_legacy_fallback():
+    protocol = read_doc("docs/event-protocol.md")
+    protocol_en = read_doc("docs/event-protocol.en.md")
+    event_flow = read_doc("docs/wiki/event-flow.md")
+    maintenance = read_doc("docs/wiki/maintenance-guide.md")
+
+    for text in (protocol, protocol_en):
+        for marker in ("turn_id", "message_id", "reply_to_message_id"):
+            assert marker in text
+    assert "`turn_id` 是可选字段" in protocol
+    assert "缺少 `turn_id` 时" in protocol
+    assert "`turn_id` is optional" in protocol_en
+    assert "When `turn_id` is absent" in protocol_en
+
+    for text in (event_flow, maintenance):
+        assert "canonical turn hard fence" in text
+        assert "turn_id" in text
+        assert "reply_to_message_id" in text
+
+
 def test_docs_describe_event_forwarding_and_real_e2e_completion():
     readme = read_doc("README.md")
     guide = read_doc("docs/user-guide.md")

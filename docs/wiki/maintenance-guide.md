@@ -30,6 +30,7 @@
 
 - 字段名必须贴合 Hermes 变量：`source`、`event`、`response`、`agent_result`、`event_message_id` 等。
 - Feishu topic 场景必须保留 `source.message_id` 和 `reply_to_message_id`。
+- `message.started` 必须从真实入站 `event.message_id` 绑定 `turn_id`；同一 `source` 的 stream/tool/terminal 回调复用这个 immutable identity。显式 `turn_id` 是 canonical turn hard fence，不能被 `message_id` 或 `reply_to_message_id` alias 覆盖；无法在 `source` 绑定私有属性时保持 legacy fail-open。
 - stable tool lifecycle 与 legacy progress callback 不能同时投递同一调用；wrapper 检测必须读取 agent 当前实际 callback，显式 fallback 标记仅用于卡片路径未接受时恢复原生进度。
 - 已识别 `system.notice` 必须按 sidecar 结果分流：已有卡片异步更新的 `accepted` 与独立卡首次投递的 `delivered` 抑制原生文本，`not_sent` 回退原始通知文本，`unknown` 只尝试固定通用提示且不重复原始通知文本；`accepted` 必须同时带有 `applied=true`，不可解析响应一律视为 `unknown`。
 - 上下文压缩只从 `_status_callback_sync` 的固定 `Compacting context` 标记产生 `context-compaction`；不得用静默 watchdog、普通 compression 文本或虚构百分比推断。
@@ -48,14 +49,14 @@
 职责：
 
 - 管理 `CardSession`。
-- 根据 `message_id`、`reply_to_message_id` 和 profile/bot 信息路由到卡片。
+- 根据 `turn_id`（若存在）、`message_id`、`reply_to_message_id` 和 profile/bot 信息路由到卡片。
 - 合并高频 delta，安排 Feishu PATCH。
 - 处理 terminal drain、终态优先更新、metrics 和 `/health`。
 - 在创建 `CardSession`、alias、动画或 Feishu client state 前再次检查 delivery policy，并接收认证 runtime events 维护 readiness。
 
 高风险点：
 
-- topic 后续事件使用不同内部 `message_id` 时，必须先查 reply anchor。
+- 显式 `turn_id` 必须作为 canonical turn hard fence，直接决定 session ownership、ordering 和 native handoff，绝不查 reply alias；只有缺少 `turn_id` 的 legacy topic 后续事件使用不同内部 `message_id` 时，才查 `reply_to_message_id` anchor。
 - terminal 事件前要 flush pending delta，避免尾部文本丢失。
 - 卡片已完成时不能让 Hermes 原生 resend 泄漏成灰色消息。
 - 初始 create/reply 只能在 Feishu API 边界用稳定 `delivery_uuid` 重试，最多 3 次；不重试 `/events`，也不把这套策略套到 PATCH。
