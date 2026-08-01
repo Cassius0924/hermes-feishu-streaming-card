@@ -743,7 +743,7 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
-| [v4.2.2](release-notes-v4.2.2.en.md) | 2026-07-31 | `/update` confirm/cancel asynchronously PATCH the original card after fast acknowledgement; cancel is terminal with no updater, and confirm publishes preparation before maintenance starts |
+| [v4.2.2](release-notes-v4.2.2.en.md) | 2026-08-01 | `/update` confirm/cancel asynchronously PATCH the original card after fast acknowledgement; cancel is terminal with no updater, and confirm publishes preparation before maintenance starts |
 | [v4.2.1](release-notes-v4.2.1.en.md) | 2026-07-31 | Registers the live runner at Gateway startup so the first heartbeat carries complete active-work evidence and the first private-chat `/update` after restart is not refused |
 | [v4.2.0](release-notes-v4.2.0.en.md) | 2026-07-31 | A bare private-chat `/update` uses an evidence-bound confirmation and independent maintenance runtime to run the official updater and restore the same HFC version, hooks, sidecar, and Gateway |
 | [v4.1.4](release-notes-v4.1.4.en.md) | 2026-07-31 | Issue #171: official Windows install/setup can rebuild a missing manifest when legacy owned hooks and clean backups match byte-for-byte; outside-block edits and inconsistent evidence remain refused |

@@ -1,6 +1,6 @@
 # Hermes Feishu Streaming Card V4.2.2
 
-发布日期：2026-07-31
+发布日期：2026-08-01
 
 V4.2.2 修复飞书/Lark WebSocket 私聊 `/update` 确认卡的状态写回缺口。V4.2.1 已能在 Gateway 重启后的第一条消息创建证据完整的确认卡，但按钮回调把 durable operation 更新为 `cancelled` 或 `locking` 后，只把新卡片放在 sidecar HTTP 响应里；Gateway 的后台转发只消费 `operation_id`，不会把这个响应渲染回飞书。因此取消后原卡片仍看起来可以点击。
 

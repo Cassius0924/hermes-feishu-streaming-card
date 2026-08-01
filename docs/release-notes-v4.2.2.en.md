@@ -1,6 +1,6 @@
 # Hermes Feishu Streaming Card V4.2.2
 
-Release date: 2026-07-31
+Release date: 2026-08-01
 
 V4.2.2 fixes the visible-state gap in Feishu/Lark WebSocket private-chat `/update` confirmation cards. V4.2.1 could create a fully evidenced confirmation as the first message after Gateway restart, but after a button callback changed the durable operation to `cancelled` or `locking`, the new card existed only in the sidecar HTTP response. The Gateway background forwarder consumes only the `operation_id`, so it could not render that response back to Feishu. The original card therefore remained apparently actionable after cancel.
 

@@ -815,7 +815,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
-| [v4.2.2](release-notes-v4.2.2.md) | 2026-07-31 | `/update` 确认/取消在快速 ACK 后异步 PATCH 原卡片；取消进入终态且不启动 updater，确认先显示准备状态再调度维护任务 |
+| [v4.2.2](release-notes-v4.2.2.md) | 2026-08-01 | `/update` 确认/取消在快速 ACK 后异步 PATCH 原卡片；取消进入终态且不启动 updater，确认先显示准备状态再调度维护任务 |
 | [v4.2.1](release-notes-v4.2.1.md) | 2026-07-31 | Gateway 启动即绑定 live runner，首个 heartbeat 提供完整任务计数证据，修复重启后第一条私聊 `/update` 被拒绝 |
 | [v4.2.0](release-notes-v4.2.0.md) | 2026-07-31 | 飞书私聊裸 `/update` 使用证据绑定确认卡与独立维护 runtime，运行官方 updater 后恢复同版本 HFC、hook、sidecar 和 Gateway |
 | [v4.1.4](release-notes-v4.1.4.md) | 2026-07-31 | Issue #171：在旧版 owned hook 与干净 backup 可逐字互证时，Windows 官方 install/setup 可安全重建缺失 manifest；用户块外改动和不一致证据继续拒绝 |
