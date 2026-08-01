@@ -2437,6 +2437,21 @@ def test_v411_release_docs_define_upgrade_recovery_safety_contract():
     assert "待验收" in acceptance
 
 
+def test_docs_define_verified_integrity_acknowledgement_boundary():
+    migration = read_doc("docs/migration.md")
+    migration_en = read_doc("docs/migration.en.md")
+    controls = read_doc("docs/wiki/v4.1-safety-controls.md")
+
+    for text in (migration, migration_en, controls):
+        assert "acknowledge-review" in text
+        assert "recovery_not_required" in text
+    for text in (migration, controls):
+        assert "其他 manual-review reason 必须先修复" in text
+        assert "重新运行 doctor" in text
+    assert "Every other manual-review reason must be repaired" in migration_en
+    assert "diagnosed again" in migration_en
+
+
 def test_v412_release_docs_define_gateway_restart_race_contract():
     changelog = read_doc("CHANGELOG.md")
     readme = read_doc("README.md")

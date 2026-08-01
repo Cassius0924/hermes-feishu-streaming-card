@@ -81,6 +81,7 @@ from .session import CardSession
 from .status import StatusConfig
 from .subscription_usage import fetch_codex_subscription_usage
 from .install.detect import HermesDetection, detect_hermes
+from .install.integrity import IntegrityRepairRefused, plan_integrity_repair
 from .install.recovery import execute_recovery, plan_recovery
 from .runtime_control import (
     RUNTIME_HOOK_GENERATION,
@@ -1902,6 +1903,10 @@ def _build_operations_report_sync(
             else load_config(config_path)
         )
         recovery_plan = plan_recovery(detection)
+        try:
+            integrity_plan = plan_integrity_repair(detection)
+        except (IntegrityRepairRefused, OSError, RuntimeError, ValueError):
+            integrity_plan = None
         server = config.get("server", {})
         event_url = (
             f"http://{server.get('host', '127.0.0.1')}:"
@@ -1912,6 +1917,7 @@ def _build_operations_report_sync(
             config,
             detection,
             recovery_plan,
+            integrity_plan=integrity_plan,
             health=health,
             profile_id=profile_id,
             profile_source=profile_source,

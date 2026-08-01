@@ -243,3 +243,7 @@ If `restore` refuses to overwrite, do not force-delete a hook. Compare run, requ
 - `status --config ...` prints `/health` metrics.
 - Hermes native text still works when the sidecar is unavailable.
 - `gateway/run.py` does not contain both legacy/dual and sidecar-only hooks.
+
+## Integrity review acknowledgement boundary
+
+`acknowledge-review` is not a general repair command. Doctor suggests it only after verifying an `installed` recovery state with no recovery actions and an `installed` integrity plan whose reason is `recovery_not_required`. Every other manual-review reason must be repaired and diagnosed again first.

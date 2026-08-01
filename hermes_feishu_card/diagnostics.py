@@ -10,6 +10,10 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from .install.detect import HermesDetection
+from .install.integrity import (
+    IntegrityRepairPlan,
+    integrity_acknowledgement_eligible,
+)
 from .install.recovery import RecoveryPlan, sanitize_recovery_plan
 from .profile_sources import PROFILE_SOURCES
 
@@ -256,6 +260,7 @@ def build_diagnostic_report(
     detection: HermesDetection,
     recovery_plan: RecoveryPlan,
     *,
+    integrity_plan: IntegrityRepairPlan | None = None,
     health: dict[str, object] | None = None,
     profile_id: str = "",
     profile_source: str = "",
@@ -347,7 +352,21 @@ def build_diagnostic_report(
         routing,
         recovery_plan,
     )
-    findings = (*findings, *_runtime_integrity_findings(health_data))
+    acknowledgement_eligible = bool(
+        integrity_plan is not None
+        and integrity_acknowledgement_eligible(
+            detection,
+            recovery_plan,
+            integrity_plan,
+        )
+    )
+    findings = (
+        *findings,
+        *_runtime_integrity_findings(
+            health_data,
+            acknowledgement_eligible=acknowledgement_eligible,
+        ),
+    )
     return DiagnosticReport(
         status=_status_for_findings(findings),
         created_at=time.time(),
@@ -873,6 +892,8 @@ def _build_runtime(
 
 def _runtime_integrity_findings(
     health: dict[str, object],
+    *,
+    acknowledgement_eligible: bool,
 ) -> tuple[DiagnosticFinding, ...]:
     readiness = _runtime_readiness(health.get("readiness"))
     if readiness.get("status") != "degraded":
@@ -886,10 +907,17 @@ def _runtime_integrity_findings(
         actions = (
             "Run hermes-feishu-card integrity migrate-safe --config CONFIG --hermes-dir PATH --yes, then rerun doctor.",
         )
+    elif (
+        reason == "manual_review_required"
+        and integrity_reason == "recovery_not_required"
+        and acknowledgement_eligible
+    ):
+        actions = (
+            "Run hermes-feishu-card doctor --explain; stop the sidecar; run hermes-feishu-card integrity acknowledge-review --config CONFIG --hermes-dir PATH --state-dir STATE --yes; then restart the sidecar and Hermes Gateway.",
+        )
     elif reason == "manual_review_required":
         actions = (
-            "Run hermes-feishu-card doctor --explain and review verified install-state findings.",
-            "After stopping the sidecar, run hermes-feishu-card integrity acknowledge-review --config CONFIG --hermes-dir PATH --state-dir STATE --yes.",
+            "Run hermes-feishu-card doctor --explain; resolve the reported install-state problem; then rerun doctor.",
         )
     else:
         actions = {
@@ -991,6 +1019,7 @@ def _runtime_integrity(value: object) -> dict[str, object]:
             "owned_backup_invalid",
             "owned_backup_mismatch",
             "git_target_modified",
+            "git_root_invalid",
             "verified_git_upgrade",
             "unsupported_anchors",
         },
