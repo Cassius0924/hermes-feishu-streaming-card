@@ -10095,6 +10095,74 @@ async def test_interrupt_abandons_stale_session_via_message_started(client):
     assert "已完成" in str(updates_for_old[-1])
 
 
+async def test_quoted_reply_with_new_message_id_opens_and_updates_new_card(client):
+    test_client, feishu_client = client
+    reply_anchor = "om_quoted_message"
+    conversation_id = "omt-topic"
+
+    first_started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": reply_anchor},
+            conversation_id=conversation_id,
+            message_id="om_first_reply",
+            thread_id=conversation_id,
+        ),
+    )
+    assert await first_started.json() == DELIVERED_RESPONSE
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            1,
+            {"reply_to_message_id": reply_anchor, "text": "第一轮内容"},
+            conversation_id=conversation_id,
+            message_id=reply_anchor,
+            thread_id=conversation_id,
+        ),
+    )
+    await wait_for_card_update(feishu_client, "第一轮内容")
+
+    second_started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": reply_anchor},
+            conversation_id=conversation_id,
+            message_id="om_second_reply",
+            thread_id=conversation_id,
+        ),
+    )
+
+    assert await second_started.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 2
+    assert [sent[3] for sent in feishu_client.sent] == [
+        "om_first_reply",
+        "om_second_reply",
+    ]
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            1,
+            {"reply_to_message_id": reply_anchor, "text": "第二轮内容"},
+            conversation_id=conversation_id,
+            message_id=reply_anchor,
+            thread_id=conversation_id,
+        ),
+    )
+    updated_message_id, _card = await wait_for_card_update(
+        feishu_client,
+        "第二轮内容",
+    )
+    assert updated_message_id == "feishu-message-2"
+
+
 async def test_interrupt_does_not_abandon_different_conversation(client):
     """Sessions in different conversations (e.g. different topic group threads)
     should NOT be abandoned when a new session is created."""
