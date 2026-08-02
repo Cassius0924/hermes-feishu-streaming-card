@@ -934,6 +934,55 @@ def test_apply_patch_restores_hooks_after_turn_runner_refactor():
     assert patcher.remove_patch(patched) == content
 
 
+def test_turn_id_patcher_seam_keeps_one_source_object_across_all_callbacks():
+    content = TURN_RUNNER_FIXTURE.read_text(encoding="utf-8")
+    patched = patcher.apply_patch(content, strategy="gateway_run_013_plus")
+    tree = ast.parse(patched)
+    handler = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_handle_message_with_agent"
+    )
+    assert [argument.arg for argument in handler.args.args][-3:] == [
+        "source",
+        "_quick_key",
+        "run_generation",
+    ]
+    bindings = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute) and target.attr == "source"
+            for target in node.targets
+        )
+    ]
+    assert len(bindings) == 1
+    assert isinstance(bindings[0].value, ast.Name)
+    assert bindings[0].value.id == "source"
+
+    started = patched[
+        patched.index(patcher.PATCH_BEGIN) : patched.index(patcher.PATCH_END)
+    ]
+    completed = patched[
+        patched.index(patcher.COMPLETE_PATCH_BEGIN) : patched.index(
+            patcher.COMPLETE_PATCH_END
+        )
+    ]
+    assert "**locals()" in started
+    assert "**locals()" in completed
+    for marker in (
+        patcher.STABLE_TOOL_PATCH_BEGIN,
+        patcher.ANSWER_DELTA_PATCH_BEGIN,
+        patcher.THINKING_DELTA_PATCH_BEGIN,
+    ):
+        begin = patched.index(marker)
+        end = patched.index("PATCH_END", begin)
+        assert '"source": _hfc_turn_ctx.source' in patched[begin:end]
+    assert patcher.remove_patch(patched) == content
+
+
 def test_apply_patch_uses_stable_tool_call_ids_when_gateway_exposes_callbacks():
     content = (
         "async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):\n"

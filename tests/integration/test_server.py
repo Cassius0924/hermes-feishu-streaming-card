@@ -471,6 +471,7 @@ def event_payload(
     message_id="hermes-message-1",
     chat_id="oc_abc",
     thread_id="",
+    turn_id="",
     created_at=None,
 ):
     data = dict(data or {})
@@ -497,6 +498,8 @@ def event_payload(
     }
     if thread_id:
         payload["thread_id"] = thread_id
+    if turn_id:
+        payload["turn_id"] = turn_id
     return payload
 
 
@@ -10093,6 +10096,176 @@ async def test_interrupt_abandons_stale_session_via_message_started(client):
     ]
     assert len(updates_for_old) >= 2
     assert "已完成" in str(updates_for_old[-1])
+
+
+async def test_late_terminal_with_turn_id_does_not_complete_new_quoted_turn(client):
+    test_client, feishu_client = client
+    quote = "om_shared_quote"
+    conversation = "omt_topic"
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": quote},
+            conversation_id=conversation,
+            message_id="om_turn_a",
+            turn_id="om_turn_a",
+        ),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": quote},
+            conversation_id=conversation,
+            message_id="om_turn_b",
+            turn_id="om_turn_b",
+        ),
+    )
+    late = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"reply_to_message_id": quote, "answer": "A FINAL"},
+            conversation_id=conversation,
+            message_id=quote,
+            turn_id="om_turn_a",
+        ),
+    )
+
+    assert await late.json() == {"ok": True, "applied": True}
+    b_delta = await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            1,
+            {"reply_to_message_id": quote, "text": "B LIVE"},
+            conversation_id=conversation,
+            message_id=quote,
+            turn_id="om_turn_b",
+        ),
+    )
+    assert (await b_delta.json())["applied"] is True
+
+    sessions = test_client.app[SESSIONS_KEY]
+    assert sessions["om_turn_b"].status not in {"completed", "failed"}
+    assert "A FINAL" not in sessions["om_turn_b"].answer_text
+    assert "B LIVE" in sessions["om_turn_b"].answer_text
+    await _wait_until(
+        lambda: any(
+            message_id == "feishu-message-2" and "B LIVE" in str(card)
+            for message_id, card in feishu_client.updated
+        )
+    )
+    assert all(
+        "A FINAL" not in str(card)
+        for message_id, card in feishu_client.updated
+        if message_id == "feishu-message-2"
+    )
+
+
+def test_explicit_turn_id_never_consults_a_preexisting_alias():
+    event = SidecarEvent.from_dict(
+        event_payload(
+            "message.completed",
+            2,
+            {"answer": "late A"},
+            message_id="om_quote",
+            turn_id="om_turn_a",
+        )
+    )
+    app = {
+        SESSIONS_KEY: {
+            "om_turn_b": CardSession("conversation-1", "om_turn_b", "oc_abc")
+        },
+        SESSION_ALIASES_KEY: {"om_turn_a": "om_turn_b"},
+    }
+
+    assert sidecar_server._resolve_session_key(app, event) == "om_turn_a"
+
+
+async def test_legacy_quoted_reply_without_turn_id_keeps_alias_routing(client):
+    test_client, _feishu_client = client
+    quote = "om_legacy_quote"
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_to_message_id": quote},
+            message_id="om_legacy_turn",
+        ),
+    )
+    delta = await test_client.post(
+        "/events",
+        json=event_payload(
+            "answer.delta",
+            1,
+            {"reply_to_message_id": quote, "text": "legacy delta"},
+            message_id=quote,
+        ),
+    )
+
+    assert (await delta.json())["applied"] is True
+    assert "legacy delta" in (
+        test_client.app[SESSIONS_KEY]["om_legacy_turn"].answer_text
+    )
+    assert quote not in test_client.app[SESSIONS_KEY]
+
+
+async def test_shared_alias_cleanup_preserves_new_canonical_owner(client):
+    test_client, _feishu_client = client
+    quote = "om_shared_cleanup_quote"
+    for turn_id in ("om_turn_a", "om_turn_b"):
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"reply_to_message_id": quote},
+                message_id=turn_id,
+                turn_id=turn_id,
+            ),
+        )
+
+    app = test_client.app
+    assert app[SESSION_ALIASES_KEY][quote] == "om_turn_b"
+    failed_a = app[SESSIONS_KEY]["om_turn_a"]
+    config_a = app[SESSION_CARD_CONFIGS_KEY].get("om_turn_a")
+    sidecar_server._cleanup_failed_session_state(
+        app,
+        "om_turn_a",
+        failed_session=failed_a,
+        session_card_config=config_a,
+    )
+
+    assert app[SESSION_ALIASES_KEY][quote] == "om_turn_b"
+    assert app[SESSIONS_KEY]["om_turn_b"].status == "thinking"
+
+
+def test_native_handoff_identity_uses_canonical_turn_not_reply_anchor():
+    event = SidecarEvent.from_dict(
+        event_payload(
+            "message.completed",
+            2,
+            {"profile_id": "work", "answer": "done"},
+            conversation_id="omt_topic",
+            message_id="om_shared_quote",
+            chat_id="oc_chat",
+            turn_id="om_turn_a",
+        )
+    )
+
+    assert sidecar_server._native_handoff_identity(event) == handoff_identity_key(
+        profile_id="work",
+        chat_id="oc_chat",
+        conversation_id="omt_topic",
+        message_id="om_turn_a",
+    )
 
 
 async def test_quoted_reply_with_new_message_id_opens_and_updates_new_card(client):

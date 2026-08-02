@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -16,6 +17,7 @@ from hermes_feishu_card.install.integrity import (
     _atomic_replace_many,
     build_integrity_provenance,
     execute_integrity_repair,
+    integrity_acknowledgement_eligible,
     migrate_integrity_manifest,
     plan_integrity_repair,
 )
@@ -26,6 +28,7 @@ from hermes_feishu_card.install.patcher import (
     remove_cron_patch,
     remove_patch,
 )
+from hermes_feishu_card.install.recovery import plan_recovery
 
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "hermes_v2026_4_23"
@@ -147,6 +150,25 @@ def _commit_upstream_upgrade(root, detection, run_source, cron_source):
     _git(root, "add", "gateway/run.py", "cron/scheduler.py")
     _git(root, "commit", "-qm", "upgrade Hermes")
     return upgraded_run, upgraded_cron
+
+
+def test_integrity_acknowledgement_eligible_requires_exact_installed_plan(
+    git_installed_state,
+):
+    _root, detection, _run_source, _cron_source = git_installed_state
+    recovery = plan_recovery(detection)
+    integrity = plan_integrity_repair(detection)
+
+    assert integrity_acknowledgement_eligible(
+        detection,
+        recovery,
+        integrity,
+    )
+    assert not integrity_acknowledgement_eligible(
+        detection,
+        recovery,
+        replace(integrity, reason="git_target_modified"),
+    )
 
 
 def test_integrity_plan_accepts_only_clean_descendant_git_upgrade(git_installed_state):

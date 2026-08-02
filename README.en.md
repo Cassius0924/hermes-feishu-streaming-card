@@ -141,7 +141,7 @@ For an existing Hermes container:
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.4
+export HFC_VERSION=v4.2.5
 bash install-docker.sh
 ```
 
@@ -154,7 +154,7 @@ Defaults:
 | `HFC_ENV_FILE` | `/opt/data/.env` |
 | `HFC_VERSION` | `latest` |
 
-`docker-compose.example.yml` is an integration example, not an official image. Since V3.8.6, Docker/source-stripped Hermes roots without `VERSION` or `.git` can fall back to Gateway anchors and still choose `gateway_run_013_plus`.
+`docker-compose.example.yml` is an integration example, not an official image. Since V3.8.6, Docker/source-stripped Hermes roots without `VERSION` or `.git` can fall back to Gateway anchors and still choose `gateway_run_013_plus`. `latest` resolves once to the exact `vX.Y.Z` tag of the latest stable GitHub Release and installs that pinned ref. Lookup, response, or tag-validation failure stops before credential prompting, pip, setup, doctor, or Docker state mutation. An explicit release tag stays pinned and bypasses the Release API; only explicit `--version main` (PowerShell: `-Version main`) opts into the moving development branch.
 
 ## Common Commands
 
@@ -181,6 +181,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ![Feishu topic reply card continuity and reasoning/tool timeline showcase](docs/assets/feishu-topic-card-showcase-v389.png)
 | Version | Highlights |
 |---|---|
+| [v4.2.5](docs/release-notes-v4.2.5.en.md) | Audit safety hotfix for canonical turn isolation, maintenance ownership/checkout/drain recovery, executable doctor actions, pinned stable-tag installs, and an exact tested annotated-tag release gate |
 | [v4.2.4](docs/release-notes-v4.2.4.en.md) | Fixes consecutive Feishu/Lark topic replies quoting the same message overwriting the first reply card; every new message opens an independent card while in-turn streaming still resolves through the reply alias |
 | [v4.2.3](docs/release-notes-v4.2.3.en.md) | Preserves `update_evidence_fingerprint` when the WebSocket hook forwards `/update` actions, allowing the sidecar to complete evidence-bound confirm/cancel transitions while missing or mismatched evidence remains fail-closed |
 | [v4.2.2](docs/release-notes-v4.2.2.en.md) | Fixes `/update` confirmation actions that changed durable state without PATCHing the original card; cancel now renders a terminal state and never starts the updater, while confirm shows preparation before scheduling maintenance |

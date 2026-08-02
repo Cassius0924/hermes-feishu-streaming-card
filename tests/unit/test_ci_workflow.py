@@ -40,11 +40,109 @@ def test_release_assets_workflow_supports_manual_package_dry_run():
 
     assert "workflow_dispatch:" in text
     assert "inputs:" in text
-    assert "tag:" in text
+    assert "tag_ref:" in text
     assert "Build install packages" in text
     assert "gh release upload" in text
     assert "install-docker.sh" in text
     assert "docker-compose.example.yml" in text
+
+
+def test_release_workflow_packages_only_after_reusable_test_gate():
+    text = (ROOT / ".github" / "workflows" / "release-assets.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "resolve-release:" in text
+    assert "release-gate:" in text
+    assert "uses: ./.github/workflows/tests.yml" in text
+    assert "needs: [resolve-release, release-gate]" in text
+    assert "checkout_ref: ${{ needs.resolve-release.outputs.commit }}" in text
+
+
+def test_release_write_permission_is_scoped_to_package_job():
+    text = (ROOT / ".github" / "workflows" / "release-assets.yml").read_text(
+        encoding="utf-8"
+    )
+    prefix, package = text.split("  package:", 1)
+
+    assert "permissions:\n  contents: read" in prefix
+    assert "contents: write" not in prefix
+    assert "permissions:\n      contents: write" in package
+
+
+def test_reusable_ci_checks_out_requested_ref_in_every_job():
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "tests.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    checkout_steps = [
+        step
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if step.get("uses") == "actions/checkout@v4"
+    ]
+
+    assert checkout_steps
+    assert all(
+        step.get("with", {}).get("ref")
+        == "${{ inputs.checkout_ref || github.sha }}"
+        for step in checkout_steps
+    )
+
+
+def test_reusable_ci_runs_powershell_installer_tests():
+    text = (ROOT / ".github" / "workflows" / "tests.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Test Windows installer contract" in text
+    assert (
+        'python -m pytest tests/unit/test_install_scripts.py -k "powershell" -q'
+        in text
+    )
+    assert "gh release upload" not in text
+    assert "gh release create" not in text
+
+
+def test_release_package_reruns_full_gate_after_exact_checkout():
+    text = (ROOT / ".github" / "workflows" / "release-assets.yml").read_text(
+        encoding="utf-8"
+    )
+    package = text.split("  package:", 1)[1]
+
+    checkout_index = package.index(
+        "ref: ${{ needs.resolve-release.outputs.commit }}"
+    )
+    verifier_positions = []
+    start = 0
+    needle = "python scripts/verify_release.py"
+    while True:
+        position = package.find(needle, start)
+        if position < 0:
+            break
+        verifier_positions.append(position)
+        start = position + len(needle)
+    build_index = package.index("Build install packages")
+    upload_index = min(
+        package.index("gh release upload"),
+        package.index("gh release create"),
+    )
+
+    assert len(verifier_positions) == 2
+    assert checkout_index < verifier_positions[0] < build_index
+    assert build_index < verifier_positions[1] < upload_index
+    assert package.count("--require-main-ancestor") == 2
+
+
+def test_release_dispatch_accepts_only_full_semver_tag_ref():
+    text = (ROOT / ".github" / "workflows" / "release-assets.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "tag_ref:" in text
+    assert "^refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+$" in text
+    assert 'tag="${tag_ref#refs/tags/}"' in text
 
 
 def test_docker_compose_example_documents_container_paths():

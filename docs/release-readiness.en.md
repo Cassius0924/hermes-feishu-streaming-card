@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.2.4`. Issue #175 proved that consecutive Feishu/Lark topic replies quoting the same message could make the old hook reuse the reply anchor as a new turn's message ID, sharing one session and overwriting the first card. V4.2.4 gives `message.started` the real incoming ID and bypasses reply aliases only for a new turn; later in-turn streaming events continue to update the current card through aliases. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.2.5`. This audit covers canonical turn isolation, maintenance reentry/checkout/drain recovery, executable doctor actions, stable-tag resolution across all installers, public-template version consistency, and an exact tested annotated-tag Release Assets gate. Full automation, build, real acceptance, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -146,6 +146,19 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.2.5 Release Gates
+
+Accepted runtime SHA: `7f87beed8a37a365c10483f3d638092fd422782e`
+
+- Candidate acceptance record: **2026-08-02 11:31:18 CST (Asia/Shanghai)** on **macOS arm64**; the read-only Hermes checkout identified itself as `v2026.7.30-15-gce6dd1a65-dirty` and was not modified by this flow; the isolated HFC package and runtime both reported `4.2.5`.
+- Real-Feishu topic acceptance: **passed**. Exactly two A/B cards were created in the most recent still-valid topic of the existing test group. The sidecar reported `events_applied=4/4`, `feishu_send_successes=2/2`, `events_rejected=0`, and zero send/update failures. After A was successfully created, the harness stopped early because it incorrectly treated the hook Boolean as the sole delivery result; recovery reused that same A card and never sent a third card. A's first marker and its late marker after B started were both PATCHed successfully; B's first delta and terminal were completed through the candidate hook/sidecar; B's indexed summary contained no A/late marker; and the two cards had distinct IDs.
+- Feishu history returns the initial body snapshot for a PATCHed card, so that stale body is not used as current-content evidence for A. A's state transition is instead supported by two successful PATCH calls, `updated=true`, an advanced `update_time`, and zero update failures. B is supported by the sidecar summary and event/send/update counters. This limitation is retained as an explicit evidence boundary and does not change the two-card, no-cross-write conclusion.
+- Accepted-runtime automation: runtime focused `938 passed`; maintenance focused `223 passed`; installer/release focused `159 passed, 3 skipped`; disposable maintenance smoke `6 passed`; full pytest **`2400 passed, 5 skipped`**. The first sandboxed runtime-focused attempt failed only because binding ephemeral `127.0.0.1` ports was denied; the unchanged command passed completely when rerun outside the sandbox under the project's loopback-test authorization.
+- Named regressions cover all nine audit IDs across quoted turns, maintenance ownership/binding/drain, doctor actions, installer pinning, and the config marker.
+- A failed `latest` lookup must stop before pip/setup/doctor and Docker state mutation; explicit `main` is the only moving ref.
+- Release Assets must run `resolve-release -> reusable exact-commit tests -> package`, with full annotated-tag verification before build and again before upload.
+- Candidate full pytest, compileall, package provenance, disposable maintenance smoke, real acceptance, PR CI, exact merge, public tag/install, and all four assets are **recorded only as each release gate completes**.
 
 ## V4.2.4 Release Gates
 

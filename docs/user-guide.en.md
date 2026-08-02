@@ -75,6 +75,7 @@ An exact bare `/update` in a Feishu private chat first performs read-only checks
 - V4.2.2 asynchronously PATCHes the original confirmation card after the button callback is acknowledged: cancel reaches a terminal state without starting the updater, while confirm shows locking/preparation before scheduling independent maintenance.
 - V4.2.3 forwards the update evidence fingerprint, `update_evidence_fingerprint`, unchanged through the WebSocket hook to the sidecar, so confirm/cancel reach the existing evidence-bound transition logic; missing or mismatched evidence remains fail-closed.
 - V4.2.4 gives every new quoted topic reply its real incoming message ID and an independent card; later in-turn stream events still update that turn's card through the reply alias instead of overwriting a previous turn.
+- V4.2.5 pins session, sequence, and policy to canonical `turn_id`, hardens maintenance owner/checkout/external-drain recovery, and makes doctor, all three installers, and Release Assets fail closed when evidence is incomplete.
 
 See the [V4.2.0 release notes](release-notes-v4.2.0.en.md) for the complete boundary and acceptance steps.
 
@@ -495,14 +496,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.2.4`.
+The Compose example defaults `HFC_VERSION` to `v4.2.5`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.4
+export HFC_VERSION=v4.2.5
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -745,6 +746,7 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.2.5](release-notes-v4.2.5.en.md) | 2026-08-02 | Audit safety hotfix for canonical turn isolation, maintenance recovery, executable doctor actions, pinned stable-tag installs, and an exact tested tag release gate |
 | [v4.2.4](release-notes-v4.2.4.en.md) | 2026-08-01 | Every new reply quoting the same topic message opens an independent card while in-turn streaming remains correlated through the reply alias |
 | [v4.2.3](release-notes-v4.2.3.en.md) | 2026-08-01 | The WebSocket hook preserves `/update` evidence fingerprints so the sidecar can complete evidence-bound confirm/cancel transitions; missing or mismatched evidence remains fail-closed |
 | [v4.2.2](release-notes-v4.2.2.en.md) | 2026-08-01 | `/update` confirm/cancel asynchronously PATCH the original card after fast acknowledgement; cancel is terminal with no updater, and confirm publishes preparation before maintenance starts |
@@ -864,3 +866,7 @@ Thanks to these contributors for improving the project:
 Default loopback uses local-process trust; do not expose an unauthenticated sidecar to the network. Non-loopback requires explicit `server.allow_non_loopback: true` and state-directory HMAC event authentication. Event authentication does not encrypt traffic, so public deployment still requires TLS/mTLS or a controlled reverse proxy. Do not commit App Secret, tenant token, or real chat_id. Production credentials belong in local config or environment variables.
 
 Windows non-loopback startup is rejected when state-directory ACL privacy cannot be verified. Windows loopback remains available under local-process trust without claiming that ACL privacy has been verified.
+
+## Installer version resolution
+
+`latest` resolves once to the exact `vX.Y.Z` tag of the latest stable GitHub Release and installs that pinned ref. Lookup, JSON parsing, or tag validation failure stops before credential prompting, pip, doctor, setup, and Docker state writes. Explicit release tags bypass the Release API; only explicit `--version main` selects the moving development branch.

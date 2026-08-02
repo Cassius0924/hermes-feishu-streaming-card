@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.2.4`。Issue #175 证明飞书/Lark 话题中连续引用同一消息时，旧 hook 会把 reply anchor 当作新 turn 的 message ID，导致多轮共用 session 并覆盖第一张卡。V4.2.4 让 `message.started` 使用真实入站 ID，并仅对新 turn 跳过 reply alias；同一轮后续流式事件仍按 alias 更新本轮卡片。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.2.5`。本轮审查覆盖 canonical turn 隔离、maintenance 重入/checkout/drain 恢复、doctor 可执行建议、三端 installer 的 stable-tag 解析、公开模板版本一致性和 exact tested annotated-tag Release Assets gate。完整自动化、构建、真实验收、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -146,6 +146,19 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.2.5 发布门禁
+
+Accepted runtime SHA: `7f87beed8a37a365c10483f3d638092fd422782e`
+
+- 候选验收记录：**2026-08-02 11:31:18 CST（Asia/Shanghai）**；平台为 **macOS arm64**；Hermes checkout 版本为 `v2026.7.30-15-gce6dd1a65-dirty`（仅只读用于验收，未由本次流程修改）；隔离运行的 HFC package/runtime 均为 `4.2.5`。
+- 真实飞书 topic 验收：**通过**。在最近仍有效的既有测试群 topic 中严格只创建两张 A/B 卡；sidecar 报告 `events_applied=4/4`、`feishu_send_successes=2/2`、`events_rejected=0`、send/update failure 均为 `0`。首次 A 已成功创建后，验收夹具因错误依赖 hook 布尔返回提前停止；恢复流程复用同一张 A，没有重发第三张卡。A 的首段与 B started 后的迟到标记均 PATCH 成功，B 的首段与 terminal 由候选 hook/sidecar 完成，B summary 已索引且不含 A/late 标记，两张卡 ID 不同。
+- 飞书历史消息接口对已 PATCH 卡片返回初始正文快照，因此不把该正文快照当作 A 的当前内容证据；A 以两次 PATCH 成功、`updated=true`、`update_time` 前进和零 update failure 证明状态转换。B 以 sidecar summary 与事件/发送/更新计数证明。该限制不影响“两张卡、无跨写”的通过结论，但保留为验收证据边界。
+- accepted runtime 自动化：runtime focused `938 passed`；maintenance focused `223 passed`；installer/release focused `159 passed, 3 skipped`；disposable maintenance smoke `6 passed`；完整 pytest **`2400 passed, 5 skipped`**。沙箱内首次 runtime focused 运行因禁止绑定 `127.0.0.1` 临时端口失败，按项目授权在沙箱外原样重跑后全部通过。
+- 九个审查 ID 均有命名回归，覆盖 quoted turn、maintenance ownership/binding/drain、doctor action、installer pin 与 config marker。
+- `latest` 解析失败必须在 pip/setup/doctor 和 Docker state mutation 前退出；显式 `main` 是唯一 moving ref。
+- Release Assets 必须按 `resolve-release -> reusable exact-commit tests -> package` 执行，并在 build 前和 upload 前 full reverify annotated tag。
+- 候选完整 pytest、compileall、package provenance、disposable maintenance smoke、真实验收、PR CI、exact merge、public tag/install 与四个 assets：**发布流程中逐项记录**。
 
 ## V4.2.4 发布门禁
 

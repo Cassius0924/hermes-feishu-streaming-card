@@ -20,7 +20,7 @@ from hermes_feishu_card.diagnostics import DiagnosticFinding, DiagnosticReport
 from hermes_feishu_card.delivery_policy import ChatDeliveryPolicy
 from hermes_feishu_card.feishu_client import FeishuAPIError
 from hermes_feishu_card.native_handoff import NativeHandoffStore
-from hermes_feishu_card.server import create_app
+from hermes_feishu_card.server import SESSIONS_KEY, create_app
 from hermes_feishu_card.operations_transport import ensure_transport_root_secret
 
 
@@ -209,6 +209,109 @@ async def test_hook_signed_policy_query_and_server_native_boundary_end_to_end(
     assert feishu_client.sent == []
     assert health["metrics"]["policy_queries"] == 1
     assert health["active_sessions"] == 0
+
+
+async def test_quoted_turn_identity_survives_hook_to_sidecar_end_to_end(
+    tmp_path,
+    monkeypatch,
+):
+    root_secret = b"q" * 32
+    feishu_client = _OperationsFeishuClient()
+    app = create_app(
+        feishu_client,
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff"),
+        operations_transport_root_secret=root_secret,
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    posted = []
+    original_post = hook_runtime._post_json_response
+
+    async def capture_post(url, payload, timeout):
+        posted.append(json.loads(json.dumps(payload)))
+        return await original_post(url, payload, timeout)
+
+    def real_policy(url, payload, timeout):
+        return hook_runtime._post_json_sync_response(url, payload, timeout)
+
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_EVENT_URL",
+        str(client.make_url("/events")),
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "read_transport_root_secret",
+        lambda: root_secret,
+    )
+    monkeypatch.setattr(hook_runtime, "_fetch_delivery_policy_sync", real_policy)
+    monkeypatch.setattr(hook_runtime, "_post_json_response", capture_post)
+    quote = "om_shared_quote"
+    source_a = SimpleNamespace(
+        platform="feishu",
+        chat_id="oc_e2e",
+        conversation_id="omt_e2e",
+        message_id=quote,
+    )
+    source_b = SimpleNamespace(
+        platform="feishu",
+        chat_id="oc_e2e",
+        conversation_id="omt_e2e",
+        message_id=quote,
+    )
+    event_a = SimpleNamespace(message_id="om_turn_a")
+    event_b = SimpleNamespace(message_id="om_turn_b")
+    try:
+        assert await hook_runtime.emit_from_hermes_locals_async(
+            {"source": source_a, "event": event_a, "message_id": "om_turn_a"},
+            "message.started",
+        )
+        assert await hook_runtime.emit_from_hermes_locals_async(
+            {"source": source_a, "message_id": quote, "text": "A FIRST"},
+            "answer.delta",
+        )
+        assert await hook_runtime.emit_from_hermes_locals_async(
+            {"source": source_b, "event": event_b, "message_id": "om_turn_b"},
+            "message.started",
+        )
+        assert await hook_runtime.emit_from_hermes_locals_async(
+            {
+                "source": source_a,
+                "event": event_a,
+                "message_id": quote,
+                "answer": "A FINAL",
+            },
+            "message.completed",
+        )
+        assert await hook_runtime.emit_from_hermes_locals_async(
+            {"source": source_b, "message_id": quote, "text": "B LIVE"},
+            "answer.delta",
+        )
+        health = await (await client.get("/health")).json()
+        a_session = next(
+            session
+            for session in app[SESSIONS_KEY].values()
+            if session.message_id == "om_turn_a"
+        )
+        b_session = next(
+            session
+            for session in app[SESSIONS_KEY].values()
+            if session.message_id == "om_turn_b"
+        )
+        a_status = a_session.status
+        a_answer = a_session.answer_text
+        b_answer = b_session.answer_text
+    finally:
+        await client.close()
+
+    a_wire = [item for item in posted if item.get("turn_id") == "om_turn_a"]
+    b_wire = [item for item in posted if item.get("turn_id") == "om_turn_b"]
+    assert [item["sequence"] for item in a_wire] == [0, 1, 2]
+    assert [item["sequence"] for item in b_wire] == [0, 1]
+    assert a_status == "completed"
+    assert a_answer == "A FIRST"
+    assert "B LIVE" in b_answer
+    assert "A FINAL" not in b_answer
+    assert health["metrics"]["policy_queries"] == 2
 
 
 async def test_installed_hook_posts_started_event_to_mock_sidecar(tmp_path, monkeypatch):

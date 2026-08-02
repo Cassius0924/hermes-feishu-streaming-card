@@ -138,10 +138,11 @@ sidecar 仍应创建 session 并发送初始卡片，不能把整条流计入 `e
 关键规则：
 
 - 首张卡片通常锚定用户 topic message id。
-- 后续事件可能只带 Hermes 内部 streaming `message_id`。
-- hook runtime 必须保存 Relay `source.message_id`。
-- sidecar 创建新 session 前先用 `reply_to_message_id` 查已有 active card。
-- 找到后继续 PATCH 原卡片，不新建重复卡片。
+- hook runtime 从真实入站 `event.message_id` 绑定可选 `turn_id`，同一轮后续事件继续携带这个稳定值；`message_id` 仍可表示 Hermes 内部 streaming/reply identity。
+- `reply_to_message_id` 只决定飞书回复锚点，不决定 session ownership。
+- sidecar 对显式 `turn_id` 启用 canonical turn hard fence：session、sequence、policy 与 native handoff 都使用 `turn_id`，绝不查询 reply alias。
+- 旧 hook 缺少 `turn_id` 时继续走兼容路径：sidecar 可用 `reply_to_message_id` 查已有 active card，找到后继续 PATCH 原卡片。
+- hook runtime 不把 `source.message_id` 当 canonical turn identity；它只保留 Feishu reply anchor 语义。
 
 这条规则解决：
 

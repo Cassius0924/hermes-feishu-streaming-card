@@ -10,6 +10,7 @@ import pytest
 from hermes_feishu_card.maintenance_store import (
     ArtifactMetadata,
     MaintenanceRefused,
+    UpdateLockLease,
     acquire_update_lock,
     create_job,
     consume_job_credentials,
@@ -20,9 +21,11 @@ from hermes_feishu_card.maintenance_store import (
     load_verified_artifact,
     load_active_drain_lease,
     maintenance_paths,
+    load_job_credentials,
     prune_jobs,
     release_drain_lease,
     require_drain_lease,
+    require_update_lock_lease,
     reserve_drain_lease,
     stage_job_credentials,
     stage_wheel_artifact,
@@ -215,6 +218,26 @@ def test_update_lock_is_exclusive(tmp_path):
                 raise AssertionError("lock must not be acquired twice")
 
 
+def test_forged_and_stale_same_job_lock_leases_are_rejected(tmp_path):
+    paths = maintenance_paths(tmp_path / "state")
+    with acquire_update_lock(paths, job_id="job-1") as real:
+        forged = UpdateLockLease(
+            job_id=real.job_id,
+            path=real.path,
+            _owner_token=real._owner_token,
+        )
+        with pytest.raises(MaintenanceRefused, match="not active"):
+            require_update_lock_lease(
+                paths,
+                job_id="job-1",
+                lease=forged,
+            )
+        stale = real
+
+    with pytest.raises(MaintenanceRefused, match="not active"):
+        require_update_lock_lease(paths, job_id="job-1", lease=stale)
+
+
 def test_update_lock_rejects_symlink_target(tmp_path):
     paths = maintenance_paths(tmp_path / "state")
     paths.root.mkdir(parents=True)
@@ -327,6 +350,27 @@ def test_job_credentials_are_private_allowlisted_and_consumed_once(tmp_path):
     assert not path.exists()
     assert consume_job_credentials(paths, job_id="job-1") == {}
     assert discard_job_credentials(paths, job_id="job-1") is False
+
+
+def test_job_environment_is_private_allowlisted_and_one_shot(tmp_path):
+    paths = maintenance_paths(tmp_path / "state")
+    staged = stage_job_credentials(
+        paths,
+        job_id="job-1",
+        environment={
+            "HTTPS_PROXY": "http://127.0.0.1:7897",
+            "UNSAFE_VALUE": "drop-me",
+        },
+    )
+
+    assert staged is not None
+    assert load_job_credentials(paths, job_id="job-1") == {
+        "HTTPS_PROXY": "http://127.0.0.1:7897"
+    }
+    assert consume_job_credentials(paths, job_id="job-1") == {
+        "HTTPS_PROXY": "http://127.0.0.1:7897"
+    }
+    assert not staged.exists()
 
 
 def test_prune_jobs_keeps_five_recent_and_removes_jobs_older_than_seven_days(

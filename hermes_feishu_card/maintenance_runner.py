@@ -5,86 +5,162 @@ import asyncio
 import os
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Mapping
 
 from .config import load_config
 from .maintenance_card import FeishuJobPublisher
 from .maintenance_store import (
+    MaintenancePaths,
     MaintenanceRefused,
+    PROXY_ENVIRONMENT_KEYS,
+    TERMINAL_UPDATE_PHASES,
+    UpdateLockBusy,
+    UpdateLockLease,
+    UpdateJob,
+    acquire_update_lock,
     consume_job_credentials,
-    discard_job_credentials,
     load_job,
     maintenance_paths,
-    release_drain_lease,
+    require_update_lock_lease,
     transition_job,
 )
-from .maintenance_update import run_job, set_gateway_external_drain
+from .maintenance_update import _cleanup_terminal_owned_job, run_job
 from .process import fetch_health
 from .runner import NoopFeishuClient, build_feishu_client
+
+
+_RUNNER_PHASE_RECOVERY_BOUNDARIES = {
+    "locking": "no_mutation",
+    "draining": "no_mutation",
+    "restoring_hooks": "old_hfc_or_manual",
+    "updating_hermes": "updater_result_classified",
+    "reinstalling_hfc": "native_hermes",
+    "starting_services": "service_recovery",
+    "verifying": "service_recovery",
+}
+
+
+def _terminalize_owned_runner_failure(
+    paths: MaintenancePaths,
+    job_path: Path,
+    lease: UpdateLockLease,
+    *,
+    error_code: str,
+    base_environment: Mapping[str, str],
+    proxy_environment: Mapping[str, str],
+) -> UpdateJob:
+    current = load_job(job_path)
+    require_update_lock_lease(
+        paths,
+        job_id=current.job_id,
+        lease=lease,
+    )
+    if current.phase not in TERMINAL_UPDATE_PHASES:
+        current = transition_job(
+            current.path,
+            expected_phase=current.phase,
+            phase="failed",
+            result={
+                "error_code": error_code,
+                "recovery_boundary": _RUNNER_PHASE_RECOVERY_BOUNDARIES[current.phase],
+                "status": "failed",
+            },
+        )
+    require_update_lock_lease(
+        paths,
+        job_id=current.job_id,
+        lease=lease,
+    )
+    _cleanup_terminal_owned_job(
+        current,
+        base_environment=base_environment,
+        proxy_environment=proxy_environment,
+    )
+    return current
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="hfc-maintenance-runner")
     parser.add_argument("--job", required=True)
     args = parser.parse_args(argv)
-    job = None
-    paths = None
     try:
         job = load_job(Path(args.job), require_private=True)
         paths = maintenance_paths(job.path.parent.parent)
-        for key, value in consume_job_credentials(
-            paths,
-            job_id=job.job_id,
-        ).items():
-            os.environ[key] = value
-        config = (
-            load_config(job.config_path, env_file=job.env_file)
-            if job.env_file is not None
-            else load_config(job.config_path)
-        )
-        profile_config = _profile_config(config, job.profile_id)
-        profile_config = _bot_profile_config(profile_config, job.bot_id)
-        client = build_feishu_client(profile_config)
-        if isinstance(client, NoopFeishuClient):
-            raise MaintenanceRefused("Feishu credentials are unavailable")
-        publisher = FeishuJobPublisher(client)
-        result = run_job(
-            job.path,
-            fetch_health=lambda: fetch_health(profile_config),
-            publish=lambda current: asyncio.run(publisher.publish(current)),
-            maintenance_python=Path(sys.executable),
-        )
-        discard_job_credentials(paths, job_id=job.job_id)
     except (MaintenanceRefused, OSError, ValueError):
-        if job is not None and paths is not None:
-            try:
-                current = load_job(job.path)
-                if current.phase not in {"succeeded", "failed", "cancelled"}:
-                    transition_job(
-                        current.path,
-                        expected_phase=current.phase,
-                        phase="failed",
-                        result={
-                            "error_code": "runner_initialization_failed",
-                            "recovery_boundary": "no_mutation",
-                            "status": "failed",
-                        },
-                    )
-            except Exception:
-                pass
-            try:
-                release_drain_lease(paths, owner_id=job.job_id)
-            except Exception:
-                pass
-            try:
-                set_gateway_external_drain(job.hermes_root, active=False)
-            except Exception:
-                pass
-            try:
-                discard_job_credentials(paths, job_id=job.job_id)
-            except Exception:
-                pass
         return 1
+
+    try:
+        try:
+            with acquire_update_lock(paths, job_id=job.job_id) as lease:
+                base_environment = dict(os.environ)
+                proxy_environment: dict[str, str] = {}
+                try:
+                    environment = consume_job_credentials(
+                        paths,
+                        job_id=job.job_id,
+                    )
+                    proxy_environment = {
+                        key: value
+                        for key, value in environment.items()
+                        if key in PROXY_ENVIRONMENT_KEYS
+                    }
+                    for key in ("FEISHU_APP_ID", "FEISHU_APP_SECRET"):
+                        value = environment.get(key)
+                        if value:
+                            os.environ[key] = value
+                    base_environment = dict(os.environ)
+                    config = (
+                        load_config(job.config_path, env_file=job.env_file)
+                        if job.env_file is not None
+                        else load_config(job.config_path)
+                    )
+                    profile_config = _bot_profile_config(
+                        _profile_config(config, job.profile_id),
+                        job.bot_id,
+                    )
+                    client = build_feishu_client(profile_config)
+                    if isinstance(client, NoopFeishuClient):
+                        raise MaintenanceRefused(
+                            "Feishu credentials are unavailable"
+                        )
+                    publisher = FeishuJobPublisher(client)
+                except (MaintenanceRefused, OSError, ValueError):
+                    result = _terminalize_owned_runner_failure(
+                        paths,
+                        job.path,
+                        lease,
+                        error_code="runner_initialization_failed",
+                        base_environment=base_environment,
+                        proxy_environment=proxy_environment,
+                    )
+                else:
+                    try:
+                        result = run_job(
+                            job.path,
+                            lock_lease=lease,
+                            fetch_health=lambda: fetch_health(profile_config),
+                            publish=lambda current: asyncio.run(
+                                publisher.publish(current)
+                            ),
+                            maintenance_python=Path(sys.executable),
+                            base_environment=base_environment,
+                            proxy_environment=proxy_environment,
+                        )
+                    except (MaintenanceRefused, OSError, ValueError):
+                        result = _terminalize_owned_runner_failure(
+                            paths,
+                            job.path,
+                            lease,
+                            error_code="runner_state_machine_exception",
+                            base_environment=base_environment,
+                            proxy_environment=proxy_environment,
+                        )
+        except UpdateLockBusy:
+            return 0
+    except (MaintenanceRefused, OSError, ValueError):
+        # No verified lease: never transition, consume, publish, or clean.
+        return 1
+
     return 0 if result.phase == "succeeded" else 1
 
 

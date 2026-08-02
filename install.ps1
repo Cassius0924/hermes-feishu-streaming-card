@@ -32,17 +32,30 @@ function Fail {
 
 function Resolve-HfcVersion {
     if ($Version -ne "latest") {
+        if ($Version -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]*$' -or $Version.Contains('..')) {
+            Fail "invalid explicit version ref; no package was installed"
+        }
         return $Version
     }
     try {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ "User-Agent" = "hermes-feishu-card-installer" }
-        if ($release.tag_name) {
-            return [string]$release.tag_name
-        }
+        $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/$Repo/releases/latest" `
+            -Headers @{ "User-Agent" = "hermes-feishu-card-installer" } `
+            -TimeoutSec 15 `
+            -ErrorAction Stop
     } catch {
-        return "main"
+        Fail "latest release lookup failed; no package was installed; retry later or set an explicit vX.Y.Z"
     }
-    return "main"
+    $tag = if ($null -ne $release) { [string]$release.tag_name } else { "" }
+    if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+        Fail "latest release response was invalid; no package was installed; retry later or set an explicit vX.Y.Z"
+    }
+    return $tag
+}
+
+function Get-HfcInstallSpec {
+    param([string]$ResolvedVersion, [string]$Repo)
+    return "git+https://github.com/$Repo.git@$ResolvedVersion"
 }
 
 $HfcAllowedEnvKeys = @(
@@ -180,6 +193,7 @@ function Ensure-HfcCredentials {
 }
 
 function Install-HfcPackage {
+    param([string]$InstallSpec, [string]$ResolvedVersion)
     try {
         & $PythonBin --version | Out-Null
     } catch {
@@ -190,16 +204,11 @@ function Install-HfcPackage {
     } catch {
         & $PythonBin -m ensurepip --upgrade | Out-Null
     }
-    $tag = Resolve-HfcVersion
-    $spec = "git+https://github.com/$Repo.git"
-    if ($tag -and $tag -ne "main") {
-        $spec = "$spec@$tag"
-    }
-    [Environment]::SetEnvironmentVariable("HFC_INSTALL_SPEC", $spec, "Process")
-    Write-HfcLog "installing $Repo@$tag"
-    $pipArgs = @("install", "--upgrade", $spec)
+    [Environment]::SetEnvironmentVariable("HFC_INSTALL_SPEC", $InstallSpec, "Process")
+    Write-HfcLog "installing $Repo@$ResolvedVersion"
+    $pipArgs = @("install", "--upgrade", $InstallSpec)
     if ($PipUserFlag -and $PipUserFlag -notin @("0", "false", "False")) {
-        $pipArgs = @("install", $PipUserFlag, "--upgrade", $spec)
+        $pipArgs = @("install", $PipUserFlag, "--upgrade", $InstallSpec)
     }
     & $PythonBin -m pip @pipArgs
 }
@@ -252,6 +261,10 @@ $ConfigPath = $Config
 $Version = if ($Version) { $Version } else { "latest" }
 $ProfileId = if ($ProfileId) { $ProfileId } else { "default" }
 $EventUrl = if ($EventUrl) { $EventUrl } else { "http://127.0.0.1:8765/events" }
+$ResolvedVersion = Resolve-HfcVersion
+$ResolvedInstallSpec = Get-HfcInstallSpec `
+    -ResolvedVersion $ResolvedVersion `
+    -Repo $Repo
 
 foreach ($key in @(
     "FEISHU_APP_ID",
@@ -267,13 +280,15 @@ foreach ($key in @(
 }
 [Environment]::SetEnvironmentVariable("HFC_CONFIG", $ConfigPath, "Process")
 [Environment]::SetEnvironmentVariable("HFC_ENV_FILE", $EnvFile, "Process")
-[Environment]::SetEnvironmentVariable("HFC_VERSION", $Version, "Process")
+[Environment]::SetEnvironmentVariable("HFC_VERSION", $ResolvedVersion, "Process")
 [Environment]::SetEnvironmentVariable("HERMES_FEISHU_CARD_PROFILE_ID", $ProfileId, "Process")
 [Environment]::SetEnvironmentVariable("HERMES_FEISHU_CARD_EVENT_URL", $EventUrl, "Process")
 [Environment]::SetEnvironmentVariable("HFC_NO_REPAIR", $NoRepairValue, "Process")
 
 Ensure-HfcCredentials
-Install-HfcPackage
+Install-HfcPackage `
+    -InstallSpec $ResolvedInstallSpec `
+    -ResolvedVersion $ResolvedVersion
 Invoke-HfcSetup
 Write-HfcLog "done"
 Write-HfcLog "status: $PythonBin -m hermes_feishu_card.cli status --config `"$ConfigPath`""

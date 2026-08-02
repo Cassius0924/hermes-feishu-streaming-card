@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_feishu_card import cli as cli_module
 from hermes_feishu_card.diagnostics import (
     DiagnosticFinding,
     DiagnosticReport,
@@ -13,6 +14,7 @@ from hermes_feishu_card.diagnostics import (
     build_route_chain,
 )
 from hermes_feishu_card.install.detect import HermesDetection
+from hermes_feishu_card.install.integrity import IntegrityRepairPlan
 from hermes_feishu_card.install.recovery import RecoveryPlan
 
 
@@ -41,6 +43,16 @@ def _recovery_plan(tmp_path: Path, *, state: str = "installed") -> RecoveryPlan:
         fingerprint="a" * 64,
         actions=("repair_gateway",) if state != "installed" else (),
         findings=(),
+    )
+
+
+def _integrity_plan(recovery_plan: RecoveryPlan) -> IntegrityRepairPlan:
+    return IntegrityRepairPlan(
+        state="installed",
+        executable=False,
+        fingerprint="b" * 64,
+        reason="recovery_not_required",
+        recovery_plan=recovery_plan,
     )
 
 
@@ -172,13 +184,23 @@ def test_manual_review_from_integrity_migration_has_actionable_command(tmp_path)
         item for item in report.findings if item.code == "runtime_integrity_degraded"
     )
     command = " ".join(finding.actions)
+    assert len(finding.actions) == 1
     assert "integrity migrate-safe" in command
     assert "--config CONFIG" in command
     assert "--hermes-dir PATH" in command
     assert "--yes" in command
+    assert "stop" not in command
+    assert "acknowledge-review" not in command
 
 
-def test_manual_review_has_explicit_verified_acknowledgement_command(tmp_path):
+@pytest.mark.parametrize(
+    "integrity_reason",
+    ["git_target_modified", "owned_backup_invalid", "git_root_invalid"],
+)
+def test_nonrecoverable_manual_review_does_not_suggest_acknowledge(
+    tmp_path,
+    integrity_reason,
+):
     report = build_diagnostic_report(
         tmp_path / "config.yaml",
         {"server": {"host": "127.0.0.1", "port": 8765}},
@@ -194,20 +216,97 @@ def test_manual_review_has_explicit_verified_acknowledgement_command(tmp_path):
             "integrity": {
                 "mode": "safe",
                 "last_status": "manual_review_required",
-                "last_reason": "manual_review_required",
+                "last_reason": integrity_reason,
             },
         },
     )
 
-    finding = next(
-        item for item in report.findings if item.code == "runtime_integrity_degraded"
+    actions = "\n".join(
+        action
+        for finding in report.findings
+        for action in finding.actions
     )
-    command = " ".join(finding.actions)
-    assert "integrity acknowledge-review" in command
-    assert "--config CONFIG" in command
-    assert "--hermes-dir PATH" in command
-    assert "--state-dir STATE" in command
-    assert "--yes" in command
+    assert "acknowledge-review" not in actions
+    assert "doctor --explain" in actions
+    assert report.runtime["integrity"]["last_reason"] == integrity_reason
+
+
+def test_recovery_not_required_suggests_acknowledgement_only_when_verified(
+    tmp_path,
+):
+    recovery = _recovery_plan(tmp_path)
+    report = build_diagnostic_report(
+        tmp_path / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+        _detection(tmp_path),
+        recovery,
+        integrity_plan=_integrity_plan(recovery),
+        health={
+            "readiness": {
+                "status": "degraded",
+                "reason": "manual_review_required",
+                "integrity_mode": "safe",
+            },
+            "integrity": {
+                "mode": "safe",
+                "last_status": "manual_review_required",
+                "last_reason": "recovery_not_required",
+            },
+        },
+    )
+    finding = next(
+        item
+        for item in report.findings
+        if item.code == "runtime_integrity_degraded"
+    )
+
+    assert len(finding.actions) == 1
+    assert "doctor --explain" in finding.actions[0]
+    assert "stop" in finding.actions[0]
+    assert "acknowledge-review" in finding.actions[0]
+
+
+def test_doctor_json_actions_do_not_expose_local_paths(tmp_path):
+    recovery = _recovery_plan(tmp_path)
+    report = build_diagnostic_report(
+        tmp_path / "private-config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+        _detection(tmp_path),
+        recovery,
+        integrity_plan=_integrity_plan(recovery),
+        health={
+            "readiness": {
+                "status": "degraded",
+                "reason": "manual_review_required",
+                "integrity_mode": "safe",
+            },
+            "integrity": {
+                "mode": "safe",
+                "last_status": "manual_review_required",
+                "last_reason": "recovery_not_required",
+            },
+        },
+    )
+    ordinary = report.to_dict()
+    finding = next(
+        item
+        for item in ordinary["findings"]
+        if item["code"] == "runtime_integrity_degraded"
+    )
+    action_text = "\n".join(finding["actions"])
+    assert str(tmp_path) not in action_text
+    assert "credential-sentinel" not in action_text
+    assert all(value in action_text for value in ("CONFIG", "PATH", "STATE"))
+
+    cli_payload = cli_module._doctor_json_output_payload(ordinary)
+    assert str(tmp_path) not in json.dumps(cli_payload, sort_keys=True)
+    card_safe = report.to_dict(card_safe=True)
+    safe_finding = next(
+        item
+        for item in card_safe["findings"]
+        if item["code"] == "runtime_integrity_degraded"
+    )
+    assert safe_finding["actions"] == []
 
 
 def test_report_keeps_full_recovery_fingerprint_internal_and_redacts_output(tmp_path):

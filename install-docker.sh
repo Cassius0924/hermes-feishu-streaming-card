@@ -29,6 +29,10 @@ fail() {
   exit 1
 }
 
+have() {
+  command -v "$1" >/dev/null 2>&1
+}
+
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -60,12 +64,67 @@ expand_path() {
   esac
 }
 
+validate_explicit_ref() {
+  case "$1" in
+    ""|/*|*..*|*[!A-Za-z0-9._/-]*)
+      fail "invalid explicit version ref; no package was installed"
+      ;;
+  esac
+}
+
 resolve_version() {
+  local python_bin="$1"
   if [ "$VERSION" != "latest" ]; then
+    validate_explicit_ref "$VERSION"
     printf '%s\n' "$VERSION"
     return
   fi
-  printf 'latest\n'
+  have curl || fail "latest release lookup requires curl; no package was installed; retry later or set an explicit vX.Y.Z"
+
+  local response_file
+  local http_status
+  local tag
+  response_file="$(mktemp)"
+  if ! http_status="$(curl \
+      --silent --show-error --location \
+      --connect-timeout 5 --max-time 15 \
+      --output "$response_file" \
+      --write-out '%{http_code}' \
+      "https://api.github.com/repos/$REPO/releases/latest")"; then
+    rm -f "$response_file"
+    fail "latest release lookup failed; no package was installed; retry later or set an explicit vX.Y.Z"
+  fi
+  if [ "$http_status" != "200" ]; then
+    rm -f "$response_file"
+    fail "latest release lookup returned HTTP $http_status; no package was installed; retry later or set an explicit vX.Y.Z"
+  fi
+  if ! tag="$("$python_bin" -I -c '
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+tag = payload.get("tag_name") if isinstance(payload, dict) else None
+if not isinstance(tag, str):
+    raise SystemExit(2)
+sys.stdout.write(tag)
+' "$response_file" 2>/dev/null)"; then
+    rm -f "$response_file"
+    fail "latest release response was invalid; no package was installed; retry later or set an explicit vX.Y.Z"
+  fi
+  rm -f "$response_file"
+  case "$tag" in
+    v[0-9]*.[0-9]*.[0-9]*) ;;
+    *) fail "latest release tag was invalid; no package was installed; retry later or set an explicit vX.Y.Z" ;;
+  esac
+  "$python_bin" -I -c \
+    'import re,sys; raise SystemExit(0 if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", sys.argv[1]) else 2)' \
+    "$tag" 2>/dev/null \
+    || fail "latest release tag was invalid; no package was installed; retry later or set an explicit vX.Y.Z"
+  printf '%s\n' "$tag"
+}
+
+build_install_spec() {
+  local resolved="$1"
+  printf 'git+https://github.com/%s.git@%s\n' "$REPO" "$resolved"
 }
 
 load_env_file() {
@@ -186,26 +245,15 @@ require_credentials() {
 
 install_package() {
   local python_bin="$1"
+  local spec="$2"
+  local resolved_version="$3"
   export PIP_ROOT_USER_ACTION="${PIP_ROOT_USER_ACTION:-ignore}"
   "$python_bin" -m pip --version >/dev/null 2>&1 || "$python_bin" -m ensurepip --upgrade >/dev/null
-  local tag=""
-  local spec=""
-  if [ -n "$INSTALL_SOURCE" ]; then
-    spec="$INSTALL_SOURCE"
-  else
-    tag="$(resolve_version)"
-    spec="git+https://github.com/$REPO.git"
-    if [ -n "$tag" ] && [ "$tag" != "latest" ]; then
-      spec="$spec@$tag"
-    fi
-  fi
   export HFC_INSTALL_SPEC="$spec"
   if [ -n "$INSTALL_SOURCE" ]; then
     log "installing local source $INSTALL_SOURCE into $python_bin"
-  elif [ "$tag" = "latest" ]; then
-    log "installing $REPO (latest branch) into $python_bin"
   else
-    log "installing $REPO@$tag into $python_bin"
+    log "installing $REPO@$resolved_version into $python_bin"
   fi
   local pip_log
   pip_log="$(mktemp)"
@@ -299,9 +347,23 @@ main() {
     INSTALL_SOURCE="$(expand_path "$INSTALL_SOURCE")"
   fi
 
+  validate_test_controls
+  local python_bin
+  python_bin="$(detect_python)"
+  local resolved_version
+  local resolved_install_spec
+  if [ -n "$INSTALL_SOURCE" ]; then
+    resolved_version="$VERSION"
+    resolved_install_spec="$INSTALL_SOURCE"
+  else
+    resolved_version="$(resolve_version "$python_bin")"
+    resolved_install_spec="$(build_install_spec "$resolved_version")"
+  fi
+  VERSION="$resolved_version"
+
   export HFC_CONFIG="$CONFIG_PATH"
   export HFC_ENV_FILE="$ENV_FILE"
-  export HFC_VERSION="$VERSION"
+  export HFC_VERSION="$resolved_version"
   export HERMES_FEISHU_CARD_PROFILE_ID="$PROFILE_ID"
   export HERMES_FEISHU_CARD_EVENT_URL="$EVENT_URL"
   export HERMES_FEISHU_CARD_SERVICE_MANAGER="$SERVICE_MANAGER"
@@ -310,14 +372,11 @@ main() {
   export HFC_INSTALL_SOURCE="$INSTALL_SOURCE"
   export HFC_TEST_NOOP_DELIVERY="$TEST_NOOP_DELIVERY"
 
-  validate_test_controls
   validate_paths
   prepare_private_state
   require_credentials
-  local python_bin
-  python_bin="$(detect_python)"
   log "using Hermes Python: $python_bin"
-  install_package "$python_bin"
+  install_package "$python_bin" "$resolved_install_spec" "$resolved_version"
   run_doctor "$python_bin"
   run_setup "$python_bin"
   log "done"

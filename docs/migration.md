@@ -245,3 +245,7 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - `status --config ...` 输出 `/health` metrics。
 - Hermes 原生文本回复在 sidecar 不可用时仍能降级运行。
 - 不存在 legacy/dual hook 与 sidecar-only hook 同时驻留在 `gateway/run.py` 的情况。
+
+## Integrity 人工确认边界
+
+`acknowledge-review` 不是通用修复命令。只有当 doctor 同时验证 recovery state 为 `installed`、recovery actions 为空、integrity plan 为 `installed` 且 reason 为 `recovery_not_required` 时，才会建议先停止 sidecar 再确认。其他 manual-review reason 必须先修复报告中的安装状态，再重新运行 doctor。

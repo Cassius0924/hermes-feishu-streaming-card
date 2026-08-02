@@ -81,6 +81,7 @@ from .session import CardSession
 from .status import StatusConfig
 from .subscription_usage import fetch_codex_subscription_usage
 from .install.detect import HermesDetection, detect_hermes
+from .install.integrity import IntegrityRepairRefused, plan_integrity_repair
 from .install.recovery import execute_recovery, plan_recovery
 from .runtime_control import (
     RUNTIME_HOOK_GENERATION,
@@ -98,6 +99,7 @@ from .maintenance_card import (
 from .maintenance_process import inspect_runtime, launch_job
 from .maintenance_store import (
     MaintenanceRefused,
+    PROXY_ENVIRONMENT_KEYS,
     create_job,
     discard_job_credentials,
     discard_unstarted_job,
@@ -107,6 +109,7 @@ from .maintenance_store import (
     maintenance_paths,
     release_drain_lease,
     reserve_drain_lease,
+    sanitize_job_environment,
     stage_job_credentials,
     transition_job,
 )
@@ -1064,23 +1067,31 @@ def _reserve_update_job_for_operation(
         pre_runtime_id_hash=str(runtime_snapshot.get("runtime_id_hash") or ""),
         pre_runtime_sequence=int(runtime_snapshot.get("last_sequence") or 0),
     )
+    environment = sanitize_job_environment(os.environ)
+    proxy_environment = {
+        key: value
+        for key, value in environment.items()
+        if key in PROXY_ENVIRONMENT_KEYS
+    }
     try:
         reserve_drain_lease(paths, owner_id=owner_id)
         if not set_gateway_external_drain(
             app[OPERATIONS_HERMES_ROOT_KEY],
             active=True,
+            proxy_environment=proxy_environment,
         ):
             raise MaintenanceRefused("gateway drain unavailable")
         stage_job_credentials(
             paths,
             job_id=owner_id,
-            environment=os.environ,
+            environment=environment,
         )
     except Exception:
         try:
             set_gateway_external_drain(
                 app[OPERATIONS_HERMES_ROOT_KEY],
                 active=False,
+                proxy_environment=proxy_environment,
             )
         except Exception:
             pass
@@ -1408,6 +1419,12 @@ async def _inspect_update_for_app(app: web.Application) -> UpdateInspection:
         artifact,
         hermes_root=app[OPERATIONS_HERMES_ROOT_KEY],
     )
+    environment = sanitize_job_environment(os.environ)
+    proxy_environment = {
+        key: value
+        for key, value in environment.items()
+        if key in PROXY_ENVIRONMENT_KEYS
+    }
     inspection = await _run_operations_mutation(
         app,
         inspect_update,
@@ -1415,6 +1432,7 @@ async def _inspect_update_for_app(app: web.Application) -> UpdateInspection:
         artifact=artifact,
         installed_hfc_version=app[PACKAGE_VERSION_KEY],
         active_sessions=active_sessions,
+        proxy_environment=proxy_environment,
     )
     if not runtime.available:
         return replace(
@@ -1885,6 +1903,10 @@ def _build_operations_report_sync(
             else load_config(config_path)
         )
         recovery_plan = plan_recovery(detection)
+        try:
+            integrity_plan = plan_integrity_repair(detection)
+        except (IntegrityRepairRefused, OSError, RuntimeError, ValueError):
+            integrity_plan = None
         server = config.get("server", {})
         event_url = (
             f"http://{server.get('host', '127.0.0.1')}:"
@@ -1895,6 +1917,7 @@ def _build_operations_report_sync(
             config,
             detection,
             recovery_plan,
+            integrity_plan=integrity_plan,
             health=health,
             profile_id=profile_id,
             profile_source=profile_source,
@@ -3104,7 +3127,7 @@ def _session_key(event: SidecarEvent) -> str:
     When profiles are active, uses composite key profile_id:message_id.
     Otherwise uses message_id directly (backward compatible).
     """
-    return _session_key_for_message_id(event, event.message_id)
+    return _session_key_for_message_id(event, event.canonical_turn_id)
 
 
 def _policy_profile_id(event: SidecarEvent) -> str | None:
@@ -3148,7 +3171,7 @@ def _native_handoff_identity(event: SidecarEvent) -> str:
         profile_id=profile_id,
         chat_id=event.chat_id,
         conversation_id=event.conversation_id,
-        message_id=event.message_id,
+        message_id=event.canonical_turn_id,
     )
 
 
@@ -3493,6 +3516,8 @@ def _active_session_key(app: web.Application, session_key: str) -> str | None:
 
 def _resolve_session_key(app: web.Application, event: SidecarEvent) -> str:
     direct_key = _session_key(event)
+    if event.turn_id:
+        return direct_key
     active_key = _active_session_key(app, direct_key)
     if active_key is not None:
         return active_key

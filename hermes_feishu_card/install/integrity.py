@@ -152,6 +152,24 @@ class IntegrityRepairResult:
     plan: IntegrityRepairPlan
 
 
+def integrity_acknowledgement_eligible(
+    detection: HermesDetection,
+    recovery_plan: RecoveryPlan,
+    integrity_plan: IntegrityRepairPlan,
+) -> bool:
+    return bool(
+        detection.supported
+        and recovery_plan.state == "installed"
+        and not recovery_plan.actions
+        and integrity_plan.state == "installed"
+        and integrity_plan.executable is False
+        and integrity_plan.reason == "recovery_not_required"
+        and integrity_plan.recovery_plan == recovery_plan
+        and integrity_plan.recovery_plan.state == "installed"
+        and not integrity_plan.recovery_plan.actions
+    )
+
+
 def build_integrity_provenance(
     root: str | Path,
     *,

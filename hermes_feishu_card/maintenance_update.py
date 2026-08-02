@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -9,13 +10,19 @@ import re
 import subprocess
 import sys
 import time
-from typing import Callable, Optional, Sequence
+from typing import Callable, Mapping, Optional, Protocol, Sequence
 
 from .install.detect import detect_hermes
 from .install.recovery import plan_recovery
 from .maintenance_store import (
     ArtifactMetadata,
+    MaintenancePaths,
     MaintenanceRefused,
+    PROXY_ENVIRONMENT_KEYS,
+    TERMINAL_UPDATE_PHASES,
+    UPDATE_PHASES,
+    UpdateLockBusy,
+    UpdateLockLease,
     UpdateJob,
     acquire_update_lock,
     discard_job_credentials,
@@ -25,6 +32,7 @@ from .maintenance_store import (
     maintenance_paths,
     release_drain_lease,
     require_drain_lease,
+    require_update_lock_lease,
     transition_job,
 )
 
@@ -52,16 +60,32 @@ _RUNTIME_IMPORT_PROBE = (
     "'location': str(pathlib.Path(hermes_feishu_card.__file__).resolve())}))"
 )
 _ENGAGE_GATEWAY_DRAIN_CODE = (
-    "import pathlib,sys; "
+    "import os,pathlib; "
     "from gateway.drain_control import write_drain_request; "
-    "write_drain_request(principal='hfc-update', home=pathlib.Path(sys.argv[1]))"
+    "write_drain_request(principal='hfc-update', "
+    "home=pathlib.Path(os.environ['HERMES_HOME']))"
 )
 _RELEASE_GATEWAY_DRAIN_CODE = (
-    "import pathlib,sys; "
+    "import os,pathlib; "
     "from gateway.drain_control import clear_drain_request; "
-    "clear_drain_request(home=pathlib.Path(sys.argv[1]))"
+    "clear_drain_request(home=pathlib.Path(os.environ['HERMES_HOME']))"
 )
-_TERMINAL_PHASES = frozenset({"succeeded", "failed", "cancelled"})
+_GATEWAY_DRAIN_PHASES = frozenset(
+    {
+        "locking",
+        "draining",
+        "restoring_hooks",
+    }
+)
+_DRAIN_RECONCILIATION_BOUNDARIES = {
+    "locking": "no_mutation",
+    "draining": "no_mutation",
+    "restoring_hooks": "old_hfc_or_manual",
+    "updating_hermes": "updater_result_classified",
+    "reinstalling_hfc": "native_hermes",
+    "starting_services": "service_recovery",
+    "verifying": "service_recovery",
+}
 
 
 @dataclass(frozen=True)
@@ -97,9 +121,46 @@ class UpdateInspection:
         return inspection_fingerprint(self)
 
 
-CommandRunner = Callable[[Sequence[str], float], CommandResult]
+class CommandRunner(Protocol):
+    def __call__(
+        self,
+        argv: Sequence[str],
+        timeout: float,
+        *,
+        cwd: Optional[Path] = None,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> CommandResult:
+        ...
+
+
 HealthFetcher = Callable[[], Optional[dict[str, object]]]
 JobPublisher = Callable[[UpdateJob], bool]
+
+
+@dataclass(frozen=True)
+class HermesCommandBinding:
+    root: Path
+    home: Path
+    runtime_python: Path
+    argv_prefix: tuple[str, ...]
+
+
+_BASE_PROCESS_ENV_KEYS = frozenset(
+    {
+        "PATH",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    }
+)
 
 
 def inspect_update(
@@ -109,6 +170,7 @@ def inspect_update(
     installed_hfc_version: str,
     active_sessions: int,
     run: CommandRunner | None = None,
+    proxy_environment: Optional[Mapping[str, str]] = None,
     now: Callable[[], float] = time.time,
 ) -> UpdateInspection:
     root = Path(hermes_root).expanduser().resolve(strict=False)
@@ -270,9 +332,23 @@ def inspect_update(
             changed_paths=unrelated,
         )
 
-    update_result = runner(
-        ("hermes", "update", "--check"),
+    try:
+        binding = resolve_hermes_command_binding(root)
+    except MaintenanceRefused:
+        return result(
+            False,
+            "hermes_runtime_unavailable",
+            current_version=version,
+            current_head=current_head,
+            hook_state=hook_state,
+            hook_fingerprint=hook_fingerprint,
+        )
+    update_result = run_hermes_command(
+        binding,
+        ("update", "--check"),
         UPDATE_CHECK_TIMEOUT_SECONDS,
+        run=runner,
+        proxy_environment=proxy_environment,
     )
     if update_result.timed_out:
         return result(
@@ -411,7 +487,13 @@ def inspection_fingerprint(inspection: UpdateInspection) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def run_command(argv: Sequence[str], timeout: float) -> CommandResult:
+def run_command(
+    argv: Sequence[str],
+    timeout: float,
+    *,
+    cwd: Optional[Path] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> CommandResult:
     normalized = tuple(str(value) for value in argv)
     try:
         completed = subprocess.run(
@@ -421,6 +503,8 @@ def run_command(argv: Sequence[str], timeout: float) -> CommandResult:
             text=True,
             timeout=timeout,
             check=False,
+            cwd=str(cwd) if cwd is not None else None,
+            env=dict(env) if env is not None else None,
         )
     except subprocess.TimeoutExpired:
         return CommandResult(normalized, -1, "", "", timed_out=True)
@@ -458,96 +542,337 @@ def detect_runtime_python(hermes_root: Path) -> Path | None:
     return None
 
 
+def resolve_hermes_command_binding(root: Path) -> HermesCommandBinding:
+    selected_root = Path(root).expanduser().resolve(strict=False)
+    runtime_python = detect_runtime_python(selected_root)
+    if runtime_python is None:
+        raise MaintenanceRefused("Hermes runtime is unavailable")
+    runtime_python = runtime_python.resolve(strict=False)
+    entrypoint_name = "hermes.exe" if os.name == "nt" else "hermes"
+    entrypoint = runtime_python.with_name(entrypoint_name)
+    prefix = (
+        (str(entrypoint),)
+        if entrypoint.is_file() and not entrypoint.is_symlink()
+        else (str(runtime_python), "-I", "-m", "hermes_cli.main")
+    )
+    return HermesCommandBinding(
+        root=selected_root,
+        home=selected_root.parent,
+        runtime_python=runtime_python,
+        argv_prefix=prefix,
+    )
+
+
+def build_hermes_process_environment(
+    binding: HermesCommandBinding,
+    *,
+    base_environment: Mapping[str, str],
+    proxy_environment: Mapping[str, str],
+) -> dict[str, str]:
+    result = {
+        key: value
+        for key, value in base_environment.items()
+        if key in _BASE_PROCESS_ENV_KEYS and isinstance(value, str) and value
+    }
+    result.update(
+        {
+            key: value
+            for key, value in proxy_environment.items()
+            if key in PROXY_ENVIRONMENT_KEYS
+            and isinstance(value, str)
+            and value
+        }
+    )
+    result.update(
+        {
+            "HERMES_HOME": str(binding.home),
+            "HERMES_DIR": str(binding.root),
+            "HFC_HERMES_DIR": str(binding.root),
+            "HERMES_AGENT_ROOT": str(binding.root),
+        }
+    )
+    return result
+
+
+def run_hermes_command(
+    binding: HermesCommandBinding,
+    args: Sequence[str],
+    timeout: float,
+    *,
+    run: Optional[CommandRunner] = None,
+    base_environment: Optional[Mapping[str, str]] = None,
+    proxy_environment: Optional[Mapping[str, str]] = None,
+) -> CommandResult:
+    selected_run = run or run_command
+    environment = build_hermes_process_environment(
+        binding,
+        base_environment=(
+            base_environment if base_environment is not None else os.environ
+        ),
+        proxy_environment=(
+            proxy_environment if proxy_environment is not None else {}
+        ),
+    )
+    return selected_run(
+        (*binding.argv_prefix, *tuple(str(value) for value in args)),
+        timeout,
+        cwd=binding.root,
+        env=environment,
+    )
+
+
+def run_bound_runtime_python(
+    binding: HermesCommandBinding,
+    args: Sequence[str],
+    timeout: float,
+    *,
+    run: Optional[CommandRunner] = None,
+    base_environment: Optional[Mapping[str, str]] = None,
+    proxy_environment: Optional[Mapping[str, str]] = None,
+) -> CommandResult:
+    selected_run = run or run_command
+    environment = build_hermes_process_environment(
+        binding,
+        base_environment=(
+            base_environment if base_environment is not None else os.environ
+        ),
+        proxy_environment=(
+            proxy_environment if proxy_environment is not None else {}
+        ),
+    )
+    return selected_run(
+        (str(binding.runtime_python), "-I", *tuple(str(value) for value in args)),
+        timeout,
+        cwd=binding.root,
+        env=environment,
+    )
+
+
 def set_gateway_external_drain(
     hermes_root: Path,
     *,
     active: bool,
-    run: CommandRunner | None = None,
+    run: Optional[CommandRunner] = None,
+    binding: Optional[HermesCommandBinding] = None,
+    base_environment: Optional[Mapping[str, str]] = None,
+    proxy_environment: Optional[Mapping[str, str]] = None,
 ) -> bool:
-    root = Path(hermes_root).expanduser().resolve(strict=False)
-    runtime_python = detect_runtime_python(root)
-    if runtime_python is None:
+    try:
+        selected = binding or resolve_hermes_command_binding(hermes_root)
+    except MaintenanceRefused:
         return False
-    result = (run or run_command)(
+    result = run_bound_runtime_python(
+        selected,
         (
-            str(runtime_python),
-            "-I",
             "-c",
             _ENGAGE_GATEWAY_DRAIN_CODE if active else _RELEASE_GATEWAY_DRAIN_CODE,
-            str(root.parent),
         ),
         30.0,
+        run=run,
+        base_environment=base_environment,
+        proxy_environment=proxy_environment,
     )
     return not result.timed_out and result.returncode == 0
+
+
+def gateway_drain_required(phase: str) -> bool:
+    if phase not in UPDATE_PHASES:
+        raise MaintenanceRefused("maintenance phase is invalid")
+    return phase in _GATEWAY_DRAIN_PHASES
+
+
+def reconcile_gateway_external_drain(
+    job: UpdateJob,
+    *,
+    binding: HermesCommandBinding,
+    run: CommandRunner,
+    base_environment: Mapping[str, str],
+    proxy_environment: Mapping[str, str],
+) -> bool:
+    required = gateway_drain_required(job.phase)
+    if job.phase in TERMINAL_UPDATE_PHASES:
+        return not required
+    return set_gateway_external_drain(
+        job.hermes_root,
+        active=required,
+        run=run,
+        binding=binding,
+        base_environment=base_environment,
+        proxy_environment=proxy_environment,
+    )
 
 
 def run_job(
     job_path: Path,
     *,
+    lock_lease: Optional[UpdateLockLease] = None,
     run: CommandRunner | None = None,
     fetch_health: HealthFetcher | None = None,
     publish: JobPublisher | None = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     maintenance_python: Path | None = None,
+    base_environment: Optional[Mapping[str, str]] = None,
+    proxy_environment: Optional[Mapping[str, str]] = None,
     drain_timeout_seconds: float = 180.0,
     update_timeout_seconds: float = 3600.0,
 ) -> UpdateJob:
-    publisher = publish or (lambda current: True)
-    result: UpdateJob | None = None
-    try:
-        result = _run_job(
-            job_path,
-            run=run,
-            fetch_health=fetch_health,
-            publish=publisher,
-            sleep=sleep,
-            monotonic=monotonic,
-            maintenance_python=maintenance_python,
-            drain_timeout_seconds=drain_timeout_seconds,
-            update_timeout_seconds=update_timeout_seconds,
-        )
-    except MaintenanceRefused:
-        current = load_job(job_path)
-        result = _fail_job(
-            current,
-            "update_lock_unavailable",
-            "no_mutation",
-            publisher,
-        )
-    finally:
-        if result is not None and result.phase in _TERMINAL_PHASES:
-            paths = maintenance_paths(result.path.parent.parent)
-            try:
-                release_drain_lease(paths, owner_id=result.job_id)
-            except (MaintenanceRefused, OSError):
-                pass
-            try:
-                discard_job_credentials(paths, job_id=result.job_id)
-            except (MaintenanceRefused, OSError):
-                pass
-            try:
-                set_gateway_external_drain(
-                    result.hermes_root,
-                    active=False,
-                    run=run,
+    selected_base_environment = dict(
+        os.environ if base_environment is None else base_environment
+    )
+    proxy_source = (
+        selected_base_environment
+        if proxy_environment is None
+        else proxy_environment
+    )
+    selected_proxy_environment = {
+        key: value
+        for key, value in proxy_source.items()
+        if key in PROXY_ENVIRONMENT_KEYS
+        and isinstance(value, str)
+        and value
+    }
+    current = load_job(job_path)
+    paths = maintenance_paths(current.path.parent.parent)
+    options = {
+        "run": run,
+        "fetch_health": fetch_health,
+        "publish": publish,
+        "sleep": sleep,
+        "monotonic": monotonic,
+        "maintenance_python": maintenance_python,
+        "base_environment": selected_base_environment,
+        "proxy_environment": selected_proxy_environment,
+        "drain_timeout_seconds": drain_timeout_seconds,
+        "update_timeout_seconds": update_timeout_seconds,
+    }
+    if lock_lease is None:
+        try:
+            with acquire_update_lock(paths, job_id=current.job_id) as acquired:
+                return _run_job_owned(
+                    current.path,
+                    lock_lease=acquired,
+                    **options,
                 )
-            except Exception:
-                pass
-    if result is None:
-        raise MaintenanceRefused("maintenance job did not produce a result")
-    return result
+        except UpdateLockBusy:
+            return load_job(current.path)
+    require_update_lock_lease(
+        paths,
+        job_id=current.job_id,
+        lease=lock_lease,
+    )
+    return _run_job_owned(
+        current.path,
+        lock_lease=lock_lease,
+        **options,
+    )
 
 
-def _run_job(
+def _run_job_owned(
     job_path: Path,
     *,
+    lock_lease: UpdateLockLease,
     run: CommandRunner | None = None,
     fetch_health: HealthFetcher | None = None,
     publish: JobPublisher | None = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     maintenance_python: Path | None = None,
+    base_environment: Mapping[str, str],
+    proxy_environment: Mapping[str, str],
+    drain_timeout_seconds: float = 180.0,
+    update_timeout_seconds: float = 3600.0,
+) -> UpdateJob:
+    current = load_job(job_path)
+    paths = maintenance_paths(current.path.parent.parent)
+    require_update_lock_lease(
+        paths,
+        job_id=current.job_id,
+        lease=lock_lease,
+    )
+    result: UpdateJob | None = None
+    try:
+        result = _run_state_machine(
+            current.path,
+            lock_lease=lock_lease,
+            run=run,
+            fetch_health=fetch_health,
+            publish=publish,
+            sleep=sleep,
+            monotonic=monotonic,
+            maintenance_python=maintenance_python,
+            base_environment=base_environment,
+            proxy_environment=proxy_environment,
+            drain_timeout_seconds=drain_timeout_seconds,
+            update_timeout_seconds=update_timeout_seconds,
+        )
+        return result
+    finally:
+        if result is not None and result.phase in TERMINAL_UPDATE_PHASES:
+            require_update_lock_lease(
+                paths,
+                job_id=result.job_id,
+                lease=lock_lease,
+            )
+            _cleanup_terminal_owned_job(
+                result,
+                run=run,
+                base_environment=base_environment,
+                proxy_environment=proxy_environment,
+            )
+
+
+def _cleanup_terminal_owned_job(
+    result: UpdateJob,
+    *,
+    run: CommandRunner | None = None,
+    base_environment: Mapping[str, str],
+    proxy_environment: Mapping[str, str],
+) -> None:
+    paths = maintenance_paths(result.path.parent.parent)
+    try:
+        release_drain_lease(paths, owner_id=result.job_id)
+    except (MaintenanceRefused, OSError):
+        pass
+    try:
+        discard_job_credentials(paths, job_id=result.job_id)
+    except (MaintenanceRefused, OSError):
+        pass
+    try:
+        set_gateway_external_drain(
+            result.hermes_root,
+            active=False,
+            run=run,
+            base_environment=base_environment,
+            proxy_environment=proxy_environment,
+        )
+    except Exception:
+        pass
+
+
+@contextmanager
+def _verified_update_lock_scope(
+    paths: MaintenancePaths,
+    *,
+    job_id: str,
+    lease: UpdateLockLease,
+):
+    require_update_lock_lease(paths, job_id=job_id, lease=lease)
+    yield lease
+
+
+def _run_state_machine(
+    job_path: Path,
+    *,
+    lock_lease: UpdateLockLease,
+    run: CommandRunner | None = None,
+    fetch_health: HealthFetcher | None = None,
+    publish: JobPublisher | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    maintenance_python: Path | None = None,
+    base_environment: Mapping[str, str],
+    proxy_environment: Mapping[str, str],
     drain_timeout_seconds: float = 180.0,
     update_timeout_seconds: float = 3600.0,
 ) -> UpdateJob:
@@ -558,12 +883,16 @@ def _run_job(
         strict=False
     )
     current = load_job(job_path)
-    if current.phase in _TERMINAL_PHASES:
+    if current.phase in TERMINAL_UPDATE_PHASES:
         return current
     paths = maintenance_paths(current.path.parent.parent)
-    with acquire_update_lock(paths, job_id=current.job_id):
+    with _verified_update_lock_scope(
+        paths,
+        job_id=current.job_id,
+        lease=lock_lease,
+    ):
         current = load_job(current.path)
-        if current.phase in _TERMINAL_PHASES:
+        if current.phase in TERMINAL_UPDATE_PHASES:
             return current
         try:
             require_drain_lease(paths, owner_id=current.job_id)
@@ -585,15 +914,32 @@ def _run_job(
                 "no_mutation",
                 publisher,
             )
-        if not set_gateway_external_drain(
-            current.hermes_root,
-            active=True,
-            run=runner,
-        ):
+        boundary = _DRAIN_RECONCILIATION_BOUNDARIES[current.phase]
+        try:
+            binding = resolve_hermes_command_binding(current.hermes_root)
+        except (MaintenanceRefused, OSError, ValueError):
             return _fail_job(
                 current,
-                "gateway_drain_unavailable",
-                "no_mutation",
+                "gateway_drain_binding_unavailable",
+                boundary,
+                publisher,
+            )
+        if not reconcile_gateway_external_drain(
+            current,
+            binding=binding,
+            run=runner,
+            base_environment=base_environment,
+            proxy_environment=proxy_environment,
+        ):
+            required = gateway_drain_required(current.phase)
+            return _fail_job(
+                current,
+                (
+                    "gateway_drain_unavailable"
+                    if required
+                    else "gateway_drain_release_failed"
+                ),
+                boundary,
                 publisher,
             )
         try:
@@ -636,6 +982,7 @@ def _run_job(
                 installed_hfc_version=current.artifact_version,
                 active_sessions=active_sessions,
                 run=runner,
+                proxy_environment=proxy_environment,
             )
             if (
                 not inspection.ready
@@ -683,9 +1030,13 @@ def _run_job(
                 return current
 
         if current.phase == "restoring_hooks":
-            gateway_stop = runner(
-                ("hermes", "gateway", "stop", "--all"),
+            gateway_stop = run_hermes_command(
+                binding,
+                ("gateway", "stop", "--all"),
                 120.0,
+                run=runner,
+                base_environment=base_environment,
+                proxy_environment=proxy_environment,
             )
             if gateway_stop.timed_out or gateway_stop.returncode != 0:
                 return _fail_job(
@@ -698,6 +1049,9 @@ def _run_job(
                 current.hermes_root,
                 active=False,
                 run=runner,
+                binding=binding,
+                base_environment=base_environment,
+                proxy_environment=proxy_environment,
             ):
                 return _fail_job(
                     current,
@@ -768,9 +1122,13 @@ def _run_job(
                     publisher,
                 )
             if actual_head == current.pre_update_head:
-                updated = runner(
-                    ("hermes", "update", "--yes"),
+                updated = run_hermes_command(
+                    binding,
+                    ("update", "--yes"),
                     update_timeout_seconds,
+                    run=runner,
+                    base_environment=base_environment,
+                    proxy_environment=proxy_environment,
                 )
                 if updated.timed_out:
                     return _fail_job(
@@ -783,6 +1141,8 @@ def _run_job(
                     restored = _restore_old_hfc_after_update_failure(
                         current,
                         runner,
+                        base_environment=base_environment,
+                        proxy_environment=proxy_environment,
                     )
                     return _fail_job(
                         current,
@@ -792,6 +1152,17 @@ def _run_job(
                             if restored
                             else "updater_result_classified"
                         ),
+                        publisher,
+                    )
+                try:
+                    binding = resolve_hermes_command_binding(
+                        current.hermes_root
+                    )
+                except MaintenanceRefused:
+                    return _fail_job(
+                        current,
+                        "hermes_runtime_missing",
+                        "updater_result_classified",
                         publisher,
                     )
                 actual_head = _git_head(current.hermes_root, runner)
@@ -832,18 +1203,19 @@ def _run_job(
                     "native_hermes",
                     publisher,
                 )
-            runtime_python = detect_runtime_python(current.hermes_root)
-            if runtime_python is None:
+            try:
+                binding = resolve_hermes_command_binding(current.hermes_root)
+            except MaintenanceRefused:
                 return _fail_job(
                     current,
                     "hermes_runtime_missing",
                     "native_hermes",
                     publisher,
                 )
-            installed = runner(
+            runtime_python = binding.runtime_python
+            installed = run_bound_runtime_python(
+                binding,
                 (
-                    str(runtime_python),
-                    "-I",
                     "-m",
                     "pip",
                     "install",
@@ -852,6 +1224,9 @@ def _run_job(
                     str(current.artifact_path),
                 ),
                 300.0,
+                run=runner,
+                base_environment=base_environment,
+                proxy_environment=proxy_environment,
             )
             if installed.timed_out or installed.returncode != 0:
                 return _fail_job(
@@ -860,10 +1235,9 @@ def _run_job(
                     "native_hermes",
                     publisher,
                 )
-            install_hook = runner(
+            install_hook = run_bound_runtime_python(
+                binding,
                 (
-                    str(runtime_python),
-                    "-I",
                     "-m",
                     "hermes_feishu_card.cli",
                     "install",
@@ -872,6 +1246,9 @@ def _run_job(
                     "--yes",
                 ),
                 180.0,
+                run=runner,
+                base_environment=base_environment,
+                proxy_environment=proxy_environment,
             )
             if install_hook.timed_out or install_hook.returncode != 0:
                 return _fail_job(
@@ -895,25 +1272,30 @@ def _run_job(
             )
 
         if current.phase == "starting_services":
-            runtime_python = detect_runtime_python(current.hermes_root)
-            if runtime_python is None:
+            try:
+                binding = resolve_hermes_command_binding(current.hermes_root)
+            except MaintenanceRefused:
                 return _fail_job(
                     current,
                     "hermes_runtime_missing",
                     "service_recovery",
                     publisher,
                 )
-            start = runner(
-                tuple(
-                    _cli_command(
-                        runtime_python,
-                        "start",
-                        config=current.config_path,
-                        env_file=current.env_file,
-                        hermes_root=current.hermes_root,
-                    )
-                ),
+            runtime_python = binding.runtime_python
+            start_argv = _cli_command(
+                runtime_python,
+                "start",
+                config=current.config_path,
+                env_file=current.env_file,
+                hermes_root=current.hermes_root,
+            )
+            start = run_bound_runtime_python(
+                binding,
+                tuple(start_argv[2:]),
                 120.0,
+                run=runner,
+                base_environment=base_environment,
+                proxy_environment=proxy_environment,
             )
             if start.timed_out or start.returncode != 0:
                 return _fail_job(
@@ -922,9 +1304,13 @@ def _run_job(
                     "service_recovery",
                     publisher,
                 )
-            restart = runner(
-                ("hermes", "gateway", "restart"),
+            restart = run_hermes_command(
+                binding,
+                ("gateway", "restart"),
                 120.0,
+                run=runner,
+                base_environment=base_environment,
+                proxy_environment=proxy_environment,
             )
             if restart.timed_out or restart.returncode != 0:
                 return _fail_job(
@@ -941,17 +1327,23 @@ def _run_job(
             )
 
         if current.phase == "verifying":
-            runtime_python = detect_runtime_python(current.hermes_root)
-            if runtime_python is None:
+            try:
+                binding = resolve_hermes_command_binding(current.hermes_root)
+            except MaintenanceRefused:
                 return _fail_job(
                     current,
                     "hermes_runtime_missing",
                     "service_recovery",
                     publisher,
                 )
-            import_result = runner(
-                (str(runtime_python), "-I", "-c", _RUNTIME_IMPORT_PROBE),
+            runtime_python = binding.runtime_python
+            import_result = run_bound_runtime_python(
+                binding,
+                ("-c", _RUNTIME_IMPORT_PROBE),
                 30.0,
+                run=runner,
+                base_environment=base_environment,
+                proxy_environment=proxy_environment,
             )
             import_ok, import_origin = _verified_import(
                 import_result,
@@ -1088,7 +1480,7 @@ def _fail_job(
     recovery_boundary: str,
     publisher: JobPublisher | None,
 ) -> UpdateJob:
-    if current.phase in _TERMINAL_PHASES:
+    if current.phase in TERMINAL_UPDATE_PHASES:
         return current
     try:
         failed = transition_job(
@@ -1374,6 +1766,9 @@ def _verified_import(
 def _restore_old_hfc_after_update_failure(
     job: UpdateJob,
     run: CommandRunner,
+    *,
+    base_environment: Optional[Mapping[str, str]] = None,
+    proxy_environment: Optional[Mapping[str, str]] = None,
 ) -> bool:
     if _git_head(job.hermes_root, run) != job.pre_update_head:
         return False
@@ -1382,13 +1777,14 @@ def _restore_old_hfc_after_update_failure(
     status = _git_status(job.hermes_root, run)
     if status is None or status:
         return False
-    runtime_python = detect_runtime_python(job.hermes_root)
-    if runtime_python is None:
+    try:
+        binding = resolve_hermes_command_binding(job.hermes_root)
+    except MaintenanceRefused:
         return False
-    install_package = run(
+    runtime_python = binding.runtime_python
+    install_package = run_bound_runtime_python(
+        binding,
         (
-            str(runtime_python),
-            "-I",
             "-m",
             "pip",
             "install",
@@ -1397,13 +1793,15 @@ def _restore_old_hfc_after_update_failure(
             str(job.artifact_path),
         ),
         300.0,
+        run=run,
+        base_environment=base_environment,
+        proxy_environment=proxy_environment,
     )
     if install_package.timed_out or install_package.returncode != 0:
         return False
-    install_hook = run(
+    install_hook = run_bound_runtime_python(
+        binding,
         (
-            str(runtime_python),
-            "-I",
             "-m",
             "hermes_feishu_card.cli",
             "install",
@@ -1412,26 +1810,39 @@ def _restore_old_hfc_after_update_failure(
             "--yes",
         ),
         180.0,
+        run=run,
+        base_environment=base_environment,
+        proxy_environment=proxy_environment,
     )
     if install_hook.timed_out or install_hook.returncode != 0:
         return False
     if not _installed_hook_verified(job.hermes_root):
         return False
-    start = run(
-        tuple(
-            _cli_command(
-                runtime_python,
-                "start",
-                config=job.config_path,
-                env_file=job.env_file,
-                hermes_root=job.hermes_root,
-            )
-        ),
+    start_argv = _cli_command(
+        runtime_python,
+        "start",
+        config=job.config_path,
+        env_file=job.env_file,
+        hermes_root=job.hermes_root,
+    )
+    start = run_bound_runtime_python(
+        binding,
+        tuple(start_argv[2:]),
         120.0,
+        run=run,
+        base_environment=base_environment,
+        proxy_environment=proxy_environment,
     )
     if start.timed_out or start.returncode != 0:
         return False
-    restart = run(("hermes", "gateway", "restart"), 120.0)
+    restart = run_hermes_command(
+        binding,
+        ("gateway", "restart"),
+        120.0,
+        run=run,
+        base_environment=base_environment,
+        proxy_environment=proxy_environment,
+    )
     return not restart.timed_out and restart.returncode == 0
 
 

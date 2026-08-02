@@ -49,6 +49,7 @@ from hermes_feishu_card.install.manifest import (
 from hermes_feishu_card.install.integrity import (
     IntegrityRepairRefused,
     build_integrity_provenance,
+    integrity_acknowledgement_eligible,
     plan_integrity_repair,
     render_integrity_manifest_migration,
 )
@@ -81,6 +82,7 @@ from hermes_feishu_card.maintenance_store import (
     load_job,
     load_verified_artifact,
     maintenance_paths,
+    sanitize_job_environment,
     stage_job_credentials,
     stage_wheel_artifact,
 )
@@ -582,14 +584,12 @@ def _run_maintenance(args: argparse.Namespace) -> int:
             if not status.available:
                 print(f"maintenance: unavailable ({status.reason_code})")
                 return 1
-            if all(
-                str(os.environ.get(key) or "").strip()
-                for key in ("FEISHU_APP_ID", "FEISHU_APP_SECRET")
-            ):
+            environment = sanitize_job_environment(os.environ)
+            if environment:
                 stage_job_credentials(
                     paths,
                     job_id=job.job_id,
-                    environment=os.environ,
+                    environment=environment,
                 )
             launched = launch_job(status, job)
             print(
@@ -1093,6 +1093,10 @@ def _build_doctor_report(
 
     install_state = _diagnose_install_state(detection)
     recovery_plan = plan_recovery(detection)
+    try:
+        integrity_plan = plan_integrity_repair(detection)
+    except (IntegrityRepairRefused, OSError, RuntimeError, ValueError):
+        integrity_plan = None
     profile_id = str(getattr(args, "_profile_id", "") or "")
     route = _diagnostic_route(config, profile_id)
     try:
@@ -1116,6 +1120,7 @@ def _build_doctor_report(
         config,
         detection,
         recovery_plan,
+        integrity_plan=integrity_plan,
         health=health,
         profile_id=profile_id,
         profile_source=str(getattr(args, "_profile_source", "") or ""),
@@ -2612,10 +2617,10 @@ def _verified_integrity_acknowledgement_binding(
     if recovery_plan.state != "installed" or recovery_plan.actions:
         raise ValueError("Hermes installed plan could not be verified")
     integrity_plan = plan_integrity_repair(detection)
-    if (
-        integrity_plan.state != "installed"
-        or integrity_plan.executable
-        or integrity_plan.reason != "recovery_not_required"
+    if not integrity_acknowledgement_eligible(
+        detection,
+        recovery_plan,
+        integrity_plan,
     ):
         raise ValueError("Hermes integrity plan could not be verified")
     return build_runtime_integrity_fence_binding(

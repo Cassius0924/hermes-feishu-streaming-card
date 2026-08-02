@@ -53,11 +53,12 @@ git status --short
 git add <release files>
 git commit -m "Release vX.Y.Z <summary>"
 git tag -a vX.Y.Z -m "Release vX.Y.Z <summary>"
-git push origin main
-git push origin vX.Y.Z
+git push origin refs/tags/vX.Y.Z
 ```
 
-`vX.Y.Z` 必须是 annotated tag。
+`vX.Y.Z` 必须是 annotated tag，并且只在合并 SHA 的精确测试和 provenance 验证完成后创建。发布审批只创建并推送 tag，绝不由 release gate 推送 main。
+
+Release Assets 只接受完整的 `refs/tags/vMAJOR.MINOR.PATCH` 输入。resolver 会把 annotated tag peel 到一个精确 commit，reusable 跨平台 tests 全部 checkout 该 exact commit；package job 在构建前重新 fetch 并执行 full verification，上传前再完整复验同一 tag/commit。任何 lightweight tag、tag 移动、metadata 不一致、非 `origin/main` 祖先或测试失败都会在资产上传前终止。
 
 ## GitHub Release
 

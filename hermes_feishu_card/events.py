@@ -36,6 +36,11 @@ class SidecarEvent:
     created_at: float
     data: Dict[str, Any]
     thread_id: str = ""
+    turn_id: str = ""
+
+    @property
+    def canonical_turn_id(self) -> str:
+        return self.turn_id or self.message_id
 
     @property
     def display_status(self) -> str:
@@ -93,6 +98,9 @@ class SidecarEvent:
             thread_id = ""
         if not isinstance(thread_id, str):
             raise EventValidationError("thread_id must be a string")
+        turn_id = payload.get("turn_id", "")
+        if not isinstance(turn_id, str):
+            raise EventValidationError("turn_id must be a string")
         return cls(
             schema_version=payload["schema_version"],
             event=event,
@@ -104,4 +112,5 @@ class SidecarEvent:
             sequence=payload["sequence"],
             created_at=created_at,
             data=data,
+            turn_id=turn_id.strip(),
         )

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email.parser import Parser
+import errno
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ from pathlib import Path
 import secrets
 import stat
 import tempfile
+import threading
 import time
 from typing import Callable, Iterator, Mapping
 import zipfile
@@ -56,10 +58,33 @@ _SAFE_RESULT_KEYS = frozenset(
 )
 _MAX_STRING_CHARS = 4096
 _EXPECTED_DISTRIBUTION = "hermes-feishu-streaming-card"
+PROXY_ENVIRONMENT_KEYS = frozenset(
+    {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    }
+)
+JOB_ENVIRONMENT_KEYS = frozenset(
+    {
+        "FEISHU_APP_ID",
+        "FEISHU_APP_SECRET",
+        *PROXY_ENVIRONMENT_KEYS,
+    }
+)
 
 
 class MaintenanceRefused(ValueError):
     """Raised when maintenance evidence is incomplete or unsafe."""
+
+
+class UpdateLockBusy(MaintenanceRefused):
+    """Raised only when another owner currently holds the OS update lock."""
 
 
 @dataclass(frozen=True)
@@ -70,6 +95,17 @@ class MaintenancePaths:
     jobs: Path
     lock: Path
     drain: Path
+
+
+@dataclass(frozen=True)
+class UpdateLockLease:
+    job_id: str
+    path: Path
+    _owner_token: str = field(repr=False)
+
+
+_UPDATE_LEASE_GUARD = threading.Lock()
+_ACTIVE_UPDATE_LEASES: dict[str, UpdateLockLease] = {}
 
 
 @dataclass(frozen=True)
@@ -232,11 +268,7 @@ def stage_job_credentials(
     environment: Mapping[str, str],
 ) -> Path | None:
     selected_job_id = _safe_job_id(job_id)
-    values = {
-        key: value
-        for key in ("FEISHU_APP_ID", "FEISHU_APP_SECRET")
-        if isinstance((value := environment.get(key)), str) and value.strip()
-    }
+    values = sanitize_job_environment(environment)
     if not values:
         return None
     _prepare_paths(paths)
@@ -274,10 +306,22 @@ def load_job_credentials(paths: MaintenancePaths, *, job_id: str) -> dict[str, s
         raise MaintenanceRefused("job credential snapshot is invalid")
     values: dict[str, str] = {}
     for key, value in raw_environment.items():
-        if key not in {"FEISHU_APP_ID", "FEISHU_APP_SECRET"}:
+        if key not in JOB_ENVIRONMENT_KEYS:
             raise MaintenanceRefused("job credential snapshot key is invalid")
         values[key] = _bounded_string(value, "job credential value")
     return values
+
+
+def sanitize_job_environment(
+    environment: Mapping[str, str],
+) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in environment.items()
+        if key in JOB_ENVIRONMENT_KEYS
+        and isinstance(value, str)
+        and value.strip()
+    }
 
 
 def consume_job_credentials(paths: MaintenancePaths, *, job_id: str) -> dict[str, str]:
@@ -634,10 +678,12 @@ def acquire_update_lock(
     paths: MaintenancePaths,
     *,
     job_id: str,
-) -> Iterator[Path]:
+) -> Iterator[UpdateLockLease]:
     _prepare_paths(paths)
     safe_job_id = _bounded_string(job_id, "job id")
     descriptor = _open_private_lock_file(paths.lock, "update lock")
+    locked = False
+    lease: UpdateLockLease | None = None
     try:
         if os.name == "nt":
             import msvcrt
@@ -646,33 +692,81 @@ def acquire_update_lock(
                 os.lseek(descriptor, 0, os.SEEK_SET)
                 msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
             except OSError as exc:
-                raise MaintenanceRefused("update already in progress") from exc
+                if _is_update_lock_contention(exc):
+                    raise UpdateLockBusy("update already in progress") from exc
+                raise
         else:
             import fcntl
 
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as exc:
-                raise MaintenanceRefused("update already in progress") from exc
+                if _is_update_lock_contention(exc):
+                    raise UpdateLockBusy("update already in progress") from exc
+                raise
+        locked = True
         os.fchmod(descriptor, 0o600) if hasattr(os, "fchmod") else None
         os.ftruncate(descriptor, 0)
         os.write(descriptor, (safe_job_id + "\n").encode("utf-8"))
         os.fsync(descriptor)
-        yield paths.lock
+        owner_token = secrets.token_urlsafe(32)
+        lease = UpdateLockLease(
+            job_id=safe_job_id,
+            path=paths.lock.resolve(strict=False),
+            _owner_token=owner_token,
+        )
+        with _UPDATE_LEASE_GUARD:
+            _ACTIVE_UPDATE_LEASES[owner_token] = lease
+        yield lease
     finally:
-        try:
-            if os.name == "nt":
-                import msvcrt
+        if lease is not None:
+            with _UPDATE_LEASE_GUARD:
+                if _ACTIVE_UPDATE_LEASES.get(lease._owner_token) is lease:
+                    _ACTIVE_UPDATE_LEASES.pop(lease._owner_token, None)
+        if locked:
+            try:
+                if os.name == "nt":
+                    import msvcrt
 
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
 
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-        except OSError:
-            pass
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
         os.close(descriptor)
+
+
+def require_update_lock_lease(
+    paths: MaintenancePaths,
+    *,
+    job_id: str,
+    lease: UpdateLockLease,
+) -> UpdateLockLease:
+    expected_job_id = _bounded_string(job_id, "job id")
+    expected_path = paths.lock.resolve(strict=False)
+    if not isinstance(lease, UpdateLockLease):
+        raise MaintenanceRefused("update lock lease is invalid")
+    with _UPDATE_LEASE_GUARD:
+        current = _ACTIVE_UPDATE_LEASES.get(lease._owner_token)
+        valid = (
+            current is lease
+            and lease.job_id == expected_job_id
+            and lease.path == expected_path
+        )
+    if not valid:
+        raise MaintenanceRefused("update lock lease is not active")
+    return lease
+
+
+def _is_update_lock_contention(exc: OSError) -> bool:
+    return isinstance(exc, BlockingIOError) or exc.errno in {
+        errno.EACCES,
+        errno.EAGAIN,
+        getattr(errno, "EWOULDBLOCK", errno.EAGAIN),
+    }
 
 
 @contextmanager
