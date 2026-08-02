@@ -149,6 +149,12 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 
 ## V4.2.5 发布门禁
 
+Accepted runtime SHA: `7f87beed8a37a365c10483f3d638092fd422782e`
+
+- 候选验收记录：**2026-08-02 11:31:18 CST（Asia/Shanghai）**；平台为 **macOS arm64**；Hermes checkout 版本为 `v2026.7.30-15-gce6dd1a65-dirty`（仅只读用于验收，未由本次流程修改）；隔离运行的 HFC package/runtime 均为 `4.2.5`。
+- 真实飞书 topic 验收：**通过**。在最近仍有效的既有测试群 topic 中严格只创建两张 A/B 卡；sidecar 报告 `events_applied=4/4`、`feishu_send_successes=2/2`、`events_rejected=0`、send/update failure 均为 `0`。首次 A 已成功创建后，验收夹具因错误依赖 hook 布尔返回提前停止；恢复流程复用同一张 A，没有重发第三张卡。A 的首段与 B started 后的迟到标记均 PATCH 成功，B 的首段与 terminal 由候选 hook/sidecar 完成，B summary 已索引且不含 A/late 标记，两张卡 ID 不同。
+- 飞书历史消息接口对已 PATCH 卡片返回初始正文快照，因此不把该正文快照当作 A 的当前内容证据；A 以两次 PATCH 成功、`updated=true`、`update_time` 前进和零 update failure 证明状态转换。B 以 sidecar summary 与事件/发送/更新计数证明。该限制不影响“两张卡、无跨写”的通过结论，但保留为验收证据边界。
+- accepted runtime 自动化：runtime focused `938 passed`；maintenance focused `223 passed`；installer/release focused `159 passed, 3 skipped`；disposable maintenance smoke `6 passed`；完整 pytest **`2400 passed, 5 skipped`**。沙箱内首次 runtime focused 运行因禁止绑定 `127.0.0.1` 临时端口失败，按项目授权在沙箱外原样重跑后全部通过。
 - 九个审查 ID 均有命名回归，覆盖 quoted turn、maintenance ownership/binding/drain、doctor action、installer pin 与 config marker。
 - `latest` 解析失败必须在 pip/setup/doctor 和 Docker state mutation 前退出；显式 `main` 是唯一 moving ref。
 - Release Assets 必须按 `resolve-release -> reusable exact-commit tests -> package` 执行，并在 build 前和 upload 前 full reverify annotated tag。
