@@ -7110,7 +7110,9 @@ async def test_v4_interaction_restores_cached_preview_on_promoted_card(client):
         ),
     )
 
-    _, waiting = await wait_for_card_update(feishu_client, "允许读取精确位置吗？")
+    assert len(feishu_client.sent) == 2
+    waiting = feishu_client.sent[-1][1]
+    assert "允许读取精确位置吗？" in str(waiting)
     assert waiting["header"]["title"]["content"] == "允许读取精确位置吗？"
     button = next(
         item for item in waiting["body"]["elements"] if item.get("tag") == "button"
