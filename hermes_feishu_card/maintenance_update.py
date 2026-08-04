@@ -37,7 +37,7 @@ from .maintenance_store import (
 )
 
 
-UPDATE_CHECK_TIMEOUT_SECONDS = 60.0
+UPDATE_CHECK_TIMEOUT_SECONDS = 300.0
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _SECRET_ASSIGNMENT_RE = re.compile(

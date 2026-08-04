@@ -168,3 +168,7 @@ Hermes and maintenance venvs commonly expose `bin/python` as a symlink. Keep
 that lexical venv path when launching isolated commands and validating
 `site-packages`; resolving it to the backing interpreter silently discards the
 venv package boundary and can make `/update` fail before mutation.
+
+The native read-only update check and the explicit target fetch may each take
+up to five minutes on a slow remote. They must still fail closed on timeout;
+do not replace the bound `origin/main` snapshot with stale local metadata.

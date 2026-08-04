@@ -26,6 +26,10 @@ The update preflight previously rejected a standard venv `bin/python` symlink, s
 
 Runtime binding and import-origin verification now preserve the lexical venv path while still using only the fixed Hermes and maintenance runtime candidates. Regression tests cover both the Hermes command binding and the full maintenance state machine with POSIX venv symlinks.
 
+The read-only native update check and target fetch retain fail-closed timeouts,
+but now allow up to five minutes each so a successful slow Git fetch is not
+misclassified as unavailable after only 60 seconds.
+
 ## Candidate verification
 
 - Focused patcher, detection, installer, session, and completion reconciliation tests.
