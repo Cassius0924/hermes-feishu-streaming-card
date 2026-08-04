@@ -69,12 +69,17 @@ to executable integrity actions, and makes installer `latest` resolve to one
 pinned stable release tag or stop before package/setup mutation. Release assets
 now require an exact tested annotated tag.
 
+V4.2.6 adds exact Hermes Agent 0.20 Base-ledger compatibility, keeps repeated
+choice requests at the latest chat position, preserves a substantial streamed
+answer before a short terminal postscript, and repairs bare Feishu `/update`
+for standard venv symlinks, slow Git fetches, and Hermes 0.20 version reporting.
+
 V4.2.4 gives every new Feishu/Lark topic reply its real incoming message ID.
 Consecutive replies quoting the same message therefore open independent cards
 instead of overwriting the first card; in-turn stream events still resolve
 through the reply alias.
 
-The current unreleased candidate recognizes Hermes Agent 0.20's awaited
+V4.2.6 recognizes Hermes Agent 0.20's awaited
 delivery-ledger calls, keeps a substantial streamed answer visible when a short
 terminal validation postscript follows it, and promotes every agent choice
 request to a fresh latest-position card for long multi-turn conversations. The
@@ -296,7 +301,7 @@ a privileged container, or mount host system-service directories.
 ```
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.5
+export HFC_VERSION=v4.2.6
 bash install-docker.sh
 ```
 

@@ -132,7 +132,7 @@ streaming:
 
 Do not set `display.platforms.feishu.streaming: false`. Do not treat `display.show_reasoning` as required for this plugin; it can append reasoning blocks to the final answer and disrupt the streaming card experience. The plugin consumes Hermes `thinking.delta` / `answer.delta` directly.
 
-The compatibility matrix covers older Hermes starting at `v2026.4.23` and Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0.19.0 (`v2026.7.20`). Automated strategy detection requires installation to verify and manage both `gateway/run.py` and `gateway/platforms/base.py` for Hermes 0.19.0, `v2026.7.20+`, or verified exact-ledger source; V4.1 `manifest_version: 2` treats run, required Base, and optional Cron backup/write/restore as one transaction. A separate read-only validation against real local source confirmed startup before ledger redelivery, recovery before adapter send, and idempotent restore, but is not a claim of a real Gateway or Feishu E2E run. `doctor` prefers `VERSION` or a Git tag and can fall back to verified anchors when metadata is missing or unparseable. A Hermes upgrade can replace managed source; `status` / `start` use `HERMES_DIR` from the config-adjacent `.env` to detect stale state and print a safe recovery command. After confirming an intentional upgrade, run the suggested `install --accept-hermes-upgrade --yes`, then `hermes gateway start`; user edits or incomplete evidence remain fail-closed behind `doctor --explain`.
+The compatibility matrix covers older Hermes starting at `v2026.4.23` and Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0.19.0 (`v2026.7.20`)/0.20.x. `doctor` prefers `VERSION`, a literal `hermes_cli.__version__`, or a Git tag and can fall back to verified anchors when metadata is missing or unparseable. Automated strategy detection requires installation to verify and manage both `gateway/run.py` and `gateway/platforms/base.py` for Hermes 0.19.0, `v2026.7.20+`, or verified exact-ledger source; Hermes 0.20 awaited `asyncio.to_thread(...)` ledger writes are accepted only at exact anchors. V4.1 `manifest_version: 2` treats run, required Base, and optional Cron backup/write/restore as one transaction. A separate read-only validation against real local source confirmed startup before ledger redelivery, recovery before adapter send, and idempotent restore, but is not a claim of a real Gateway or Feishu E2E run. A Hermes upgrade can replace managed source; `status` / `start` use `HERMES_DIR` from the config-adjacent `.env` to detect stale state and print a safe recovery command. After confirming an intentional upgrade, run the suggested `install --accept-hermes-upgrade --yes`, then `hermes gateway start`; user edits or incomplete evidence remain fail-closed behind `doctor --explain`.
 
 ## Docker Container Install
 
@@ -141,7 +141,7 @@ For an existing Hermes container:
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.5
+export HFC_VERSION=v4.2.6
 bash install-docker.sh
 ```
 
@@ -181,7 +181,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ![Feishu topic reply card continuity and reasoning/tool timeline showcase](docs/assets/feishu-topic-card-showcase-v389.png)
 | Version | Highlights |
 |---|---|
-| [v4.2.5](docs/release-notes-v4.2.5.en.md) | Audit safety hotfix for canonical turn isolation, maintenance ownership/checkout/drain recovery, executable doctor actions, pinned stable-tag installs, and an exact tested annotated-tag release gate |
+| [v4.2.6](docs/release-notes-v4.2.6.en.md) | Fixes Issue #187 repeated choice-card position, #188 short terminal postscripts replacing answers, #189/PR #190 exact Base compatibility for Hermes 0.20, and bare Feishu `/update` venv-symlink, slow-fetch, and version-reporting failures; see [v4.2.5](docs/release-notes-v4.2.5.en.md) for the preceding audit safety hotfix |
 | [v4.2.4](docs/release-notes-v4.2.4.en.md) | Fixes consecutive Feishu/Lark topic replies quoting the same message overwriting the first reply card; every new message opens an independent card while in-turn streaming still resolves through the reply alias |
 | [v4.2.3](docs/release-notes-v4.2.3.en.md) | Preserves `update_evidence_fingerprint` when the WebSocket hook forwards `/update` actions, allowing the sidecar to complete evidence-bound confirm/cancel transitions while missing or mismatched evidence remains fail-closed |
 | [v4.2.2](docs/release-notes-v4.2.2.en.md) | Fixes `/update` confirmation actions that changed durable state without PATCHing the original card; cancel now renders a terminal state and never starts the updater, while confirm shows preparation before scheduling maintenance |

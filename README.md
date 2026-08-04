@@ -131,7 +131,7 @@ streaming:
 
 不要设置 `display.platforms.feishu.streaming: false`。也不要把 `display.show_reasoning` 当成本插件必需开关；它可能把 reasoning 追加到最终回复里，反而干扰卡片流式体验。插件会直接处理 Hermes 的 `thinking.delta` / `answer.delta`。
 
-Hermes `v2026.4.23` 起的旧版和 Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0.19.0（`v2026.7.20`）均有兼容策略；`doctor` 会优先读取 `VERSION` 或 Git tag `v2026.4.23+`，也会在版本 metadata 不完整或不可解析时用可验证 anchors 兜底。自动化 strategy detection 在 Hermes 0.19.0、`v2026.7.20+` 或检测到精确 ledger 结构时，要求安装器同时验证并管理 `gateway/run.py` 与 `gateway/platforms/base.py`；V4.1 `manifest_version: 2` 把 run、required Base、optional Cron 的 backup/write/restore 作为同一事务。另一次本机真实源码只读验证确认 patcher 保持启动早于 ledger redelivery、recovery 早于 adapter send，并可幂等恢复；它只证明源码 patch 边界，不等同于真实 Gateway 或飞书 E2E。升级 Hermes 可能替换受管源码；`status` / `start` 会从配置旁 `.env` 的 `HERMES_DIR` 主动识别残留状态并给出安全恢复命令。确认是有意升级后，执行提示的 `install --accept-hermes-upgrade --yes`，再执行 `hermes gateway start`；若检测到用户改动或证据不完整，只会要求 `doctor --explain` 人工检查。
+Hermes `v2026.4.23` 起的旧版和 Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0.19.0（`v2026.7.20`）/0.20.x 均有兼容策略；`doctor` 会优先读取 `VERSION`、literal `hermes_cli.__version__` 或 Git tag `v2026.4.23+`，也会在版本 metadata 不完整或不可解析时用可验证 anchors 兜底。自动化 strategy detection 在 Hermes 0.19.0、`v2026.7.20+` 或检测到精确 ledger 结构时，要求安装器同时验证并管理 `gateway/run.py` 与 `gateway/platforms/base.py`；Hermes 0.20 的 awaited `asyncio.to_thread(...)` ledger writes 只在精确 anchors 内接受。V4.1 `manifest_version: 2` 把 run、required Base、optional Cron 的 backup/write/restore 作为同一事务。另一次本机真实源码只读验证确认 patcher 保持启动早于 ledger redelivery、recovery 早于 adapter send，并可幂等恢复；它只证明源码 patch 边界，不等同于真实 Gateway 或飞书 E2E。升级 Hermes 可能替换受管源码；`status` / `start` 会从配置旁 `.env` 的 `HERMES_DIR` 主动识别残留状态并给出安全恢复命令。确认是有意升级后，执行提示的 `install --accept-hermes-upgrade --yes`，再执行 `hermes gateway start`；若检测到用户改动或证据不完整，只会要求 `doctor --explain` 人工检查。
 
 ## Docker 容器内安装
 
@@ -140,7 +140,7 @@ Hermes `v2026.4.23` 起的旧版和 Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.5
+export HFC_VERSION=v4.2.6
 bash install-docker.sh
 ```
 
@@ -180,7 +180,7 @@ bash install-docker.sh
 ![飞书话题内卡片连续更新与思考工具 timeline 展示](docs/assets/feishu-topic-card-showcase-v389.png)
 | 版本 | 重点 |
 |---|---|
-| [v4.2.5](docs/release-notes-v4.2.5.md) | 审查安全热修：canonical turn 隔离、maintenance owner/checkout/drain 恢复、可执行 doctor 建议、固定 stable-tag 安装，以及 exact tested annotated-tag 发布门禁 |
+| [v4.2.6](docs/release-notes-v4.2.6.md) | 修复 Issue #187 重复选项卡位置、#188 终态短后记覆盖正文、#189/PR #190 Hermes 0.20 exact Base 兼容，并修复飞书裸 `/update` 的 venv symlink、慢 fetch 与 Hermes 0.20 版本误报；上一版审查安全热修见 [v4.2.5](docs/release-notes-v4.2.5.md) |
 | [v4.2.4](docs/release-notes-v4.2.4.md) | 修复飞书/Lark 话题中连续引用同一消息时复用旧 session、覆盖首张回复卡的问题；每条新消息创建独立卡片，同一轮流式更新仍通过 reply alias 关联 |
 | [v4.2.3](docs/release-notes-v4.2.3.md) | 修复 WebSocket hook 转发 `/update` 按钮动作时遗漏 `update_evidence_fingerprint` 的问题，使 sidecar 能完成证据绑定的确认/取消状态转换；缺失或不匹配证据仍 fail-closed |
 | [v4.2.2](docs/release-notes-v4.2.2.md) | 修复 `/update` 确认卡按钮回调只更新服务端状态、未 PATCH 原卡片的问题；取消会进入“已取消更新”终态且绝不启动 updater，确认会先显示准备更新再启动维护任务 |

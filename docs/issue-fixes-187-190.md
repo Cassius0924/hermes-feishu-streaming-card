@@ -1,8 +1,8 @@
-# Issues #187–#190 candidate fixes
+# Issues #187–#190 fixes
 
 Date: 2026-08-04
 
-This candidate branch addresses the following open compatibility and card UX reports without changing the published V4.2.5 version contract.
+These compatibility, maintenance, and card UX fixes are published in V4.2.6.
 
 ## Issue #189 / PR #190: Hermes Agent 0.20
 
@@ -35,9 +35,9 @@ reads the literal `hermes_cli.__version__` assignment without importing Hermes
 before falling back to the nearest Git tag, so doctor and the final update card
 report `0.20.0` instead of a stale calendar tag such as `v2026.7.30`.
 
-## Candidate verification
+## Verification
 
 - Focused patcher, detection, installer, session, and completion reconciliation tests.
 - Complete server integration tests, including repeated interaction promotion and rollback after send failure.
 - Real local `/update` preflight and confirmation-card checks against a symlink-based Hermes venv.
-- Full repository test suite and `git diff --check` before publishing the candidate branch.
+- Full repository test suite and `git diff --check` before publishing V4.2.6.

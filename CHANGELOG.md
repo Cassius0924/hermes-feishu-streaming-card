@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.2.6 — 2026-08-04
+
+See also: [docs/release-notes-v4.2.6.md](docs/release-notes-v4.2.6.md)
+
+### Fixed
+- Issue #187: every repeated `interaction.requested` now creates a fresh latest-position choice card, promotes that message as the update target, and rolls back exactly when creation fails.
+- Issue #188: a substantial streamed answer remains visible when completion adds only a short terminal postscript; ordinary final answers still replace short progress prefaces.
+- Issue #189 / PR #190: Hermes Agent 0.20's awaited `asyncio.to_thread(...)` delivery-ledger writes are patched only at the verified exact Base anchors.
+- Bare private-chat `/update` accepts lexical venv Python symlinks, preserves the independent maintenance runtime, and allows slow read-only check/fetch operations up to five minutes.
+- Hermes 0.20 version detection reads the literal `hermes_cli.__version__` assignment before Git fallback, preventing stale calendar-tag reporting.
+
+### Safety
+- Unknown, unawaited, reordered, or inexact Hermes ledger shapes remain fail-closed, and apply/remove is verified byte-for-byte.
+- Existing update evidence, target, drain, ownership, rollback, and exact-merge release gates remain unchanged.
+
 ## V4.2.5 — 2026-08-02
 
 See also: [docs/release-notes-v4.2.5.md](docs/release-notes-v4.2.5.md)
