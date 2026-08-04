@@ -18,6 +18,9 @@ FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "hermes_v2026_4_23"
 EXACT_BASE_FIXTURE = (
     Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base.py"
 )
+EXACT_BASE_V020_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base_v020.py"
+)
 CRON_FIXTURE = (
     Path(__file__).resolve().parents[1]
     / "fixtures"
@@ -106,6 +109,15 @@ def make_exact_019_hermes(tmp_path):
     target = base_path(hermes_dir)
     target.parent.mkdir(parents=True)
     shutil.copy2(EXACT_BASE_FIXTURE, target)
+    return hermes_dir
+
+
+def make_exact_020_hermes(tmp_path):
+    hermes_dir = copy_hermes(tmp_path)
+    (hermes_dir / "VERSION").write_text("v2026.8.3\n", encoding="utf-8")
+    target = base_path(hermes_dir)
+    target.parent.mkdir(parents=True)
+    shutil.copy2(EXACT_BASE_V020_FIXTURE, target)
     return hermes_dir
 
 
@@ -1516,6 +1528,21 @@ def test_install_and_restore_019_manages_exact_base_as_third_target(tmp_path):
     assert not backup_path(hermes_dir).exists()
     assert not base_backup_path(hermes_dir).exists()
     assert not manifest_path(hermes_dir).exists()
+
+
+def test_install_and_restore_020_manages_awaited_ledger_contract(tmp_path):
+    hermes_dir = make_exact_020_hermes(tmp_path)
+    run_original = run_py(hermes_dir).read_bytes()
+    base_original = base_path(hermes_dir).read_bytes()
+
+    assert cli.main(["install", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    patched = base_path(hermes_dir).read_text(encoding="utf-8")
+    assert patcher.EXACT_BASE_NO_TEXT_PATCH_BEGIN in patched
+    assert patcher.EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN in patched
+
+    assert cli.main(["restore", "--hermes-dir", str(hermes_dir), "--yes"]) == 0
+    assert run_py(hermes_dir).read_bytes() == run_original
+    assert base_path(hermes_dir).read_bytes() == base_original
 
 
 @pytest.mark.parametrize("command", ["restore", "uninstall"])

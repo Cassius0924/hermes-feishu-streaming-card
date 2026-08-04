@@ -97,7 +97,7 @@ message.completed
 状态规则：
 
 - 运行中：Header title 保留用户配置；subtitle 将 Hermes 最新一条非空工具预览与工具名整理为确定性的动作摘要。正文继续累积公开 `thinking.delta`，完整命令留在 timeline。
-- 等待用户：待处理的 `interaction.requested.prompt` 临时覆盖 Header；正文只保留说明和交互控件，不重复问题。交互完成后恢复此前工具预览。
+- 等待用户：待处理的 `interaction.requested.prompt` 临时覆盖 Header；正文只保留说明和交互控件，不重复问题。每次请求都会把完整当前状态提升为一张新的最新卡片，旧卡保留为此前快照；交互完成后，最新卡恢复此前工具预览。
 - 失败：保留失败前最后一条工具预览，正文显示 Hermes 的失败原因。
 - 已完成：移除运行时预览；普通聊天只保留飞书原生回复引用作为 Header，不再显示配置标题或在卡片内复制引用。没有有效 reply anchor 的兼容路径仍使用配置标题 fallback。
 - 一旦 `answer.delta` 开始，最终回答成为正文主内容，之前的公开阶段性输出不再与答案并排显示。
@@ -218,7 +218,7 @@ V3.10.0 的 command-card adapter hook 会在运行时包装 runner 的 `_handle_
 
 ## Agent clarify / approval 交互
 
-Agent 任务内的 `interaction.requested` 会渲染为当前 streaming card 里的按钮。
+Agent 任务内的 `interaction.requested` 会渲染为当前 streaming card 里的按钮。若本轮已经存在卡片，sidecar 会发送一张新的完整当前状态卡并把后续更新切换到新 message id；因此多轮选择始终出现在聊天底部，旧卡不会被追加按钮或再次改写。
 
 HTTP callback 可达时，Feishu/Lark 直接 POST 到 sidecar `/card/actions`。在 WebSocket 长连接或本地/private sidecar 场景中，按钮点击会先到 Hermes Feishu adapter 的原生 card-action channel，再由 hook runtime 接管 `interaction.select` 并转发到 sidecar `/card/actions`。
 
@@ -226,6 +226,7 @@ HTTP callback 可达时，Feishu/Lark 直接 POST 到 sidecar `/card/actions`。
 
 - sidecar 仍负责校验 `interaction_id` 和 callback token。
 - callback payload 带 `open_chat_id` 时，sidecar 还会确认 chat id 与 active session 匹配。
+- 新卡使用独立 interaction delivery key；发送失败会恢复请求前 session，原卡仍保持权威，Hermes 可按同一事件安全重试。
 - 成功后 sidecar 记录 `interaction.completed`，Hermes hook 轮询 `/interactions/{interaction_id}` 后继续执行。
 - sidecar 拒绝、超时或没有返回 card 时，hook 返回空 Feishu callback response，避免崩溃或落入未知原生 handler。
 

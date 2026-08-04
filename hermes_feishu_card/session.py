@@ -17,6 +17,9 @@ from .text import StreamingTextNormalizer, normalize_stream_text
 
 MIN_COMPLETED_SUFFIX_CHARS = 20
 MIN_COMPLETED_SUFFIX_RATIO_DENOMINATOR = 5
+MIN_PRESERVED_STREAMED_ANSWER_CHARS = 64
+MAX_SHORT_COMPLETION_POSTSCRIPT_CHARS = 240
+MIN_STREAMED_ANSWER_TO_POSTSCRIPT_RATIO = 3
 
 _RUNTIME_ACTION_PREFIX_RE = re.compile(
     r"^(?:正在)?(?:读取|执行(?:终端)?|编辑|写入|搜索|查询|浏览|访问|打开)\s*[:：]?\s*",
@@ -357,6 +360,9 @@ class CardSession:
             ):
                 self._answer_archive_index = None
                 return final
+            if _short_completion_would_replace_substantive_answer(preface, final):
+                self._answer_archive_index = None
+                return f"{preface}\n\n---\n\n{final}"
             self._archive_current_answer_to_reasoning()
             return stripped
 
@@ -595,6 +601,27 @@ def _has_substantial_completed_suffix(final: str, stripped: str) -> bool:
         len(final) // MIN_COMPLETED_SUFFIX_RATIO_DENOMINATOR,
     )
     return len(stripped) > threshold
+
+
+def _short_completion_would_replace_substantive_answer(
+    streamed_answer: str,
+    completed_answer: str,
+) -> bool:
+    """Keep a long streamed answer visible when completion is a short postscript.
+
+    This is intentionally content-agnostic: validators and custom skills can
+    append many different status messages, so recognizing private marker text
+    would be brittle.  The size and ratio bounds preserve an actual answer while
+    still letting a normal authoritative completion replace a brief preface.
+    """
+    streamed_length = len(streamed_answer.strip())
+    completed_length = len(completed_answer.strip())
+    return (
+        streamed_length >= MIN_PRESERVED_STREAMED_ANSWER_CHARS
+        and 0 < completed_length <= MAX_SHORT_COMPLETION_POSTSCRIPT_CHARS
+        and streamed_length
+        >= completed_length * MIN_STREAMED_ANSWER_TO_POSTSCRIPT_RATIO
+    )
 
 
 def _strip_preface_prefix(final: str, preface: str) -> str:

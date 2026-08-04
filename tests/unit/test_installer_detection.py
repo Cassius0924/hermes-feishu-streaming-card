@@ -16,6 +16,9 @@ FIXTURE_ROOT = (
 EXACT_BASE_FIXTURE = (
     Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base.py"
 )
+EXACT_BASE_V020_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base_v020.py"
+)
 TURN_RUNNER_FIXTURE = (
     Path(__file__).resolve().parents[1] / "fixtures" / "hermes_turn_runner.py"
 )
@@ -666,6 +669,23 @@ def test_detect_019_accepts_exact_base_delivery_contract(tmp_path):
     assert result.base_required is True
     assert result.base_py == base_py
     assert result.base_py_exists is True
+    assert result.base_hook_strategy == "exact_base_delivery"
+    assert result.capabilities["exact_base_delivery"] is True
+
+
+def test_detect_020_accepts_awaited_to_thread_delivery_contract(tmp_path):
+    _write_hermes_root(tmp_path, version="v2026.8.3")
+    base_py = tmp_path / "gateway" / "platforms" / "base.py"
+    base_py.parent.mkdir(parents=True, exist_ok=True)
+    base_py.write_text(
+        EXACT_BASE_V020_FIXTURE.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    result = detect_hermes(tmp_path)
+
+    assert result.supported is True
+    assert result.base_required is True
     assert result.base_hook_strategy == "exact_base_delivery"
     assert result.capabilities["exact_base_delivery"] is True
 

@@ -74,6 +74,13 @@ Consecutive replies quoting the same message therefore open independent cards
 instead of overwriting the first card; in-turn stream events still resolve
 through the reply alias.
 
+The current unreleased candidate recognizes Hermes Agent 0.20's awaited
+delivery-ledger calls, keeps a substantial streamed answer visible when a short
+terminal validation postscript follows it, and promotes every agent choice
+request to a fresh latest-position card for long multi-turn conversations. The
+maintenance flow also preserves standard venv `python` symlink paths when it
+binds the Hermes runtime and launches its independent updater.
+
 From V3.8.4, those standalone command cards also work in Feishu/Lark WebSocket
 long-connection deployments by patching the Feishu adapter's native interactive
 card action path; local/private sidecars no longer have to fall back to gray

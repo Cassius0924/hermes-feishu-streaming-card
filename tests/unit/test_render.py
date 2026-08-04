@@ -1751,7 +1751,10 @@ def test_render_expanded_timeline_splits_without_global_truncation():
             platform="feishu",
             sequence=3,
             created_at=0.0,
-            data={"answer": "最终回答。"},
+            # Keep this fixture focused on timeline splitting: a substantive
+            # authoritative completion should archive the earlier stream,
+            # unlike the short postscript preservation covered by issue #188.
+            data={"answer": "最终回答。" * 50},
         )
     )
 

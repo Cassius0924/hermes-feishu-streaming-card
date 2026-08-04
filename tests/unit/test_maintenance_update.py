@@ -11,6 +11,7 @@ from hermes_feishu_card.maintenance_store import (
 )
 from hermes_feishu_card.maintenance_update import (
     CommandResult,
+    _verified_import,
     gateway_drain_required,
     inspect_update,
     resolve_hermes_command_binding,
@@ -175,6 +176,57 @@ def test_hermes_command_binding_ignores_path_decoy(tmp_path):
         "-I",
         "-m",
         "hermes_cli.main",
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX venv symlink layout")
+def test_hermes_command_binding_accepts_standard_venv_python_symlink(tmp_path):
+    root = tmp_path / "custom" / "hermes-agent"
+    runtime = root / "venv" / "bin" / "python"
+    runtime.parent.mkdir(parents=True)
+    backing_python = tmp_path / "python3.12"
+    backing_python.write_text("#!python\n", encoding="utf-8")
+    backing_python.chmod(0o700)
+    runtime.symlink_to(backing_python)
+    entrypoint = runtime.with_name("hermes")
+    entrypoint.write_text("#!python\n", encoding="utf-8")
+    entrypoint.chmod(0o700)
+
+    binding = resolve_hermes_command_binding(root)
+
+    assert binding.runtime_python == runtime
+    assert binding.argv_prefix == (str(entrypoint),)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX venv symlink layout")
+def test_runtime_import_verification_uses_venv_path_for_symlink(tmp_path):
+    runtime = tmp_path / "venv" / "bin" / "python"
+    runtime.parent.mkdir(parents=True)
+    backing_python = tmp_path / "runtime" / "bin" / "python3.12"
+    backing_python.parent.mkdir(parents=True)
+    backing_python.write_text("#!python\n", encoding="utf-8")
+    runtime.symlink_to(backing_python)
+    location = (
+        tmp_path
+        / "venv"
+        / "lib"
+        / "python3.12"
+        / "site-packages"
+        / "hermes_feishu_card"
+        / "__init__.py"
+    )
+    location.parent.mkdir(parents=True)
+    location.write_text("", encoding="utf-8")
+    result = CommandResult(
+        argv=(str(runtime),),
+        returncode=0,
+        stdout='{"version":"4.2.5","location":"' + str(location) + '"}',
+        stderr="",
+    )
+
+    assert _verified_import(result, runtime, expected_version="4.2.5") == (
+        True,
+        "site-packages",
     )
 
 

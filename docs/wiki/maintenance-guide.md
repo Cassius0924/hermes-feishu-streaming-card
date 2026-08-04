@@ -65,6 +65,7 @@
 - 首轮加载和运行中工具动画必须复用 session 的 `FlushController` 更新同一卡，并保持有界；正文/工具终态到达、更新失败、session reset 或应用清理时必须停止，不能与 terminal drain 竞争或制造独立消息。
 - 群聊 `/hfc status` 只做路由诊断和 binding 提示；@机器人触发、白名单和群消息准入属于 Hermes Gateway。
 - 真实 Card JSON 上限由共享 serializer 最终裁决：5 张 table、200 tagged element、28,000 UTF-8 byte。terminal native handoff 必须幂等，不能发送半截卡后再重复原生答案。
+- `interaction.requested` 在已有 session card 时会发送新的当前状态卡并迁移后续 message id；必须使用 interaction-specific delivery key，发送失败恢复 session，动画任务也必须从旧 message id 切到新卡。
 
 ### `hermes_feishu_card/install/patcher.py`
 
@@ -79,6 +80,7 @@
 - patch 必须幂等、可移除、可检测 corrupt markers。
 - Hermes source-stripped Docker 目录缺少 `VERSION`，或版本 metadata 可读但格式不可解析时，只能在 gateway anchors 可验证时兜底。
 - 新 hook block 必须有 patcher 单测和 remove/restore 覆盖。
+- Hermes 0.20 将同步 delivery-ledger 写入包装为 `await asyncio.to_thread(...)`；只可在已验证的 ledger anchor 内解包这一精确结构，未 `await`、其他 wrapper 或全局 call 解包必须继续拒绝。
 - `_status_callback_sync` 是 optional `status_callback` capability；缺失时保持其他安装路径可用并由 doctor 报 partial compatibility。
 
 ### `hermes_feishu_card/install/recovery.py` and operations execution
@@ -161,3 +163,8 @@ Never hand-edit a job, copy secrets into it, or bypass a failed evidence check.
 If a job stops, inspect it with `maintenance status`; only resume the exact
 existing job file. Recovery deliberately uses the official Hermes updater and
 HFC patcher and does not implement a custom Git rollback.
+
+Hermes and maintenance venvs commonly expose `bin/python` as a symlink. Keep
+that lexical venv path when launching isolated commands and validating
+`site-packages`; resolving it to the backing interpreter silently discards the
+venv package boundary and can make `/update` fail before mutation.
