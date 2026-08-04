@@ -58,6 +58,13 @@ def detect_hermes(root: str | Path) -> HermesDetection:
     base_py = hermes_root / "gateway" / "platforms" / "base.py"
     version, version_error, version_source = _read_version(hermes_root / "VERSION")
     if version == "unknown" and version_error is None:
+        package_version = _read_static_package_version(
+            hermes_root / "hermes_cli" / "__init__.py"
+        )
+        if package_version != "unknown":
+            version = package_version
+            version_source = "hermes_cli.__version__"
+    if version == "unknown" and version_error is None:
         git_version = _read_git_version(hermes_root)
         if git_version != "unknown":
             version = git_version
@@ -261,6 +268,40 @@ def _read_version(path: Path) -> tuple[str, str | None, str]:
     if error is not None:
         return "unknown", error, "VERSION"
     return contents.strip() or "unknown", None, "VERSION"
+
+
+def _read_static_package_version(path: Path) -> str:
+    """Read Hermes' literal package version without importing its code."""
+    if not path.exists():
+        return "unknown"
+    contents, error = _read_text(path, "hermes_cli/__init__.py")
+    if error is not None:
+        return "unknown"
+    try:
+        tree = ast.parse(contents)
+    except SyntaxError:
+        return "unknown"
+    versions: list[str] = []
+    for node in tree.body:
+        value = None
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "__version__"
+        ):
+            value = node.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "__version__"
+        ):
+            value = node.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            versions.append(value.value.strip())
+    if len(versions) != 1 or _parse_version(versions[0]) is None:
+        return "unknown"
+    return versions[0]
 
 
 def _read_git_version(root: Path) -> str:

@@ -172,3 +172,8 @@ venv package boundary and can make `/update` fail before mutation.
 The native read-only update check and the explicit target fetch may each take
 up to five minutes on a slow remote. They must still fail closed on timeout;
 do not replace the bound `origin/main` snapshot with stale local metadata.
+
+When the root `VERSION` file is absent, version detection reads only a literal
+top-level `hermes_cli.__version__` assignment without importing Hermes before
+falling back to Git tags. This keeps 0.20+ doctor and update results from
+reporting an older nearest tag.

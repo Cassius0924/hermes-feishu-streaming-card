@@ -436,6 +436,44 @@ def test_detect_hermes_supports_git_tag_when_version_file_missing(tmp_path):
     assert result.run_py_exists is True
 
 
+def test_detect_hermes_prefers_static_package_version_over_stale_git_tag(tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("git is required for git tag fallback detection")
+    root = _write_hermes_root(tmp_path, version=None)
+    package = root / "hermes_cli"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        '__version__ = "0.20.0"\n',
+        encoding="utf-8",
+    )
+    base_py = root / "gateway" / "platforms" / "base.py"
+    base_py.parent.mkdir(parents=True, exist_ok=True)
+    base_py.write_text(
+        EXACT_BASE_V020_FIXTURE.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    _git(root, "init")
+    _git(root, "add", ".")
+    _git(
+        root,
+        "-c",
+        "user.name=Hermes Test",
+        "-c",
+        "user.email=hermes-test@example.com",
+        "commit",
+        "-m",
+        "fixture",
+    )
+    _git(root, "tag", "v2026.7.30")
+
+    result = detect_hermes(root)
+
+    assert result.supported is True
+    assert result.version == "0.20.0"
+    assert result.version_source == "hermes_cli.__version__"
+    assert result.base_required is True
+
+
 def test_detect_hermes_supports_four_part_git_tag_when_version_file_missing(tmp_path):
     if shutil.which("git") is None:
         pytest.skip("git is required for git tag fallback detection")
