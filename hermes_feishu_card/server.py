@@ -4246,8 +4246,10 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             status=409,
         ), None
 
-    terminal_session_snapshot = (
-        copy.deepcopy(session) if event_is_terminal else None
+    rollback_session_snapshot = (
+        copy.deepcopy(session)
+        if event_is_terminal or event.event == "interaction.requested"
+        else None
     )
     applied = session.apply(event)
     if applied:
@@ -4294,8 +4296,8 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 ),
             )
             if handoff_record is None:
-                if terminal_session_snapshot is not None:
-                    _restore_session_snapshot(session, terminal_session_snapshot)
+                if rollback_session_snapshot is not None:
+                    _restore_session_snapshot(session, rollback_session_snapshot)
                 metrics.events_rejected += 1
                 return web.json_response(
                     {"ok": False, "error": "native handoff state unavailable"},
@@ -4325,6 +4327,71 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 metrics.cron_fallbacks += 1
         else:
             _record_card_render_decision(metrics, render_result)
+    if (
+        applied
+        and event.event == "interaction.requested"
+        and feishu_message_id is not None
+        and render_result is not None
+    ):
+        interaction = session.active_interaction
+        interaction_id = (
+            interaction.interaction_id if interaction is not None else "pending"
+        )
+        bot_id = message_bot_ids.get(session_key)
+        reply_to_message_id = (
+            _reply_to_message_id_for_event(incoming_event)
+            or session.reply_to_message_id
+            or None
+        )
+        delivery = await _send_card(
+            request,
+            event.chat_id,
+            render_result.card,
+            bot_id,
+            thread_id=_thread_id_for_event(incoming_event),
+            reply_to_message_id=reply_to_message_id,
+            delivery_key=f"{session_key}:interaction:{interaction_id}",
+            delivery_kind="interaction",
+        )
+        if not delivery.delivered:
+            if rollback_session_snapshot is not None:
+                _restore_session_snapshot(session, rollback_session_snapshot)
+            metrics.events_rejected += 1
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "feishu interaction send failed",
+                    "delivery": _delivery_payload(delivery),
+                },
+                status=502,
+            ), None
+
+        promoted_message_id = str(delivery.message_id)
+        feishu_message_ids[session_key] = promoted_message_id
+        animation_task = request.app[CARD_ANIMATION_TASKS_KEY].pop(
+            session_key, None
+        )
+        if animation_task is not None:
+            animation_task.cancel()
+        _store_interaction_result(request.app, session)
+        _ensure_card_animation(
+            request.app,
+            session_key=session_key,
+            session=session,
+            feishu_message_id=promoted_message_id,
+            bot_id=bot_id,
+        )
+        metrics.events_applied += 1
+        return web.json_response(
+            {
+                "ok": True,
+                "applied": True,
+                "interaction_mode": _interaction_mode_for_session_key(
+                    request.app,
+                    session_key,
+                ),
+            }
+        ), None
     if applied and event.event.startswith("interaction."):
         _store_interaction_result(request.app, session)
     if event_is_terminal:

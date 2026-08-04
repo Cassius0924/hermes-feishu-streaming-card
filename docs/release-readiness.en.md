@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.2.5`. This audit covers canonical turn isolation, maintenance reentry/checkout/drain recovery, executable doctor actions, stable-tag resolution across all installers, public-template version consistency, and an exact tested annotated-tag Release Assets gate. Full automation, build, real acceptance, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.2.6`. This cycle covers Issue #187 repeated-choice card promotion, Issue #188 short terminal-postscript preservation, Issue #189 / PR #190 exact Hermes 0.20 Base-ledger support, and bare Feishu `/update` venv-symlink, slow-fetch, and Hermes 0.20 version detection fixes. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -146,6 +146,18 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.2.6 Release Gates
+
+Accepted candidate SHA: `a03838da5f012aae112ca549cbe03727a91b578a`
+
+- As of 2026-08-04 15:00 CST, Issues #187, #188, #189 and PR #190 had no valid candidate retest report containing Hermes/HFC versions, a real scenario, and a concrete result.
+- Candidate GitHub Actions [run 30880188189](https://github.com/baileyh8/hermes-feishu-streaming-card/actions/runs/30880188189) succeeded with all five jobs green.
+- Candidate full pytest: **`2412 passed, 5 skipped`**.
+- A local bare Feishu private-chat `/update` against Hermes `0.20.0` passed preflight, confirmation-card, and independent update execution; the sidecar returned ready and version reporting showed `0.20.0`. Public records contain no local paths, credentials, or chat ids.
+- Release-branch version/docs contracts: **`103 passed`**; focused release matrix: **`1201 passed, 1 skipped`**; full pytest: **`2413 passed, 5 skipped`**; `git diff --check`: **passed**.
+- Local sdist/wheel build passed; wheel and sdist metadata both report `4.2.6`, while isolated `-I` import resolves from venv `site-packages` with package/distribution versions both at `4.2.6`.
+- PR CI, exact merge, public tag/install, and all four Release assets are recorded during the release process.
 
 ## V4.2.5 Release Gates
 

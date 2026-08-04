@@ -7072,7 +7072,7 @@ async def test_v4_runtime_header_and_interim_body_share_one_card(client):
     assert "gpt-5.5" in str(completed)
 
 
-async def test_v4_interaction_restores_cached_preview_on_same_card(client):
+async def test_v4_interaction_restores_cached_preview_on_promoted_card(client):
     test_client, feishu_client = client
 
     await test_client.post("/events", json=event_payload("message.started", 0))
@@ -7110,7 +7110,9 @@ async def test_v4_interaction_restores_cached_preview_on_same_card(client):
         ),
     )
 
-    _, waiting = await wait_for_card_update(feishu_client, "允许读取精确位置吗？")
+    assert len(feishu_client.sent) == 2
+    waiting = feishu_client.sent[-1][1]
+    assert "允许读取精确位置吗？" in str(waiting)
     assert waiting["header"]["title"]["content"] == "允许读取精确位置吗？"
     button = next(
         item for item in waiting["body"]["elements"] if item.get("tag") == "button"
@@ -7132,10 +7134,8 @@ async def test_v4_interaction_restores_cached_preview_on_same_card(client):
     _, resumed = await wait_for_card_update(feishu_client, "已选择：允许一次")
     assert resumed["header"]["title"]["content"] == "Hermes Agent"
     assert resumed["header"]["subtitle"]["content"] == "正在读取：weather_client.py"
-    assert all(
-        message_id == "feishu-message-1"
-        for message_id, _card in feishu_client.updated
-    )
+    assert len(feishu_client.sent) == 2
+    assert feishu_client.updated[-1][0] == "feishu-message-2"
 
 
 async def test_v4_preview_burst_coalesces_and_late_preview_cannot_reopen_card(
@@ -7879,7 +7879,8 @@ async def test_interaction_request_renders_buttons_and_callback_resolves(client)
         "applied": True,
         "interaction_mode": "callback",
     }
-    interaction_card = feishu_client.updated[-1][1]
+    assert len(feishu_client.sent) == 2
+    interaction_card = feishu_client.sent[-1][1]
     button = next(
         element
         for element in interaction_card["body"]["elements"]
@@ -7911,7 +7912,67 @@ async def test_interaction_request_renders_buttons_and_callback_resolves(client)
         "choice_label": "允许一次",
         "interaction_id": "approval-1",
     }
+    assert feishu_client.updated[-1][0] == "feishu-message-2"
     assert "已选择：允许一次" in str(feishu_client.updated[-1][1])
+
+
+async def test_repeated_interactions_each_promote_a_fresh_latest_card(client):
+    test_client, feishu_client = client
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    for sequence, interaction_id in ((1, "choice-1"), (2, "choice-2")):
+        requested = await test_client.post(
+            "/events",
+            json=event_payload(
+                "interaction.requested",
+                sequence,
+                {
+                    "interaction_id": interaction_id,
+                    "prompt": f"第 {sequence} 轮请选择",
+                    "options": [
+                        {"label": "继续", "value": "continue", "style": "primary"}
+                    ],
+                },
+            ),
+        )
+
+        assert requested.status == 200
+        assert len(feishu_client.sent) == sequence + 1
+        newest_card = feishu_client.sent[-1][1]
+        assert f"第 {sequence} 轮请选择" in str(newest_card)
+        assert any(
+            element.get("tag") == "button"
+            for element in newest_card["body"]["elements"]
+        )
+
+    assert feishu_client.sent[1][1] != feishu_client.sent[2][1]
+
+
+async def test_interaction_promotion_failure_restores_session_for_retry(client):
+    test_client, feishu_client = client
+    payload = event_payload(
+        "interaction.requested",
+        1,
+        {
+            "interaction_id": "retry-choice",
+            "prompt": "请选择",
+            "options": [{"label": "继续", "value": "continue"}],
+        },
+    )
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    feishu_client.fail_send = True
+    failed = await test_client.post("/events", json=payload)
+
+    assert failed.status == 502
+    assert len(feishu_client.sent) == 1
+
+    feishu_client.fail_send = False
+    retried = await test_client.post("/events", json=payload)
+
+    assert retried.status == 200
+    assert (await retried.json())["applied"] is True
+    assert len(feishu_client.sent) == 2
 
 
 def test_interaction_operator_name_never_falls_back_to_feishu_ids():
@@ -7950,7 +8011,8 @@ async def test_interaction_request_uses_text_fallback_when_configured():
 
         assert requested.status == 200
         assert (await requested.json())["interaction_mode"] == "text"
-        interaction_card = feishu_client.updated[-1][1]
+        assert len(feishu_client.sent) == 2
+        interaction_card = feishu_client.sent[-1][1]
         content = str(interaction_card)
         assert not any(
             element.get("tag") == "button"

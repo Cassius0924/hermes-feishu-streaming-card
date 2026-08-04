@@ -37,7 +37,7 @@ from .maintenance_store import (
 )
 
 
-UPDATE_CHECK_TIMEOUT_SECONDS = 60.0
+UPDATE_CHECK_TIMEOUT_SECONDS = 300.0
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _SECRET_ASSIGNMENT_RE = re.compile(
@@ -535,10 +535,8 @@ def detect_runtime_python(hermes_root: Path) -> Path | None:
         root / "gateway" / ".venv" / "Scripts" / "python.exe",
     )
     for candidate in candidates:
-        if candidate.is_symlink():
-            continue
         if candidate.is_file():
-            return candidate.resolve(strict=False)
+            return candidate
     return None
 
 
@@ -547,7 +545,6 @@ def resolve_hermes_command_binding(root: Path) -> HermesCommandBinding:
     runtime_python = detect_runtime_python(selected_root)
     if runtime_python is None:
         raise MaintenanceRefused("Hermes runtime is unavailable")
-    runtime_python = runtime_python.resolve(strict=False)
     entrypoint_name = "hermes.exe" if os.name == "nt" else "hermes"
     entrypoint = runtime_python.with_name(entrypoint_name)
     prefix = (
@@ -879,8 +876,8 @@ def _run_state_machine(
     runner = run or run_command
     health_fetcher = fetch_health or (lambda: None)
     publisher = publish or (lambda current: True)
-    selected_python = Path(maintenance_python or sys.executable).resolve(
-        strict=False
+    selected_python = (
+        Path(maintenance_python or sys.executable).expanduser().absolute()
     )
     current = load_job(job_path)
     if current.phase in TERMINAL_UPDATE_PHASES:
@@ -1754,7 +1751,7 @@ def _verified_import(
         return False, ""
     location = Path(location_text).resolve(strict=False)
     try:
-        runtime_root = runtime_python.resolve(strict=False).parent.parent
+        runtime_root = runtime_python.parent.parent.resolve(strict=False)
         location.relative_to(runtime_root)
     except ValueError:
         return False, ""

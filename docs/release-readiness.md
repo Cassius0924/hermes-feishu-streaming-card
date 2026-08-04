@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.2.5`。本轮审查覆盖 canonical turn 隔离、maintenance 重入/checkout/drain 恢复、doctor 可执行建议、三端 installer 的 stable-tag 解析、公开模板版本一致性和 exact tested annotated-tag Release Assets gate。完整自动化、构建、真实验收、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.2.6`。本轮覆盖 Issue #187 重复选项卡提升、Issue #188 terminal 短后记保留、Issue #189 / PR #190 Hermes 0.20 exact Base ledger，以及飞书裸 `/update` 的 venv symlink、慢 fetch 和 Hermes 0.20 版本检测。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -146,6 +146,18 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.2.6 发布门禁
+
+Accepted candidate SHA: `a03838da5f012aae112ca549cbe03727a91b578a`
+
+- 截止 2026-08-04 15:00 CST，Issue #187、#188、#189 与 PR #190 没有包含 Hermes/HFC 版本、真实场景和明确结果的有效候选复测反馈。
+- 候选 GitHub Actions [run 30880188189](https://github.com/baileyh8/hermes-feishu-streaming-card/actions/runs/30880188189) 成功，五个 jobs 全部通过。
+- 候选完整 pytest：**`2412 passed, 5 skipped`**。
+- 本机 Hermes `0.20.0` 飞书私聊裸 `/update`：预检、确认卡与独立更新流程通过；sidecar ready，版本显示为 `0.20.0`。公开记录不含本机路径、凭据或 chat id。
+- 发布分支版本/文档契约：**`103 passed`**；发布聚焦矩阵：**`1201 passed, 1 skipped`**；完整 pytest：**`2413 passed, 5 skipped`**；`git diff --check`：**通过**。
+- 本地 sdist/wheel 构建成功；wheel 与 sdist metadata 均为 `4.2.6`，隔离 `-I` import 来自 venv `site-packages`，package/distribution 版本均为 `4.2.6`。
+- PR CI、exact merge、public tag/install 与四个 Release assets：**发布流程中逐项记录**。
 
 ## V4.2.5 发布门禁
 

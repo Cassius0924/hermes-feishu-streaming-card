@@ -9,6 +9,9 @@ from hermes_feishu_card.install import patcher
 TURN_RUNNER_FIXTURE = (
     Path(__file__).resolve().parents[1] / "fixtures" / "hermes_turn_runner.py"
 )
+EXACT_BASE_V020_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base_v020.py"
+)
 
 
 def test_apply_patch_accepts_explicit_legacy_strategy():
@@ -2067,6 +2070,31 @@ def test_apply_base_patch_inserts_exact_hooks_at_semantic_boundaries():
     ast.parse(patched)
     assert patcher.apply_base_patch(patched) == patched
     assert patcher.remove_base_patch(patched) == _EXACT_BASE_SOURCE
+
+
+def test_apply_base_patch_accepts_020_awaited_to_thread_ledger_calls():
+    source = EXACT_BASE_V020_FIXTURE.read_text(encoding="utf-8")
+
+    patched = patcher.apply_base_patch(source)
+
+    ledger_attempt = patched.index(
+        "await asyncio.to_thread(mark_attempting, _obligation_id)"
+    )
+    final = patched.index(patcher.EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN)
+    send = patched.index("result = await delivery_adapter._send_with_retry(")
+    assert ledger_attempt < final < send
+    assert patcher.remove_base_patch(patched) == source
+
+
+def test_apply_base_patch_rejects_unawaited_to_thread_ledger_calls():
+    source = EXACT_BASE_V020_FIXTURE.read_text(encoding="utf-8").replace(
+        "await asyncio.to_thread(mark_attempting, _obligation_id)",
+        "asyncio.to_thread(mark_attempting, _obligation_id)",
+        1,
+    )
+
+    with pytest.raises(ValueError, match="safe BasePlatformAdapter contract"):
+        patcher.apply_base_patch(source)
 
 
 @pytest.mark.parametrize(

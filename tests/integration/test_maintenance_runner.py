@@ -451,6 +451,37 @@ def test_binding_is_re_resolved_after_updater_rebuilds_venv(maintenance_fixture)
     assert restart[0] == str(commands.runtime_python.resolve(strict=False))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX venv symlink layout")
+def test_maintenance_runner_preserves_venv_python_symlink(
+    maintenance_fixture,
+    tmp_path,
+):
+    commands = CommandHarness(maintenance_fixture)
+    backing_python = tmp_path / "runtime" / "bin" / "python3.12"
+    backing_python.parent.mkdir(parents=True)
+    backing_python.write_text("#!python\n", encoding="utf-8")
+    maintenance_python = tmp_path / "maintenance" / "venv" / "bin" / "python"
+    maintenance_python.parent.mkdir(parents=True)
+    maintenance_python.symlink_to(backing_python)
+
+    result = run_job(
+        maintenance_fixture.job.path,
+        run=commands,
+        fetch_health=HealthHarness(commands.runtime_python, commands),
+        publish=lambda current: True,
+        sleep=lambda _delay: None,
+        maintenance_python=maintenance_python,
+    )
+
+    assert result.phase == "succeeded"
+    stop = next(
+        command
+        for command in commands.commands
+        if "hermes_feishu_card.cli" in command and "stop" in command
+    )
+    assert stop[0] == str(maintenance_python)
+
+
 def test_custom_root_upgrade_never_mutates_default_hermes(
     maintenance_fixture,
     tmp_path,

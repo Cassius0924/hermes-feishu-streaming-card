@@ -76,6 +76,7 @@ An exact bare `/update` in a Feishu private chat first performs read-only checks
 - V4.2.3 forwards the update evidence fingerprint, `update_evidence_fingerprint`, unchanged through the WebSocket hook to the sidecar, so confirm/cancel reach the existing evidence-bound transition logic; missing or mismatched evidence remains fail-closed.
 - V4.2.4 gives every new quoted topic reply its real incoming message ID and an independent card; later in-turn stream events still update that turn's card through the reply alias instead of overwriting a previous turn.
 - V4.2.5 pins session, sequence, and policy to canonical `turn_id`, hardens maintenance owner/checkout/external-drain recovery, and makes doctor, all three installers, and Release Assets fail closed when evidence is incomplete.
+- V4.2.6 adds exact Hermes 0.20 Base-ledger compatibility, preserves substantial streamed answers before short terminal postscripts, promotes repeated choices to the latest card, and fixes bare `/update` venv-symlink, slow-fetch, and version-reporting failures.
 
 See the [V4.2.0 release notes](release-notes-v4.2.0.en.md) for the complete boundary and acceptance steps.
 
@@ -496,14 +497,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.2.5`.
+The Compose example defaults `HFC_VERSION` to `v4.2.6`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.5
+export HFC_VERSION=v4.2.6
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -746,6 +747,7 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.2.6](release-notes-v4.2.6.en.md) | 2026-08-04 | Issues #187–#190, exact Hermes 0.20 Base support, repeated choice cards, short-terminal-postscript preservation, and bare Feishu `/update` venv/fetch/version fixes |
 | [v4.2.5](release-notes-v4.2.5.en.md) | 2026-08-02 | Audit safety hotfix for canonical turn isolation, maintenance recovery, executable doctor actions, pinned stable-tag installs, and an exact tested tag release gate |
 | [v4.2.4](release-notes-v4.2.4.en.md) | 2026-08-01 | Every new reply quoting the same topic message opens an independent card while in-turn streaming remains correlated through the reply alias |
 | [v4.2.3](release-notes-v4.2.3.en.md) | 2026-08-01 | The WebSocket hook preserves `/update` evidence fingerprints so the sidecar can complete evidence-bound confirm/cancel transitions; missing or mismatched evidence remains fail-closed |
