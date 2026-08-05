@@ -166,11 +166,15 @@ upsert_env() {
   mkdir -p "$(dirname "$ENV_FILE")"
   touch "$ENV_FILE"
   chmod 600 "$ENV_FILE" 2>/dev/null || true
-  if grep -q "^${key}=" "$ENV_FILE"; then
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$ENV_FILE"; then
     local tmp
     tmp="$(mktemp)"
     awk -v key="$key" -v value="$quoted" '
-      index($0, key "=") == 1 { print key "=" value; next }
+      {
+        normalized = $0
+        sub(/^[[:space:]]*export[[:space:]]+/, "", normalized)
+      }
+      normalized ~ "^[[:space:]]*" key "[[:space:]]*=" { print key "=" value; next }
       { print }
     ' "$ENV_FILE" > "$tmp"
     mv "$tmp" "$ENV_FILE"
@@ -181,19 +185,19 @@ upsert_env() {
 }
 
 prompt_credentials() {
-  if [ -n "${FEISHU_APP_ID:-}" ] && [ -n "${FEISHU_APP_SECRET:-}" ]; then
-    return 0
-  fi
-  if [ "${HFC_NO_PROMPT:-0}" = "1" ] || [ ! -t 0 ]; then
+  if { [ -z "${FEISHU_APP_ID:-}" ] || [ -z "${FEISHU_APP_SECRET:-}" ]; } && \
+      { [ "${HFC_NO_PROMPT:-0}" = "1" ] || [ ! -t 0 ]; }; then
     fail "FEISHU_APP_ID/FEISHU_APP_SECRET are missing. Set them or write them to $ENV_FILE."
   fi
 
-  log "Feishu credentials were not found. They will be saved to $ENV_FILE."
+  if [ -z "${FEISHU_APP_ID:-}" ] || [ -z "${FEISHU_APP_SECRET:-}" ]; then
+    log "Feishu credentials were not found. They will be saved to $ENV_FILE."
+  fi
   if [ -z "${FEISHU_APP_ID:-}" ]; then
     printf 'FEISHU_APP_ID: '
     IFS= read -r app_id
     [ -n "$app_id" ] || fail "FEISHU_APP_ID is required"
-    upsert_env "FEISHU_APP_ID" "$app_id"
+    export FEISHU_APP_ID="$app_id"
   fi
   if [ -z "${FEISHU_APP_SECRET:-}" ]; then
     printf 'FEISHU_APP_SECRET: '
@@ -202,8 +206,10 @@ prompt_credentials() {
     stty echo 2>/dev/null || true
     printf '\n'
     [ -n "$app_secret" ] || fail "FEISHU_APP_SECRET is required"
-    upsert_env "FEISHU_APP_SECRET" "$app_secret"
+    export FEISHU_APP_SECRET="$app_secret"
   fi
+  upsert_env "FEISHU_APP_ID" "$FEISHU_APP_ID"
+  upsert_env "FEISHU_APP_SECRET" "$FEISHU_APP_SECRET"
 }
 
 detect_python() {

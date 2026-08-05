@@ -135,6 +135,20 @@ function Read-HfcEnvFile {
     return $values
 }
 
+function ConvertTo-HfcEnvValue {
+    param([string]$Value)
+    if ($Value.Contains("`r") -or $Value.Contains("`n")) {
+        Fail "credential values must not contain line breaks"
+    }
+    if (!$Value.Contains("'")) {
+        return "'$Value'"
+    }
+    if (!$Value.Contains('"')) {
+        return '"' + $Value + '"'
+    }
+    Fail "credential values must not contain both quote styles"
+}
+
 function Set-HfcEnvValue {
     param([string]$Key, [string]$Value)
     $dir = Split-Path -Parent $EnvFile
@@ -146,16 +160,18 @@ function Set-HfcEnvValue {
     }
     $lines = @(Get-Content $EnvFile)
     $updated = $false
+    $serialized = ConvertTo-HfcEnvValue $Value
+    $assignmentPattern = '^\s*(?:export\s+)?' + [regex]::Escape($Key) + '\s*='
     $next = foreach ($line in $lines) {
-        if ($line.StartsWith("$Key=")) {
-            "$Key=$Value"
+        if ($line -match $assignmentPattern) {
+            "$Key=$serialized"
             $updated = $true
         } else {
             $line
         }
     }
     if (!$updated) {
-        $next += "$Key=$Value"
+        $next += "$Key=$serialized"
     }
     Set-Content -Path $EnvFile -Value $next -Encoding UTF8
     [Environment]::SetEnvironmentVariable($Key, $Value, "Process")
@@ -174,6 +190,8 @@ function Read-PlainSecret {
 
 function Ensure-HfcCredentials {
     if ($env:FEISHU_APP_ID -and $env:FEISHU_APP_SECRET) {
+        Set-HfcEnvValue "FEISHU_APP_ID" $env:FEISHU_APP_ID
+        Set-HfcEnvValue "FEISHU_APP_SECRET" $env:FEISHU_APP_SECRET
         return
     }
     if ($env:HFC_NO_PROMPT -eq "1") {
@@ -190,6 +208,8 @@ function Ensure-HfcCredentials {
         if (!$appSecret) { Fail "FEISHU_APP_SECRET is required" }
         Set-HfcEnvValue "FEISHU_APP_SECRET" $appSecret
     }
+    Set-HfcEnvValue "FEISHU_APP_ID" $env:FEISHU_APP_ID
+    Set-HfcEnvValue "FEISHU_APP_SECRET" $env:FEISHU_APP_SECRET
 }
 
 function Install-HfcPackage {

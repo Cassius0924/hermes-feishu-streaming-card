@@ -74,7 +74,9 @@ choice requests at the latest chat position, preserves a substantial streamed
 answer before a short terminal postscript, and repairs bare Feishu `/update`
 for standard venv symlinks, slow Git fetches, and Hermes 0.20 version reporting.
 
-V4.2.7 hardens Windows installation and process startup: cold SDK/runtime probes
+V4.2.8 persists process-supplied Feishu credentials into the selected private
+dotenv file across macOS/Linux, Docker, and Windows installers. V4.2.7 hardened
+Windows installation and process startup: cold SDK/runtime probes
 allow 30 seconds, manifests use portable POSIX relative paths while safely
 reading exact legacy backslash paths, parent `HERMES_HOME` layouts are detected,
 and detached venv runners can rebind only a strictly verified owned pidfile.
@@ -307,7 +309,7 @@ a privileged container, or mount host system-service directories.
 ```
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.7
+export HFC_VERSION=v4.2.8
 bash install-docker.sh
 ```
 

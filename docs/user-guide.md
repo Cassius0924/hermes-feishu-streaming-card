@@ -77,6 +77,7 @@ V3.8.2 起，最终答案保留在主内容区，pre-tool answer 会按“正文
 - V4.2.4 让每个新的话题引用回复使用真实入站 message ID 创建独立卡片；同一轮后续流式事件仍通过 reply alias 更新本轮卡片，不会覆盖上一轮。
 - V4.2.5 用 canonical `turn_id` 固定整轮 session/sequence/policy，收紧 maintenance owner、checkout 与 external drain 恢复，并让 doctor、三端 installer 与 Release Assets 在不可验证时 fail closed。
 - V4.2.6 兼容 Hermes 0.20 exact Base ledger，保留终态短后记前的完整流式答案，把重复选项提升到最新卡片，并修复裸 `/update` 的 venv symlink、慢 fetch 与版本误报。
+- V4.2.8 让 macOS/Linux、Docker 与 PowerShell 安装器把进程环境中的飞书凭据持久化到私有 `.env`。
 - V4.2.7 修复 Windows 冷启动探针超时、旧 manifest 反斜杠路径、parent `HERMES_HOME` 查找、detached venv runner PID 重绑与 PowerShell 错误传播。
 
 完整边界和验收步骤见 [V4.2.0 发布说明](release-notes-v4.2.0.md)。
@@ -527,7 +528,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.2.7`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.2.8`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -535,7 +536,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.7
+export HFC_VERSION=v4.2.8
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -820,6 +821,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
+| [v4.2.8](release-notes-v4.2.8.md) | 2026-08-05 | 三平台安装器持久化进程环境中的飞书凭据，POSIX `.env` 权限为 `0600`，日志不输出凭据值 |
 | [v4.2.7](release-notes-v4.2.7.md) | 2026-08-05 | Issue #193、PR #180/#181：Windows 探针超时、manifest 路径、parent `HERMES_HOME`、detached runner PID 与 PowerShell 失败传播 |
 | [v4.2.6](release-notes-v4.2.6.md) | 2026-08-04 | Issue #187–#190、Hermes 0.20 exact Base、重复选项卡、终态短后记保留，以及飞书裸 `/update` venv/fetch/version 修复 |
 | [v4.2.5](release-notes-v4.2.5.md) | 2026-08-02 | 审查安全热修：canonical turn 隔离、maintenance 恢复、可执行 doctor 建议、固定 stable-tag 安装与 exact tested tag 发布门禁 |

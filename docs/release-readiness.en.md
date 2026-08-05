@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.2.7`. This cycle covers Issue #193 Windows cold-import probes and legacy manifest paths, PR #180 parent `HERMES_HOME` config discovery, PR #181 safe detached venv runner PID rebinding, and PowerShell install failure propagation. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.2.8`. This cycle fixes the process-credential persistence gap across all three installers that was found by the public v4.2.7 installation acceptance. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -146,6 +146,15 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.2.8 Release Gates
+
+- A fresh macOS install from the public v4.2.7 tag imported from the target venv `site-packages` and installed a consistent hook, but process credentials were not written to the selected `.env`; a later isolated doctor therefore reported missing credentials.
+- TDD regressions cover process-credential persistence, a secret containing spaces, POSIX mode `0600`, and log redaction across `install.sh`, `install-docker.sh`, and `install.ps1`.
+- Installer and CLI install/setup/restore focused matrix: **`285 passed, 5 skipped`**; version/docs contracts: **`92 passed`**; the dynamic PowerShell case runs in Windows GitHub Actions.
+- Full pytest in an isolated v4.2.8 test venv: **`2431 passed, 6 skipped`**; `git diff --check`: **passed**.
+- Local sdist/wheel builds passed with metadata at `4.2.8`. A second fresh venv installed the wheel and public dependencies, reported package/distribution versions of `4.2.8`, imported from venv `site-packages`, and exited 0 for CLI help.
+- PR CI, exact merge, public tag/install, and all four Release assets are recorded during the release process.
 
 ## V4.2.7 Release Gates
 
