@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.2.8 — 2026-08-05
+
+See also: [docs/release-notes-v4.2.8.md](docs/release-notes-v4.2.8.md)
+
+### Fixed
+- `install.sh`, `install-docker.sh`, and `install.ps1` now persist Feishu credentials supplied through the process environment into the selected dotenv file.
+- PowerShell dotenv replacement recognizes normalized and `export`-style assignments instead of appending a conflicting duplicate.
+
+### Safety
+- POSIX installers create or normalize the credential file with mode `0600`.
+- Installer logs do not print persisted credential values; newline-bearing or ambiguous dual-quote PowerShell values are rejected instead of serialized unsafely.
+
 ## V4.2.7 — 2026-08-05
 
 See also: [docs/release-notes-v4.2.7.md](docs/release-notes-v4.2.7.md)

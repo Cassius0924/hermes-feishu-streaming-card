@@ -2,11 +2,20 @@
 
 当前 active runtime 是 `hermes_feishu_card/`。legacy adapter、dual mode、旧 `sidecar/`、旧 `patch/` 和 `installer_v2.py` 不是 active runtime，仅保留作历史参考。
 
-## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3 / V4.2.4 / V4.2.5 / V4.2.6 / V4.2.7
+## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3 / V4.2.4 / V4.2.5 / V4.2.6 / V4.2.7 / V4.2.8
 
 详细路线见 [docs/superpowers/specs/2026-06-30-v3-8-design.md](docs/superpowers/specs/2026-06-30-v3-8-design.md) 和 [docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md](docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md)。
 
-### V4.2.7：Windows 安装与 detached runner 热修（发布候选）
+### V4.2.8：安装凭据持久化热修（发布候选）
+
+- [x] 公开 v4.2.7 tag 安装复现环境凭据只在当前进程可见，后续 doctor 无法读取。
+- [x] macOS/Linux、Docker 与 PowerShell 安装器把进程凭据持久化到选定 `.env`。
+- [x] POSIX `.env` 权限为 `0600`，安装日志不包含凭据值。
+- [x] 三平台回归覆盖进程凭据、带空格 secret、dotenv 替换与日志脱敏。
+- [x] 完整 pytest、sdist/wheel、隔离 `site-packages` provenance 与 `git diff --check`。
+- [ ] PR CI、exact merge、public tag/install 与 Release assets。
+
+### V4.2.7：Windows 安装与 detached runner 热修（已发布）
 
 - [x] Issue #193 的 SDK/HFC 冷启动探针上限从 8 秒调整为 30 秒。
 - [x] 新 manifest/recovery plan 写 POSIX 相对路径，精确兼容旧 Windows 反斜杠路径并拒绝越界输入。
@@ -14,7 +23,7 @@
 - [x] PowerShell installer 传播 native pip/setup 非零退出，不在失败后打印 `done`。
 - [x] 候选完整自动化与五项 GitHub Actions 门禁通过。
 - [x] 发布分支聚焦/完整测试、sdist/wheel 与隔离 `site-packages` provenance。
-- [ ] exact merge、public tag/install 与 Release assets。
+- [x] exact merge、public tag/install 与 Release assets。
 
 ### V4.2.6：Issues #187–#190 与更新兼容修复（已发布）
 

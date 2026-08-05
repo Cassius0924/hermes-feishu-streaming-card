@@ -185,6 +185,60 @@ exit 0
     assert not system_marker.exists()
 
 
+def test_install_sh_persists_process_credentials_to_private_env_file(tmp_path):
+    env_file = tmp_path / "data" / ".env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text(
+        "export FEISHU_APP_ID=old_app\n"
+        "export FEISHU_APP_SECRET=old_secret\n"
+        "KEEP_VALUE=untouched\n",
+        encoding="utf-8",
+    )
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "FEISHU_APP_ID": "cli_process_value",
+            "FEISHU_APP_SECRET": "process secret value",
+            "HERMES_DIR": str(tmp_path / "hermes-agent"),
+            "HFC_CONFIG": str(tmp_path / "config.yaml"),
+            "HFC_ENV_FILE": str(env_file),
+            "HFC_NO_PROMPT": "1",
+            "HFC_SKIP_START": "1",
+            "HFC_VERSION": "main",
+            "HFC_PYTHON": str(fake_python),
+            "HFC_PIP_USER": "0",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "install.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert env_file.read_text(encoding="utf-8").splitlines() == [
+        "FEISHU_APP_ID='cli_process_value'",
+        "FEISHU_APP_SECRET='process secret value'",
+        "KEEP_VALUE=untouched",
+    ]
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert "process secret value" not in result.stdout + result.stderr
+
+
 def test_install_sh_latest_resolves_release_tag_and_pins_spec(tmp_path):
     result, python_log, curl_log, _state_dir = run_release_installer(
         tmp_path,
@@ -564,6 +618,69 @@ exit 0
     )
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
+
+
+def test_install_docker_sh_persists_process_credentials_to_private_env_file(
+    tmp_path,
+):
+    hermes_dir = tmp_path / "hermes"
+    (hermes_dir / "gateway").mkdir(parents=True)
+    (hermes_dir / "gateway" / "run.py").write_text(
+        "# gateway\n", encoding="utf-8"
+    )
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$FAKE_PYTHON_LOG"
+exit 0
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+    env_file = tmp_path / "data" / ".env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text(
+        "export FEISHU_APP_ID=old_app\n"
+        "export FEISHU_APP_SECRET=old_secret\n"
+        "KEEP_VALUE=untouched\n",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "FEISHU_APP_ID": "cli_docker_process",
+            "FEISHU_APP_SECRET": "docker process secret",
+            "FAKE_PYTHON_LOG": str(tmp_path / "python.log"),
+            "HERMES_DIR": str(hermes_dir),
+            "HFC_CONFIG": str(tmp_path / "data" / "config.yaml"),
+            "HFC_ENV_FILE": str(env_file),
+            "HFC_NO_PROMPT": "1",
+            "HFC_SKIP_START": "1",
+            "HFC_VERSION": "main",
+            "HFC_PYTHON": str(fake_python),
+            "HFC_INSTALL_SOURCE": str(ROOT),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "install-docker.sh"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert env_file.read_text(encoding="utf-8").splitlines() == [
+        "FEISHU_APP_ID='cli_docker_process'",
+        "FEISHU_APP_SECRET='docker process secret'",
+        "KEEP_VALUE=untouched",
+    ]
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert "docker process secret" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(
@@ -1620,6 +1737,53 @@ def test_install_powershell_propagates_native_setup_and_pip_failures():
     assert "& $PythonBin @args" in setup_function
     assert "if ($LASTEXITCODE -ne 0)" in setup_function
     assert 'Fail "setup failed' in setup_function
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is not installed")
+def test_install_powershell_persists_process_credentials_to_env_file(tmp_path):
+    fake_python = tmp_path / "fake-python.ps1"
+    fake_python.write_text("exit 0\n", encoding="utf-8")
+    env_file = tmp_path / "data" / ".env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text(
+        " export FEISHU_APP_ID = 'old_app'\n"
+        "export FEISHU_APP_SECRET=old_secret\n"
+        "KEEP_VALUE=untouched\n",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "FEISHU_APP_ID": "cli_powershell_process",
+            "FEISHU_APP_SECRET": "powershell process secret",
+            "HERMES_DIR": str(tmp_path / "hermes"),
+            "HFC_CONFIG": str(tmp_path / "config.yaml"),
+            "HFC_ENV_FILE": str(env_file),
+            "HFC_NO_PROMPT": "1",
+            "HFC_SKIP_START": "1",
+            "HFC_PIP_USER": "0",
+            "HFC_VERSION": "main",
+            "PYTHON": str(fake_python),
+        }
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(ROOT / "install.ps1")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert env_file.read_text(encoding="utf-8-sig").splitlines() == [
+        "FEISHU_APP_ID='cli_powershell_process'",
+        "FEISHU_APP_SECRET='powershell process secret'",
+        "KEEP_VALUE=untouched",
+    ]
+    assert "powershell process secret" not in result.stdout + result.stderr
 
 
 def test_install_powershell_latest_fails_closed_on_api_error():

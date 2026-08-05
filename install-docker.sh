@@ -64,6 +64,10 @@ expand_path() {
   esac
 }
 
+quote_env_value() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 validate_explicit_ref() {
   case "$1" in
     ""|/*|*..*|*[!A-Za-z0-9._/-]*)
@@ -172,6 +176,33 @@ load_env_file() {
   done < "$ENV_FILE"
 }
 
+upsert_env() {
+  local key="$1"
+  local value="$2"
+  local quoted
+  quoted="$(quote_env_value "$value")"
+  mkdir -p "$(dirname "$ENV_FILE")"
+  touch "$ENV_FILE"
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$ENV_FILE"; then
+    local tmp
+    tmp="$(mktemp)"
+    awk -v key="$key" -v value="$quoted" '
+      {
+        normalized = $0
+        sub(/^[[:space:]]*export[[:space:]]+/, "", normalized)
+      }
+      normalized ~ "^[[:space:]]*" key "[[:space:]]*=" { print key "=" value; next }
+      { print }
+    ' "$ENV_FILE" > "$tmp"
+    mv "$tmp" "$ENV_FILE"
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
+  else
+    printf '%s=%s\n' "$key" "$quoted" >> "$ENV_FILE"
+  fi
+  export "$key=$value"
+}
+
 detect_python() {
   if [ -n "${HFC_PYTHON:-}" ]; then
     [ -x "$HFC_PYTHON" ] || fail "HFC_PYTHON is not executable: $HFC_PYTHON"
@@ -235,6 +266,8 @@ require_credentials() {
     return 0
   fi
   if [ -n "${FEISHU_APP_ID:-}" ] && [ -n "${FEISHU_APP_SECRET:-}" ]; then
+    upsert_env "FEISHU_APP_ID" "$FEISHU_APP_ID"
+    upsert_env "FEISHU_APP_SECRET" "$FEISHU_APP_SECRET"
     return 0
   fi
   if [ "$NO_PROMPT" = "1" ] || [ ! -t 0 ]; then

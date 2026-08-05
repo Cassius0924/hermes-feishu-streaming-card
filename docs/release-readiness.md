@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.2.7`。本轮覆盖 Issue #193 的 Windows 冷启动探针与旧 manifest 路径，PR #180 的 parent `HERMES_HOME` config 查找，PR #181 的 detached venv runner PID 安全重绑，以及 PowerShell 安装失败传播。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.2.8`。本轮修复公开 v4.2.7 安装验收发现的三平台进程凭据持久化缺口。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -146,6 +146,15 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.2.8 发布门禁
+
+- 公开 v4.2.7 tag 的全新 macOS 安装复现：包从目标 venv `site-packages` 导入且 hook 状态完整，但环境凭据未写入所选 `.env`，后续隔离 doctor 报告凭据缺失。
+- TDD 回归覆盖 `install.sh`、`install-docker.sh` 与 `install.ps1` 的进程凭据持久化、带空格 secret、POSIX `0600` 权限和日志不泄露。
+- 安装脚本与 CLI install/setup/restore 聚焦矩阵：**`285 passed, 5 skipped`**；版本/文档契约：**`92 passed`**；PowerShell 动态用例由 Windows GitHub Actions 执行。
+- 隔离 v4.2.8 测试 venv 完整 pytest：**`2431 passed, 6 skipped`**；`git diff --check`：**通过**。
+- 本地 sdist/wheel 构建成功，metadata 均为 `4.2.8`；第二个全新 venv 安装 wheel 与公开依赖后，package/distribution 版本均为 `4.2.8`，import 来自 venv `site-packages`，CLI help exit 0。
+- PR CI、exact merge、public tag/install 与四个 Release assets：**发布流程中逐项记录**。
 
 ## V4.2.7 发布门禁
 
