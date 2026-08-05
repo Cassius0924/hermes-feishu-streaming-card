@@ -613,8 +613,21 @@ def wait_for_managed_pidfile(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         record = read_pid_record()
-        if record == {"pid": pid, "token": token, "manager": "detached"}:
+        expected = {"pid": pid, "token": token, "manager": "detached"}
+        if record == expected:
             return True
+        if sys.platform == "win32":
+            launcher_record = {
+                "pid": os.getppid(),
+                "token": token,
+                "manager": "detached",
+            }
+            if record == launcher_record:
+                try:
+                    write_pid_record(pid, token, manager="detached")
+                except (OSError, ValueError):
+                    return False
+                return read_pid_record() == expected
         time.sleep(0.05)
     return False
 
