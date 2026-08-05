@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.2.7 — 2026-08-05
+
+See also: [docs/release-notes-v4.2.7.md](docs/release-notes-v4.2.7.md)
+
+### Fixed
+- Issue #193: Windows SDK and HFC runtime probes now allow 30 seconds for cold imports instead of failing after 8 seconds.
+- Ownership manifests and recovery plans write portable POSIX relative paths; exact legacy Windows backslash paths remain readable while absolute, traversal, and extra-suffix paths stay rejected.
+- PR #180: config discovery accepts the parent `HERMES_HOME` layout used by Windows installations.
+- PR #181: a Windows detached venv launcher may rebind the owned pidfile from its verified parent to the exact runner child.
+- `install.ps1` propagates native `pip` and `setup` failures and never prints `done` after a failed command.
+
+### Safety
+- PID rebinding remains restricted to Windows detached mode with exact process token, manager, and parent evidence, followed by a strict read-back check.
+- Legacy path compatibility is narrow and does not accept absolute paths, path traversal, or additional components.
+
 ## V4.2.6 — 2026-08-04
 
 See also: [docs/release-notes-v4.2.6.md](docs/release-notes-v4.2.6.md)

@@ -74,6 +74,12 @@ choice requests at the latest chat position, preserves a substantial streamed
 answer before a short terminal postscript, and repairs bare Feishu `/update`
 for standard venv symlinks, slow Git fetches, and Hermes 0.20 version reporting.
 
+V4.2.7 hardens Windows installation and process startup: cold SDK/runtime probes
+allow 30 seconds, manifests use portable POSIX relative paths while safely
+reading exact legacy backslash paths, parent `HERMES_HOME` layouts are detected,
+and detached venv runners can rebind only a strictly verified owned pidfile.
+PowerShell now propagates native install failures instead of printing `done`.
+
 V4.2.4 gives every new Feishu/Lark topic reply its real incoming message ID.
 Consecutive replies quoting the same message therefore open independent cards
 instead of overwriting the first card; in-turn stream events still resolve
@@ -301,7 +307,7 @@ a privileged container, or mount host system-service directories.
 ```
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.6
+export HFC_VERSION=v4.2.7
 bash install-docker.sh
 ```
 

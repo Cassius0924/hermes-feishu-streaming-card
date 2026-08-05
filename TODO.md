@@ -2,18 +2,28 @@
 
 当前 active runtime 是 `hermes_feishu_card/`。legacy adapter、dual mode、旧 `sidecar/`、旧 `patch/` 和 `installer_v2.py` 不是 active runtime，仅保留作历史参考。
 
-## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3 / V4.2.4 / V4.2.5 / V4.2.6
+## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3 / V4.2.4 / V4.2.5 / V4.2.6 / V4.2.7
 
 详细路线见 [docs/superpowers/specs/2026-06-30-v3-8-design.md](docs/superpowers/specs/2026-06-30-v3-8-design.md) 和 [docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md](docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md)。
 
-### V4.2.6：Issues #187–#190 与更新兼容修复（发布候选）
+### V4.2.7：Windows 安装与 detached runner 热修（发布候选）
+
+- [x] Issue #193 的 SDK/HFC 冷启动探针上限从 8 秒调整为 30 秒。
+- [x] 新 manifest/recovery plan 写 POSIX 相对路径，精确兼容旧 Windows 反斜杠路径并拒绝越界输入。
+- [x] 合入 PR #180 的 parent `HERMES_HOME` config 查找与 PR #181 的 detached runner PID 严格重绑。
+- [x] PowerShell installer 传播 native pip/setup 非零退出，不在失败后打印 `done`。
+- [x] 候选完整自动化与五项 GitHub Actions 门禁通过。
+- [x] 发布分支聚焦/完整测试、sdist/wheel 与隔离 `site-packages` provenance。
+- [ ] exact merge、public tag/install 与 Release assets。
+
+### V4.2.6：Issues #187–#190 与更新兼容修复（已发布）
 
 - [x] 重复 `interaction.requested` 创建并提升最新选项卡，失败时精确回滚。
 - [x] 保留完整流式答案后的短 terminal postscript，同时维持正常 final 替换语义。
 - [x] Hermes 0.20 exact Base awaited ledger patch 可验证、可移除且逐字节恢复。
 - [x] 裸 `/update` 保留 venv symlink runtime，放宽慢 fetch 上限，并正确识别 `hermes_cli.__version__`。
 - [x] 发布分支版本契约、聚焦矩阵、完整测试、本地包与 `site-packages` provenance。
-- [ ] PR CI、exact merge、public tag/install、Release assets 与外部确认。
+- [x] PR CI、exact merge、public tag/install 与 Release assets。
 
 ### V4.2.5：审查安全热修（已发布）
 

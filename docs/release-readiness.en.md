@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.2.6`. This cycle covers Issue #187 repeated-choice card promotion, Issue #188 short terminal-postscript preservation, Issue #189 / PR #190 exact Hermes 0.20 Base-ledger support, and bare Feishu `/update` venv-symlink, slow-fetch, and Hermes 0.20 version detection fixes. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.2.7`. This cycle covers Issue #193 Windows cold-import probes and legacy manifest paths, PR #180 parent `HERMES_HOME` config discovery, PR #181 safe detached venv runner PID rebinding, and PowerShell install failure propagation. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -146,6 +146,17 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.2.7 Release Gates
+
+Accepted candidate SHA: `18d0346bd041a7c7b2c049ace116b78c720bad98`
+
+- Candidate GitHub Actions [run 30966895426](https://github.com/baileyh8/hermes-feishu-streaming-card/actions/runs/30966895426) passed all five jobs: Python 3.9/3.12, PowerShell installer, Docker Compose runtime smoke, and Feishu SDK compatibility.
+- Candidate focused regressions: **`632 passed, 4 skipped`**; candidate full pytest: **`2429 passed, 5 skipped`**; `git diff --check`: **passed**.
+- Windows-specific coverage includes 30-second SDK/HFC probes, POSIX manifest writes, exact legacy backslash reads, escape rejection, parent `HERMES_HOME`, detached-runner PID rebinding, and PowerShell non-zero exit propagation.
+- Release-branch version/docs contracts: **`92 passed`**; Windows/installer/CLI focused matrix: **`628 passed, 4 skipped`**; full pytest: **`2429 passed, 5 skipped`**; `git diff --check`: **passed**.
+- Local sdist/wheel builds passed with metadata at `4.2.7`. A fresh venv installed the wheel and public dependencies, reported package/distribution versions of `4.2.7`, imported from venv `site-packages`, and exited 0 for CLI help.
+- Exact merge SHA, public tag/install, and all four Release assets are recorded during the release process.
 
 ## V4.2.6 Release Gates
 
