@@ -616,6 +616,7 @@ def test_runtime_hook_import_probe_uses_isolated_python_and_reports_library_root
     assert report["platlib"] == "/verified/site-packages"
     assert calls[0][0][:2] == [sys.executable, "-I"]
     assert calls[0][0][2] == "-c"
+    assert calls[0][1]["timeout"] == 30
 
 
 def test_current_python_identity_preserves_venv_entry_for_isolated_import(
