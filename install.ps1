@@ -211,6 +211,9 @@ function Install-HfcPackage {
         $pipArgs = @("install", $PipUserFlag, "--upgrade", $InstallSpec)
     }
     & $PythonBin -m pip @pipArgs
+    if ($LASTEXITCODE -ne 0) {
+        Fail "package installation failed with exit code $LASTEXITCODE"
+    }
 }
 
 function Invoke-HfcSetup {
@@ -231,6 +234,9 @@ function Invoke-HfcSetup {
     }
     Write-HfcLog "running setup"
     & $PythonBin @args
+    if ($LASTEXITCODE -ne 0) {
+        Fail "setup failed with exit code $LASTEXITCODE"
+    }
 }
 
 $envValues = Read-HfcEnvFile

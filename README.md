@@ -140,7 +140,7 @@ Hermes `v2026.4.23` 起的旧版和 Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.6
+export HFC_VERSION=v4.2.7
 bash install-docker.sh
 ```
 
@@ -180,6 +180,7 @@ bash install-docker.sh
 ![飞书话题内卡片连续更新与思考工具 timeline 展示](docs/assets/feishu-topic-card-showcase-v389.png)
 | 版本 | 重点 |
 |---|---|
+| [v4.2.7](docs/release-notes-v4.2.7.md) | 修复 Issue #193 的 Windows 冷启动探针超时与旧 manifest 反斜杠路径，合入 PR #180 的 parent `HERMES_HOME` 查找和 PR #181 的 detached runner PID 安全重绑，并让 PowerShell 安装器正确传播失败 |
 | [v4.2.6](docs/release-notes-v4.2.6.md) | 修复 Issue #187 重复选项卡位置、#188 终态短后记覆盖正文、#189/PR #190 Hermes 0.20 exact Base 兼容，并修复飞书裸 `/update` 的 venv symlink、慢 fetch 与 Hermes 0.20 版本误报；上一版审查安全热修见 [v4.2.5](docs/release-notes-v4.2.5.md) |
 | [v4.2.4](docs/release-notes-v4.2.4.md) | 修复飞书/Lark 话题中连续引用同一消息时复用旧 session、覆盖首张回复卡的问题；每条新消息创建独立卡片，同一轮流式更新仍通过 reply alias 关联 |
 | [v4.2.3](docs/release-notes-v4.2.3.md) | 修复 WebSocket hook 转发 `/update` 按钮动作时遗漏 `update_evidence_fingerprint` 的问题，使 sidecar 能完成证据绑定的确认/取消状态转换；缺失或不匹配证据仍 fail-closed |
@@ -223,8 +224,7 @@ bash install-docker.sh
 | [v3.8.8](docs/release-notes-v3.8.8.md) | Hermes 原生系统提示卡片化：Working、上下文压缩、skill loading、自我改进 review |
 | [v3.8.7](docs/release-notes-v3.8.7.md) | 新版 Hermes 缺少 `message.started` 时也能从首个 delta/completed 事件创建卡片 |
 | [v3.8.6](docs/release-notes-v3.8.6.md) | Docker/source-stripped Hermes 缺 `VERSION` 时用 Gateway anchors 兜底，兼容 Hermes v0.18.0 |
-| [v3.8.5](docs/release-notes-v3.8.5.md) | 历史修复版本；完整说明保留在 release notes |
-完整版本历史见 [CHANGELOG.md](CHANGELOG.md)，更长的历史说明保留在 [详细使用手册](docs/user-guide.md#版本历史)。
+完整版本历史见 [CHANGELOG.md](CHANGELOG.md)，更长的历史说明保留在 [详细使用手册](docs/user-guide.md#版本历史)；早期说明见 [v3.8.5](docs/release-notes-v3.8.5.md)。
 
 ## 架构简图
 

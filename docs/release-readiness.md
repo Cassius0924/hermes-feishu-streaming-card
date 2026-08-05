@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.2.6`。本轮覆盖 Issue #187 重复选项卡提升、Issue #188 terminal 短后记保留、Issue #189 / PR #190 Hermes 0.20 exact Base ledger，以及飞书裸 `/update` 的 venv symlink、慢 fetch 和 Hermes 0.20 版本检测。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.2.7`。本轮覆盖 Issue #193 的 Windows 冷启动探针与旧 manifest 路径，PR #180 的 parent `HERMES_HOME` config 查找，PR #181 的 detached venv runner PID 安全重绑，以及 PowerShell 安装失败传播。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -146,6 +146,17 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.2.7 发布门禁
+
+Accepted candidate SHA: `18d0346bd041a7c7b2c049ace116b78c720bad98`
+
+- 候选 GitHub Actions [run 30966895426](https://github.com/baileyh8/hermes-feishu-streaming-card/actions/runs/30966895426) 成功，Python 3.9/3.12、PowerShell installer、Docker Compose runtime smoke 与 Feishu SDK compat 五个 jobs 全部通过。
+- 候选聚焦回归：**`632 passed, 4 skipped`**；候选完整 pytest：**`2429 passed, 5 skipped`**；`git diff --check`：**通过**。
+- Windows 专项覆盖 30 秒 SDK/HFC 探针、POSIX manifest 写入、精确 legacy 反斜杠读取、越界拒绝、parent `HERMES_HOME`、detached runner PID 重绑和 PowerShell 非零退出传播。
+- 发布分支版本/文档契约：**`92 passed`**；Windows/installer/CLI 聚焦矩阵：**`628 passed, 4 skipped`**；完整 pytest：**`2429 passed, 5 skipped`**；`git diff --check`：**通过**。
+- 本地 sdist/wheel 构建成功，metadata 均为 `4.2.7`；全新 venv 安装 wheel 与公开依赖后，package/distribution 版本均为 `4.2.7`，import 来自 venv `site-packages`，CLI help exit 0。
+- exact merge SHA、public tag/install 与四个 Release assets：**发布流程中逐项记录**。
 
 ## V4.2.6 发布门禁
 

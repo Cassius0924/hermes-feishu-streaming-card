@@ -141,7 +141,7 @@ For an existing Hermes container:
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.6
+export HFC_VERSION=v4.2.7
 bash install-docker.sh
 ```
 
@@ -181,6 +181,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ![Feishu topic reply card continuity and reasoning/tool timeline showcase](docs/assets/feishu-topic-card-showcase-v389.png)
 | Version | Highlights |
 |---|---|
+| [v4.2.7](docs/release-notes-v4.2.7.en.md) | Fixes Issue #193 Windows cold-import timeouts and legacy backslash manifest paths, integrates PR #180 parent `HERMES_HOME` discovery and PR #181 safe detached-runner PID rebinding, and propagates PowerShell installer failures |
 | [v4.2.6](docs/release-notes-v4.2.6.en.md) | Fixes Issue #187 repeated choice-card position, #188 short terminal postscripts replacing answers, #189/PR #190 exact Base compatibility for Hermes 0.20, and bare Feishu `/update` venv-symlink, slow-fetch, and version-reporting failures; see [v4.2.5](docs/release-notes-v4.2.5.en.md) for the preceding audit safety hotfix |
 | [v4.2.4](docs/release-notes-v4.2.4.en.md) | Fixes consecutive Feishu/Lark topic replies quoting the same message overwriting the first reply card; every new message opens an independent card while in-turn streaming still resolves through the reply alias |
 | [v4.2.3](docs/release-notes-v4.2.3.en.md) | Preserves `update_evidence_fingerprint` when the WebSocket hook forwards `/update` actions, allowing the sidecar to complete evidence-bound confirm/cancel transitions while missing or mismatched evidence remains fail-closed |
@@ -224,8 +225,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 | [v3.8.9](docs/release-notes-v3.8.9.md) | Feishu/Lark topic card continuity; `system.notice` no longer duplicates outside the card |
 | [v3.8.8](docs/release-notes-v3.8.8.md) | Cardifies native Hermes notices: Working, context compression, skill loading, and self-improvement review |
 | [v3.8.7](docs/release-notes-v3.8.7.md) | Newer Hermes streams can create cards even when `message.started` is missing |
-| [v3.8.6](docs/release-notes-v3.8.6.md) | Docker/source-stripped Hermes can fall back from missing `VERSION` to Gateway anchors; Hermes v0.18.0 support |
-Full history: [CHANGELOG.md](CHANGELOG.md). Longer historical notes remain in the [full user guide](docs/user-guide.en.md#version-history).
+Full history: [CHANGELOG.md](CHANGELOG.md). Longer historical notes remain in the [full user guide](docs/user-guide.en.md#version-history); see also the archived [v3.8.6 notes](docs/release-notes-v3.8.6.md).
 
 ## Architecture At A Glance
 

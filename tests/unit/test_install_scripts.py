@@ -1605,6 +1605,23 @@ def test_install_powershell_latest_resolves_release_tag_and_pins_spec():
     assert "-InstallSpec $ResolvedInstallSpec" in script
 
 
+def test_install_powershell_propagates_native_setup_and_pip_failures():
+    script = (ROOT / "install.ps1").read_text(encoding="utf-8")
+    package_function = script.split("function Install-HfcPackage", 1)[1].split(
+        "function Invoke-HfcSetup", 1
+    )[0]
+    setup_function = script.split("function Invoke-HfcSetup", 1)[1].split(
+        "$envValues = Read-HfcEnvFile", 1
+    )[0]
+
+    assert "& $PythonBin -m pip @pipArgs" in package_function
+    assert "if ($LASTEXITCODE -ne 0)" in package_function
+    assert 'Fail "package installation failed' in package_function
+    assert "& $PythonBin @args" in setup_function
+    assert "if ($LASTEXITCODE -ne 0)" in setup_function
+    assert 'Fail "setup failed' in setup_function
+
+
 def test_install_powershell_latest_fails_closed_on_api_error():
     script = (ROOT / "install.ps1").read_text(encoding="utf-8")
     catch_block = script.split("} catch {", 1)[1].split("}", 1)[0]

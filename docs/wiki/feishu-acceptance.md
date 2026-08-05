@@ -2,6 +2,13 @@
 
 自动化测试不能完全证明 Feishu/Lark 客户端体验。涉及卡片 UX、topic、系统提示、命令卡片的版本，发布前需要真实飞书 smoke。
 
+## Windows installer follow-up 候选验收
+
+- Windows 10/11 + Python 3.11 的 Hermes venv 首次导入 `lark_oapi.ws.Client` 或 HFC 超过 8 秒、但少于 30 秒时，官方 PowerShell `install/setup` 应继续完成；超过 30 秒或子进程非零退出仍必须失败。
+- 新 ownership manifest 的 run/Cron/Base target 与 backup 路径均使用 `/`；由旧 Windows 版本写出的精确 `gateway\\platforms\\base.py` 与对应 backup 可安全重装/恢复，路径穿越、绝对路径和多余后缀继续拒绝。
+- venv launcher 写入 parent PID、runner 使用 child PID 时，只有精确 `detached` manager、token 与 parent 关系可重绑；错误 token/manager/parent、非 Windows 和写后复核失败均拒绝。
+- 人为令 PowerShell installer 的 `pip` 或 `hermes_feishu_card.cli setup` 返回非零，脚本必须返回失败且不打印 `done`。
+
 ## V4.1.4 Windows 旧版安装迁移验收
 
 - 在 Windows 10 / Hermes v0.19.0 上保留 Issue #171 的原始 `gateway/run.py`、`.hermes_feishu_card.bak` 与 optional Cron，不再手工创建 manifest 或调用内部 `apply_patch()`。
