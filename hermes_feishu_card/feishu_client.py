@@ -353,9 +353,8 @@ class FeishuClient:
             )
         if response.status >= 400:
             retryable = response.status in _RETRYABLE_HTTP_STATUSES
-            api_msg = payload.get("msg") if isinstance(payload, dict) else None
             raise FeishuAPIError(
-                f"Feishu API HTTP failure: {api_msg}" if api_msg else "Feishu API HTTP failure",
+                "Feishu API HTTP failure",
                 status_code=response.status,
                 api_code=_safe_api_code(payload.get("code")),
                 retryable=retryable,

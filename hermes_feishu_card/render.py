@@ -4,6 +4,7 @@ import ast
 from dataclasses import dataclass
 import html
 import json
+import math
 import re
 import time as _time
 from collections.abc import Mapping
@@ -1002,7 +1003,14 @@ def _render_footer(
     if session.status == "failed" or display_status == "failed":
         return "已停止"
     if display_status == "waiting":
-        return "等待选择"
+        interaction = session.active_interaction
+        timeout_seconds = (
+            float(interaction.timeout_seconds)
+            if interaction is not None
+            else 300.0
+        )
+        minutes = max(1, int(math.ceil(timeout_seconds / 60.0)))
+        return f"等待选择 · ⏳ {minutes} 分钟后过期"
     if session.status != "completed":
         return _spinner_text("生成中")
     tokens = session.tokens if isinstance(session.tokens, dict) else {}
