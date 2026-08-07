@@ -2396,7 +2396,17 @@ def request_interaction_from_hermes_locals(
             _hfc_warn(
                 f"interaction request failed: POST to sidecar failed (kind={kind} id={interaction_id} url={config.event_url})"
             )
-            return None
+            # The event may still have been delivered even though the response
+            # was lost (connection dropped mid-flight). Falling straight back to
+            # native text then produces a duplicate: the card was already sent
+            # AND a numbered-list text appears. Ask the sidecar before giving up.
+            if _hfc_interaction_card_confirmed(config, interaction_id):
+                _hfc_warn(
+                    f"interaction card confirmed present after POST failure (id={interaction_id}) — continuing to poll"
+                )
+                post_result = {"ok": True, "applied": True}
+            else:
+                return None
         if isinstance(post_result, dict) and post_result.get("ok") is False:
             _hfc_warn(
                 "interaction request failed: sidecar rejected (kind="
@@ -7596,21 +7606,52 @@ def _post_interaction_event(
     payload: dict[str, Any],
     timeout: float,
 ) -> dict[str, Any] | None | object:
+    """POST an interaction event to the sidecar with fast retries.
+
+    Transient connection failures (sidecar restart window, dropped keep-alive
+    connection) previously fell straight through to the native text fallback,
+    which made a clarify prompt appear as a plain numbered list instead of a
+    card. Retry a couple of times quickly before giving up. Events are
+    idempotent on the sidecar (sequence dedupe), so a retried POST is safe.
+    """
     loop = local_vars.get("_hfc_loop")
-    if loop is not None:
+    attempts = 3
+    delay = 0.5
+    for attempt in range(attempts):
         try:
-            if loop.is_running():
+            if loop is not None and loop.is_running():
                 future = asyncio.run_coroutine_threadsafe(
                     _post_json_ordered_response(url, payload, timeout),
                     loop,
                 )
                 return future.result(timeout=max(1.0, timeout + 1.0))
+            return _post_json_sync_response(url, payload, timeout)
         except Exception:
-            return _POST_FAILED
+            if attempt < attempts - 1:
+                time.sleep(delay)
+    return _POST_FAILED
+
+
+def _hfc_interaction_card_confirmed(
+    config: RuntimeConfig, interaction_id: str
+) -> bool:
+    """Return True when the sidecar already tracks the interaction (card sent).
+
+    Used after a POST to /events failed at the transport layer: the event may
+    have been delivered even though the response was lost, in which case
+    falling back to native text would produce a duplicate (card + text).
+    """
     try:
-        return _post_json_sync_response(url, payload, timeout)
+        base_url = _summary_base_url(config.event_url)
+        url = f"{base_url}/interactions/{parse.quote(interaction_id, safe='')}"
+        result = _get_json_sync(url, config.timeout_seconds)
+        return isinstance(result, dict) and result.get("status") in (
+            "pending",
+            "completed",
+            "failed",
+        )
     except Exception:
-        return _POST_FAILED
+        return False
 
 
 def _timeout_for_event(config: RuntimeConfig, event_name: str) -> float:
