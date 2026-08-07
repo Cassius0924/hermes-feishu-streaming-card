@@ -57,6 +57,7 @@ class InteractionState:
     status: str = "pending"
     options: list[InteractionOption] = field(default_factory=list)
     callback_token: str = ""
+    multi_select: bool = False
     choice: str = ""
     choice_label: str = ""
     user_name: str = ""
@@ -402,6 +403,7 @@ def _interaction_from_event_data(data: dict[str, Any]) -> InteractionState:
         description=str(data.get("description") or "").strip(),
         options=_interaction_options(data.get("options")),
         callback_token=str(data.get("callback_token") or secrets.token_urlsafe(16)),
+        multi_select=bool(data.get("multi_select", False)),
     )
 
 

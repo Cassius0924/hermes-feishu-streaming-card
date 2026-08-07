@@ -2330,6 +2330,7 @@ def build_interaction_event(
     description: str = "",
     timeout_seconds: float | None = None,
     fallback_policy: str = "",
+    multi_select: bool = False,
 ) -> dict[str, Any] | None:
     event_locals = {
         **local_vars,
@@ -2340,6 +2341,7 @@ def build_interaction_event(
         "_hfc_interaction_options": options or [],
         "_hfc_interaction_timeout_seconds": timeout_seconds,
         "_hfc_interaction_fallback_policy": fallback_policy,
+        "_hfc_interaction_multi_select": bool(multi_select),
     }
     return build_event("interaction.requested", event_locals)
 
@@ -2354,16 +2356,20 @@ def request_interaction_from_hermes_locals(
     description: str = "",
     timeout_seconds: float | None = None,
     poll_interval_seconds: float | None = None,
+    multi_select: bool = False,
 ) -> dict[str, Any] | None:
     try:
         config = load_runtime_config()
         if not config.enabled:
+            _hfc_warn(
+                f"interaction request skipped: config disabled (kind={kind} id={interaction_id})"
+            )
             return None
-        if not _policy_gate_sync(
-            config,
-            local_vars,
-            "interaction.requested",
-        ).card:
+        gate = _policy_gate_sync(config, local_vars, "interaction.requested")
+        if not gate.card:
+            _hfc_warn(
+                f"interaction request denied by policy gate (kind={kind} id={interaction_id} identity={getattr(gate, 'identity', None)})"
+            )
             return None
         payload = build_interaction_event(
             local_vars,
@@ -2373,8 +2379,12 @@ def request_interaction_from_hermes_locals(
             options=options or [],
             description=description,
             timeout_seconds=timeout_seconds,
+            multi_select=multi_select,
         )
         if payload is None:
+            _hfc_warn(
+                f"interaction request skipped: build_event returned None (kind={kind} id={interaction_id})"
+            )
             return None
         post_result = _post_interaction_event(
             local_vars,
@@ -2383,10 +2393,29 @@ def request_interaction_from_hermes_locals(
             _timeout_for_event(config, payload["event"]),
         )
         if post_result is _POST_FAILED:
+            _hfc_warn(
+                f"interaction request failed: POST to sidecar failed (kind={kind} id={interaction_id} url={config.event_url})"
+            )
             return None
         if isinstance(post_result, dict) and post_result.get("ok") is False:
+            _hfc_warn(
+                "interaction request failed: sidecar rejected (kind="
+                + str(kind)
+                + " id="
+                + str(interaction_id)
+                + ") post_result="
+                + _hfc_summarize_post_result(post_result)
+            )
             return None
         if _uses_text_interaction_fallback(post_result):
+            _hfc_warn(
+                "interaction request text-mode fallback (kind="
+                + str(kind)
+                + " id="
+                + str(interaction_id)
+                + ") post_result="
+                + _hfc_summarize_post_result(post_result)
+            )
             return None
         if isinstance(post_result, dict) and post_result.get("applied") is False:
             for _ in range(2):
@@ -2399,6 +2428,7 @@ def request_interaction_from_hermes_locals(
                     options=options or [],
                     description=description,
                     timeout_seconds=timeout_seconds,
+                    multi_select=multi_select,
                 )
                 if payload is None:
                     return None
@@ -2409,10 +2439,28 @@ def request_interaction_from_hermes_locals(
                     _timeout_for_event(config, payload["event"]),
                 )
                 if post_result is _POST_FAILED:
+                    _hfc_warn(
+                        f"interaction retry POST failed (kind={kind} id={interaction_id})"
+                    )
                     return None
                 if isinstance(post_result, dict) and post_result.get("ok") is False:
+                    _hfc_warn(
+                        "interaction retry rejected (kind="
+                        + str(kind)
+                        + " id="
+                        + str(interaction_id)
+                        + ") post_result="
+                        + _hfc_summarize_post_result(post_result)
+                    )
                     return None
                 if _uses_text_interaction_fallback(post_result):
+                    _hfc_warn(
+                        "interaction retry text-mode fallback (kind="
+                        + str(kind)
+                        + " id="
+                        + str(interaction_id)
+                        + ")"
+                    )
                     return None
                 if not (
                     isinstance(post_result, dict)
@@ -2420,6 +2468,9 @@ def request_interaction_from_hermes_locals(
                 ):
                     break
             else:
+                _hfc_warn(
+                    f"interaction not applied after retries (kind={kind} id={interaction_id})"
+                )
                 return None
         base_url = _summary_base_url(config.event_url)
         url = f"{base_url}/interactions/{parse.quote(interaction_id, safe='')}"
@@ -2434,13 +2485,17 @@ def request_interaction_from_hermes_locals(
             if isinstance(result, dict) and result.get("status") in {"completed", "failed"}:
                 return result
             if time.monotonic() >= deadline:
+                _hfc_warn(f"interaction poll timeout: id={interaction_id}")
                 return {
                     "ok": False,
                     "status": "timeout",
                     "interaction_id": interaction_id,
                 }
             time.sleep(poll_interval)
-    except Exception:
+    except Exception as exc:
+        _hfc_warn(
+            f"interaction request exception (kind={kind} id={interaction_id}): {exc.__class__.__name__}: {exc}"
+        )
         return None
 
 
@@ -3591,6 +3646,27 @@ def _hfc_warn(message: str) -> None:
         print(f"[hermes-feishu-card] {message}", file=sys.stderr)
     except Exception:
         pass
+
+
+def _hfc_summarize_post_result(result: Any) -> str:
+    try:
+        if not isinstance(result, dict):
+            return repr(result)
+        keys = (
+            "ok",
+            "applied",
+            "delivery",
+            "error",
+            "message_id",
+            "interaction_mode",
+            "status",
+            "choice",
+        )
+        return json.dumps(
+            {k: result.get(k) for k in keys if k in result}, ensure_ascii=False
+        )
+    except Exception:
+        return repr(result)
 
 
 def _hfc_info(message: str) -> None:
@@ -5983,10 +6059,97 @@ def _hfc_on_feishu_card_action_trigger(self: Any, data: Any) -> Any:
     if action == "operations.select":
         return _hfc_handle_operations_select_action(self, data, action_value)
 
+    if not action:
+        # Form-submit buttons (form_action_type=submit) cannot carry
+        # behaviors, so their callbacks arrive with an EMPTY value. The
+        # interaction is identified by the button name
+        # (hfc_confirm_<id> / hfc_other_<id>) and the submitted data lives
+        # in action.form_value. Without this branch such callbacks fell
+        # through to the original adapter handler and were dropped — the
+        # card looked unresponsive.
+        form_payload = _hfc_form_submit_payload(data)
+        if form_payload is not None:
+            return _hfc_forward_form_submit_action(self, data, form_payload)
+
     original = getattr(type(self), "_hfc_original_on_card_action_trigger", None)
     if callable(original):
         return original(self, data)
     return _hfc_empty_feishu_callback_response(self)
+
+
+def _hfc_form_submit_payload(data: Any) -> dict[str, Any] | None:
+    """Extract a clarify form-submit callback into a sidecar /card/actions
+    payload, or None when the action isn't one of ours.
+
+    Form-submit callbacks carry ``event.action.name`` (button name) and
+    ``event.action.form_value`` (submitted component values) but an empty
+    ``value``. The sidecar's ``_parse_form_action_name`` resolves the mode
+    (confirm/other) and interaction id from the button name."""
+    event = getattr(data, "event", None)
+    action = getattr(event, "action", None)
+    name = str(getattr(action, "name", "") or "").strip()
+    if not (name.startswith("hfc_confirm_") or name.startswith("hfc_other_")):
+        return None
+    form_value = getattr(action, "form_value", {}) or {}
+    if not isinstance(form_value, dict):
+        try:
+            form_value = json.loads(str(form_value)) if str(form_value).strip() else {}
+        except Exception:
+            form_value = {}
+    if not isinstance(form_value, dict):
+        form_value = {}
+
+    payload: dict[str, Any] = {
+        "event": {
+            "action": {
+                "value": {},
+                "name": name,
+                "form_value": form_value,
+            },
+            "context": {"open_chat_id": _hfc_action_chat_id(data)},
+            "operator": {},
+        }
+    }
+    open_id = _hfc_action_open_id(data)
+    if open_id:
+        payload["event"]["operator"]["open_id"] = open_id
+    operator_name = ""
+    operator_obj = getattr(event, "operator", None)
+    if operator_obj is not None:
+        operator_name = str(
+            getattr(operator_obj, "user_name", "")
+            or getattr(operator_obj, "name", "")
+            or ""
+        ).strip()
+    if operator_name:
+        payload["event"]["operator"]["name"] = operator_name
+    return payload
+
+
+def _hfc_forward_form_submit_action(
+    adapter: Any,
+    data: Any,
+    sidecar_payload: dict[str, Any],
+) -> Any:
+    """Forward a clarify form-submit callback to the sidecar's /card/actions
+    and echo back the updated card so Feishu refreshes it in place."""
+    _hfc_info("inline card action received: form submit")
+    try:
+        config = load_runtime_config()
+        url = f"{_summary_base_url(config.event_url)}/card/actions"
+        result = _post_json_sync_response(url, sidecar_payload, 5.0)
+    except Exception as exc:
+        _hfc_warn(
+            "form submit forward failed: "
+            f"{_hfc_exception_summary(exc)}"
+        )
+        return _hfc_empty_feishu_callback_response(adapter)
+
+    if isinstance(result, dict) and isinstance(result.get("card"), dict):
+        _hfc_info("form submit resolved and card updated")
+        return _hfc_raw_feishu_callback_response(adapter, result["card"])
+    _hfc_info("form submit forwarded but no card returned")
+    return _hfc_empty_feishu_callback_response(adapter)
 
 
 def _hfc_handle_operations_select_action(
@@ -7264,6 +7427,7 @@ def request_clarify_response_from_hermes_locals(
     question: str,
     choices: Any,
     timeout_seconds: float | None = None,
+    multi_select: bool = False,
 ) -> str | None:
     if not choices:
         return None
@@ -7275,7 +7439,7 @@ def request_clarify_response_from_hermes_locals(
                 {
                     "label": label,
                     "value": label,
-                    "style": "primary" if index == 0 else "default",
+                    "style": "default" if multi_select else ("primary" if index == 0 else "default"),
                 }
             )
     if not options:
@@ -7287,10 +7451,21 @@ def request_clarify_response_from_hermes_locals(
         prompt=str(question or "请选择").strip(),
         options=options,
         timeout_seconds=timeout_seconds,
+        multi_select=multi_select,
     )
     if isinstance(result, dict) and result.get("status") == "completed":
         choice = str(result.get("choice") or "").strip()
         return choice or None
+    _hfc_warn(
+        "clarify fell back to native text: interaction_id="
+        + str(interaction_id)
+        + " result="
+        + (
+            _hfc_summarize_post_result(result)
+            if isinstance(result, dict)
+            else repr(result)
+        )
+    )
     return None
 
 
@@ -8083,6 +8258,10 @@ def _event_data(
                 ),
             }
         )
+        multi_select_value = local_vars.get("_hfc_interaction_multi_select")
+        if multi_select_value is None:
+            multi_select_value = local_vars.get("multi_select")
+        data["multi_select"] = bool(multi_select_value)
         timeout_value = _finite_float(local_vars.get("_hfc_interaction_timeout_seconds"))
         if timeout_value is not None:
             data["timeout_seconds"] = timeout_value
