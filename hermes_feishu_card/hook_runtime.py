@@ -7460,7 +7460,7 @@ def request_clarify_response_from_hermes_locals(
         interaction_id=interaction_id,
         prompt=str(question or "请选择").strip(),
         options=options,
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=_interaction_timeout(timeout_seconds),
         multi_select=multi_select,
     )
     if isinstance(result, dict) and result.get("status") == "completed":
