@@ -13,7 +13,8 @@
 - [x] PR #199 的多选、单选序号、自定义回答、pending freeze 与过期 footer 完成安全整合。
 - [x] form submit 使用随机 callback token，并要求非空精确 chat binding；不接受 interaction ID 作为凭据。
 - [x] `/events` 单次 POST、Hermes 旧 clarify 签名兼容与日志脱敏完成回归。
-- [ ] 完整 pytest、构建、PR CI、exact merge、public tag/install 与 Release assets。
+- [x] 完整 pytest、sdist/wheel、隔离 `site-packages` provenance 与 `git diff --check`。
+- [ ] PR CI、exact merge、public tag/install 与 Release assets。
 
 ### V4.2.8：安装凭据持久化热修（已发布）
 

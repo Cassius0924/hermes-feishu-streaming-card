@@ -151,7 +151,9 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 
 - The original PR #196/#199 commits retain authorship. Additional regressions cover submission failure, duplicate resolution, callback token/chat authentication, old Hermes callback signatures, single-attempt `/events`, and redacted diagnostics.
 - Focused hook/runtime/render/server/patcher/install matrix: **`1161 passed, 2 skipped`**.
-- Full pytest, builds, GitHub Actions, exact merge SHA, tag, public install, and Release assets: **pending release gates**.
+- Full pytest with an isolated v4.2.9 runtime: **`2452 passed, 6 skipped`**; `git diff --check`: **passed**.
+- Local sdist/wheel builds passed with metadata at `4.2.9`. A fresh venv installed the wheel and public dependencies, reported package/distribution versions of `4.2.9`, imported from venv `site-packages`, and exited 0 for the console entrypoint and CLI help.
+- GitHub Actions, exact merge SHA, tag, public tag/install, and Release assets: **pending release gates**.
 
 ## V4.2.8 Release Gates
 

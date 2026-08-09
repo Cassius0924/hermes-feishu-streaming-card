@@ -151,7 +151,9 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 
 - PR #196/#199 原作者提交已保留；额外回归锁定调度失败、并发重复、token/chat 鉴权、旧 Hermes callback 签名、单次 `/events` 与日志脱敏。
 - hook/runtime/render/server/patcher/install 聚焦矩阵：**`1161 passed, 2 skipped`**。
-- 完整 pytest、构建、GitHub Actions、exact merge SHA、tag、公开安装和 Release assets：**待发布门禁完成**。
+- 隔离 v4.2.9 runtime 完整 pytest：**`2452 passed, 6 skipped`**；`git diff --check`：**通过**。
+- 本地 sdist/wheel 构建成功，metadata 均为 `4.2.9`；全新 venv 安装 wheel 与公开依赖后，package/distribution 版本均为 `4.2.9`，import 来自 venv `site-packages`，console entrypoint 与 CLI help exit 0。
+- GitHub Actions、exact merge SHA、tag、公开 tag/install 与 Release assets：**待发布门禁完成**。
 
 ## V4.2.8 发布门禁
 
