@@ -5,8 +5,9 @@ Covers:
   multi_select_static form with ONE confirm button (+ Other input)
 - single-select renders choice buttons + an Other form
 - /card/actions form submits (identified via button name, no behaviors):
-  hfc_confirm_<id> (multi-select JSON array, typed text wins) and
-  hfc_other_<id> (typed free text) complete the interaction correctly
+  hfc_confirm_<callback_token> (multi-select JSON array, typed text wins) and
+  hfc_other_<callback_token> (typed free text) complete the interaction correctly
+- form submits require the exact callback token and exact non-empty chat binding
 - legacy direct button clicks still work
 - interaction.noop callbacks from selection components are acknowledged
 """
@@ -58,22 +59,36 @@ def event_payload(
     return payload
 
 
-def form_action_payload(interaction_id, *, button_name=None, form_value=None, hfc_action=""):
+def form_action_payload(
+    callback_token,
+    *,
+    button_name=None,
+    form_value=None,
+    hfc_action="",
+    chat_id="oc_abc",
+):
     """Form-submit callback: buttons carry NO behaviors, so the callback has
     an empty value dict and the interaction is in the button name."""
-    action = {"tag": "button", "value": {}, "name": button_name or f"hfc_confirm_{interaction_id}"}
+    action = {
+        "tag": "button",
+        "value": {},
+        "name": button_name or f"hfc_confirm_{callback_token}",
+    }
     if form_value is not None:
         action["form_value"] = form_value
     if hfc_action:
         action["value"] = {"hfc_action": hfc_action}
-    return {
+    payload = {
         "schema": "2.0",
         "event": {
             "operator": {"open_id": "ou_test", "name": "测试用户"},
             "action": action,
-            "context": {"open_chat_id": "oc_abc", "open_message_id": "om_x"},
+            "context": {"open_message_id": "om_x"},
         },
     }
+    if chat_id is not None:
+        payload["event"]["context"]["open_chat_id"] = chat_id
+    return payload
 
 
 def button_action_payload(interaction_id, token, *, choice=None, choice_label=None, hfc_action="interaction.select"):
@@ -130,6 +145,12 @@ async def request_interaction(client, interaction_id, *, multi_select=False, opt
     return app
 
 
+def active_interaction(app):
+    session = next(iter(app[sidecar_server.SESSIONS_KEY].values()))
+    assert session.active_interaction is not None
+    return session.active_interaction
+
+
 def find_elements(elements, tag):
     """Recursively find components by tag (forms nest their children)."""
     found = []
@@ -167,7 +188,7 @@ async def test_multi_select_request_renders_single_confirm_button_form(client):
     assert labels == ["✅ 确认选择"]
     confirm = buttons[0]
     assert confirm["form_action_type"] == "submit"
-    assert confirm["name"] == "hfc_confirm_clarify-ms-1"
+    assert confirm["name"] == f"hfc_confirm_{interaction.callback_token}"
     # form-submit buttons must NOT carry behaviors callbacks
     assert "behaviors" not in confirm
 
@@ -204,13 +225,14 @@ async def test_single_select_request_renders_buttons_plus_other_form(client):
 
 async def test_confirm_form_submit_completes_with_json_array(client):
     app = await request_interaction(client, "clarify-ms-2", multi_select=True)
+    token = active_interaction(app).callback_token
 
     test_client, _, _ = client
     response = await test_client.post(
         "/card/actions",
         json=form_action_payload(
-            "clarify-ms-2",
-            button_name="hfc_confirm_clarify-ms-2",
+            token,
+            button_name=f"hfc_confirm_{token}",
             form_value={"hfc_multi": ["A", "B"], "hfc_other": ""},
         ),
     )
@@ -229,13 +251,14 @@ async def test_confirm_form_submit_typed_text_merges_with_selections(client):
     """Single confirm button: typed custom answer merges with selections
     as '[自定义] <text>' (user requirement: keep BOTH)."""
     app = await request_interaction(client, "clarify-ms-4", multi_select=True)
+    token = active_interaction(app).callback_token
 
     test_client, _, _ = client
     response = await test_client.post(
         "/card/actions",
         json=form_action_payload(
-            "clarify-ms-4",
-            button_name="hfc_confirm_clarify-ms-4",
+            token,
+            button_name=f"hfc_confirm_{token}",
             form_value={"hfc_multi": ["A"], "hfc_other": "自定义答案"},
         ),
     )
@@ -250,13 +273,14 @@ async def test_confirm_form_submit_typed_text_merges_with_selections(client):
 async def test_confirm_form_submit_typed_text_only_when_no_selection(client):
     """Typed text without selections stays a plain string answer."""
     app = await request_interaction(client, "clarify-ms-5", multi_select=True)
+    token = active_interaction(app).callback_token
 
     test_client, _, _ = client
     response = await test_client.post(
         "/card/actions",
         json=form_action_payload(
-            "clarify-ms-5",
-            button_name="hfc_confirm_clarify-ms-5",
+            token,
+            button_name=f"hfc_confirm_{token}",
             form_value={"hfc_multi": [], "hfc_other": "只有自定义"},
         ),
     )
@@ -269,13 +293,14 @@ async def test_confirm_form_submit_typed_text_only_when_no_selection(client):
 
 async def test_confirm_form_submit_empty_selection_completes_with_empty_array(client):
     app = await request_interaction(client, "clarify-ms-3", multi_select=True)
+    token = active_interaction(app).callback_token
 
     test_client, _, _ = client
     response = await test_client.post(
         "/card/actions",
         json=form_action_payload(
-            "clarify-ms-3",
-            button_name="hfc_confirm_clarify-ms-3",
+            token,
+            button_name=f"hfc_confirm_{token}",
             form_value={"hfc_multi": [], "hfc_other": ""},
         ),
     )
@@ -288,13 +313,14 @@ async def test_confirm_form_submit_empty_selection_completes_with_empty_array(cl
 
 async def test_other_form_submit_completes_with_typed_text(client):
     app = await request_interaction(client, "clarify-ot-1", multi_select=False)
+    token = active_interaction(app).callback_token
 
     test_client, _, _ = client
     response = await test_client.post(
         "/card/actions",
         json=form_action_payload(
-            "clarify-ot-1",
-            button_name="hfc_other_clarify-ot-1",
+            token,
+            button_name=f"hfc_other_{token}",
             form_value={"hfc_other": "自定义答案内容", "hfc_multi": []},
         ),
     )
@@ -307,13 +333,14 @@ async def test_other_form_submit_completes_with_typed_text(client):
 
 async def test_other_form_submit_empty_input_rejected(client):
     app = await request_interaction(client, "clarify-ot-2", multi_select=False)
+    token = active_interaction(app).callback_token
 
     test_client, _, _ = client
     response = await test_client.post(
         "/card/actions",
         json=form_action_payload(
-            "clarify-ot-2",
-            button_name="hfc_other_clarify-ot-2",
+            token,
+            button_name=f"hfc_other_{token}",
             form_value={"hfc_other": "   ", "hfc_multi": []},
         ),
     )
@@ -321,6 +348,56 @@ async def test_other_form_submit_empty_input_rejected(client):
     # interaction must still be pending
     result_response = await test_client.get("/interactions/clarify-ot-2")
     assert (await result_response.json())["status"] == "pending"
+
+
+async def test_form_submit_requires_exact_token_and_nonempty_exact_chat(client):
+    app = await request_interaction(
+        client,
+        "clarify-secure-1",
+        multi_select=True,
+        token="callback-secret",
+    )
+    assert active_interaction(app).status == "pending"
+    test_client, _, _ = client
+
+    rejected_payloads = [
+        form_action_payload(
+            "clarify-secure-1",
+            button_name="hfc_confirm_clarify-secure-1",
+            form_value={"hfc_multi": ["A"]},
+        ),
+        form_action_payload(
+            "wrong-token",
+            button_name="hfc_confirm_wrong-token",
+            form_value={"hfc_multi": ["A"]},
+        ),
+        form_action_payload(
+            "callback-secret",
+            form_value={"hfc_multi": ["A"]},
+            chat_id=None,
+        ),
+        form_action_payload(
+            "callback-secret",
+            form_value={"hfc_multi": ["A"]},
+            chat_id="oc_attacker",
+        ),
+    ]
+    for payload in rejected_payloads:
+        response = await test_client.post("/card/actions", json=payload)
+        assert response.status == 404
+        result = await test_client.get("/interactions/clarify-secure-1")
+        assert (await result.json())["status"] == "pending"
+
+    accepted = await test_client.post(
+        "/card/actions",
+        json=form_action_payload(
+            "callback-secret",
+            form_value={"hfc_multi": ["A"]},
+        ),
+    )
+    assert accepted.status == 200
+    result = await test_client.get("/interactions/clarify-secure-1")
+    assert (await result.json())["status"] == "completed"
 
 
 async def test_legacy_direct_button_click_still_works(client):

@@ -2362,13 +2362,15 @@ def request_interaction_from_hermes_locals(
         config = load_runtime_config()
         if not config.enabled:
             _hfc_warn(
-                f"interaction request skipped: config disabled (kind={kind} id={interaction_id})"
+                "interaction request skipped: config disabled "
+                f"kind={kind} {_hfc_log_reference('interaction', interaction_id)}"
             )
             return None
         gate = _policy_gate_sync(config, local_vars, "interaction.requested")
         if not gate.card:
             _hfc_warn(
-                f"interaction request denied by policy gate (kind={kind} id={interaction_id} identity={getattr(gate, 'identity', None)})"
+                "interaction request denied by policy gate "
+                f"kind={kind} {_hfc_log_reference('interaction', interaction_id)}"
             )
             return None
         payload = build_interaction_event(
@@ -2383,7 +2385,8 @@ def request_interaction_from_hermes_locals(
         )
         if payload is None:
             _hfc_warn(
-                f"interaction request skipped: build_event returned None (kind={kind} id={interaction_id})"
+                "interaction request skipped: build_event returned None "
+                f"kind={kind} {_hfc_log_reference('interaction', interaction_id)}"
             )
             return None
         post_result = _post_interaction_event(
@@ -2394,7 +2397,8 @@ def request_interaction_from_hermes_locals(
         )
         if post_result is _POST_FAILED:
             _hfc_warn(
-                f"interaction request failed: POST to sidecar failed (kind={kind} id={interaction_id} url={config.event_url})"
+                "interaction request failed: POST to sidecar failed "
+                f"kind={kind} {_hfc_log_reference('interaction', interaction_id)}"
             )
             # The event may still have been delivered even though the response
             # was lost (connection dropped mid-flight). Falling straight back to
@@ -2402,7 +2406,8 @@ def request_interaction_from_hermes_locals(
             # AND a numbered-list text appears. Ask the sidecar before giving up.
             if _hfc_interaction_card_confirmed(config, interaction_id):
                 _hfc_warn(
-                    f"interaction card confirmed present after POST failure (id={interaction_id}) — continuing to poll"
+                    "interaction card confirmed present after POST failure: "
+                    f"{_hfc_log_reference('interaction', interaction_id)}"
                 )
                 post_result = {"ok": True, "applied": True}
             else:
@@ -2411,9 +2416,9 @@ def request_interaction_from_hermes_locals(
             _hfc_warn(
                 "interaction request failed: sidecar rejected (kind="
                 + str(kind)
-                + " id="
-                + str(interaction_id)
-                + ") post_result="
+                + ") "
+                + _hfc_log_reference("interaction", interaction_id)
+                + " post_result="
                 + _hfc_summarize_post_result(post_result)
             )
             return None
@@ -2421,67 +2426,18 @@ def request_interaction_from_hermes_locals(
             _hfc_warn(
                 "interaction request text-mode fallback (kind="
                 + str(kind)
-                + " id="
-                + str(interaction_id)
-                + ") post_result="
+                + ") "
+                + _hfc_log_reference("interaction", interaction_id)
+                + " post_result="
                 + _hfc_summarize_post_result(post_result)
             )
             return None
         if isinstance(post_result, dict) and post_result.get("applied") is False:
-            for _ in range(2):
-                time.sleep(0.05)
-                payload = build_interaction_event(
-                    local_vars,
-                    kind=kind,
-                    interaction_id=interaction_id,
-                    prompt=prompt,
-                    options=options or [],
-                    description=description,
-                    timeout_seconds=timeout_seconds,
-                    multi_select=multi_select,
-                )
-                if payload is None:
-                    return None
-                post_result = _post_interaction_event(
-                    local_vars,
-                    config.event_url,
-                    payload,
-                    _timeout_for_event(config, payload["event"]),
-                )
-                if post_result is _POST_FAILED:
-                    _hfc_warn(
-                        f"interaction retry POST failed (kind={kind} id={interaction_id})"
-                    )
-                    return None
-                if isinstance(post_result, dict) and post_result.get("ok") is False:
-                    _hfc_warn(
-                        "interaction retry rejected (kind="
-                        + str(kind)
-                        + " id="
-                        + str(interaction_id)
-                        + ") post_result="
-                        + _hfc_summarize_post_result(post_result)
-                    )
-                    return None
-                if _uses_text_interaction_fallback(post_result):
-                    _hfc_warn(
-                        "interaction retry text-mode fallback (kind="
-                        + str(kind)
-                        + " id="
-                        + str(interaction_id)
-                        + ")"
-                    )
-                    return None
-                if not (
-                    isinstance(post_result, dict)
-                    and post_result.get("applied") is False
-                ):
-                    break
-            else:
-                _hfc_warn(
-                    f"interaction not applied after retries (kind={kind} id={interaction_id})"
-                )
-                return None
+            _hfc_warn(
+                "interaction not applied "
+                f"kind={kind} {_hfc_log_reference('interaction', interaction_id)}"
+            )
+            return None
         base_url = _summary_base_url(config.event_url)
         url = f"{base_url}/interactions/{parse.quote(interaction_id, safe='')}"
         timeout = _interaction_timeout(timeout_seconds)
@@ -2495,7 +2451,10 @@ def request_interaction_from_hermes_locals(
             if isinstance(result, dict) and result.get("status") in {"completed", "failed"}:
                 return result
             if time.monotonic() >= deadline:
-                _hfc_warn(f"interaction poll timeout: id={interaction_id}")
+                _hfc_warn(
+                    "interaction poll timeout: "
+                    f"{_hfc_log_reference('interaction', interaction_id)}"
+                )
                 return {
                     "ok": False,
                     "status": "timeout",
@@ -2504,7 +2463,9 @@ def request_interaction_from_hermes_locals(
             time.sleep(poll_interval)
     except Exception as exc:
         _hfc_warn(
-            f"interaction request exception (kind={kind} id={interaction_id}): {exc.__class__.__name__}: {exc}"
+            "interaction request exception: "
+            f"kind={kind} {_hfc_log_reference('interaction', interaction_id)} "
+            f"error={exc.__class__.__name__}"
         )
         return None
 
@@ -3661,22 +3622,35 @@ def _hfc_warn(message: str) -> None:
 def _hfc_summarize_post_result(result: Any) -> str:
     try:
         if not isinstance(result, dict):
-            return repr(result)
-        keys = (
-            "ok",
-            "applied",
-            "delivery",
-            "error",
-            "message_id",
-            "interaction_mode",
-            "status",
-            "choice",
-        )
-        return json.dumps(
-            {k: result.get(k) for k in keys if k in result}, ensure_ascii=False
-        )
+            return f"type={result.__class__.__name__}"
+        safe = {
+            key: result.get(key)
+            for key in (
+                "ok",
+                "applied",
+                "interaction_mode",
+                "status",
+                "disposition",
+            )
+            if key in result
+        }
+        delivery = result.get("delivery")
+        if isinstance(delivery, dict):
+            outcome = str(delivery.get("outcome") or "").strip()
+            allowed_outcomes = {
+                "accepted",
+                "delivered",
+                "not_sent",
+                "unknown",
+                "native",
+                "card",
+            }
+            safe["delivery"] = {
+                "outcome": outcome if outcome in allowed_outcomes else "other"
+            }
+        return json.dumps(safe, ensure_ascii=False)
     except Exception:
-        return repr(result)
+        return f"type={result.__class__.__name__}"
 
 
 def _hfc_info(message: str) -> None:
@@ -5900,6 +5874,8 @@ def _hfc_prepare_native_slash_action(
     adapter: Any,
     data: Any,
     action_value: dict[str, Any],
+    *,
+    claim: bool = False,
 ) -> dict[str, Any] | None:
     loop = getattr(adapter, "_loop", None)
     loop_accepts = getattr(adapter, "_loop_accepts_callbacks", None)
@@ -5924,9 +5900,17 @@ def _hfc_prepare_native_slash_action(
         return None
     if not _hfc_card_operator_allowed(adapter, data, expected_chat_id or chat_id):
         return None
+    if claim:
+        claimed_item = state.pop(confirm_id, None)
+        if claimed_item is not item:
+            if isinstance(claimed_item, dict):
+                state.setdefault(confirm_id, claimed_item)
+            return None
     return {
         "loop": loop,
         "state": state,
+        "item": item,
+        "resolution_started": False,
         "confirm_id": confirm_id,
         "choice": choice,
         "session_key": str(item.get("session_key") or ""),
@@ -6073,12 +6057,16 @@ def _hfc_on_feishu_card_action_trigger(self: Any, data: Any) -> Any:
         # Form-submit buttons (form_action_type=submit) cannot carry
         # behaviors, so their callbacks arrive with an EMPTY value. The
         # interaction is identified by the button name
-        # (hfc_confirm_<id> / hfc_other_<id>) and the submitted data lives
+        # (hfc_confirm_<token> / hfc_other_<token>) and the submitted data lives
         # in action.form_value. Without this branch such callbacks fell
         # through to the original adapter handler and were dropped — the
         # card looked unresponsive.
         form_payload = _hfc_form_submit_payload(data)
         if form_payload is not None:
+            chat_id = _hfc_action_chat_id(data)
+            if not chat_id or not _hfc_card_operator_allowed(self, data, chat_id):
+                _hfc_info("form submit rejected by Hermes admission")
+                return _hfc_empty_feishu_callback_response(self)
             return _hfc_forward_form_submit_action(self, data, form_payload)
 
     original = getattr(type(self), "_hfc_original_on_card_action_trigger", None)
@@ -6378,10 +6366,21 @@ def _hfc_resolve_native_slash_action(
     adapter: Any,
     data: Any,
     action_value: dict[str, Any],
+    *,
+    prepared: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str] | None:
-    prepared = _hfc_prepare_native_slash_action(adapter, data, action_value)
+    if prepared is None:
+        prepared = _hfc_prepare_native_slash_action(
+            adapter,
+            data,
+            action_value,
+            claim=True,
+        )
     if prepared is None:
         return None
+    if prepared.get("resolution_started"):
+        return None
+    prepared["resolution_started"] = True
 
     try:
         from tools import slash_confirm
@@ -6394,7 +6393,6 @@ def _hfc_resolve_native_slash_action(
         )
     except Exception as exc:
         result = f"处理失败：{exc}"
-    prepared["state"].pop(prepared["confirm_id"], None)
     return (
         _hfc_native_slash_result_card(adapter, data, prepared["choice"], result),
         prepared["message_id"],
@@ -6405,10 +6403,21 @@ async def _hfc_resolve_native_slash_action_async(
     adapter: Any,
     data: Any,
     action_value: dict[str, Any],
+    *,
+    prepared: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str] | None:
-    prepared = _hfc_prepare_native_slash_action(adapter, data, action_value)
+    if prepared is None:
+        prepared = _hfc_prepare_native_slash_action(
+            adapter,
+            data,
+            action_value,
+            claim=True,
+        )
     if prepared is None:
         return None
+    if prepared.get("resolution_started"):
+        return None
+    prepared["resolution_started"] = True
 
     try:
         from tools import slash_confirm
@@ -6429,7 +6438,6 @@ async def _hfc_resolve_native_slash_action_async(
             )
     except Exception as exc:
         result = f"处理失败：{exc}"
-    prepared["state"].pop(prepared["confirm_id"], None)
     return (
         _hfc_native_slash_result_card(adapter, data, prepared["choice"], result),
         prepared["message_id"],
@@ -6493,7 +6501,12 @@ def _hfc_handle_native_slash_action(
     still completes.
     """
     _hfc_info("inline card action received: slash_confirm")
-    prepared = _hfc_prepare_native_slash_action(adapter, data, action_value)
+    prepared = _hfc_prepare_native_slash_action(
+        adapter,
+        data,
+        action_value,
+        claim=True,
+    )
     if prepared is None:
         _hfc_info("inline slash_confirm ignored: unresolved")
         return _hfc_empty_feishu_callback_response(adapter)
@@ -6503,10 +6516,23 @@ def _hfc_handle_native_slash_action(
     if loop is None or not callable(submit):
         # No event loop to schedule on — resolve synchronously (legacy path)
         # so the confirmation still takes effect.
-        _hfc_resolve_native_slash_action(adapter, data, action_value)
-        return _hfc_empty_feishu_callback_response(adapter)
+        resolved = _hfc_resolve_native_slash_action(
+            adapter,
+            data,
+            action_value,
+            prepared=prepared,
+        )
+        if resolved is None:
+            return _hfc_empty_feishu_callback_response(adapter)
+        card, _message_id = resolved
+        return _hfc_raw_feishu_callback_response(adapter, card)
 
-    coroutine = _hfc_resolve_slash_confirm_background(adapter, data, action_value)
+    coroutine = _hfc_resolve_slash_confirm_background(
+        adapter,
+        data,
+        action_value,
+        prepared,
+    )
     submitted = False
     try:
         submitted = bool(submit(loop, coroutine))
@@ -6520,6 +6546,16 @@ def _hfc_handle_native_slash_action(
     finally:
         if not submitted:
             coroutine.close()
+    if not submitted:
+        resolved = _hfc_resolve_native_slash_action(
+            adapter,
+            data,
+            action_value,
+            prepared=prepared,
+        )
+        if resolved is not None:
+            card, _message_id = resolved
+            return _hfc_raw_feishu_callback_response(adapter, card)
     return _hfc_empty_feishu_callback_response(adapter)
 
 
@@ -6527,6 +6563,7 @@ async def _hfc_resolve_slash_confirm_background(
     adapter: Any,
     data: Any,
     action_value: dict[str, Any],
+    prepared: dict[str, Any],
 ) -> None:
     """Resolve a slash-confirm off the Feishu callback path, then update the card.
 
@@ -6536,7 +6573,12 @@ async def _hfc_resolve_slash_confirm_background(
     result card is sent as a follow-up message so the user still sees the
     outcome.
     """
-    resolved = await _hfc_resolve_native_slash_action_async(adapter, data, action_value)
+    resolved = await _hfc_resolve_native_slash_action_async(
+        adapter,
+        data,
+        action_value,
+        prepared=prepared,
+    )
     if resolved is None:
         _hfc_info("background slash_confirm ignored: unresolved")
         return
@@ -7547,14 +7589,10 @@ def request_clarify_response_from_hermes_locals(
         choice = str(result.get("choice") or "").strip()
         return choice or None
     _hfc_warn(
-        "clarify fell back to native text: interaction_id="
-        + str(interaction_id)
+        "clarify fell back to native text: "
+        + _hfc_log_reference("interaction", interaction_id)
         + " result="
-        + (
-            _hfc_summarize_post_result(result)
-            if isinstance(result, dict)
-            else repr(result)
-        )
+        + _hfc_summarize_post_result(result)
     )
     return None
 
@@ -7606,30 +7644,23 @@ def _post_interaction_event(
     payload: dict[str, Any],
     timeout: float,
 ) -> dict[str, Any] | None | object:
-    """POST an interaction event to the sidecar with fast retries.
+    """POST an interaction event once.
 
-    Transient connection failures (sidecar restart window, dropped keep-alive
-    connection) previously fell straight through to the native text fallback,
-    which made a clarify prompt appear as a plain numbered list instead of a
-    card. Retry a couple of times quickly before giving up. Events are
-    idempotent on the sidecar (sequence dedupe), so a retried POST is safe.
+    The caller performs a read-only interaction lookup after an ambiguous
+    transport failure. It must not replay /events because a response loss does
+    not prove that the first event was rejected.
     """
     loop = local_vars.get("_hfc_loop")
-    attempts = 3
-    delay = 0.5
-    for attempt in range(attempts):
-        try:
-            if loop is not None and loop.is_running():
-                future = asyncio.run_coroutine_threadsafe(
-                    _post_json_ordered_response(url, payload, timeout),
-                    loop,
-                )
-                return future.result(timeout=max(1.0, timeout + 1.0))
-            return _post_json_sync_response(url, payload, timeout)
-        except Exception:
-            if attempt < attempts - 1:
-                time.sleep(delay)
-    return _POST_FAILED
+    try:
+        if loop is not None and loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                _post_json_ordered_response(url, payload, timeout),
+                loop,
+            )
+            return future.result(timeout=max(1.0, timeout + 1.0))
+        return _post_json_sync_response(url, payload, timeout)
+    except Exception:
+        return _POST_FAILED
 
 
 def _hfc_interaction_card_confirmed(

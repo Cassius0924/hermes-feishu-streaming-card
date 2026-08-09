@@ -87,7 +87,7 @@ async def test_streaming_events_do_not_update_card_while_interaction_pending(cli
         "event": {
             "operator": {"open_id": "ou_test", "name": "测试用户"},
             "action": {
-                "tag": "button", "value": {}, "name": "hfc_confirm_clarify-fz-1",
+                "tag": "button", "value": {}, "name": "hfc_confirm_tok-fz",
                 "form_value": {"hfc_multi": ["A"], "hfc_other": ""},
             },
             "context": {"open_chat_id": "oc_abc", "open_message_id": "om_x"},

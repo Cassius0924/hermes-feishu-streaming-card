@@ -30,6 +30,7 @@ DEFAULT_FOOTER_FIELDS = (
 MAIN_CONTENT_CHUNK_CHARS = 2400
 DEFAULT_TITLE = "Hermes Agent"
 RUNTIME_HEADER_MAX_CHARS = 120
+CARD_QUOTE_SUMMARY_MAX_CHARS = 120
 TEXT_SIZE_ROLE_ORDER = ("body", "reasoning", "tool", "notice", "footer")
 MODEL_COLOR_PREFIXES = (
     (("gpt-", "o1", "o3"), "blue"),
@@ -304,7 +305,13 @@ def _render_card_unchecked(
         "schema": "2.0",
         "config": {
             "update_multi": True,
-            "summary": {"content": status.get("summary", status["subtitle"])},
+            "summary": {
+                "content": _card_quote_summary(
+                    session,
+                    status,
+                    display_status=display_status,
+                )
+            },
         },
         "body": {
             "elements": elements
@@ -322,6 +329,25 @@ def _render_card_unchecked(
     if not native_reply_completed:
         card["header"] = header
     return card
+
+
+def _card_quote_summary(
+    session: CardSession,
+    status: Mapping[str, str],
+    *,
+    display_status: str,
+) -> str:
+    if display_status == "completed":
+        answer = normalize_stream_text(session.answer_text).strip()
+        if answer:
+            normalized = " ".join(answer.split())
+            if len(normalized) <= CARD_QUOTE_SUMMARY_MAX_CHARS:
+                return normalized
+            return (
+                normalized[: CARD_QUOTE_SUMMARY_MAX_CHARS - 1].rstrip()
+                + "…"
+            )
+    return status.get("summary", status.get("subtitle", ""))
 
 
 def _primary_text_for_session(session: CardSession) -> str:
@@ -603,9 +629,10 @@ def _render_other_input() -> Dict[str, Any]:
 def _render_other_form(interaction: Any) -> Dict[str, Any]:
     """Single-select card footer: a form with the free-text input + submit
     button. On submit, Feishu returns action.form_value.hfc_other with the
-    user's typed answer and action.name = hfc_other_<interaction_id> (the
-    interaction is identified via the button name — form-submit buttons
-    must NOT carry behaviors callbacks, Feishu ignores them)."""
+    user's typed answer and action.name = hfc_other_<callback_token>.
+    Form-submit buttons must not carry behaviors callbacks, so the unguessable
+    token in the button name preserves the normal callback authentication
+    boundary without exposing the interaction id as a credential."""
     return {
         "tag": "form",
         "name": "hfc_other_form",
@@ -617,7 +644,7 @@ def _render_other_form(interaction: Any) -> Dict[str, Any]:
                 "type": "default",
                 "width": "default",
                 "form_action_type": "submit",
-                "name": f"hfc_other_{interaction.interaction_id}",
+                "name": f"hfc_other_{interaction.callback_token}",
             },
         ],
     }
@@ -631,7 +658,7 @@ def _render_multi_select_form(interaction: Any) -> Dict[str, Any]:
     One submit button only: if the user typed into hfc_other the typed text
     wins (custom answer); otherwise the selected options are submitted.
     On submit, Feishu returns action.form_value (hfc_multi list /
-    hfc_other text) and action.name = hfc_confirm_<interaction_id>."""
+    hfc_other text) and action.name = hfc_confirm_<callback_token>."""
     options = [
         {
             "text": {
@@ -672,7 +699,7 @@ def _render_multi_select_form(interaction: Any) -> Dict[str, Any]:
                 "type": "primary",
                 "width": "fill",
                 "form_action_type": "submit",
-                "name": f"hfc_confirm_{interaction.interaction_id}",
+                "name": f"hfc_confirm_{interaction.callback_token}",
             },
         ],
     }

@@ -727,12 +727,17 @@ async def _card_actions(request: web.Request) -> web.Response:
     if not hfc_action:
         # Form-submit buttons carry NO behaviors (Feishu ignores callbacks on
         # form_action_type=submit buttons), so the interaction is identified
-        # via the button name: hfc_confirm_<interaction_id> / hfc_other_<id>.
+        # via the button name:
+        # hfc_confirm_<callback_token> / hfc_other_<callback_token>.
         form_parsed = _parse_form_action_name(payload)
         if form_parsed is not None:
-            mode, interaction_id = form_parsed
+            mode, callback_token = form_parsed
             return await _interaction_action(
-                request, payload, value, form_mode=mode, form_interaction_id=interaction_id
+                request,
+                payload,
+                value,
+                form_mode=mode,
+                form_callback_token=callback_token,
             )
     return await _interaction_action(request, payload, value)
 
@@ -741,19 +746,21 @@ def _parse_form_action_name(payload: dict[str, Any]) -> tuple[str, str] | None:
     """Identify a clarify form submit from the button name.
 
     Form-submit buttons cannot carry behaviors callbacks, so render.py
-    encodes the interaction id into the button name:
-      hfc_confirm_<interaction_id>  (multi-select confirm / combined submit)
-      hfc_other_<interaction_id>    (free-text Other submit)
-    Returns (mode, interaction_id) or None when the action isn't a clarify
+    encodes the callback token into the button name:
+      hfc_confirm_<callback_token>  (multi-select confirm / combined submit)
+      hfc_other_<callback_token>    (free-text Other submit)
+    Returns (mode, callback_token) or None when the action isn't a clarify
     form submit.
     """
     event = payload.get("event") if isinstance(payload, dict) else None
     action = event.get("action") if isinstance(event, dict) else None
     name = str(action.get("name") or "").strip() if isinstance(action, dict) else ""
     if name.startswith("hfc_confirm_"):
-        return "confirm", name[len("hfc_confirm_"):]
+        token = name[len("hfc_confirm_"):].strip()
+        return ("confirm", token) if token else None
     if name.startswith("hfc_other_"):
-        return "other", name[len("hfc_other_"):]
+        token = name[len("hfc_other_"):].strip()
+        return ("other", token) if token else None
     return None
 
 
@@ -763,27 +770,47 @@ async def _interaction_action(
     value: dict[str, Any],
     *,
     form_mode: str = "",
-    form_interaction_id: str = "",
+    form_callback_token: str = "",
 ) -> web.Response:
     interaction_id = str(value.get("interaction_id") or "").strip()
     token = str(value.get("token") or "").strip()
     mode = str(value.get("mode") or form_mode or "").strip()
-    if form_interaction_id:
-        # Form-submit path: the button carries no behaviors value, so the
-        # interaction id comes from the button name and there is no token.
-        interaction_id = form_interaction_id
-        token = ""
+    callback_chat_id = _extract_callback_chat_id(payload)
+    if form_callback_token:
+        token = form_callback_token
+        found = _find_session_by_callback_token(
+            request.app,
+            token,
+            callback_chat_id,
+        )
+    else:
+        if not interaction_id:
+            return web.json_response(
+                {"ok": False, "error": "invalid action"},
+                status=400,
+            )
+        found = _find_session_by_interaction(
+            request.app,
+            interaction_id,
+            token,
+            callback_chat_id,
+        )
+    if found is None:
+        return web.json_response(
+            {"ok": False, "error": "interaction not found"},
+            status=404,
+        )
+    session_key, session = found
+    if form_callback_token:
+        interaction = session.active_interaction
+        if interaction is None:
+            return web.json_response(
+                {"ok": False, "error": "interaction not found"},
+                status=404,
+            )
+        interaction_id = interaction.interaction_id
     if not interaction_id:
         return web.json_response({"ok": False, "error": "invalid action"}, status=400)
-
-    callback_chat_id = _extract_callback_chat_id(payload)
-    found = _find_session_by_interaction(
-        request.app, interaction_id, token, callback_chat_id,
-        allow_empty_token=bool(form_interaction_id),
-    )
-    if found is None:
-        return web.json_response({"ok": False, "error": "interaction not found"}, status=404)
-    session_key, session = found
 
     form_value = _extract_form_value(payload)
     if mode == "confirm":
@@ -4861,18 +4888,37 @@ def _find_session_by_interaction(
     interaction_id: str,
     token: str,
     callback_chat_id: str,
-    *,
-    allow_empty_token: bool = False,
 ) -> tuple[str, CardSession] | None:
+    if not interaction_id or not token or not callback_chat_id:
+        return None
     for session_key, session in app[SESSIONS_KEY].items():
         interaction = session.active_interaction
         if interaction is None:
             continue
         if interaction.interaction_id != interaction_id:
             continue
-        if not allow_empty_token and interaction.callback_token != token:
+        if interaction.callback_token != token:
             return None
-        if callback_chat_id and callback_chat_id != session.chat_id:
+        if callback_chat_id != session.chat_id:
+            return None
+        return str(session_key), session
+    return None
+
+
+def _find_session_by_callback_token(
+    app: web.Application,
+    token: str,
+    callback_chat_id: str,
+) -> tuple[str, CardSession] | None:
+    if not token or not callback_chat_id:
+        return None
+    for session_key, session in app[SESSIONS_KEY].items():
+        interaction = session.active_interaction
+        if interaction is None:
+            continue
+        if interaction.callback_token != token:
+            continue
+        if callback_chat_id != session.chat_id:
             return None
         return str(session_key), session
     return None

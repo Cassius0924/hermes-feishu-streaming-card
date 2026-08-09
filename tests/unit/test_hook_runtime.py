@@ -5395,33 +5395,18 @@ def test_command_completion_does_not_suppress_without_explicit_commit(
     assert asyncio.run(run()) is False
 
 
-def test_request_interaction_retries_when_sidecar_reports_not_applied(monkeypatch):
+def test_request_interaction_does_not_retry_when_sidecar_reports_not_applied(
+    monkeypatch,
+):
     posted = []
-    polls = iter(
-        [
-            {
-                "ok": True,
-                "status": "completed",
-                "interaction_id": "clarify-1",
-                "choice": "保留",
-            },
-        ]
-    )
-    post_results = iter(
-        [
-            {"ok": True, "applied": False},
-            {"ok": True, "applied": True},
-        ]
-    )
     monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
 
     def fake_post(local_vars, url, payload, timeout):
         posted.append(payload)
-        return next(post_results)
+        return {"ok": True, "applied": False}
 
     def fake_get(url, timeout):
-        assert url == "http://sidecar.test/interactions/clarify-1"
-        return next(polls)
+        raise AssertionError("not-applied interaction must not enter polling")
 
     monkeypatch.setattr(hook_runtime, "_post_interaction_event", fake_post)
     monkeypatch.setattr(hook_runtime, "_get_json_sync", fake_get)
@@ -5436,9 +5421,60 @@ def test_request_interaction_retries_when_sidecar_reports_not_applied(monkeypatc
         poll_interval_seconds=0,
     )
 
-    assert result["status"] == "completed"
-    assert result["choice"] == "保留"
-    assert [payload["sequence"] for payload in posted] == [0, 1]
+    assert result is None
+    assert [payload["sequence"] for payload in posted] == [0]
+
+
+def test_post_interaction_event_does_not_retry_transport_failure(monkeypatch):
+    calls = []
+
+    def fail_once(url, payload, timeout):
+        calls.append((url, payload, timeout))
+        raise TimeoutError("response lost")
+
+    monkeypatch.setattr(hook_runtime, "_post_json_sync_response", fail_once)
+    monkeypatch.setattr(
+        hook_runtime.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("interaction events must not retry")
+        ),
+    )
+
+    result = hook_runtime._post_interaction_event(
+        {},
+        "http://sidecar.test/events",
+        {"event": "interaction.requested"},
+        0.2,
+    )
+
+    assert result is hook_runtime._POST_FAILED
+    assert len(calls) == 1
+
+
+def test_interaction_post_summary_omits_user_content_and_identifiers():
+    summary = hook_runtime._hfc_summarize_post_result(
+        {
+            "ok": False,
+            "applied": False,
+            "interaction_mode": "card",
+            "status": "pending",
+            "delivery": {
+                "outcome": "not_sent",
+                "detail": "private delivery detail",
+            },
+            "error": "secret error body",
+            "message_id": "om_sensitive_message",
+            "choice": "private user answer",
+        }
+    )
+
+    assert '"ok": false' in summary
+    assert '"outcome": "not_sent"' in summary
+    assert "secret error body" not in summary
+    assert "om_sensitive_message" not in summary
+    assert "private user answer" not in summary
+    assert "private delivery detail" not in summary
 
 
 def test_request_interaction_returns_none_for_text_fallback_mode(monkeypatch):
