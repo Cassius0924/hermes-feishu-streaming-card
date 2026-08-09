@@ -4,6 +4,7 @@ import ast
 from dataclasses import dataclass
 import html
 import json
+import math
 import re
 import time as _time
 from collections.abc import Mapping
@@ -29,6 +30,7 @@ DEFAULT_FOOTER_FIELDS = (
 MAIN_CONTENT_CHUNK_CHARS = 2400
 DEFAULT_TITLE = "Hermes Agent"
 RUNTIME_HEADER_MAX_CHARS = 120
+CARD_QUOTE_SUMMARY_MAX_CHARS = 120
 TEXT_SIZE_ROLE_ORDER = ("body", "reasoning", "tool", "notice", "footer")
 MODEL_COLOR_PREFIXES = (
     (("gpt-", "o1", "o3"), "blue"),
@@ -303,7 +305,13 @@ def _render_card_unchecked(
         "schema": "2.0",
         "config": {
             "update_multi": True,
-            "summary": {"content": status.get("summary", status["subtitle"])},
+            "summary": {
+                "content": _card_quote_summary(
+                    session,
+                    status,
+                    display_status=display_status,
+                )
+            },
         },
         "body": {
             "elements": elements
@@ -321,6 +329,25 @@ def _render_card_unchecked(
     if not native_reply_completed:
         card["header"] = header
     return card
+
+
+def _card_quote_summary(
+    session: CardSession,
+    status: Mapping[str, str],
+    *,
+    display_status: str,
+) -> str:
+    if display_status == "completed":
+        answer = normalize_stream_text(session.answer_text).strip()
+        if answer:
+            normalized = " ".join(answer.split())
+            if len(normalized) <= CARD_QUOTE_SUMMARY_MAX_CHARS:
+                return normalized
+            return (
+                normalized[: CARD_QUOTE_SUMMARY_MAX_CHARS - 1].rstrip()
+                + "…"
+            )
+    return status.get("summary", status.get("subtitle", ""))
 
 
 def _primary_text_for_session(session: CardSession) -> str:
@@ -493,45 +520,39 @@ def _render_interaction_elements(
             for index, option in enumerate(interaction.options, start=1)
         ]
         if choice_lines:
+            if interaction.multi_select:
+                choice_lines += [
+                    "",
+                    "Reply with numbers separated by commas, the option text, or your own answer.",
+                ]
+            else:
+                choice_lines += [
+                    "",
+                    "Reply with the number, the option text, or your own answer.",
+                ]
             elements.append(
                 {
                     "tag": "markdown",
                     "element_id": "interaction_text_choices",
-                    "content": "\n".join(
-                        choice_lines
-                        + [
-                            "",
-                            "Reply with the number, the option text, or your own answer.",
-                        ]
-                    ),
+                    "content": "\n".join(choice_lines),
                 }
             )
         return elements
 
     if interaction.status == "pending":
-        for index, option in enumerate(interaction.options):
+        if interaction.multi_select:
+            elements.append(_render_multi_select_form(interaction))
+        else:
             elements.append(
                 {
-                    "tag": "button",
-                    "element_id": f"hfc_btn_{index}",
-                    "text": {"tag": "plain_text", "content": option.label},
-                    "type": _button_type(option.style),
-                    "size": "medium",
-                    "width": "default",
-                    "behaviors": [
-                        {
-                            "type": "callback",
-                            "value": {
-                                "hfc_action": "interaction.select",
-                                "interaction_id": interaction.interaction_id,
-                                "choice": option.value,
-                                "choice_label": option.label,
-                                "token": interaction.callback_token,
-                            },
-                        }
-                    ],
+                    "tag": "markdown",
+                    "element_id": "interaction_hint",
+                    "content": "（单选）请选择，或输入自定义内容",
                 }
             )
+            for index, option in enumerate(interaction.options):
+                elements.append(_render_choice_button(interaction, index, option))
+            elements.append(_render_other_form(interaction))
         return elements
 
     if interaction.status == "completed":
@@ -548,6 +569,140 @@ def _render_interaction_elements(
         }
     )
     return elements
+
+
+def _interaction_callback_value(
+    interaction: Any, **extra: Any
+) -> Dict[str, Any]:
+    """Base callback value for an interaction action — always carries the
+    interaction id + token so the sidecar can authenticate the click."""
+    value: Dict[str, Any] = {
+        "hfc_action": "interaction.select",
+        "interaction_id": interaction.interaction_id,
+        "token": interaction.callback_token,
+    }
+    value.update(extra)
+    return value
+
+
+def _render_choice_button(
+    interaction: Any, index: int, option: Any
+) -> Dict[str, Any]:
+    return {
+        "tag": "button",
+        "element_id": f"hfc_btn_{index}",
+        # Sequence number is display-only (like the multi-select dropdown);
+        # the submitted value stays the clean option value.
+        "text": {
+            "tag": "plain_text",
+            "content": f"{index + 1}. {option.label}",
+        },
+        "type": _button_type(option.style),
+        "size": "medium",
+        "width": "default",
+        "behaviors": [
+            {
+                "type": "callback",
+                "value": _interaction_callback_value(
+                    interaction,
+                    choice=option.value,
+                    choice_label=option.label,
+                ),
+            }
+        ],
+    }
+
+
+def _render_other_input() -> Dict[str, Any]:
+    """Free-text input used for the 'Other' answer path (Hermes native clarify
+    always appends an 'Other (type your answer)' option)."""
+    return {
+        "tag": "input",
+        "element_id": "hfc_other",
+        "name": "hfc_other",
+        "input_type": "text",
+        "placeholder": {"tag": "plain_text", "content": "或输入自定义答案…"},
+        "width": "fill",
+    }
+
+
+def _render_other_form(interaction: Any) -> Dict[str, Any]:
+    """Single-select card footer: a form with the free-text input + submit
+    button. On submit, Feishu returns action.form_value.hfc_other with the
+    user's typed answer and action.name = hfc_other_<callback_token>.
+    Form-submit buttons must not carry behaviors callbacks, so the unguessable
+    token in the button name preserves the normal callback authentication
+    boundary without exposing the interaction id as a credential."""
+    return {
+        "tag": "form",
+        "name": "hfc_other_form",
+        "elements": [
+            _render_other_input(),
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "✏️ 提交自定义答案"},
+                "type": "default",
+                "width": "default",
+                "form_action_type": "submit",
+                "name": f"hfc_other_{interaction.callback_token}",
+            },
+        ],
+    }
+
+
+def _render_multi_select_form(interaction: Any) -> Dict[str, Any]:
+    """Multi-select card body: a form with a native multi-select dropdown
+    (multi_select_static) + a single confirm button, plus the free-text
+    'Other' input.
+
+    One submit button only: if the user typed into hfc_other the typed text
+    wins (custom answer); otherwise the selected options are submitted.
+    On submit, Feishu returns action.form_value (hfc_multi list /
+    hfc_other text) and action.name = hfc_confirm_<callback_token>."""
+    options = [
+        {
+            "text": {
+                "tag": "plain_text",
+                "content": f"{index}. {option.label}",
+            },
+            "value": option.value,
+        }
+        for index, option in enumerate(interaction.options, start=1)
+    ]
+    return {
+        "tag": "form",
+        "name": "hfc_clarify_form",
+        "elements": [
+            {
+                "tag": "multi_select_static",
+                "element_id": "hfc_multi",
+                "name": "hfc_multi",
+                "type": "default",
+                "width": "fill",
+                "required": False,
+                "placeholder": {
+                    "tag": "plain_text",
+                    "content": "请选择（可多选）",
+                },
+                "options": options,
+                "behaviors": [
+                    {
+                        "type": "callback",
+                        "value": {"hfc_action": "interaction.noop"},
+                    }
+                ],
+            },
+            _render_other_input(),
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "✅ 确认选择"},
+                "type": "primary",
+                "width": "fill",
+                "form_action_type": "submit",
+                "name": f"hfc_confirm_{interaction.callback_token}",
+            },
+        ],
+    }
 
 
 def _normalize_interaction_mode(value: str) -> str:
@@ -875,7 +1030,14 @@ def _render_footer(
     if session.status == "failed" or display_status == "failed":
         return "已停止"
     if display_status == "waiting":
-        return "等待选择"
+        interaction = session.active_interaction
+        timeout_seconds = (
+            float(interaction.timeout_seconds)
+            if interaction is not None
+            else 300.0
+        )
+        minutes = max(1, int(math.ceil(timeout_seconds / 60.0)))
+        return f"等待选择 · ⏳ {minutes} 分钟后过期"
     if session.status != "completed":
         return _spinner_text("生成中")
     tokens = session.tokens if isinstance(session.tokens, dict) else {}

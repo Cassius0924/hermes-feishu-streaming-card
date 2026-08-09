@@ -830,6 +830,8 @@ def test_apply_patch_inserts_streaming_callback_hooks():
     assert '}, event_name="answer.delta"):\n                    return\n' in patched
     assert '}, event_name="thinking.delta"):\n                    return\n' in patched
     assert '"_hfc_loop": _loop_for_step' in patched
+    assert 'multi_select=locals().get("multi_select", False)' in patched
+    assert "multi_select=multi_select" not in patched
     assert patcher.remove_patch(patched) == content
 
 

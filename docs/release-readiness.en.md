@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.2.8`. This cycle fixes the process-credential persistence gap across all three installers that was found by the public v4.2.7 installation acceptance. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.2.9`. This cycle fixes Issue #197 and securely integrates the slash-confirm and clarify-form work from PRs #196/#199. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -146,6 +146,15 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.2.9 Release Gates
+
+- The original PR #196/#199 commits retain authorship. Additional regressions cover submission failure, duplicate resolution, callback token/chat authentication, old Hermes callback signatures, single-attempt `/events`, and redacted diagnostics.
+- Focused hook/runtime/render/server/patcher/install matrix: **`1161 passed, 2 skipped`**.
+- Full pytest with an isolated v4.2.9 runtime: **`2452 passed, 6 skipped`**; `git diff --check`: **passed**.
+- Local sdist/wheel builds passed with metadata at `4.2.9`. A fresh venv installed the wheel and public dependencies, reported package/distribution versions of `4.2.9`, imported from venv `site-packages`, and exited 0 for the console entrypoint and CLI help.
+- GitHub Actions (Python 3.9/3.12, Feishu SDK, PowerShell, Docker): **passed** ([run 31318602152](https://github.com/baileyh8/hermes-feishu-streaming-card/actions/runs/31318602152)).
+- Exact merge SHA, tag, public tag/install, and Release assets: **pending release gates**.
 
 ## V4.2.8 Release Gates
 

@@ -982,6 +982,7 @@ def test_install_feishu_command_card_methods_adds_native_slash_confirm():
     assert adapter.sent["reply_to"] == "om_user_cmd"
 
     card = json.loads(adapter.sent["payload"])
+    assert card["config"] == {"wide_screen_mode": True, "update_multi": True}
     assert card["header"]["template"] == "orange"
     assert card["header"]["title"]["content"] == "/new"
     assert "This starts a fresh session" in card["elements"][0]["content"]
@@ -3608,7 +3609,7 @@ def test_refresh_feishu_event_handler_fails_open_when_ws_loop_state_raises():
     assert adapter._ws_client._event_handler is live_handler
 
 
-def test_feishu_command_card_action_resolves_native_slash_confirm(monkeypatch):
+def test_feishu_command_card_action_resolves_native_slash_confirm_in_background(monkeypatch):
     class FakeCallBackCard:
         def __init__(self):
             self.type = None
@@ -3630,6 +3631,7 @@ def test_feishu_command_card_action_resolves_native_slash_confirm(monkeypatch):
             self._loop = object()
             self._allowed_group_users = {"ou_user"}
             self.updated = None
+            self.sent = None
 
         def _loop_accepts_callbacks(self, loop):
             return loop is self._loop
@@ -3655,6 +3657,10 @@ def test_feishu_command_card_action_resolves_native_slash_confirm(monkeypatch):
             self.updated = request
             return SimpleNamespace(success=lambda: True)
 
+        async def _feishu_send_with_retry(self, **kwargs):
+            self.sent = kwargs
+            return SimpleNamespace(success=True, message_id="om_fallback")
+
         def _on_card_action_trigger(self, data):
             return "original"
 
@@ -3667,10 +3673,15 @@ def test_feishu_command_card_action_resolves_native_slash_confirm(monkeypatch):
     resolved = []
     slash_confirm_module = types.ModuleType("tools.slash_confirm")
 
+    async def fake_resolve(session_key, confirm_id, choice):
+        resolved.append((session_key, confirm_id, choice))
+        return "New session started."
+
     def fake_resolve_sync_compat(loop, session_key, confirm_id, choice):
         resolved.append((loop, session_key, confirm_id, choice))
         return "New session started."
 
+    slash_confirm_module.resolve = fake_resolve
     slash_confirm_module.resolve_sync_compat = fake_resolve_sync_compat
     tools_module = types.ModuleType("tools")
     tools_module.slash_confirm = slash_confirm_module
@@ -3704,13 +3715,131 @@ def test_feishu_command_card_action_resolves_native_slash_confirm(monkeypatch):
 
     response = adapter._on_card_action_trigger(data)
 
-    assert resolved == [(adapter._loop, "feishu:oc_abc", "cf-1", "once")]
+    # The callback returns an empty ack immediately (within Feishu's 3s
+    # callback timeout) instead of blocking on the slow confirm handler.
+    assert resolved == [("feishu:oc_abc", "cf-1", "once")]
     assert "cf-1" not in adapter._hfc_slash_confirm_state
-    assert adapter.updated is None
-    assert response.card.type == "raw"
-    card = response.card.data
+    assert response.card is None
+    # The result card is pushed via a background PATCH update instead of the
+    # callback response.
+    assert adapter.updated is not None
+    card = json.loads(adapter.updated.request_body.content)
     assert card["header"]["template"] == "green"
     assert "允许一次" in card["header"]["title"]["content"]
+    assert "New session started." in card["elements"][0]["content"]
+
+
+def test_feishu_command_card_action_slash_confirm_fallback_sends_result_when_patch_fails(monkeypatch):
+    """When the background PATCH update fails, a result card is still sent.
+
+    The confirm must never be lost silently: if the original message cannot
+    be updated (e.g. message too old, update_multi not honoured), the result
+    card is delivered as a new follow-up message.
+    """
+    class FakeCallBackCard:
+        def __init__(self):
+            self.type = None
+            self.data = None
+
+    class FakeP2Response:
+        def __init__(self):
+            self.card = None
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        def __init__(self):
+            self._client = SimpleNamespace(
+                im=SimpleNamespace(
+                    v1=SimpleNamespace(message=SimpleNamespace(update=lambda request: None))
+                )
+            )
+            self._loop = object()
+            self._allowed_group_users = {"ou_user"}
+            self.sent = None
+
+        def _loop_accepts_callbacks(self, loop):
+            return loop is self._loop
+
+        def _allow_group_message(self, sender_id, chat_id, is_bot=False):
+            return sender_id.open_id == "ou_user" and chat_id == "oc_abc"
+
+        def _get_cached_sender_name(self, open_id):
+            return "Bailey" if open_id == "ou_user" else ""
+
+        def _submit_on_loop(self, loop, coro):
+            assert loop is self._loop
+            asyncio.run(coro)
+            return True
+
+        def _build_update_message_body(self, *, msg_type, content):
+            return SimpleNamespace(msg_type=msg_type, content=content)
+
+        def _build_update_message_request(self, message_id, request_body):
+            return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+        async def _run_blocking(self, func, request):
+            # PATCH update fails.
+            return SimpleNamespace(success=lambda: False)
+
+        async def _feishu_send_with_retry(self, **kwargs):
+            self.sent = kwargs
+            return SimpleNamespace(success=True, message_id="om_result_card")
+
+        def _on_card_action_trigger(self, data):
+            return "original"
+
+    DummyFeishuAdapter.__module__ = hook_runtime.__name__
+    monkeypatch.setattr(
+        hook_runtime, "P2CardActionTriggerResponse", FakeP2Response, raising=False
+    )
+    monkeypatch.setattr(hook_runtime, "CallBackCard", FakeCallBackCard, raising=False)
+
+    async def fake_resolve(session_key, confirm_id, choice):
+        return "New session started."
+
+    slash_confirm_module = types.ModuleType("tools.slash_confirm")
+    slash_confirm_module.resolve = fake_resolve
+    tools_module = types.ModuleType("tools")
+    tools_module.slash_confirm = slash_confirm_module
+    monkeypatch.setitem(sys.modules, "tools", tools_module)
+    monkeypatch.setitem(sys.modules, "tools.slash_confirm", slash_confirm_module)
+
+    adapter = DummyFeishuAdapter()
+    adapter._hfc_slash_confirm_state = {
+        "cf-1": {
+            "session_key": "feishu:oc_abc",
+            "chat_id": "oc_abc",
+            "message_id": "om_slash_card",
+        }
+    }
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner) is True
+
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            action=SimpleNamespace(
+                value={
+                    "hfc_action": "slash_confirm",
+                    "hfc_confirm_id": "cf-1",
+                    "hfc_choice": "once",
+                }
+            ),
+            context=SimpleNamespace(open_chat_id="oc_abc"),
+            operator=SimpleNamespace(open_id="ou_user", user_id="u_1"),
+        )
+    )
+
+    response = adapter._on_card_action_trigger(data)
+
+    assert response.card is None
+    assert "cf-1" not in adapter._hfc_slash_confirm_state
+    assert adapter.sent is not None
+    assert adapter.sent["chat_id"] == "oc_abc"
+    assert adapter.sent["msg_type"] == "interactive"
+    assert adapter.sent["reply_to"] == "om_slash_card"
+    card = json.loads(adapter.sent["payload"])
+    assert card["header"]["template"] == "green"
     assert "New session started." in card["elements"][0]["content"]
 
 
@@ -5266,33 +5395,18 @@ def test_command_completion_does_not_suppress_without_explicit_commit(
     assert asyncio.run(run()) is False
 
 
-def test_request_interaction_retries_when_sidecar_reports_not_applied(monkeypatch):
+def test_request_interaction_does_not_retry_when_sidecar_reports_not_applied(
+    monkeypatch,
+):
     posted = []
-    polls = iter(
-        [
-            {
-                "ok": True,
-                "status": "completed",
-                "interaction_id": "clarify-1",
-                "choice": "保留",
-            },
-        ]
-    )
-    post_results = iter(
-        [
-            {"ok": True, "applied": False},
-            {"ok": True, "applied": True},
-        ]
-    )
     monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
 
     def fake_post(local_vars, url, payload, timeout):
         posted.append(payload)
-        return next(post_results)
+        return {"ok": True, "applied": False}
 
     def fake_get(url, timeout):
-        assert url == "http://sidecar.test/interactions/clarify-1"
-        return next(polls)
+        raise AssertionError("not-applied interaction must not enter polling")
 
     monkeypatch.setattr(hook_runtime, "_post_interaction_event", fake_post)
     monkeypatch.setattr(hook_runtime, "_get_json_sync", fake_get)
@@ -5307,9 +5421,60 @@ def test_request_interaction_retries_when_sidecar_reports_not_applied(monkeypatc
         poll_interval_seconds=0,
     )
 
-    assert result["status"] == "completed"
-    assert result["choice"] == "保留"
-    assert [payload["sequence"] for payload in posted] == [0, 1]
+    assert result is None
+    assert [payload["sequence"] for payload in posted] == [0]
+
+
+def test_post_interaction_event_does_not_retry_transport_failure(monkeypatch):
+    calls = []
+
+    def fail_once(url, payload, timeout):
+        calls.append((url, payload, timeout))
+        raise TimeoutError("response lost")
+
+    monkeypatch.setattr(hook_runtime, "_post_json_sync_response", fail_once)
+    monkeypatch.setattr(
+        hook_runtime.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("interaction events must not retry")
+        ),
+    )
+
+    result = hook_runtime._post_interaction_event(
+        {},
+        "http://sidecar.test/events",
+        {"event": "interaction.requested"},
+        0.2,
+    )
+
+    assert result is hook_runtime._POST_FAILED
+    assert len(calls) == 1
+
+
+def test_interaction_post_summary_omits_user_content_and_identifiers():
+    summary = hook_runtime._hfc_summarize_post_result(
+        {
+            "ok": False,
+            "applied": False,
+            "interaction_mode": "card",
+            "status": "pending",
+            "delivery": {
+                "outcome": "not_sent",
+                "detail": "private delivery detail",
+            },
+            "error": "secret error body",
+            "message_id": "om_sensitive_message",
+            "choice": "private user answer",
+        }
+    )
+
+    assert '"ok": false' in summary
+    assert '"outcome": "not_sent"' in summary
+    assert "secret error body" not in summary
+    assert "om_sensitive_message" not in summary
+    assert "private user answer" not in summary
+    assert "private delivery detail" not in summary
 
 
 def test_request_interaction_returns_none_for_text_fallback_mode(monkeypatch):
@@ -10693,3 +10858,119 @@ def test_native_command_card_logs_never_expose_raw_identifiers(
     assert message_id not in output
     assert "message#" in output
     assert "RuntimeError" in output
+
+
+@pytest.mark.parametrize("submit_mode", ["false", "raise"])
+def test_native_slash_confirm_submission_failure_falls_back_without_losing_click(
+    monkeypatch, submit_mode
+):
+    resolved = []
+    submitted = []
+
+    slash_confirm_module = types.ModuleType("tools.slash_confirm")
+
+    def resolve_sync_compat(loop, session_key, confirm_id, choice):
+        resolved.append((loop, session_key, confirm_id, choice))
+        return "resolved"
+
+    slash_confirm_module.resolve_sync_compat = resolve_sync_compat
+    tools_module = types.ModuleType("tools")
+    tools_module.slash_confirm = slash_confirm_module
+    monkeypatch.setitem(sys.modules, "tools", tools_module)
+    monkeypatch.setitem(sys.modules, "tools.slash_confirm", slash_confirm_module)
+
+    class DummyAdapter:
+        def __init__(self):
+            self._loop = object()
+            self._hfc_slash_confirm_state = {
+                "cf-1": {
+                    "session_key": "feishu:oc_abc",
+                    "chat_id": "oc_abc",
+                    "message_id": "om_card",
+                }
+            }
+
+        def _loop_accepts_callbacks(self, loop):
+            return loop is self._loop
+
+        def _allow_group_message(self, sender_id, chat_id, is_bot=False):
+            return sender_id.open_id == "ou_user" and chat_id == "oc_abc"
+
+        def _submit_on_loop(self, loop, coroutine):
+            submitted.append(coroutine)
+            if submit_mode == "raise":
+                raise RuntimeError("loop unavailable")
+            return False
+
+    adapter = DummyAdapter()
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            context=SimpleNamespace(open_chat_id="oc_abc"),
+            operator=SimpleNamespace(open_id="ou_user"),
+        )
+    )
+
+    hook_runtime._hfc_handle_native_slash_action(
+        adapter,
+        data,
+        {
+            "hfc_confirm_id": "cf-1",
+            "hfc_choice": "once",
+        },
+    )
+
+    for coroutine in submitted:
+        coroutine.close()
+    assert len(submitted) == 1
+    assert resolved == [
+        (adapter._loop, "feishu:oc_abc", "cf-1", "once")
+    ]
+    assert "cf-1" not in adapter._hfc_slash_confirm_state
+
+
+def test_native_slash_confirm_claims_state_before_background_submission(monkeypatch):
+    submitted = []
+
+    class DummyAdapter:
+        def __init__(self):
+            self._loop = object()
+            self._hfc_slash_confirm_state = {
+                "cf-1": {
+                    "session_key": "feishu:oc_abc",
+                    "chat_id": "oc_abc",
+                    "message_id": "om_card",
+                }
+            }
+
+        def _loop_accepts_callbacks(self, loop):
+            return loop is self._loop
+
+        def _allow_group_message(self, sender_id, chat_id, is_bot=False):
+            return sender_id.open_id == "ou_user" and chat_id == "oc_abc"
+
+        def _submit_on_loop(self, loop, coroutine):
+            submitted.append(coroutine)
+            return True
+
+    adapter = DummyAdapter()
+
+    def event(event_id):
+        return SimpleNamespace(
+            header=SimpleNamespace(event_id=event_id),
+            event=SimpleNamespace(
+                context=SimpleNamespace(open_chat_id="oc_abc"),
+                operator=SimpleNamespace(open_id="ou_user"),
+            ),
+        )
+
+    value = {
+        "hfc_confirm_id": "cf-1",
+        "hfc_choice": "once",
+    }
+    hook_runtime._hfc_handle_native_slash_action(adapter, event("evt-1"), value)
+    hook_runtime._hfc_handle_native_slash_action(adapter, event("evt-2"), value)
+
+    for coroutine in submitted:
+        coroutine.close()
+    assert len(submitted) == 1
+    assert "cf-1" not in adapter._hfc_slash_confirm_state
