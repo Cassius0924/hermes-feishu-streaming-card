@@ -153,7 +153,8 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - hook/runtime/render/server/patcher/install 聚焦矩阵：**`1161 passed, 2 skipped`**。
 - 隔离 v4.2.9 runtime 完整 pytest：**`2452 passed, 6 skipped`**；`git diff --check`：**通过**。
 - 本地 sdist/wheel 构建成功，metadata 均为 `4.2.9`；全新 venv 安装 wheel 与公开依赖后，package/distribution 版本均为 `4.2.9`，import 来自 venv `site-packages`，console entrypoint 与 CLI help exit 0。
-- GitHub Actions、exact merge SHA、tag、公开 tag/install 与 Release assets：**待发布门禁完成**。
+- GitHub Actions（Python 3.9/3.12、Feishu SDK、PowerShell、Docker）：**通过**（[run 31318602152](https://github.com/baileyh8/hermes-feishu-streaming-card/actions/runs/31318602152)）。
+- exact merge SHA、tag、公开 tag/install 与 Release assets：**待发布门禁完成**。
 
 ## V4.2.8 发布门禁
 
