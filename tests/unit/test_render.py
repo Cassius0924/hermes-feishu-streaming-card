@@ -244,6 +244,34 @@ def test_v4_waiting_prompt_moves_to_header_without_body_duplication():
     assert "ctx " not in footer["content"]
 
 
+def test_multi_select_form_binds_submit_action_to_callback_token():
+    session = CardSession(conversation_id="c", message_id="m", chat_id="oc")
+    session.active_interaction = InteractionState(
+        interaction_id="approval-1",
+        kind="clarify",
+        prompt="请选择要继续的项目",
+        options=[],
+        callback_token="callback-secret",
+        multi_select=True,
+    )
+
+    card = render_card(session)
+
+    form = next(
+        item
+        for item in card["body"]["elements"]
+        if item.get("tag") == "form"
+    )
+    submit = next(
+        item
+        for item in form["elements"]
+        if item.get("tag") == "button"
+    )
+    assert submit["form_action_type"] == "submit"
+    assert submit["name"] == "hfc_confirm_callback-secret"
+    assert "approval-1" not in submit["name"]
+
+
 def test_v4_completed_restores_configured_title_and_metrics():
     session = CardSession(conversation_id="c", message_id="m", chat_id="oc")
     session.latest_tool_preview = "正在执行终端：pytest"
@@ -270,7 +298,7 @@ def test_v4_completed_reply_card_uses_only_native_feishu_quote_header():
 
     assert "header" not in card
     assert "最终答案" in str(card)
-    assert card["config"]["summary"]["content"] == "已完成"
+    assert card["config"]["summary"]["content"] == "最终答案"
     footer = next(
         item
         for item in card["body"]["elements"]

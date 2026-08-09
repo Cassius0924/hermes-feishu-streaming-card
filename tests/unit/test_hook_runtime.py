@@ -10693,3 +10693,119 @@ def test_native_command_card_logs_never_expose_raw_identifiers(
     assert message_id not in output
     assert "message#" in output
     assert "RuntimeError" in output
+
+
+@pytest.mark.parametrize("submit_mode", ["false", "raise"])
+def test_native_slash_confirm_submission_failure_falls_back_without_losing_click(
+    monkeypatch, submit_mode
+):
+    resolved = []
+    submitted = []
+
+    slash_confirm_module = types.ModuleType("tools.slash_confirm")
+
+    def resolve_sync_compat(loop, session_key, confirm_id, choice):
+        resolved.append((loop, session_key, confirm_id, choice))
+        return "resolved"
+
+    slash_confirm_module.resolve_sync_compat = resolve_sync_compat
+    tools_module = types.ModuleType("tools")
+    tools_module.slash_confirm = slash_confirm_module
+    monkeypatch.setitem(sys.modules, "tools", tools_module)
+    monkeypatch.setitem(sys.modules, "tools.slash_confirm", slash_confirm_module)
+
+    class DummyAdapter:
+        def __init__(self):
+            self._loop = object()
+            self._hfc_slash_confirm_state = {
+                "cf-1": {
+                    "session_key": "feishu:oc_abc",
+                    "chat_id": "oc_abc",
+                    "message_id": "om_card",
+                }
+            }
+
+        def _loop_accepts_callbacks(self, loop):
+            return loop is self._loop
+
+        def _allow_group_message(self, sender_id, chat_id, is_bot=False):
+            return sender_id.open_id == "ou_user" and chat_id == "oc_abc"
+
+        def _submit_on_loop(self, loop, coroutine):
+            submitted.append(coroutine)
+            if submit_mode == "raise":
+                raise RuntimeError("loop unavailable")
+            return False
+
+    adapter = DummyAdapter()
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            context=SimpleNamespace(open_chat_id="oc_abc"),
+            operator=SimpleNamespace(open_id="ou_user"),
+        )
+    )
+
+    hook_runtime._hfc_handle_native_slash_action(
+        adapter,
+        data,
+        {
+            "hfc_confirm_id": "cf-1",
+            "hfc_choice": "once",
+        },
+    )
+
+    for coroutine in submitted:
+        coroutine.close()
+    assert len(submitted) == 1
+    assert resolved == [
+        (adapter._loop, "feishu:oc_abc", "cf-1", "once")
+    ]
+    assert "cf-1" not in adapter._hfc_slash_confirm_state
+
+
+def test_native_slash_confirm_claims_state_before_background_submission(monkeypatch):
+    submitted = []
+
+    class DummyAdapter:
+        def __init__(self):
+            self._loop = object()
+            self._hfc_slash_confirm_state = {
+                "cf-1": {
+                    "session_key": "feishu:oc_abc",
+                    "chat_id": "oc_abc",
+                    "message_id": "om_card",
+                }
+            }
+
+        def _loop_accepts_callbacks(self, loop):
+            return loop is self._loop
+
+        def _allow_group_message(self, sender_id, chat_id, is_bot=False):
+            return sender_id.open_id == "ou_user" and chat_id == "oc_abc"
+
+        def _submit_on_loop(self, loop, coroutine):
+            submitted.append(coroutine)
+            return True
+
+    adapter = DummyAdapter()
+
+    def event(event_id):
+        return SimpleNamespace(
+            header=SimpleNamespace(event_id=event_id),
+            event=SimpleNamespace(
+                context=SimpleNamespace(open_chat_id="oc_abc"),
+                operator=SimpleNamespace(open_id="ou_user"),
+            ),
+        )
+
+    value = {
+        "hfc_confirm_id": "cf-1",
+        "hfc_choice": "once",
+    }
+    hook_runtime._hfc_handle_native_slash_action(adapter, event("evt-1"), value)
+    hook_runtime._hfc_handle_native_slash_action(adapter, event("evt-2"), value)
+
+    for coroutine in submitted:
+        coroutine.close()
+    assert len(submitted) == 1
+    assert "cf-1" not in adapter._hfc_slash_confirm_state
