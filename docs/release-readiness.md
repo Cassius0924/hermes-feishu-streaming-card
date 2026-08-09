@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.2.8`。本轮修复公开 v4.2.7 安装验收发现的三平台进程凭据持久化缺口。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.2.9`。本轮修复 Issue #197，并安全整合 PR #196/#199 的 slash-confirm 与 clarify 表单能力。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -146,6 +146,12 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.2.9 发布门禁
+
+- PR #196/#199 原作者提交已保留；额外回归锁定调度失败、并发重复、token/chat 鉴权、旧 Hermes callback 签名、单次 `/events` 与日志脱敏。
+- hook/runtime/render/server/patcher/install 聚焦矩阵：**`1161 passed, 2 skipped`**。
+- 完整 pytest、构建、GitHub Actions、exact merge SHA、tag、公开安装和 Release assets：**待发布门禁完成**。
 
 ## V4.2.8 发布门禁
 

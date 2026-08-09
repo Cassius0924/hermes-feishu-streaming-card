@@ -74,7 +74,8 @@ choice requests at the latest chat position, preserves a substantial streamed
 answer before a short terminal postscript, and repairs bare Feishu `/update`
 for standard venv symlinks, slow Git fetches, and Hermes 0.20 version reporting.
 
-V4.2.8 persists process-supplied Feishu credentials into the selected private
+V4.2.9 includes authenticated clarify forms, non-blocking slash confirmations,
+and answer-backed quote summaries. V4.2.8 persists process-supplied Feishu credentials into the selected private
 dotenv file across macOS/Linux, Docker, and Windows installers. V4.2.7 hardened
 Windows installation and process startup: cold SDK/runtime probes
 allow 30 seconds, manifests use portable POSIX relative paths while safely
@@ -309,7 +310,7 @@ a privileged container, or mount host system-service directories.
 ```
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.8
+export HFC_VERSION=v4.2.9
 bash install-docker.sh
 ```
 

@@ -64,6 +64,15 @@ sidecar 为 Feishu create/reply 初始卡片生成同一条逻辑投递稳定、
    - 渲染终态卡片。
    - 标记 session completed。
    - 抑制 Hermes 原生重复答复。
+   - 对用户显示状态确认为 completed 时，`config.summary` 写入最长 120 字符的单行回答摘录，使后续引用保留真实上下文；进度接力仍使用“生成中”状态摘要。
+
+## 交互表单与 slash-confirm
+
+- clarify 单选按钮继续携带 `interaction_id + callback_token`；多选和 “Other” form-submit 按钮名只携带随机 callback token。
+- Gateway WebSocket handler 先验证非空 chat 与操作者准入，再转发到本机 sidecar。sidecar 必须同时匹配 callback token 和 session chat；interaction ID、空 chat、错误 chat 或错误 token 全部拒绝。
+- pending interaction 期间保留事件状态但冻结无关卡片 PATCH 和动画，避免飞书全量替换清空用户正在编辑的选择。
+- `interaction.requested` 的 `/events` 请求不重试。若响应可能丢失，hook 只读查询 `/interactions/{id}`；已存在则继续 poll，不存在则回到原生文本 fail-open。
+- slash-confirm 在飞书 callback 内原子 claim 后立即交给 Gateway loop；后台解析完成再 PATCH 原卡，PATCH 失败时发送结果卡。loop 拒绝或抛错时同步回退，确保点击既不丢失也不重复执行。
 
 ## 工具事件视觉与运行动画
 

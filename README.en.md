@@ -141,7 +141,7 @@ For an existing Hermes container:
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.8
+export HFC_VERSION=v4.2.9
 bash install-docker.sh
 ```
 
@@ -181,6 +181,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ![Feishu topic reply card continuity and reasoning/tool timeline showcase](docs/assets/feishu-topic-card-showcase-v389.png)
 | Version | Highlights |
 |---|---|
+| [v4.2.9](docs/release-notes-v4.2.9.en.md) | Fixes Issue #197 completed-card quote context, integrates PR #196 non-blocking slash confirmations and PR #199 multi-select/custom-answer forms, and preserves exact callback-token/chat binding plus single-attempt `/events` delivery |
 | [v4.2.8](docs/release-notes-v4.2.8.en.md) | Fixes the installer contract so `install.sh`, `install-docker.sh`, and `install.ps1` persist process-supplied Feishu credentials into the private `.env` instead of using them only for the current process |
 | [v4.2.7](docs/release-notes-v4.2.7.en.md) | Fixes Issue #193 Windows cold-import timeouts and legacy backslash manifest paths, integrates PR #180 parent `HERMES_HOME` discovery and PR #181 safe detached-runner PID rebinding, and propagates PowerShell installer failures |
 | [v4.2.6](docs/release-notes-v4.2.6.en.md) | Fixes Issue #187 repeated choice-card position, #188 short terminal postscripts replacing answers, #189/PR #190 exact Base compatibility for Hermes 0.20, and bare Feishu `/update` venv-symlink, slow-fetch, and version-reporting failures; see [v4.2.5](docs/release-notes-v4.2.5.en.md) for the preceding audit safety hotfix |
@@ -260,11 +261,10 @@ This remains a sidecar-only design: Hermes keeps only installer-owned, detectabl
 
 ## Contributors
 
-- [gischuck](https://github.com/gischuck) - [PR #12](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/12) Accept-Encoding fix
-- [gischuck](https://github.com/gischuck) - [PR #76](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/76) reasoning/tool timeline UX proposal and implementation exploration
+- [gischuck](https://github.com/gischuck) - [PR #12](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/12) Accept-Encoding fix; [PR #76](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/76) reasoning/tool timeline UX proposal and implementation exploration
 - [fengs2021](https://github.com/fengs2021) - [PR #17](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/17) lock optimization and update interval improvement
 - [colinaaa](https://github.com/colinaaa) - [PR #87](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/87) WebSocket `interaction.select` clarify/approval card interaction support; [PR #88](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/88) fresh cards for second turns when Feishu topic groups reuse `message_id`; [PR #91](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/91) cron `thread_id` routing back to the originating Feishu topic-group thread
-- [zayn-0101](https://github.com/zayn-0101) - [PR #77](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/77) cron `deliver=origin/all` routing-intent card delivery fix
+- [zayn-0101](https://github.com/zayn-0101) - [PR #77](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/77) cron `deliver=origin/all` routing-intent card delivery fix; [PR #196](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/196) non-blocking slash confirmation; [Cassius0924](https://github.com/Cassius0924) - [PR #199](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/199) multi-select and custom-answer forms
 - [Zanetach](https://github.com/Zanetach) - [PR #84](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/84) / @Zanetach: card progress-status routing and `.env` allowlist expansion for profile environment support (V3.9.0)
 - [colinaaa](https://github.com/colinaaa) - [PR #93](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/93) reliable terminal cards for interrupted tasks; [PR #97](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/97) completed-answer preservation (V3.9.1)
 - [wjiemin49-ux](https://github.com/wjiemin49-ux) - [PR #52](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/52) diagnosis and direction for loopback health checks bypassing proxies (adopted in V3.9.1)

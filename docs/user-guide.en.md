@@ -78,6 +78,7 @@ An exact bare `/update` in a Feishu private chat first performs read-only checks
 - V4.2.5 pins session, sequence, and policy to canonical `turn_id`, hardens maintenance owner/checkout/external-drain recovery, and makes doctor, all three installers, and Release Assets fail closed when evidence is incomplete.
 - V4.2.6 adds exact Hermes 0.20 Base-ledger compatibility, preserves substantial streamed answers before short terminal postscripts, promotes repeated choices to the latest card, and fixes bare `/update` venv-symlink, slow-fetch, and version-reporting failures.
 - V4.2.8 makes the macOS/Linux, Docker, and PowerShell installers persist process-supplied Feishu credentials into the private `.env`.
+- V4.2.9 keeps answer context in completed-card quotes, adds token/chat-bound multi-select and custom-answer forms, and resolves slow slash confirmations outside the callback deadline.
 - V4.2.7 fixes Windows cold-import probe timeouts, legacy backslash manifest paths, parent `HERMES_HOME` discovery, detached venv runner PID rebinding, and PowerShell failure propagation.
 
 See the [V4.2.0 release notes](release-notes-v4.2.0.en.md) for the complete boundary and acceptance steps.
@@ -499,14 +500,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.2.8`.
+The Compose example defaults `HFC_VERSION` to `v4.2.9`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.8
+export HFC_VERSION=v4.2.9
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -749,6 +750,7 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.2.9](release-notes-v4.2.9.en.md) | 2026-08-09 | Issue #197 answer-backed quote summaries, PR #196 non-blocking slash confirmations, and PR #199 authenticated multi-select/custom-answer forms |
 | [v4.2.8](release-notes-v4.2.8.en.md) | 2026-08-05 | All three installers persist process-supplied Feishu credentials, POSIX dotenv files use mode `0600`, and logs do not print credential values |
 | [v4.2.7](release-notes-v4.2.7.en.md) | 2026-08-05 | Issue #193 and PRs #180/#181: Windows probe timeouts, manifest paths, parent `HERMES_HOME`, detached-runner PID handling, and PowerShell failure propagation |
 | [v4.2.6](release-notes-v4.2.6.en.md) | 2026-08-04 | Issues #187–#190, exact Hermes 0.20 Base support, repeated choice cards, short-terminal-postscript preservation, and bare Feishu `/update` venv/fetch/version fixes |

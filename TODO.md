@@ -2,18 +2,27 @@
 
 当前 active runtime 是 `hermes_feishu_card/`。legacy adapter、dual mode、旧 `sidecar/`、旧 `patch/` 和 `installer_v2.py` 不是 active runtime，仅保留作历史参考。
 
-## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3 / V4.2.4 / V4.2.5 / V4.2.6 / V4.2.7 / V4.2.8
+## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3 / V4.2.4 / V4.2.5 / V4.2.6 / V4.2.7 / V4.2.8 / V4.2.9
 
 详细路线见 [docs/superpowers/specs/2026-06-30-v3-8-design.md](docs/superpowers/specs/2026-06-30-v3-8-design.md) 和 [docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md](docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md)。
 
-### V4.2.8：安装凭据持久化热修（发布候选）
+### V4.2.9：交互回调与引用摘要热修（发布候选）
+
+- [x] Issue #197 已完成卡片的引用摘要使用有界真实回答摘录。
+- [x] PR #196 的慢速 slash-confirm 移出飞书 callback deadline，并增加原子 claim 与调度失败回退。
+- [x] PR #199 的多选、单选序号、自定义回答、pending freeze 与过期 footer 完成安全整合。
+- [x] form submit 使用随机 callback token，并要求非空精确 chat binding；不接受 interaction ID 作为凭据。
+- [x] `/events` 单次 POST、Hermes 旧 clarify 签名兼容与日志脱敏完成回归。
+- [ ] 完整 pytest、构建、PR CI、exact merge、public tag/install 与 Release assets。
+
+### V4.2.8：安装凭据持久化热修（已发布）
 
 - [x] 公开 v4.2.7 tag 安装复现环境凭据只在当前进程可见，后续 doctor 无法读取。
 - [x] macOS/Linux、Docker 与 PowerShell 安装器把进程凭据持久化到选定 `.env`。
 - [x] POSIX `.env` 权限为 `0600`，安装日志不包含凭据值。
 - [x] 三平台回归覆盖进程凭据、带空格 secret、dotenv 替换与日志脱敏。
 - [x] 完整 pytest、sdist/wheel、隔离 `site-packages` provenance 与 `git diff --check`。
-- [ ] PR CI、exact merge、public tag/install 与 Release assets。
+- [x] PR CI、exact merge、public tag/install 与 Release assets。
 
 ### V4.2.7：Windows 安装与 detached runner 热修（已发布）
 

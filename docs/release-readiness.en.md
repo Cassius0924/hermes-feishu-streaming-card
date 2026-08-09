@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.2.8`. This cycle fixes the process-credential persistence gap across all three installers that was found by the public v4.2.7 installation acceptance. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.2.9`. This cycle fixes Issue #197 and securely integrates the slash-confirm and clarify-form work from PRs #196/#199. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -146,6 +146,12 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.2.9 Release Gates
+
+- The original PR #196/#199 commits retain authorship. Additional regressions cover submission failure, duplicate resolution, callback token/chat authentication, old Hermes callback signatures, single-attempt `/events`, and redacted diagnostics.
+- Focused hook/runtime/render/server/patcher/install matrix: **`1161 passed, 2 skipped`**.
+- Full pytest, builds, GitHub Actions, exact merge SHA, tag, public install, and Release assets: **pending release gates**.
 
 ## V4.2.8 Release Gates
 

@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.2.9 — 2026-08-09
+
+See also: [docs/release-notes-v4.2.9.md](docs/release-notes-v4.2.9.md)
+
+### Added
+- PR #199: agent clarify cards support native multi-select, numbered single-select choices, and a free-text “Other” form while preserving in-progress input until the interaction resolves.
+- Pending interaction cards show their configured expiry in the footer.
+
+### Fixed
+- Issue #197: completed card quote summaries use a bounded normalized answer excerpt instead of the fixed “已完成” status.
+- PR #196: slow slash-command confirmations resolve outside Feishu's callback deadline, atomically consume pending state, update the original card, and fall back without losing the click when loop submission fails.
+- Clarify hook injection reads optional `multi_select` safely on both older and newer Hermes callback signatures.
+
+### Safety
+- Form submits require the exact unguessable callback token and an exact non-empty chat binding; interaction IDs are not accepted as credentials.
+- Ambiguous interaction-event delivery is checked with a read-only lookup and never replays `/events`.
+- Interaction diagnostics omit raw IDs, URLs, user choices, response bodies, and error text.
+
+### Credits
+- Thanks @zayn-0101 for PR #196 and @Cassius0924 for PR #199.
+
 ## V4.2.8 — 2026-08-05
 
 See also: [docs/release-notes-v4.2.8.md](docs/release-notes-v4.2.8.md)
