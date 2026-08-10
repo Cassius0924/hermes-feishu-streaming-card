@@ -521,15 +521,12 @@ def _render_interaction_elements(
         ]
         if choice_lines:
             if interaction.multi_select:
-                choice_lines += [
-                    "",
-                    "Reply with numbers separated by commas, the option text, or your own answer.",
-                ]
+                instruction = "Reply with numbers separated by commas or the option text."
             else:
-                choice_lines += [
-                    "",
-                    "Reply with the number, the option text, or your own answer.",
-                ]
+                instruction = "Reply with the number or the option text."
+            if interaction.allow_custom_input:
+                instruction = instruction[:-1] + ", or your own answer."
+            choice_lines += ["", instruction]
             elements.append(
                 {
                     "tag": "markdown",
@@ -543,16 +540,20 @@ def _render_interaction_elements(
         if interaction.multi_select:
             elements.append(_render_multi_select_form(interaction))
         else:
+            hint = "（单选）请选择"
+            if interaction.allow_custom_input:
+                hint += "，或输入自定义内容"
             elements.append(
                 {
                     "tag": "markdown",
                     "element_id": "interaction_hint",
-                    "content": "（单选）请选择，或输入自定义内容",
+                    "content": hint,
                 }
             )
             for index, option in enumerate(interaction.options):
                 elements.append(_render_choice_button(interaction, index, option))
-            elements.append(_render_other_form(interaction))
+            if interaction.allow_custom_input:
+                elements.append(_render_other_form(interaction))
         return elements
 
     if interaction.status == "completed":
@@ -669,39 +670,43 @@ def _render_multi_select_form(interaction: Any) -> Dict[str, Any]:
         }
         for index, option in enumerate(interaction.options, start=1)
     ]
+    elements = [
+        {
+            "tag": "multi_select_static",
+            "element_id": "hfc_multi",
+            "name": "hfc_multi",
+            "type": "default",
+            "width": "fill",
+            "required": False,
+            "placeholder": {
+                "tag": "plain_text",
+                "content": "请选择（可多选）",
+            },
+            "options": options,
+            "behaviors": [
+                {
+                    "type": "callback",
+                    "value": {"hfc_action": "interaction.noop"},
+                }
+            ],
+        }
+    ]
+    if interaction.allow_custom_input:
+        elements.append(_render_other_input())
+    elements.append(
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "✅ 确认选择"},
+            "type": "primary",
+            "width": "fill",
+            "form_action_type": "submit",
+            "name": f"hfc_confirm_{interaction.callback_token}",
+        }
+    )
     return {
         "tag": "form",
         "name": "hfc_clarify_form",
-        "elements": [
-            {
-                "tag": "multi_select_static",
-                "element_id": "hfc_multi",
-                "name": "hfc_multi",
-                "type": "default",
-                "width": "fill",
-                "required": False,
-                "placeholder": {
-                    "tag": "plain_text",
-                    "content": "请选择（可多选）",
-                },
-                "options": options,
-                "behaviors": [
-                    {
-                        "type": "callback",
-                        "value": {"hfc_action": "interaction.noop"},
-                    }
-                ],
-            },
-            _render_other_input(),
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "✅ 确认选择"},
-                "type": "primary",
-                "width": "fill",
-                "form_action_type": "submit",
-                "name": f"hfc_confirm_{interaction.callback_token}",
-            },
-        ],
+        "elements": elements,
     }
 
 

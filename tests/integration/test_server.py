@@ -7957,6 +7957,7 @@ async def test_interaction_request_renders_buttons_and_callback_resolves(client)
                 "kind": "approval",
                 "prompt": "允许执行命令吗？",
                 "description": "rm -rf /tmp/demo",
+                "allow_custom_input": False,
                 "options": [
                     {"label": "允许一次", "value": "once", "style": "primary"},
                     {"label": "拒绝", "value": "deny", "style": "danger"},
@@ -7979,6 +7980,23 @@ async def test_interaction_request_renders_buttons_and_callback_resolves(client)
         if element.get("tag") == "button"
     )
     action_value = button["behaviors"][0]["value"]
+
+    custom = await test_client.post(
+        "/card/actions",
+        json={
+            "event": {
+                "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                "context": {"open_chat_id": "oc_abc"},
+                "action": {
+                    "name": f"hfc_other_{action_value['token']}",
+                    "form_value": {"hfc_other": "please approve"},
+                },
+            }
+        },
+    )
+
+    assert custom.status == 400
+    assert (await custom.json())["error"] == "custom input not allowed"
 
     callback = await test_client.post(
         "/card/actions",

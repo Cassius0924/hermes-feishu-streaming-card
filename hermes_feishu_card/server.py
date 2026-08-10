@@ -863,6 +863,12 @@ async def _interaction_action(
     if not interaction_id:
         return web.json_response({"ok": False, "error": "invalid action"}, status=400)
 
+    interaction = session.active_interaction
+    if interaction is None:
+        return web.json_response(
+            {"ok": False, "error": "interaction not found"}, status=404
+        )
+    allowed_values = {option.value for option in interaction.options}
     form_value = _extract_form_value(payload)
     if mode == "confirm":
         # Multi-select form submit: action.form_value.hfc_multi is a list of
@@ -877,6 +883,14 @@ async def _interaction_action(
             raw = []
         selected = raw if isinstance(raw, list) else ([raw] if raw != "" else [])
         selected = [str(s).strip() for s in selected if str(s).strip()]
+        if any(item not in allowed_values for item in selected):
+            return web.json_response(
+                {"ok": False, "error": "invalid choice"}, status=400
+            )
+        if typed and not interaction.allow_custom_input:
+            return web.json_response(
+                {"ok": False, "error": "custom input not allowed"}, status=400
+            )
         if typed:
             if selected:
                 combined = selected + [f"[自定义] {typed}"]
@@ -891,6 +905,10 @@ async def _interaction_action(
     elif mode == "other":
         # Free-text 'Other' answer: action.form_value.hfc_other holds the
         # user's typed input.
+        if not interaction.allow_custom_input:
+            return web.json_response(
+                {"ok": False, "error": "custom input not allowed"}, status=400
+            )
         typed = str(form_value.get("hfc_other") or "").strip()
         if not typed:
             return web.json_response(
@@ -905,6 +923,10 @@ async def _interaction_action(
         choice_label = str(value.get("choice_label") or choice).strip()
         if not choice:
             return web.json_response({"ok": False, "error": "invalid action"}, status=400)
+        if not interaction.allow_custom_input and choice not in allowed_values:
+            return web.json_response(
+                {"ok": False, "error": "invalid choice"}, status=400
+            )
 
     user_name = _extract_operator_name(payload)
     data = {

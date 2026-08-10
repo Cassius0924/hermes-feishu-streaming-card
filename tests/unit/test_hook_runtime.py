@@ -779,6 +779,7 @@ def test_build_interaction_event_reuses_active_card_message_id():
             {"label": "允许一次", "value": "once"},
             {"label": "拒绝", "value": "deny"},
         ],
+        allow_custom_input=False,
     )
 
     assert interaction["event"] == "interaction.requested"
@@ -787,6 +788,67 @@ def test_build_interaction_event_reuses_active_card_message_id():
     assert interaction["data"]["kind"] == "approval"
     assert interaction["data"]["prompt"] == "允许执行命令吗？"
     assert interaction["data"]["options"][0]["value"] == "once"
+    assert interaction["data"]["allow_custom_input"] is False
+
+
+def test_approval_and_clarify_publish_distinct_custom_input_capabilities(monkeypatch):
+    calls = []
+
+    def fake_request(local_vars, **kwargs):
+        calls.append((local_vars, kwargs))
+        choice = kwargs["options"][0]["value"]
+        if kwargs["kind"] == "approval" and kwargs["allow_custom_input"]:
+            choice = "future custom approval response"
+        return {
+            "ok": True,
+            "status": "completed",
+            "choice": choice,
+        }
+
+    monkeypatch.setattr(
+        hook_runtime,
+        "request_interaction_from_hermes_locals",
+        fake_request,
+    )
+
+    approval = hook_runtime.request_approval_choice_from_hermes_locals(
+        {"chat_id": "oc_abc"},
+        {
+            "command": "rm -rf /tmp/demo",
+            "description": "recursive delete",
+            "allow_session": False,
+            "allow_permanent": False,
+        },
+        interaction_id="approval-1",
+    )
+    clarify = hook_runtime.request_clarify_response_from_hermes_locals(
+        {"chat_id": "oc_abc"},
+        interaction_id="clarify-1",
+        question="请选择",
+        choices=["继续", "取消"],
+    )
+    future_approval = hook_runtime.request_approval_choice_from_hermes_locals(
+        {"chat_id": "oc_abc"},
+        {
+            "command": "future command",
+            "allow_custom_input": True,
+        },
+        interaction_id="approval-2",
+    )
+
+    assert approval == "once"
+    assert clarify == "继续"
+    assert future_approval == "future custom approval response"
+    approval_call = calls[0][1]
+    clarify_call = calls[1][1]
+    future_approval_call = calls[2][1]
+    assert approval_call["allow_custom_input"] is False
+    assert [option["value"] for option in approval_call["options"]] == [
+        "once",
+        "deny",
+    ]
+    assert clarify_call["allow_custom_input"] is True
+    assert future_approval_call["allow_custom_input"] is True
 
 
 def test_request_interaction_posts_event_and_polls_until_completed(monkeypatch):
