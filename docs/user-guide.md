@@ -529,7 +529,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.2.10`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.2.11`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -537,7 +537,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.10
+export HFC_VERSION=v4.2.11
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -822,6 +822,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
+| [v4.2.11](release-notes-v4.2.11.md) | 2026-08-10 | Issue #202 旧交互卡冻结为“已转入交互卡片”历史快照，保留内容与工具记录，并维持 PATCH fail-open |
 | [v4.2.10](release-notes-v4.2.10.md) | 2026-08-10 | 非回环 sidecar HMAC、交互绝对过期/晚到回调拒绝，以及跨平台 CI、CodeQL、Dependabot 与 Action SHA 固定 |
 | [v4.2.9](release-notes-v4.2.9.md) | 2026-08-09 | Issue #197 回答引用摘要、PR #196 非阻塞 slash-confirm、PR #199 多选/自定义回答表单与严格 token/chat 鉴权 |
 | [v4.2.8](release-notes-v4.2.8.md) | 2026-08-05 | 三平台安装器持久化进程环境中的飞书凭据，POSIX `.env` 权限为 `0600`，日志不输出凭据值 |
