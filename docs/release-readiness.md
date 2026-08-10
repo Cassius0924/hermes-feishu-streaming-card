@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.2.10`。本轮为非回环 sidecar 的交互回调/结果读取增加独立 HMAC proof，落实交互绝对过期与晚到回调拒绝，并补齐跨平台 CI、CodeQL、Dependabot 与 Action SHA 固定。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.2.11`。本轮修复 Issue #202：新交互卡成功发送后，旧流式卡冻结为绿色“已转入交互卡片”只读快照，保留可见内容与工具历史并移除 pending 控件；旧卡 PATCH 失败保持 fail-open。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -146,6 +146,17 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.2.11 发布门禁
+
+- Issue #202 回归先在旧实现观察到 predecessor 没有终态 PATCH，再验证绿色“已转入交互卡片” Header/summary、内容与工具保留、临时运行态和 pending 控件清除。
+- 连续 interaction 每张 predecessor 只 final PATCH 一次；旧 pending token/按钮不会残留，只有最新卡继续接收 callback 与后续更新。
+- replacement send 失败恢复请求前 session；predecessor PATCH 全部失败仍提升新卡并记录既有脱敏 update metrics/diagnostics。
+- animation cancellation 在 predecessor PATCH 前完成；canonical `turn_id` session 使用原 per-session card config。
+- session/render/server/clarify 聚焦矩阵：**`450 passed`**；`git diff --check`：**通过**。
+- 隔离 v4.2.11 候选完整 pytest：**`2478 passed, 6 skipped`**。
+- 本地 sdist/wheel 与全新 venv 候选 wheel `site-packages` provenance/CLI smoke：**通过**。
+- PR CI、exact merge SHA、public tag/install 与 Release assets：**发布流程中逐项记录**。
 
 ## V4.2.10 发布门禁
 

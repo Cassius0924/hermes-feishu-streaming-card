@@ -2,6 +2,15 @@
 
 自动化测试不能完全证明 Feishu/Lark 客户端体验。涉及卡片 UX、topic、系统提示、命令卡片的版本，发布前需要真实飞书 smoke。
 
+## V4.2.11 旧交互卡接力快照验收
+
+- 在一张仍显示 clarify 或运行中工具 Header 的流式卡上触发 `interaction.requested`；新卡必须出现在聊天底部并保持按钮可用，旧卡必须变为绿色“已转入交互卡片”。
+- 旧卡正文、thinking、timeline、工具记录和附件保持可读，但 Header 不再显示临时工具/clarify 文案，卡内不存在 pending 按钮、interaction id 或 callback token。
+- 连续触发两轮 interaction；前两张卡各只出现一次接力终态 PATCH，只有第三张最新卡可操作。完成选择和继续生成时，后续 PATCH 全部落在第三张卡。
+- 受控让旧卡 PATCH 的全部有界重试失败；新卡仍保持可点击并可完成 interaction，`/health` 只出现脱敏的 update failure 证据，不回退到旧卡或重复发送交互。
+- 受控延迟旧 animation frame；必须先观察 animation 取消完成，再出现“已转入交互卡片”最终 PATCH，之后旧卡不被运行态覆盖。
+- 复验私聊、群聊/topic、`turn_id`、per-session card title、交互过期、form submit 与 native gray-text suppression；不在记录中保留真实 chat/message/user id、callback token、回答正文或截图中的私人信息。
+
 ## Windows installer follow-up 候选验收
 
 - Windows 10/11 + Python 3.11 的 Hermes venv 首次导入 `lark_oapi.ws.Client` 或 HFC 超过 8 秒、但少于 30 秒时，官方 PowerShell `install/setup` 应继续完成；超过 30 秒或子进程非零退出仍必须失败。

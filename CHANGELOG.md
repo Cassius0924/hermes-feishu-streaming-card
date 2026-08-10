@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.2.11 — 2026-08-10
+
+See also: [docs/release-notes-v4.2.11.md](docs/release-notes-v4.2.11.md)
+
+### Fixed
+- Issue #202: after a replacement interaction card is delivered, the superseded streaming card is finalized as a green read-only `已转入交互卡片` history snapshot instead of retaining a transient clarify/tool header forever.
+- Repeated interactions finalize each predecessor once and remove pending buttons and callback tokens from old cards while only the newest card stays interactive.
+
+### Safety
+- Replacement delivery still succeeds before predecessor finalization starts; send failure restores the original session and card authority exactly as before.
+- Predecessor animation cancellation completes before the final PATCH. A failed predecessor PATCH uses existing bounded retry/diagnostic metrics and remains fail-open for the delivered interaction.
+- Callback authentication, chat/operator binding, expiry, sequence, topic/reply, native suppression, `legacy/`, and Hermes patch ownership are unchanged.
+
 ## V4.2.10 — 2026-08-10
 
 See also: [docs/release-notes-v4.2.10.md](docs/release-notes-v4.2.10.md)

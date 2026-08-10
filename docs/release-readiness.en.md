@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.2.10`. This cycle authenticates non-loopback sidecar callbacks and result reads with a dedicated HMAC proof, enforces absolute interaction expiry and late-callback rejection, and adds cross-platform CI, CodeQL, Dependabot, and immutable Action pins. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.2.11`. This cycle fixes Issue #202: after replacement delivery succeeds, each superseded streaming card becomes a green read-only “moved to the interaction card” snapshot that preserves visible content and tool history without pending controls; predecessor PATCH failure remains fail-open. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -146,6 +146,17 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.2.11 Release Gates
+
+- The Issue #202 regression first observed that the predecessor received no final PATCH, then verified the green “moved to the interaction card” header/summary, visible content and tool preservation, and removal of transient runtime state and pending controls.
+- Repeated interactions final-PATCH every predecessor once. Old pending tokens and buttons do not remain, and only the newest card receives callbacks and later updates.
+- Replacement-send failure restores the pre-request session. Exhausting every predecessor PATCH attempt still promotes the replacement and records only the existing redacted update metrics/diagnostics.
+- Animation cancellation completes before predecessor PATCH, and canonical `turn_id` sessions retain their per-session card configuration.
+- Session/render/server/clarify focused matrix: **`450 passed`**; `git diff --check`: **passed**.
+- Full pytest in the isolated v4.2.11 candidate: **`2478 passed, 6 skipped`**.
+- Local sdist/wheel and fresh-venv candidate-wheel `site-packages` provenance/CLI smoke: **passed**.
+- PR CI, exact merge SHA, public tag/install, and Release assets: **recorded during the publication flow**.
 
 ## V4.2.10 Release Gates
 
