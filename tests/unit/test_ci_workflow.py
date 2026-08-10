@@ -38,6 +38,37 @@ def test_github_actions_runs_full_pytest_matrix():
     assert text.count("python -m pytest -q") >= 3
 
 
+def test_windows_gate_runs_fixed_portable_runtime_core_without_exclusions():
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "tests.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    windows_job = workflow["jobs"]["pytest-windows"]
+    test_step = next(
+        step for step in windows_job["steps"] if step.get("name") == "Test"
+    )
+    command = test_step["run"]
+    required_suites = {
+        "tests/unit/test_event_auth.py",
+        "tests/unit/test_hook_runtime.py",
+        "tests/unit/test_lifecycle.py",
+        "tests/unit/test_render.py",
+        "tests/unit/test_runner.py",
+        "tests/unit/test_session.py",
+        "tests/integration/test_card_freeze.py",
+        "tests/integration/test_clarify_multi_select.py",
+        "tests/integration/test_feishu_client_http.py",
+        "tests/integration/test_hook_runtime_integration.py",
+        "tests/integration/test_server.py",
+    }
+
+    assert required_suites <= set(command.split())
+    assert "--ignore" not in command
+    assert "-k" not in command
+    assert windows_job.get("continue-on-error") is not True
+
+
 def test_pr_workflows_do_not_duplicate_codex_branch_push_runs():
     for name in ("tests.yml", "codeql.yml"):
         workflow = yaml.safe_load(

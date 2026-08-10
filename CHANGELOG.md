@@ -12,7 +12,7 @@ See also: [docs/release-notes-v4.2.10.md](docs/release-notes-v4.2.10.md)
 ### Added
 - Non-loopback sidecar callbacks and result reads use a domain-separated HMAC proof that binds the HTTP method, canonical path, and raw body.
 - Interaction state records an absolute sidecar-owned deadline and the cleanup loop expires stale pending interactions before normal retention cleanup.
-- CI runs full pytest on Ubuntu Python 3.9–3.12, Windows 3.12, and macOS 3.12; CodeQL and weekly Dependabot configuration are included.
+- CI runs full pytest on Ubuntu Python 3.9–3.12 and macOS 3.12. Windows 3.12 runs a fixed portable runtime/server suite plus dedicated PowerShell and migration contracts; POSIX `dir_fd`, mode-bit, systemd, and bash-only tests remain covered on POSIX runners. CodeQL and weekly Dependabot configuration are included.
 
 ### Fixed
 - Late direct buttons and clarify form submits can no longer complete an expired interaction; the original card is refreshed with an expired result.

@@ -14,7 +14,7 @@ V4.2.10 closes two runtime gaps confirmed by the repository audit: non-loopback 
 
 ## CI and security gates
 
-- Full pytest runs on Ubuntu with Python 3.9, 3.10, 3.11, and 3.12, plus Windows 3.12 and macOS 3.12.
+- Full pytest runs on Ubuntu with Python 3.9, 3.10, 3.11, and 3.12 and on macOS 3.12. Windows 3.12 runs a fixed portable runtime/server suite plus dedicated PowerShell installer and migration contracts; tests that require POSIX `dir_fd`, mode bits, systemd, or bash remain on POSIX runners.
 - Feishu SDK compatibility, the PowerShell installer, and Docker Compose runtime smoke remain in place.
 - `actions/checkout v7.0.1`, `actions/setup-python v7.0.0`, and `github/codeql-action v4` were verified to use Node 24 and are pinned to immutable 40-character commit SHAs.
 - CodeQL scans Python on push, pull request, and weekly schedule. Dependabot checks pip and GitHub Actions weekly.
@@ -60,8 +60,9 @@ hermes-feishu-card status --config ~/.hermes/config.yaml
 
 - Session/lifecycle/render/hook unit regressions: `556 passed`.
 - Full server/clarify integration regression: `297 passed`.
-- CI workflow contracts: `15 passed`.
-- Full pytest in the isolated v4.2.10 runtime: `2473 passed, 6 skipped`.
+- Fixed Windows portable runtime/server list (equivalent local execution): `1272 passed`; the exact Windows-runner result is gated by the PR checks.
+- CI workflow contracts: `16 passed`.
+- Full pytest in the isolated v4.2.10 runtime: `2475 passed, 6 skipped`.
 - Exact merge SHA, post-tag Release assets, and public-tag installation results are added to the Release after the publication flow completes.
 
 Expected Release assets:

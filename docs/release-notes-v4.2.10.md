@@ -14,7 +14,7 @@ V4.2.10 收口仓库审查中确认的两个运行时缺口：非回环 sidecar 
 
 ## CI 与安全门禁
 
-- Ubuntu 全量 pytest 覆盖 Python 3.9、3.10、3.11、3.12；Windows 3.12 与 macOS 3.12 也运行全量 pytest。
+- Ubuntu 全量 pytest 覆盖 Python 3.9、3.10、3.11、3.12，macOS 3.12 运行全量 pytest。Windows 3.12 运行固定的 portable runtime/server 套件，以及独立的 PowerShell installer 和迁移契约；依赖 POSIX `dir_fd`、mode bit、systemd 或 bash 的测试保留在 POSIX runner。
 - 保留 Feishu SDK compatibility、PowerShell installer 与 Docker Compose runtime smoke。
 - `actions/checkout v7.0.1`、`actions/setup-python v7.0.0` 和 `github/codeql-action v4` 均核验为 Node 24 runtime，并固定到 40 位不可变 commit SHA。
 - 新增 CodeQL Python push/PR/weekly 扫描，以及 pip/GitHub Actions weekly Dependabot。
@@ -60,8 +60,9 @@ hermes-feishu-card status --config ~/.hermes/config.yaml
 
 - session/lifecycle/render/hook 单元回归：`556 passed`。
 - server/clarify 完整集成回归：`297 passed`。
-- CI workflow 契约：`15 passed`。
-- 隔离 v4.2.10 runtime 完整 pytest：`2473 passed, 6 skipped`。
+- 固定 Windows portable runtime/server 清单（在本机等价执行）：`1272 passed`；精确 Windows runner 结果以 PR 门禁为准。
+- CI workflow 契约：`16 passed`。
+- 隔离 v4.2.10 runtime 完整 pytest：`2475 passed, 6 skipped`。
 - 精确 merge SHA、tag 后 Release assets 与公共 tag 安装结果在发布流程完成后写入 Release。
 
 预期 Release assets：
