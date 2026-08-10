@@ -38,6 +38,20 @@ def test_github_actions_runs_full_pytest_matrix():
     assert text.count("python -m pytest -q") >= 3
 
 
+def test_pr_workflows_do_not_duplicate_codex_branch_push_runs():
+    for name in ("tests.yml", "codeql.yml"):
+        workflow = yaml.safe_load(
+            (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+        )
+        triggers = workflow.get("on", workflow.get(True))
+
+        assert triggers["push"]["branches"] == ["main"]
+        assert workflow["concurrency"] == {
+            "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+            "cancel-in-progress": True,
+        }
+
+
 def test_release_assets_workflow_supports_manual_package_dry_run():
     workflow = ROOT / ".github" / "workflows" / "release-assets.yml"
 

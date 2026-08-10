@@ -152,7 +152,7 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - sidecar request proof 绑定 HTTP method、规范 path 与 raw body，使用独立 `hfc-sidecar-request-v1` 域；缺失、过期、跨 method/path/body 与 replay 均 fail-closed，认证失败响应与指标不包含签名、标识符、正文或选择。
 - 默认 loopback 部署保持兼容；启用非回环事件认证时，`/card/actions`、`/interactions/{id}` 与 `/messages/{id}/summary` 在解析/返回前必须验签。
 - interaction deadline 由 sidecar 接收时刻决定；晚到直连按钮与 form submit 返回过期状态，周期任务刷新原卡，过期 pending 不再永久阻塞清理；Gateway poll 超时只发送一次独立 `interaction.failed`。
-- session/lifecycle/render/hook 单元回归：**`556 passed`**；完整 server/clarify 集成回归：**`297 passed`**；CI workflow 契约：**`14 passed`**。
+- session/lifecycle/render/hook 单元回归：**`556 passed`**；完整 server/clarify 集成回归：**`297 passed`**；CI workflow 契约：**`15 passed`**。
 - GitHub Actions 覆盖 Ubuntu Python 3.9/3.10/3.11/3.12、Windows 3.12、macOS 3.12 全量 pytest，并保留 Feishu SDK、PowerShell installer 与 Docker Compose smoke；官方 Action 固定到已核验 Node 24 版本的不可变 SHA。
 - 新增 CodeQL Python push/PR/weekly 扫描与 pip/GitHub Actions weekly Dependabot 配置。
 - 隔离 v4.2.10 runtime 完整 pytest：**`2473 passed, 6 skipped`**；精确 PR merge、detached merge-SHA 复验、public tag/install 与 Release assets：**发布流程中逐项记录**。

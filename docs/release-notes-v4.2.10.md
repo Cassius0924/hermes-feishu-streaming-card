@@ -60,7 +60,7 @@ hermes-feishu-card status --config ~/.hermes/config.yaml
 
 - session/lifecycle/render/hook 单元回归：`556 passed`。
 - server/clarify 完整集成回归：`297 passed`。
-- CI workflow 契约：`14 passed`。
+- CI workflow 契约：`15 passed`。
 - 隔离 v4.2.10 runtime 完整 pytest：`2473 passed, 6 skipped`。
 - 精确 merge SHA、tag 后 Release assets 与公共 tag 安装结果在发布流程完成后写入 Release。
 

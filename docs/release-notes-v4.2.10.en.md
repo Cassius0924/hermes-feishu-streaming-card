@@ -60,7 +60,7 @@ hermes-feishu-card status --config ~/.hermes/config.yaml
 
 - Session/lifecycle/render/hook unit regressions: `556 passed`.
 - Full server/clarify integration regression: `297 passed`.
-- CI workflow contracts: `14 passed`.
+- CI workflow contracts: `15 passed`.
 - Full pytest in the isolated v4.2.10 runtime: `2473 passed, 6 skipped`.
 - Exact merge SHA, post-tag Release assets, and public-tag installation results are added to the Release after the publication flow completes.
 
