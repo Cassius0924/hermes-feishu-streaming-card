@@ -425,7 +425,8 @@ async def test_send_card_delivery_network_failure_is_safe_and_unknown(unused_tcp
     error = exc_info.value
     assert error.retryable is True
     assert error.outcome == "unknown"
-    assert "ClientConnectorError" in str(error)
+    assert str(error).startswith("Feishu API request failed: ")
+    assert str(error).endswith("Error")
     assert str(unused_tcp_port) not in str(error)
     assert "oc_private" not in str(error)
 

@@ -45,6 +45,8 @@
 - slash-confirm 必须在回调线程先原子 claim pending state，再提交到 Gateway loop；submit 返回 false 或抛错时必须回退执行，不能空 ACK 后丢失点击。
 - schema-2 form submit 的按钮名携带 callback token；Gateway 转发前要求非空 chat 和可验证操作者，sidecar 再要求 token/chat 完全匹配。
 - `interaction.requested` 对 `/events` 只 POST 一次；响应丢失后只允许只读查询 interaction 状态，禁止重放事件。
+- 非回环 sidecar 的 `/card/actions`、`/interactions/{id}` 与 `/messages/{id}/summary` 必须使用独立 `hfc-sidecar-request-v1` proof；签名绑定 HTTP method、规范 path 与 raw body，不能复用 `/events` proof，也不能只把 callback token 当作网络认证。
+- Gateway poll 到达 deadline 时只 best-effort 发送一次新的 `interaction.failed`，不得重放原始 `interaction.requested`；发送失败保持 fail-open，不循环重试。
 - policy cache 必须有界、短 TTL、线程安全且按 profile/chat/endpoint 隔离；认证、timeout、reload 或响应异常全部回到 Hermes 原生路径。terminal 必须清理 turn 决策、pending delta 和 native-media suppression。
 
 ### `hermes_feishu_card/server.py`
@@ -71,6 +73,8 @@
 - pending interaction 期间，非 interaction lifecycle 的 card PATCH 与动画必须冻结，避免全量替换清空用户尚未提交的多选和输入。
 - form submit 不接受 interaction ID 或空 token 作为凭据，也不接受缺失或不匹配的 callback chat。
 - `interaction.requested` 在已有 session card 时会发送新的当前状态卡并迁移后续 message id；必须使用 interaction-specific delivery key，发送失败恢复 session，动画任务也必须从旧 message id 切到新卡。
+- interaction deadline 由 sidecar 接收时刻与 `timeout_seconds` 计算为绝对截止时间 `expires_at`；action、result poll 与周期清理都在现有 session lock 下先做幂等过期转换。过期状态只能是 failed，晚到直连按钮或 form submit 不能把它改回 completed，原卡必须刷新为“交互已过期”。
+- cleanup 只把尚未到期的 pending interaction 视为活跃；周期循环先转换/刷新过期 interaction，再执行普通 retention cleanup，避免永久保留或删掉仍显示可点击按钮的旧卡。
 
 ### `hermes_feishu_card/install/patcher.py`
 

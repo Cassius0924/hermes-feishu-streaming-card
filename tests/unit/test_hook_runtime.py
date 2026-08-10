@@ -5542,6 +5542,84 @@ def test_request_interaction_polls_through_transient_not_found(monkeypatch):
     assert result["choice"] == "删除"
 
 
+def test_request_interaction_timeout_posts_one_distinct_failed_event(monkeypatch):
+    posted = []
+    monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
+    monkeypatch.setattr(hook_runtime.time, "monotonic", lambda: 100.0)
+
+    def fake_post(local_vars, url, payload, timeout):
+        posted.append((url, payload, timeout))
+        return {"ok": True, "applied": True}
+
+    monkeypatch.setattr(hook_runtime, "_post_interaction_event", fake_post)
+    monkeypatch.setattr(
+        hook_runtime,
+        "_get_json_sync",
+        lambda _url, _timeout: {"ok": True, "status": "pending"},
+    )
+
+    result = hook_runtime.request_interaction_from_hermes_locals(
+        {"chat_id": "oc_abc", "message_id": "msg_1"},
+        kind="clarify",
+        interaction_id="clarify-timeout",
+        prompt="怎么处理？",
+        options=[{"label": "删除", "value": "删除"}],
+        timeout_seconds=0,
+        poll_interval_seconds=0,
+    )
+
+    assert result == {
+        "ok": False,
+        "status": "timeout",
+        "interaction_id": "clarify-timeout",
+    }
+    assert [payload["event"] for _url, payload, _timeout in posted] == [
+        "interaction.requested",
+        "interaction.failed",
+    ]
+    assert posted[1][1]["sequence"] == posted[0][1]["sequence"] + 1
+    assert posted[1][1]["data"] == {
+        "interaction_id": "clarify-timeout",
+        "error": "交互已过期",
+        "profile_id": "default",
+    }
+
+
+def test_interaction_timeout_failure_uses_fresh_sequence_after_concurrent_event(
+    monkeypatch,
+):
+    posted = []
+    monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
+    monkeypatch.setattr(hook_runtime.time, "monotonic", lambda: 100.0)
+
+    def fake_post(local_vars, url, payload, timeout):
+        posted.append(payload)
+        return {"ok": True, "applied": True}
+
+    def concurrent_poll(_url, _timeout):
+        hook_runtime._next_sequence("msg_1")
+        return {"ok": True, "status": "pending"}
+
+    monkeypatch.setattr(hook_runtime, "_post_interaction_event", fake_post)
+    monkeypatch.setattr(hook_runtime, "_get_json_sync", concurrent_poll)
+
+    hook_runtime.request_interaction_from_hermes_locals(
+        {"chat_id": "oc_abc", "message_id": "msg_1"},
+        kind="clarify",
+        interaction_id="clarify-concurrent-timeout",
+        prompt="怎么处理？",
+        options=[{"label": "删除", "value": "删除"}],
+        timeout_seconds=0,
+        poll_interval_seconds=0,
+    )
+
+    assert [payload["event"] for payload in posted] == [
+        "interaction.requested",
+        "interaction.failed",
+    ]
+    assert posted[1]["sequence"] == posted[0]["sequence"] + 2
+
+
 def test_completed_event_extracts_attachment_summaries_from_response():
     payload = hook_runtime.build_event(
         "message.completed",
@@ -10054,6 +10132,56 @@ def test_policy_headers_use_distinct_signed_domain(monkeypatch):
     PolicyProofVerifier(root).verify(headers, body)
     with pytest.raises(Exception):
         EventProofVerifier(root).verify(headers, body)
+
+
+def test_sensitive_post_headers_use_sidecar_request_proof(monkeypatch):
+    from hermes_feishu_card import event_auth as event_auth_module
+
+    root = b"s" * 32
+    body = b'{"event":{"action":{}}}'
+    monkeypatch.setattr(hook_runtime, "read_transport_root_secret", lambda: root)
+
+    headers = hook_runtime._post_headers(
+        "http://sidecar.test/card/actions/",
+        body,
+    )
+
+    verifier_type = getattr(event_auth_module, "SidecarRequestProofVerifier", None)
+    assert verifier_type is not None
+    verifier_type(root).verify(headers, "POST", "/card/actions", body)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_get_uses_sidecar_request_proof(monkeypatch):
+    from hermes_feishu_card import event_auth as event_auth_module
+
+    root = b"s" * 32
+    captured = {}
+    monkeypatch.setattr(hook_runtime, "read_transport_root_secret", lambda: root)
+
+    def fake_open(req, timeout):
+        captured["request"] = req
+        captured["timeout"] = timeout
+        return {"ok": True, "status": "pending"}
+
+    monkeypatch.setattr(hook_runtime, "_open_json_request", fake_open)
+
+    result = await hook_runtime._get_json(
+        "http://sidecar.test/interactions/approval-1",
+        0.8,
+    )
+
+    req = captured["request"]
+    verifier_type = getattr(event_auth_module, "SidecarRequestProofVerifier", None)
+    assert verifier_type is not None
+    verifier_type(root).verify(
+        dict(req.header_items()),
+        req.get_method(),
+        "/interactions/approval-1",
+        b"",
+    )
+    assert result == {"ok": True, "status": "pending"}
+    assert captured["timeout"] == 0.8
 
 
 def test_policy_cache_is_bounded_and_reset_clears_all_policy_state():

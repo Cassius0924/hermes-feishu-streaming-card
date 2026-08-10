@@ -1031,12 +1031,12 @@ def _render_footer(
         return "已停止"
     if display_status == "waiting":
         interaction = session.active_interaction
-        timeout_seconds = (
-            float(interaction.timeout_seconds)
+        remaining_seconds = (
+            max(0.0, float(interaction.expires_at) - _time.time())
             if interaction is not None
             else 300.0
         )
-        minutes = max(1, int(math.ceil(timeout_seconds / 60.0)))
+        minutes = max(1, int(math.ceil(remaining_seconds / 60.0)))
         return f"等待选择 · ⏳ {minutes} 分钟后过期"
     if session.status != "completed":
         return _spinner_text("生成中")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from hermes_feishu_card import event_auth as event_auth_module
 from hermes_feishu_card.event_auth import (
     EventAuthenticationError,
     EventProofVerifier,
@@ -212,5 +213,112 @@ def test_event_nonce_capacity_remains_fail_closed_when_explicitly_full():
                 timestamp=100,
                 nonce="small-event-nonce-0002",
             ),
+            body,
+        )
+
+
+def test_sidecar_request_proof_binds_method_path_and_body_and_rejects_replay():
+    signer = getattr(event_auth_module, "sign_sidecar_request", None)
+    verifier_type = getattr(event_auth_module, "SidecarRequestProofVerifier", None)
+    error_type = getattr(
+        event_auth_module,
+        "SidecarRequestAuthenticationError",
+        ValueError,
+    )
+
+    assert callable(signer)
+    assert verifier_type is not None
+
+    secret = b"s" * 32
+    body = b'{"choice":"once"}'
+    headers = signer(
+        secret,
+        "POST",
+        "/card/actions",
+        body,
+        timestamp=100,
+        nonce="sidecar-request-nonce-0001",
+    )
+    verifier = verifier_type(secret, now=lambda: 100.0)
+
+    verifier.verify(headers, "POST", "/card/actions", body)
+    with pytest.raises(error_type, match="replayed"):
+        verifier.verify(headers, "POST", "/card/actions", body)
+    with pytest.raises(error_type, match="invalid"):
+        verifier_type(secret, now=lambda: 100.0).verify(
+            headers,
+            "GET",
+            "/card/actions",
+            body,
+        )
+    with pytest.raises(error_type, match="invalid"):
+        verifier_type(secret, now=lambda: 100.0).verify(
+            headers,
+            "POST",
+            "/interactions/approval-1",
+            body,
+        )
+    with pytest.raises(error_type, match="invalid"):
+        verifier_type(secret, now=lambda: 100.0).verify(
+            headers,
+            "POST",
+            "/card/actions",
+            body + b" ",
+        )
+
+
+def test_sidecar_request_proof_is_domain_separated_and_expires():
+    signer = getattr(event_auth_module, "sign_sidecar_request", None)
+    verifier_type = getattr(event_auth_module, "SidecarRequestProofVerifier", None)
+    error_type = getattr(
+        event_auth_module,
+        "SidecarRequestAuthenticationError",
+        ValueError,
+    )
+
+    assert callable(signer)
+    assert verifier_type is not None
+
+    secret = b"s" * 32
+    body = b""
+    headers = signer(
+        secret,
+        "GET",
+        "/messages/message-1/summary/",
+        body,
+        timestamp=100,
+        nonce="sidecar-request-nonce-0002",
+    )
+
+    verifier_type(secret, now=lambda: 130.0).verify(
+        headers,
+        "GET",
+        "/messages/message-1/summary",
+        body,
+    )
+    with pytest.raises(error_type, match="expired"):
+        verifier_type(secret, now=lambda: 131.0).verify(
+            headers,
+            "GET",
+            "/messages/message-1/summary",
+            body,
+        )
+
+    event_headers = sign_event_request(
+        secret,
+        body,
+        timestamp=100,
+        nonce="sidecar-request-nonce-0003",
+    )
+    remapped_headers = {
+        "X-HFC-Sidecar-Timestamp": event_headers["X-HFC-Event-Timestamp"],
+        "X-HFC-Sidecar-Nonce": event_headers["X-HFC-Event-Nonce"],
+        "X-HFC-Sidecar-Signature": event_headers["X-HFC-Event-Signature"],
+    }
+    with pytest.raises(error_type, match="invalid"):
+        verifier_type(secret, now=lambda: 100.0).verify(
+            remapped_headers,
+            "GET",
+            "/messages/message-1/summary",
             body,
         )

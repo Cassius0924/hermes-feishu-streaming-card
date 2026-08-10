@@ -60,10 +60,27 @@ class InteractionState:
     callback_token: str = ""
     multi_select: bool = False
     timeout_seconds: float = 300.0
+    requested_at: float = field(default_factory=_now)
     choice: str = ""
     choice_label: str = ""
     user_name: str = ""
     error: str = ""
+
+    @property
+    def expires_at(self) -> float:
+        return self.requested_at + max(0.0, float(self.timeout_seconds))
+
+    def is_expired(self, now: float | None = None) -> bool:
+        checked_at = _now() if now is None else float(now)
+        return self.status == "pending" and checked_at >= self.expires_at
+
+    def expire(self, now: float | None = None) -> bool:
+        checked_at = _now() if now is None else float(now)
+        if not self.is_expired(checked_at):
+            return False
+        self.status = "failed"
+        self.error = "交互已过期"
+        return True
 
 
 @dataclass
@@ -377,6 +394,8 @@ class CardSession:
             interaction_id and interaction_id != self.active_interaction.interaction_id
         ):
             return
+        if self.active_interaction.status != "pending":
+            return
         self.active_interaction.status = "completed"
         self.active_interaction.choice = str(data.get("choice") or "").strip()
         self.active_interaction.choice_label = str(
@@ -389,6 +408,8 @@ class CardSession:
         if self.active_interaction is None or (
             interaction_id and interaction_id != self.active_interaction.interaction_id
         ):
+            return
+        if self.active_interaction.status != "pending":
             return
         self.active_interaction.status = "failed"
         self.active_interaction.error = str(data.get("error") or "交互请求失败").strip()
