@@ -748,10 +748,13 @@ def _render_timeline_elements(
     entries = _select_timeline_entries(all_entries, max_items=max_items)
     folded = max(0, len(all_entries) - len(entries))
     if not entries and not folded:
-        if not _is_initial_loading(session):
-            return []
+        empty_content = (
+            '<font color="grey">等待工具事件…</font>'
+            if _is_initial_loading(session)
+            else '<font color="grey">暂无可展示的思考或工具记录。</font>'
+        )
         panel_elements = _timeline_markdown_elements(
-            '<font color="grey">等待工具事件…</font>',
+            empty_content,
             "auxiliary_timeline_loading",
             text_size=_role_text_size(
                 text_sizes,

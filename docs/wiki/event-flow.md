@@ -77,6 +77,7 @@ sidecar 为 Feishu create/reply 初始卡片生成同一条逻辑投递稳定、
 ## 工具事件视觉与运行动画
 
 - `message.started` 后、首个模型或工具事件到达前，正文显示“正在加载上下文…”，并保留“思考与工具 · 0 次工具调用”折叠入口。
+- 启用 reasoning timeline 时，折叠入口在整个卡片生命周期保持稳定；即使终态为 0 次工具调用且没有可公开的 timeline 记录，也显示同款折叠条，展开后给出明确空状态，不回退成普通 Markdown 摘要。原始 `thinking.delta` 继续保持隐藏。
 - 工具事件使用紧凑两级结构：首行由状态图标、工具名和耗时组成；参数、结果或失败原因放在第二行灰色小字中。成功、运行中、失败、取消和等待分别使用语义色，不再使用整块 Markdown 引用背景。
 - 初始加载和运行中工具复用该 session 的 `FlushController` PATCH 同一卡片，每 0.8 秒推进一次 spinner，最多 15 次（约 12 秒）；收到可见正文、工具终态或 session 终态后停止。
 - 动画更新失败即停止，不重建卡片、不切换 message id，也不绕过既有更新重试、终态 drain 和 topic/reply anchor 规则。
