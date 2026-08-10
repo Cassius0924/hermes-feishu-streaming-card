@@ -7140,6 +7140,96 @@ async def test_v4_interaction_restores_cached_preview_on_promoted_card(client):
     assert feishu_client.updated[-1][0] == "feishu-message-2"
 
 
+async def test_interaction_promotion_finalizes_predecessor_snapshot(client):
+    test_client, feishu_client = client
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"card": {"title": "Scoped Hermes Agent"}},
+            turn_id="turn-handoff",
+        ),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "thinking.delta",
+            1,
+            {"text": "我先检查天气客户端。", "mode": "append_block"},
+            turn_id="turn-handoff",
+        ),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "tool.updated",
+            2,
+            {
+                "tool_id": "read",
+                "name": "read_file",
+                "status": "running",
+                "detail": "读取 weather_client.py",
+            },
+            turn_id="turn-handoff",
+        ),
+    )
+
+    requested = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            3,
+            {
+                "interaction_id": "approval-handoff",
+                "kind": "approval",
+                "prompt": "允许读取精确位置吗？",
+                "description": "仅用于本次查询。",
+                "options": [
+                    {
+                        "label": "允许一次",
+                        "value": "once",
+                        "style": "primary",
+                    }
+                ],
+            },
+            turn_id="turn-handoff",
+        ),
+    )
+
+    assert requested.status == 200
+    predecessor_snapshots = [
+        card
+        for message_id, card in feishu_client.updated
+        if message_id == "feishu-message-1"
+        and "已转入交互卡片" in str(card)
+    ]
+    assert len(predecessor_snapshots) == 1
+    snapshot = predecessor_snapshots[0]
+    assert snapshot["header"] == {
+        "template": "green",
+        "title": {"tag": "plain_text", "content": "Scoped Hermes Agent"},
+        "subtitle": {"tag": "plain_text", "content": "已转入交互卡片"},
+    }
+    assert snapshot["config"]["summary"]["content"] == "已转入交互卡片"
+    assert "我先检查天气客户端。" in str(snapshot)
+    assert "read_file" in str(snapshot)
+    assert "正在读取：weather_client.py" not in str(snapshot["header"])
+    assert not any(
+        element.get("tag") == "button"
+        for element in snapshot["body"]["elements"]
+    )
+    assert "approval-handoff" not in str(snapshot)
+
+    replacement = feishu_client.sent[-1][1]
+    assert "允许读取精确位置吗？" in str(replacement)
+    assert any(
+        element.get("tag") == "button"
+        for element in replacement["body"]["elements"]
+    )
+
+
 async def test_v4_preview_burst_coalesces_and_late_preview_cannot_reopen_card(
     client,
 ):
@@ -7948,6 +8038,140 @@ async def test_repeated_interactions_each_promote_a_fresh_latest_card(client):
         )
 
     assert feishu_client.sent[1][1] != feishu_client.sent[2][1]
+    for predecessor_message_id in ("feishu-message-1", "feishu-message-2"):
+        snapshots = [
+            card
+            for message_id, card in feishu_client.updated
+            if message_id == predecessor_message_id
+            and "已转入交互卡片" in str(card)
+        ]
+        assert len(snapshots) == 1
+        assert not any(
+            element.get("tag") == "button"
+            for element in snapshots[0]["body"]["elements"]
+        )
+        assert "choice-1" not in str(snapshots[0])
+        assert "choice-2" not in str(snapshots[0])
+
+    latest_card = feishu_client.sent[-1][1]
+    assert "第 2 轮请选择" in str(latest_card)
+    assert any(
+        element.get("tag") == "button"
+        for element in latest_card["body"]["elements"]
+    )
+
+
+async def test_interaction_predecessor_update_failure_still_promotes_replacement(
+    client,
+):
+    test_client, feishu_client = client
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    feishu_client.update_failures_remaining = sidecar_server.UPDATE_MAX_ATTEMPTS
+    requested = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "fail-open-choice",
+                "prompt": "请选择",
+                "options": [
+                    {"label": "继续", "value": "continue", "style": "primary"}
+                ],
+            },
+        ),
+    )
+
+    assert requested.status == 200
+    assert test_client.app[sidecar_server.FEISHU_MESSAGE_IDS_KEY][
+        "hermes-message-1"
+    ] == "feishu-message-2"
+    result = await test_client.get("/interactions/fail-open-choice")
+    assert await result.json() == {
+        "ok": True,
+        "interaction_id": "fail-open-choice",
+        "status": "pending",
+        "choice": "",
+        "choice_label": "",
+    }
+    metrics = test_client.app[METRICS_KEY]
+    assert metrics.feishu_update_failures == sidecar_server.UPDATE_MAX_ATTEMPTS
+    assert metrics.feishu_update_attempts == sidecar_server.UPDATE_MAX_ATTEMPTS
+
+    replacement = feishu_client.sent[-1][1]
+    button = next(
+        element
+        for element in replacement["body"]["elements"]
+        if element.get("tag") == "button"
+    )
+    callback = await test_client.post(
+        "/card/actions",
+        json={
+            "event": {
+                "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                "context": {"open_chat_id": "oc_abc"},
+                "action": {"value": button["behaviors"][0]["value"]},
+            }
+        },
+    )
+
+    assert callback.status == 200
+    assert feishu_client.updated[-1][0] == "feishu-message-2"
+    assert "已选择：继续" in str(feishu_client.updated[-1][1])
+
+
+async def test_interaction_predecessor_animation_cancels_before_final_patch(client):
+    test_client, feishu_client = client
+    session_key = "hermes-message-1"
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    original_animation = test_client.app[sidecar_server.CARD_ANIMATION_TASKS_KEY].pop(
+        session_key
+    )
+    original_animation.cancel()
+    await asyncio.gather(original_animation, return_exceptions=True)
+
+    observed = []
+    animation_started = asyncio.Event()
+
+    async def controlled_animation():
+        animation_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            observed.append("animation_cancelled")
+            raise
+
+    animation_task = asyncio.create_task(controlled_animation())
+    await animation_started.wait()
+    test_client.app[sidecar_server.CARD_ANIMATION_TASKS_KEY][session_key] = (
+        animation_task
+    )
+
+    original_update = feishu_client.update_card_message
+
+    async def record_update(message_id, card):
+        if message_id == "feishu-message-1" and "已转入交互卡片" in str(card):
+            observed.append("predecessor_patched")
+        await original_update(message_id, card)
+
+    feishu_client.update_card_message = record_update
+    requested = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "ordered-choice",
+                "prompt": "请选择",
+                "options": [{"label": "继续", "value": "continue"}],
+            },
+        ),
+    )
+
+    assert requested.status == 200
+    assert observed[:2] == ["animation_cancelled", "predecessor_patched"]
 
 
 async def test_interaction_promotion_failure_restores_session_for_retry(client):

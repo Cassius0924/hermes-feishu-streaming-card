@@ -4615,12 +4615,19 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             ), None
 
         promoted_message_id = str(delivery.message_id)
-        feishu_message_ids[session_key] = promoted_message_id
         animation_task = request.app[CARD_ANIMATION_TASKS_KEY].pop(
             session_key, None
         )
-        if animation_task is not None:
-            animation_task.cancel()
+        if rollback_session_snapshot is not None:
+            await _finalize_interaction_predecessor(
+                request.app,
+                session_key=session_key,
+                predecessor_message_id=feishu_message_id,
+                bot_id=bot_id,
+                predecessor_snapshot=rollback_session_snapshot,
+                animation_task=animation_task,
+            )
+        feishu_message_ids[session_key] = promoted_message_id
         _store_interaction_result(request.app, session)
         _ensure_card_animation(
             request.app,
@@ -4842,6 +4849,54 @@ def _ensure_card_animation(
             session_key,
             completed,
         )
+    )
+
+
+async def _finalize_interaction_predecessor(
+    app: web.Application,
+    *,
+    session_key: str,
+    predecessor_message_id: str,
+    bot_id: str | None,
+    predecessor_snapshot: CardSession,
+    animation_task: asyncio.Task[None] | None,
+) -> bool:
+    if animation_task is not None:
+        animation_task.cancel()
+        await asyncio.gather(animation_task, return_exceptions=True)
+
+    predecessor_interaction = predecessor_snapshot.active_interaction
+    if (
+        predecessor_interaction is not None
+        and predecessor_interaction.status == "pending"
+    ):
+        predecessor_snapshot.active_interaction = None
+    predecessor_snapshot.latest_tool_preview = ""
+    predecessor_snapshot.runtime_phase_text = ""
+    predecessor_snapshot.display_status = "completed"
+    predecessor_snapshot.display_status_source = "explicit"
+    card = _render_session_card_for_app(
+        app,
+        predecessor_snapshot,
+        session_key=session_key,
+    )
+    header = card.get("header")
+    title = header.get("title") if isinstance(header, dict) else None
+    if not isinstance(title, dict):
+        title = {"tag": "plain_text", "content": app[CARD_TITLE_KEY]}
+    card["header"] = {
+        "template": "green",
+        "title": title,
+        "subtitle": {"tag": "plain_text", "content": "已转入交互卡片"},
+    }
+    card.setdefault("config", {}).setdefault("summary", {})["content"] = (
+        "已转入交互卡片"
+    )
+    return await _update_card_for_app(
+        app,
+        predecessor_message_id,
+        card,
+        bot_id,
     )
 
 
@@ -5310,17 +5365,32 @@ def _render_session_card(request: web.Request, session: CardSession) -> dict[str
 
 
 def _render_session_card_for_app(
-    app: web.Application, session: CardSession
+    app: web.Application,
+    session: CardSession,
+    *,
+    session_key: str | None = None,
 ) -> dict[str, Any]:
-    return _render_session_card_result_for_app(app, session).card
+    return _render_session_card_result_for_app(
+        app,
+        session,
+        session_key=session_key,
+    ).card
 
 
 def _render_session_card_result_for_app(
-    app: web.Application, session: CardSession
+    app: web.Application,
+    session: CardSession,
+    *,
+    session_key: str | None = None,
 ) -> CardRenderResult:
     footer_fields = _footer_fields_for_session(app, session)
+    resolved_session_key = (
+        session_key
+        if session_key is not None
+        else _session_key_for_session(app, session)
+    )
     card_config = app[SESSION_CARD_CONFIGS_KEY].get(
-        _session_key_for_session(app, session),
+        resolved_session_key,
         {},
     )
     title = card_config.get("title", app[CARD_TITLE_KEY])
@@ -5328,7 +5398,7 @@ def _render_session_card_result_for_app(
         title = app[CARD_TITLE_KEY]
     interaction_mode = _interaction_mode_for_session_key(
         app,
-        _session_key_for_session(app, session),
+        resolved_session_key,
     )
     raw_table_overflow_mode = card_config.get("table_overflow_mode", "compact")
     table_overflow_mode = (
