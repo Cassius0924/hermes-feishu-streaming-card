@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import yaml
 
@@ -15,7 +16,7 @@ def test_github_actions_runs_full_pytest_matrix():
 
     assert "pull_request:" in text
     assert "push:" in text
-    assert 'python-version: ["3.9", "3.12"]' in text
+    assert 'python-version: ["3.9", "3.10", "3.11", "3.12"]' in text
     assert 'python -m pip install -e ".[test]"' in text
     assert "python -m pytest -q" in text
     assert "powershell-installer:" in text
@@ -31,6 +32,10 @@ def test_github_actions_runs_full_pytest_matrix():
     assert "docker compose -f docker-compose.smoke.yml logs" in text
     assert "--no-color setup sidecar gateway" in text
     assert "--abort-on-container-exit" not in text
+    assert "pytest-windows:" in text
+    assert "pytest-macos:" in text
+    assert "runs-on: macos-latest" in text
+    assert text.count("python -m pytest -q") >= 3
 
 
 def test_release_assets_workflow_supports_manual_package_dry_run():
@@ -80,7 +85,7 @@ def test_reusable_ci_checks_out_requested_ref_in_every_job():
         step
         for job in workflow["jobs"].values()
         for step in job.get("steps", [])
-        if step.get("uses") == "actions/checkout@v4"
+        if str(step.get("uses", "")).startswith("actions/checkout@")
     ]
 
     assert checkout_steps
@@ -89,6 +94,66 @@ def test_reusable_ci_checks_out_requested_ref_in_every_job():
         == "${{ inputs.checkout_ref || github.sha }}"
         for step in checkout_steps
     )
+
+
+def test_official_actions_are_sha_pinned_to_node24_capable_releases():
+    expected = {
+        "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/setup-python": "5fda3b95a4ea91299a34e894583c3862153e4b97",
+        "github/codeql-action/init": "5595ccaf912efad79be6eef63a5619ff05969be3",
+        "github/codeql-action/analyze": "5595ccaf912efad79be6eef63a5619ff05969be3",
+    }
+    workflow_paths = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+
+    found = set()
+    for workflow_path in workflow_paths:
+        text = workflow_path.read_text(encoding="utf-8")
+        for action, ref in re.findall(
+            r"uses:\s+([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)@([^\s#]+)",
+            text,
+        ):
+            if action.startswith(("actions/", "github/codeql-action/")):
+                assert ref == expected[action]
+                assert re.fullmatch(r"[0-9a-f]{40}", ref)
+                found.add(action)
+
+    assert found == set(expected)
+
+
+def test_codeql_scans_python_on_push_pull_request_and_schedule():
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "codeql.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert workflow["permissions"] == {
+        "contents": "read",
+        "security-events": "write",
+    }
+    triggers = workflow.get("on", workflow.get(True))
+    assert set(triggers) == {"push", "pull_request", "schedule"}
+    analyze = workflow["jobs"]["analyze"]
+    assert analyze["runs-on"] == "ubuntu-latest"
+    assert analyze["strategy"]["matrix"]["language"] == ["python"]
+    uses = [step.get("uses", "") for step in analyze["steps"]]
+    assert any(value.startswith("github/codeql-action/init@") for value in uses)
+    assert any(value.startswith("github/codeql-action/analyze@") for value in uses)
+
+
+def test_dependabot_updates_pip_and_github_actions_weekly():
+    config = yaml.safe_load(
+        (ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+    )
+
+    assert config["version"] == 2
+    updates = config["updates"]
+    assert {item["package-ecosystem"] for item in updates} == {
+        "pip",
+        "github-actions",
+    }
+    assert all(item["directory"] == "/" for item in updates)
+    assert all(item["schedule"]["interval"] == "weekly" for item in updates)
 
 
 def test_reusable_ci_runs_powershell_installer_tests():

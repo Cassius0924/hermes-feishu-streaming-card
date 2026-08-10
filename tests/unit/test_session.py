@@ -1,5 +1,5 @@
 from hermes_feishu_card.events import SidecarEvent
-from hermes_feishu_card.session import CardSession
+from hermes_feishu_card.session import CardSession, InteractionState
 import pytest
 
 
@@ -488,6 +488,37 @@ def test_session_tracks_pending_and_completed_interaction():
     assert session.active_interaction.choice == "once"
     assert session.active_interaction.choice_label == "允许一次"
     assert session.active_interaction.user_name == "Bailey"
+
+
+def test_interaction_expiry_uses_absolute_sidecar_deadline_and_is_idempotent():
+    interaction = InteractionState(
+        interaction_id="approval-expiry",
+        kind="approval",
+        prompt="允许吗？",
+        timeout_seconds=5.0,
+        requested_at=100.0,
+    )
+
+    assert interaction.expires_at == 105.0
+    assert interaction.is_expired(104.999) is False
+    assert interaction.is_expired(105.0) is True
+    assert interaction.expire(105.0) is True
+    assert interaction.status == "failed"
+    assert interaction.error == "交互已过期"
+    assert interaction.expire(106.0) is False
+
+
+def test_zero_timeout_interaction_expires_immediately():
+    interaction = InteractionState(
+        interaction_id="approval-zero",
+        kind="approval",
+        prompt="允许吗？",
+        timeout_seconds=0.0,
+        requested_at=100.0,
+    )
+
+    assert interaction.expires_at == 100.0
+    assert interaction.is_expired(100.0) is True
 
 
 def test_system_notice_records_and_updates_timeline_entry():

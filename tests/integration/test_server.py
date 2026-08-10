@@ -17,6 +17,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from hermes_feishu_card import hook_runtime
+from hermes_feishu_card import event_auth as event_auth_module
 from hermes_feishu_card import flush as flush_module
 from hermes_feishu_card import server as sidecar_server
 from hermes_feishu_card.bots import RouteResult
@@ -1376,6 +1377,7 @@ async def test_health_reports_healthy_status_and_active_sessions(client):
         "events_ignored": 0,
         "events_rejected": 0,
         "event_auth_rejections": 0,
+        "sidecar_request_auth_rejections": 0,
         "runtime_control_events_received": 0,
         "runtime_control_events_accepted": 0,
         "runtime_control_auth_rejections": 0,
@@ -8105,6 +8107,224 @@ async def test_completed_card_summary_can_be_looked_up_by_feishu_message_id(clie
     assert "source_message_id" not in body
     assert body["summary"] == long_answer[:4000]
     assert len(body["summary"]) == 4000
+
+
+async def test_required_transport_auth_rejects_unsigned_sensitive_routes_before_use():
+    app = create_app(FakeFeishuClient(), event_auth_required=True)
+    app[CARD_SUMMARIES_KEY]["message-1"] = {"summary": "private summary"}
+    app[INTERACTION_RESULTS_KEY]["approval-1"] = {
+        "interaction_id": "approval-1",
+        "status": "completed",
+        "choice": "once",
+        "choice_label": "允许一次",
+    }
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        summary = await test_client.get("/messages/message-1/summary")
+        interaction = await test_client.get("/interactions/approval-1")
+        action = await test_client.post(
+            "/card/actions",
+            data=b"{not-json",
+            headers={"Content-Type": "application/json"},
+        )
+        health = await test_client.get("/health")
+        summary_body = await summary.json()
+        interaction_body = await interaction.json()
+        action_body = await action.json()
+        health_body = await health.json()
+    finally:
+        await test_client.close()
+
+    assert summary.status == 401
+    assert interaction.status == 401
+    assert action.status == 401
+    assert summary_body == {
+        "ok": False,
+        "error": "sidecar request authentication failed",
+    }
+    assert interaction_body == {
+        "ok": False,
+        "error": "sidecar request authentication failed",
+    }
+    assert action_body == {
+        "ok": False,
+        "error": "sidecar request authentication failed",
+    }
+    assert health_body["metrics"]["sidecar_request_auth_rejections"] == 3
+
+
+async def test_required_transport_auth_accepts_signed_sensitive_routes():
+    signer = getattr(event_auth_module, "sign_sidecar_request", None)
+    assert callable(signer)
+
+    app = create_app(FakeFeishuClient(), event_auth_required=True)
+    app[CARD_SUMMARIES_KEY]["message-1"] = {"summary": "private summary"}
+    app[INTERACTION_RESULTS_KEY]["approval-1"] = {
+        "interaction_id": "approval-1",
+        "status": "completed",
+        "choice": "once",
+        "choice_label": "允许一次",
+    }
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        summary_path = "/messages/message-1/summary"
+        summary = await test_client.get(
+            summary_path,
+            headers=signer(TRANSPORT_ROOT_SECRET, "GET", summary_path, b""),
+        )
+        interaction_path = "/interactions/approval-1"
+        interaction = await test_client.get(
+            interaction_path,
+            headers=signer(
+                TRANSPORT_ROOT_SECRET,
+                "GET",
+                interaction_path,
+                b"",
+            ),
+        )
+        action_path = "/card/actions"
+        action_body = json.dumps(
+            {"event": {"action": {"value": {"hfc_action": "interaction.noop"}}}},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        action = await test_client.post(
+            action_path,
+            data=action_body,
+            headers={
+                "Content-Type": "application/json",
+                **signer(
+                    TRANSPORT_ROOT_SECRET,
+                    "POST",
+                    action_path,
+                    action_body,
+                ),
+            },
+        )
+        summary_body = await summary.json()
+        interaction_body = await interaction.json()
+        action_response_body = await action.json()
+    finally:
+        await test_client.close()
+
+    assert summary.status == 200
+    assert summary_body["summary"] == "private summary"
+    assert interaction.status == 200
+    assert interaction_body["choice"] == "once"
+    assert action.status == 200
+    assert action_response_body == {"ok": True}
+
+
+async def test_signed_sensitive_route_uses_raw_encoded_path_for_proof():
+    signer = getattr(event_auth_module, "sign_sidecar_request", None)
+    assert callable(signer)
+
+    app = create_app(FakeFeishuClient(), event_auth_required=True)
+    app[CARD_SUMMARIES_KEY]["message one"] = {"summary": "encoded path"}
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        raw_path = "/messages/message%20one/summary"
+        response = await test_client.get(
+            raw_path,
+            headers=signer(TRANSPORT_ROOT_SECRET, "GET", raw_path, b""),
+        )
+        body = await response.json()
+    finally:
+        await test_client.close()
+
+    assert response.status == 200
+    assert body == {"ok": True, "summary": "encoded path"}
+
+
+async def test_zero_timeout_interaction_rejects_late_choice_and_refreshes_card(client):
+    test_client, feishu_client = client
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    requested = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "approval-expired",
+                "kind": "approval",
+                "prompt": "允许执行吗？",
+                "options": [{"label": "允许一次", "value": "once"}],
+                "timeout_seconds": 0,
+            },
+        ),
+    )
+    assert requested.status == 200
+    waiting_card = feishu_client.sent[-1][1]
+    button = next(
+        element
+        for element in waiting_card["body"]["elements"]
+        if element.get("tag") == "button"
+    )
+    action_value = button["behaviors"][0]["value"]
+
+    callback = await test_client.post(
+        "/card/actions",
+        json={
+            "event": {
+                "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                "context": {"open_chat_id": "oc_abc"},
+                "action": {"value": action_value},
+            }
+        },
+    )
+    callback_body = await callback.json()
+    result = await test_client.get("/interactions/approval-expired")
+    result_body = await result.json()
+    _message_id, expired_card = await wait_for_card_update(feishu_client, "交互已过期")
+
+    assert callback.status == 409
+    assert callback_body["ok"] is False
+    assert callback_body["status"] == "failed"
+    assert callback_body["toast"] == {"type": "warning", "content": "交互已过期"}
+    assert result.status == 200
+    assert result_body["status"] == "failed"
+    assert result_body["error"] == "交互已过期"
+    assert "已选择" not in str(expired_card)
+
+
+async def test_periodic_expiry_marks_pending_result_and_patches_existing_card(client):
+    test_client, feishu_client = client
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "approval-periodic-expiry",
+                "kind": "approval",
+                "prompt": "允许执行吗？",
+                "options": [{"label": "允许一次", "value": "once"}],
+                "timeout_seconds": 300,
+            },
+        ),
+    )
+    session = next(iter(test_client.app[SESSIONS_KEY].values()))
+    assert session.active_interaction is not None
+    session.active_interaction.requested_at = 100.0
+
+    expired = await sidecar_server._expire_pending_interactions(
+        test_client.app,
+        now=400.0,
+    )
+    result = await test_client.get("/interactions/approval-periodic-expiry")
+    result_body = await result.json()
+    _message_id, card = await wait_for_card_update(feishu_client, "交互已过期")
+
+    assert expired == 1
+    assert result_body["status"] == "failed"
+    assert result_body["error"] == "交互已过期"
+    assert "交互已过期" in str(card)
 
 
 async def test_blank_completed_card_summary_is_not_indexed(client):

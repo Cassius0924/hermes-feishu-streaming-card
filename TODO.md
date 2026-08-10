@@ -2,11 +2,20 @@
 
 当前 active runtime 是 `hermes_feishu_card/`。legacy adapter、dual mode、旧 `sidecar/`、旧 `patch/` 和 `installer_v2.py` 不是 active runtime，仅保留作历史参考。
 
-## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3 / V4.2.4 / V4.2.5 / V4.2.6 / V4.2.7 / V4.2.8 / V4.2.9
+## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3 / V4.2.4 / V4.2.5 / V4.2.6 / V4.2.7 / V4.2.8 / V4.2.9 / V4.2.10
 
 详细路线见 [docs/superpowers/specs/2026-06-30-v3-8-design.md](docs/superpowers/specs/2026-06-30-v3-8-design.md) 和 [docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md](docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md)。
 
-### V4.2.9：交互回调与引用摘要热修（发布候选）
+### V4.2.10：sidecar 请求鉴权、交互过期与仓库门禁（发布候选）
+
+- [x] 非回环 sidecar 的 `/card/actions`、`/interactions/{id}` 与 `/messages/{id}/summary` 使用 method/path/body 绑定的独立 HMAC proof。
+- [x] 交互使用 sidecar 绝对截止时间；晚到按钮/表单不能完成，周期清理会标记 failed 并刷新原卡。
+- [x] Gateway poll 超时只发送一次独立 `interaction.failed`，不重放 `interaction.requested`。
+- [x] Ubuntu Python 3.9–3.12、Windows 3.12 与 macOS 3.12 全量 pytest 门禁；保留 Feishu SDK、PowerShell 与 Docker smoke。
+- [x] 官方 Actions 固定到 Node 24 版本的不可变 SHA；新增 CodeQL 与每周 Dependabot。
+- [ ] 完整 pytest、精确 PR merge、detached merge-SHA 复验、public tag/install 与 Release assets。
+
+### V4.2.9：交互回调与引用摘要热修（已发布）
 
 - [x] Issue #197 已完成卡片的引用摘要使用有界真实回答摘录。
 - [x] PR #196 的慢速 slash-confirm 移出飞书 callback deadline，并增加原子 claim 与调度失败回退。
@@ -15,7 +24,7 @@
 - [x] `/events` 单次 POST、Hermes 旧 clarify 签名兼容与日志脱敏完成回归。
 - [x] 完整 pytest、sdist/wheel、隔离 `site-packages` provenance 与 `git diff --check`。
 - [x] PR CI 五项门禁。
-- [ ] exact merge、public tag/install 与 Release assets。
+- [x] exact merge `dc332212c14423abb3b42f524dce46ff0ff28479`、public tag/install 与四个 Release assets。
 
 ### V4.2.8：安装凭据持久化热修（已发布）
 

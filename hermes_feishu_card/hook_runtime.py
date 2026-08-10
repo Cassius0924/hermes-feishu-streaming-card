@@ -35,6 +35,7 @@ from .event_auth import (
     sign_native_handoff_ack_request,
     sign_native_handoff_recovery_request,
     sign_policy_request,
+    sign_sidecar_request,
 )
 from .operations import sign_transport_proof
 from .operations_transport import (
@@ -2455,6 +2456,12 @@ def request_interaction_from_hermes_locals(
                     "interaction poll timeout: "
                     f"{_hfc_log_reference('interaction', interaction_id)}"
                 )
+                _post_interaction_timeout_sync(
+                    local_vars,
+                    config.event_url,
+                    payload,
+                    config.timeout_seconds,
+                )
                 return {
                     "ok": False,
                     "status": "timeout",
@@ -2580,6 +2587,11 @@ async def request_slash_confirm_from_hermes_locals_async(
             if isinstance(result, dict) and result.get("status") == "failed":
                 return None
             if time.monotonic() >= deadline:
+                await _post_interaction_timeout_async(
+                    config.event_url,
+                    payload,
+                    config.timeout_seconds,
+                )
                 return None
             await asyncio.sleep(poll_interval)
     except Exception:
@@ -2762,6 +2774,11 @@ async def _request_command_card_choice_async(
             if isinstance(result, dict) and result.get("status") == "failed":
                 return None
             if time.monotonic() >= deadline:
+                await _post_interaction_timeout_async(
+                    config.event_url,
+                    payload,
+                    config.timeout_seconds,
+                )
                 return None
             await asyncio.sleep(poll_interval)
     except Exception:
@@ -7782,6 +7799,14 @@ def _post_json_sync_response(url: str, payload: dict[str, Any], timeout: float) 
 def _post_headers(url: str, body: bytes) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
     path = parse.urlsplit(url).path.rstrip("/")
+    if _is_sensitive_sidecar_path(path):
+        try:
+            root_secret = read_transport_root_secret()
+            if root_secret is not None:
+                headers.update(sign_sidecar_request(root_secret, "POST", path, body))
+        except Exception:
+            pass
+        return headers
     if not path.endswith(
         (
             "/events",
@@ -7805,6 +7830,29 @@ def _post_headers(url: str, body: bytes) -> dict[str, str]:
     except Exception:
         pass
     return headers
+
+
+def _get_headers(url: str) -> dict[str, str]:
+    headers = {"Accept": "application/json"}
+    path = parse.urlsplit(url).path.rstrip("/")
+    if not _is_sensitive_sidecar_path(path):
+        return headers
+    try:
+        root_secret = read_transport_root_secret()
+        if root_secret is not None:
+            headers.update(sign_sidecar_request(root_secret, "GET", path, b""))
+    except Exception:
+        pass
+    return headers
+
+
+def _is_sensitive_sidecar_path(path: str) -> bool:
+    normalized = str(path or "").rstrip("/")
+    return (
+        normalized.endswith("/card/actions")
+        or "/interactions/" in normalized
+        or ("/messages/" in normalized and normalized.endswith("/summary"))
+    )
 
 
 async def lookup_card_summary(
@@ -7842,7 +7890,7 @@ def _summary_base_url(event_url: str) -> str:
 async def _get_json(url: str, timeout: float) -> Any:
     req = request.Request(
         url,
-        headers={"Accept": "application/json"},
+        headers=_get_headers(url),
         method="GET",
     )
     loop = asyncio.get_running_loop()
@@ -7906,7 +7954,7 @@ def _should_bypass_proxy(url: str) -> bool:
 def _get_json_sync(url: str, timeout: float) -> Any:
     req = request.Request(
         url,
-        headers={"Accept": "application/json"},
+        headers=_get_headers(url),
         method="GET",
     )
     return _open_json_request(req, timeout)
@@ -8122,6 +8170,69 @@ def _interaction_timeout(value: float | None) -> float:
     if env_value is not None and env_value >= 0:
         return env_value
     return 300.0
+
+
+def _interaction_timeout_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    failed = dict(payload)
+    sequence_id = str(
+        payload.get("turn_id") or payload.get("message_id") or ""
+    ).strip()
+    if sequence_id:
+        failed["sequence"] = _next_sequence(sequence_id)
+    else:
+        try:
+            failed["sequence"] = int(payload.get("sequence", 0)) + 1
+        except (TypeError, ValueError):
+            failed["sequence"] = 1
+    failed["event"] = "interaction.failed"
+    failed["created_at"] = time.time()
+    source_data = payload.get("data")
+    data = {
+        "interaction_id": (
+            str(source_data.get("interaction_id") or "").strip()
+            if isinstance(source_data, dict)
+            else ""
+        ),
+        "error": "交互已过期",
+    }
+    if isinstance(source_data, dict):
+        profile_id = str(source_data.get("profile_id") or "").strip()
+        if profile_id:
+            data["profile_id"] = profile_id
+    failed["data"] = data
+    return failed
+
+
+def _post_interaction_timeout_sync(
+    local_vars: dict[str, Any],
+    event_url: str,
+    payload: dict[str, Any],
+    timeout: float,
+) -> None:
+    try:
+        _post_interaction_event(
+            local_vars,
+            event_url,
+            _interaction_timeout_payload(payload),
+            timeout,
+        )
+    except Exception:
+        return
+
+
+async def _post_interaction_timeout_async(
+    event_url: str,
+    payload: dict[str, Any],
+    timeout: float,
+) -> None:
+    try:
+        await _post_json_ordered_response(
+            event_url,
+            _interaction_timeout_payload(payload),
+            timeout,
+        )
+    except Exception:
+        return
 
 
 def _interaction_poll_interval(value: float | None) -> float:

@@ -38,6 +38,8 @@ from .event_auth import (
     NativeHandoffRecoveryProofVerifier,
     PolicyAuthenticationError,
     PolicyProofVerifier,
+    SidecarRequestAuthenticationError,
+    SidecarRequestProofVerifier,
     is_loopback_host,
 )
 from .flush import FlushController
@@ -142,6 +144,9 @@ METRICS_KEY = web.AppKey("metrics", SidecarMetrics)
 NOOP_MODE_KEY = web.AppKey("noop_mode", bool)
 EVENT_AUTH_REQUIRED_KEY = web.AppKey("event_auth_required", bool)
 EVENT_AUTH_VERIFIER_KEY = web.AppKey("event_auth_verifier", EventProofVerifier)
+SIDECAR_REQUEST_AUTH_VERIFIER_KEY = web.AppKey(
+    "sidecar_request_auth_verifier", SidecarRequestProofVerifier
+)
 RUNTIME_AUTH_VERIFIER_KEY = web.AppKey("runtime_auth_verifier", RuntimeProofVerifier)
 RUNTIME_INTEGRITY_SUPERVISOR_KEY = web.AppKey(
     "runtime_integrity_supervisor", RuntimeIntegritySupervisor
@@ -328,6 +333,9 @@ def create_app(
     app[EVENT_AUTH_REQUIRED_KEY] = bool(event_auth_required)
     if event_auth_required:
         app[EVENT_AUTH_VERIFIER_KEY] = EventProofVerifier(
+            operations_transport_root_secret
+        )
+        app[SIDECAR_REQUEST_AUTH_VERIFIER_KEY] = SidecarRequestProofVerifier(
             operations_transport_root_secret
         )
     runtime_supervisor = RuntimeIntegritySupervisor(
@@ -547,7 +555,9 @@ async def _stop_operations_diagnostics(app: web.Application) -> None:
 async def _runtime_cleanup_loop(app: web.Application) -> None:
     while True:
         await _cleanup_sleep(RUNTIME_CLEANUP_INTERVAL_SECONDS)
-        cleanup_runtime_state(app, time.time())
+        now = time.time()
+        await _expire_pending_interactions(app, now=now)
+        cleanup_runtime_state(app, now)
 
 
 async def _cleanup_sleep(delay: float) -> None:
@@ -688,6 +698,9 @@ def _safe_native_handoff_diagnostics(app: web.Application) -> dict[str, Any]:
 
 
 async def _message_summary(request: web.Request) -> web.Response:
+    auth_failure = await _authenticate_sensitive_request(request)
+    if auth_failure is not None:
+        return auth_failure
     summaries: Dict[str, dict[str, Any]] = request.app[CARD_SUMMARIES_KEY]
     summary = summaries.get(request.match_info["message_id"])
     if summary is None:
@@ -696,14 +709,30 @@ async def _message_summary(request: web.Request) -> web.Response:
 
 
 async def _interaction_result(request: web.Request) -> web.Response:
+    auth_failure = await _authenticate_sensitive_request(request)
+    if auth_failure is not None:
+        return auth_failure
+    interaction_id = request.match_info["interaction_id"]
+    owner_key = request.app[INTERACTION_RESULT_SESSION_KEYS_KEY].get(interaction_id)
+    owner = request.app[SESSIONS_KEY].get(owner_key) if owner_key is not None else None
+    if owner_key is not None and owner is not None:
+        await _expire_pending_interaction(
+            request.app,
+            str(owner_key),
+            owner,
+            now=time.time(),
+        )
     results: Dict[str, dict[str, Any]] = request.app[INTERACTION_RESULTS_KEY]
-    result = results.get(request.match_info["interaction_id"])
+    result = results.get(interaction_id)
     if result is None:
         return web.json_response({"ok": False, "error": "not found"}, status=404)
     return web.json_response({"ok": True, **result})
 
 
 async def _card_actions(request: web.Request) -> web.Response:
+    auth_failure = await _authenticate_sensitive_request(request)
+    if auth_failure is not None:
+        return auth_failure
     try:
         payload = await request.json()
     except ValueError:
@@ -740,6 +769,28 @@ async def _card_actions(request: web.Request) -> web.Response:
                 form_callback_token=callback_token,
             )
     return await _interaction_action(request, payload, value)
+
+
+async def _authenticate_sensitive_request(
+    request: web.Request,
+) -> web.Response | None:
+    if not request.app[EVENT_AUTH_REQUIRED_KEY]:
+        return None
+    body = await request.read()
+    try:
+        request.app[SIDECAR_REQUEST_AUTH_VERIFIER_KEY].verify(
+            request.headers,
+            request.method,
+            request.raw_path.split("?", 1)[0],
+            body,
+        )
+    except SidecarRequestAuthenticationError:
+        request.app[METRICS_KEY].sidecar_request_auth_rejections += 1
+        return web.json_response(
+            {"ok": False, "error": "sidecar request authentication failed"},
+            status=401,
+        )
+    return None
 
 
 def _parse_form_action_name(payload: dict[str, Any]) -> tuple[str, str] | None:
@@ -878,10 +929,77 @@ async def _interaction_action(
 
     message_locks: Dict[str, asyncio.Lock] = request.app[MESSAGE_LOCKS_KEY]
     lock = message_locks.setdefault(session_key, asyncio.Lock())
+    expired_card: dict[str, Any] | None = None
+    expired_interaction = None
+    expiry_sequence = -1
     async with lock:
-        response, post_lock_task = await _apply_event_locked(request, event)
+        current_session = request.app[SESSIONS_KEY].get(session_key)
+        current_interaction = (
+            current_session.active_interaction
+            if current_session is session
+            else None
+        )
+        if (
+            current_interaction is None
+            or current_interaction.interaction_id != interaction_id
+            or current_interaction.callback_token != token
+            or current_session.chat_id != callback_chat_id
+        ):
+            return web.json_response(
+                {"ok": False, "error": "interaction not found"},
+                status=404,
+            )
+        expired_at = time.time()
+        if current_interaction.expire(expired_at):
+            _mark_interaction_expired_locked(
+                request.app,
+                session_key,
+                session,
+                now=expired_at,
+            )
+            expired_card = _render_session_card(request, session)
+            expired_interaction = current_interaction
+            expiry_sequence = session.last_sequence
+            response = None
+            post_lock_task = None
+        elif current_interaction.status == "failed":
+            expired_card = _render_session_card(request, session)
+            expired_interaction = current_interaction
+            expiry_sequence = session.last_sequence
+            response = None
+            post_lock_task = None
+        elif current_interaction.status != "pending":
+            return web.json_response(
+                {"ok": False, "error": "interaction already completed"},
+                status=409,
+            )
+        else:
+            event = replace(
+                event,
+                sequence=current_session.last_sequence + 1,
+                created_at=time.time(),
+            )
+            response, post_lock_task = await _apply_event_locked(request, event)
+    if expired_card is not None:
+        feishu_message_id = request.app[FEISHU_MESSAGE_IDS_KEY].get(session_key)
+        if feishu_message_id:
+            await _update_card_for_app(
+                request.app,
+                feishu_message_id,
+                expired_card,
+                request.app[MESSAGE_BOT_IDS_KEY].get(session_key),
+                is_current=lambda: (
+                    request.app[SESSIONS_KEY].get(session_key) is session
+                    and session.active_interaction is expired_interaction
+                    and expired_interaction is not None
+                    and expired_interaction.status == "failed"
+                    and session.last_sequence == expiry_sequence
+                ),
+            )
+        return _expired_interaction_response(expired_card)
     if post_lock_task is not None:
         await post_lock_task
+    assert response is not None
     if response.status >= 400:
         return response
     return web.json_response(
@@ -4369,6 +4487,18 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
         if event_is_terminal or event.event == "interaction.requested"
         else None
     )
+    active_interaction = session.active_interaction
+    interaction_checked_at = time.time()
+    if (
+        active_interaction is not None
+        and active_interaction.expire(interaction_checked_at)
+    ):
+        _mark_interaction_expired_locked(
+            request.app,
+            session_key,
+            session,
+            now=interaction_checked_at,
+        )
     applied = session.apply(event)
     if applied:
         _refresh_session_display_status(request, session)
@@ -4808,15 +4938,104 @@ def _store_interaction_result(app: web.Application, session: CardSession) -> Non
     interaction = session.active_interaction
     if interaction is None:
         return
-    app[INTERACTION_RESULTS_KEY][interaction.interaction_id] = {
+    result = {
         "interaction_id": interaction.interaction_id,
         "status": interaction.status,
         "choice": interaction.choice,
         "choice_label": interaction.choice_label,
     }
+    if interaction.error:
+        result["error"] = interaction.error
+    app[INTERACTION_RESULTS_KEY][interaction.interaction_id] = result
     app[INTERACTION_RESULT_SESSION_KEYS_KEY][interaction.interaction_id] = (
         _session_key_for_session(app, session)
     )
+
+
+def _mark_interaction_expired_locked(
+    app: web.Application,
+    session_key: str,
+    session: CardSession,
+    *,
+    now: float,
+) -> None:
+    session.updated_at = now
+    card_config = app[SESSION_CARD_CONFIGS_KEY].get(session_key, {})
+    session.refresh_display_status_source(
+        StatusConfig.from_mapping(card_config.get("status"))
+    )
+    _store_interaction_result(app, session)
+
+
+def _expired_interaction_response(card: dict[str, Any]) -> web.Response:
+    return web.json_response(
+        {
+            "ok": False,
+            "status": "failed",
+            "error": "interaction expired",
+            "toast": {"type": "warning", "content": "交互已过期"},
+            "card": card,
+        },
+        status=409,
+    )
+
+
+async def _expire_pending_interaction(
+    app: web.Application,
+    session_key: str,
+    session: CardSession,
+    *,
+    now: float,
+) -> bool:
+    lock = app[MESSAGE_LOCKS_KEY].setdefault(session_key, asyncio.Lock())
+    expired_card: dict[str, Any] | None = None
+    async with lock:
+        if app[SESSIONS_KEY].get(session_key) is not session:
+            return False
+        interaction = session.active_interaction
+        if interaction is None or not interaction.expire(now):
+            return False
+        _mark_interaction_expired_locked(
+            app,
+            session_key,
+            session,
+            now=now,
+        )
+        expired_card = _render_session_card_for_app(app, session)
+        expired_interaction = interaction
+        expiry_sequence = session.last_sequence
+    feishu_message_id = app[FEISHU_MESSAGE_IDS_KEY].get(session_key)
+    if feishu_message_id and expired_card is not None:
+        await _update_card_for_app(
+            app,
+            feishu_message_id,
+            expired_card,
+            app[MESSAGE_BOT_IDS_KEY].get(session_key),
+            is_current=lambda: (
+                app[SESSIONS_KEY].get(session_key) is session
+                and session.active_interaction is expired_interaction
+                and expired_interaction.status == "failed"
+                and session.last_sequence == expiry_sequence
+            ),
+        )
+    return True
+
+
+async def _expire_pending_interactions(
+    app: web.Application,
+    *,
+    now: float,
+) -> int:
+    expired = 0
+    for session_key, session in tuple(app[SESSIONS_KEY].items()):
+        if await _expire_pending_interaction(
+            app,
+            str(session_key),
+            session,
+            now=now,
+        ):
+            expired += 1
+    return expired
 
 
 def _extract_action_value(payload: dict[str, Any]) -> dict[str, Any]:

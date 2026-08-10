@@ -1132,6 +1132,25 @@ def test_footer_still_static_for_failed():
     assert _render_footer(session) == "已停止"
 
 
+def test_waiting_footer_uses_absolute_remaining_deadline(monkeypatch):
+    from hermes_feishu_card import render as render_module
+    from hermes_feishu_card.render import _render_footer
+
+    session = CardSession(conversation_id="c", message_id="m", chat_id="c")
+    session.active_interaction = InteractionState(
+        interaction_id="approval-1",
+        kind="approval",
+        prompt="允许吗？",
+        timeout_seconds=120.0,
+        requested_at=100.0,
+    )
+    monkeypatch.setattr(render_module._time, "time", lambda: 160.0)
+
+    assert _render_footer(session, display_status="waiting") == (
+        "等待选择 · ⏳ 1 分钟后过期"
+    )
+
+
 def test_render_card_compacts_tables_over_limit_by_default_without_losing_prose():
     from hermes_feishu_card.session import CardSession
     from hermes_feishu_card.render import render_card

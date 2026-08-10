@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.2.10 — 2026-08-10
+
+See also: [docs/release-notes-v4.2.10.md](docs/release-notes-v4.2.10.md)
+
+### Added
+- Non-loopback sidecar callbacks and result reads use a domain-separated HMAC proof that binds the HTTP method, canonical path, and raw body.
+- Interaction state records an absolute sidecar-owned deadline and the cleanup loop expires stale pending interactions before normal retention cleanup.
+- CI runs full pytest on Ubuntu Python 3.9–3.12, Windows 3.12, and macOS 3.12; CodeQL and weekly Dependabot configuration are included.
+
+### Fixed
+- Late direct buttons and clarify form submits can no longer complete an expired interaction; the original card is refreshed with an expired result.
+- Gateway poll timeout sends one distinct `interaction.failed` event and never replays the original `interaction.requested`.
+- Official GitHub Actions are pinned to immutable Node 24-capable release SHAs, removing the Node 20 deprecation path.
+
+### Safety
+- Missing, expired, cross-method, cross-path, cross-body, and replayed sidecar proofs fail closed with a generic response and bounded rejection metric.
+- Default loopback deployments remain compatible, and callback token/chat checks remain defense in depth.
+
 ## V4.2.9 — 2026-08-09
 
 See also: [docs/release-notes-v4.2.9.md](docs/release-notes-v4.2.9.md)

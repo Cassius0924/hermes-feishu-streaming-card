@@ -46,6 +46,15 @@ python -m pytest -q
 git diff --check
 ```
 
+PR 与 tag gate 还必须等待以下仓库门禁全部通过：
+
+- Ubuntu 上 Python 3.9、3.10、3.11、3.12 全量 pytest。
+- Windows 3.12 与 macOS 3.12 全量 pytest。
+- Feishu SDK compatibility、PowerShell installer 与 Docker Compose runtime smoke。
+- CodeQL Python analysis。
+
+官方 GitHub Actions 必须固定到核验过的 40 位 commit SHA，并在旁注保留对应 release tag；升级前读取官方 `action.yml` 确认 runtime，不凭 major tag 推断 Node 版本。Dependabot 的 pip 与 GitHub Actions weekly PR 是维护输入，不替代上述 release gate。
+
 如果使用 `uv run --extra test pytest -q`，测试后删除临时 `uv.lock`，除非项目明确决定开始提交 lockfile。
 
 ## 提交和 tag
@@ -61,6 +70,8 @@ git push origin refs/tags/vX.Y.Z
 `vX.Y.Z` 必须是 annotated tag，并且只在合并 SHA 的精确测试和 provenance 验证完成后创建。发布审批只创建并推送 tag，绝不由 release gate 推送 main。
 
 Release Assets 只接受完整的 `refs/tags/vMAJOR.MINOR.PATCH` 输入。resolver 会把 annotated tag peel 到一个精确 commit，reusable 跨平台 tests 全部 checkout 该 exact commit；package job 在构建前重新 fetch 并执行 full verification，上传前再完整复验同一 tag/commit。任何 lightweight tag、tag 移动、metadata 不一致、非 `origin/main` 祖先或测试失败都会在资产上传前终止。
+
+main 应启用 PR-only branch protection，并要求 tests 与 CodeQL 的实际 check contexts；先让新 workflow 在 main/PR 上真实出现，再设置 required checks，不能预填尚未产生的 context。Dependabot vulnerability alerts/security updates 与 CodeQL 可在发布后启用；Secret Scanning 告警必须按维护者的单独裁决处理，不得在普通发版流程中自动 dismiss、rotate 或改写。
 
 ## GitHub Release
 

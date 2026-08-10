@@ -31,10 +31,11 @@ def session_cleanup_reason(
     policy: CleanupPolicy,
 ) -> str | None:
     interaction = session.active_interaction
-    interaction_active = interaction is not None and interaction.status not in {
-        "completed",
-        "failed",
-    }
+    interaction_active = (
+        interaction is not None
+        and interaction.status not in {"completed", "failed"}
+        and not interaction.is_expired(now)
+    )
     if interaction_active or has_inflight_send:
         return None
 
