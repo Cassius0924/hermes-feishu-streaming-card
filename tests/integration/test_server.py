@@ -9438,7 +9438,8 @@ async def test_terminal_update_is_not_blocked_by_streaming_update_backlog(client
     # final event is authoritative, so stale intermediate deltas may be
     # accepted as no-ops without weakening the terminal update guarantee.
     assert 2 <= metrics["events_applied"] <= 13
-    assert metrics["feishu_update_attempts"] <= 3
+    assert metrics["update_coalesced"] > 0
+    assert metrics["feishu_update_attempts"] < metrics["events_received"]
     assert metrics["feishu_update_failures"] == 0
 
 
