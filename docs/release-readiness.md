@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.2.11`。本轮修复 Issue #202：新交互卡成功发送后，旧流式卡冻结为绿色“已转入交互卡片”只读快照，保留可见内容与工具历史并移除 pending 控件；旧卡 PATCH 失败保持 fail-open。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.2.12`。本轮让 approval 卡按 Hermes `smart_denied`、`allow_session`、`allow_permanent` 能力生成固定选项，并在 hook、event、session、renderer 与 sidecar 回调边界显式传播/校验 `allow_custom_input`；启用 reasoning timeline 时，零工具调用卡片在整个生命周期保持稳定折叠入口。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -146,6 +146,16 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.2.12 发布门禁
+
+- PR #206 的 approval capability matrix 覆盖默认、`allow_permanent=false`、`allow_session=false` 与 `smart_denied=true`；approval 默认只接受当前卡声明的协议选项，clarify 继续支持自定义输入。
+- sidecar 拒绝伪造固定选项、approval 自定义 form 与 truthy-string capability；拒绝后 interaction 保持 pending，token/chat/operator/expiry/idempotency 不变。
+- PR #205 在 reasoning timeline 启用时为零工具运行、完成和失败卡保留同款折叠条与明确空状态；`show_reasoning=false` 保留普通 tool summary，raw thinking 不公开。
+- 两个 PR 更新到同一 main 后的 GitHub 多平台 CI：**已通过**；合并后 runtime 基线完整 pytest：**`2481 passed, 6 skipped`**。
+- v4.2.12 发布候选门禁：docs/package **`94 passed`**、聚焦矩阵 **`830 passed`**、完整 pytest **`2481 passed, 6 skipped`**；sdist/wheel、干净 venv `site-packages` provenance、CLI help 与 `git diff --check`：**已通过**。
+- 本轮不额外发送真实飞书测试消息；PR #205 的真实飞书结果属于贡献者证据，PR #206 与组合结果以自动化、独立攻击测试和多平台 CI 为门禁，不写成维护者真实客户端复测。
+- exact merge SHA、annotated tag、public tag/install 与 Release assets：**发布流程中逐项记录**。
 
 ## V4.2.11 发布门禁
 

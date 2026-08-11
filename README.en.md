@@ -139,9 +139,7 @@ The compatibility matrix covers older Hermes starting at `v2026.4.23` and Hermes
 For an existing Hermes container:
 
 ```bash
-export FEISHU_APP_ID=cli_xxx
-export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.11
+export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.2.12
 bash install-docker.sh
 ```
 
@@ -180,6 +178,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ## Latest Releases
 | Version | Highlights |
 |---|---|
+| [v4.2.12](docs/release-notes-v4.2.12.en.md) | Makes approval cards follow Hermes capabilities and reject undeclared input, while zero-tool cards retain a stable collapsed timeline whenever reasoning display is enabled |
 | [v4.2.11](docs/release-notes-v4.2.11.en.md) | Fixes Issue #202 by freezing each superseded streaming card as a green “moved to the interaction card” history snapshot after replacement delivery; predecessor PATCH failure remains fail-open and only the newest card receives choices and later updates |
 | [v4.2.10](docs/release-notes-v4.2.10.en.md) | Authenticates non-loopback sidecar callbacks and result reads with method/path/body-bound HMAC, enforces absolute interaction expiry with late-button/form rejection and same-card refresh, and adds cross-platform CI, CodeQL, Dependabot, and Node 24 Action SHA gates; see [v4.2.9](docs/release-notes-v4.2.9.en.md) for the preceding release |
 | [v4.2.8](docs/release-notes-v4.2.8.en.md) | Fixes the installer contract so `install.sh`, `install-docker.sh`, and `install.ps1` persist process-supplied Feishu credentials into the private `.env` instead of using them only for the current process |

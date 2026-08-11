@@ -500,14 +500,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.2.11`.
+The Compose example defaults `HFC_VERSION` to `v4.2.12`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.11
+export HFC_VERSION=v4.2.12
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -750,6 +750,7 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.2.12](release-notes-v4.2.12.en.md) | 2026-08-11 | Capability-aware approval cards with server-side choice validation, plus a stable zero-tool reasoning timeline |
 | [v4.2.11](release-notes-v4.2.11.en.md) | 2026-08-10 | Issue #202 freezes superseded interaction cards as “moved to the interaction card” history snapshots while preserving content, tool history, and fail-open PATCH behavior |
 | [v4.2.10](release-notes-v4.2.10.en.md) | 2026-08-10 | Non-loopback sidecar HMAC, absolute interaction expiry and late-callback rejection, plus cross-platform CI, CodeQL, Dependabot, and immutable Action pins |
 | [v4.2.9](release-notes-v4.2.9.en.md) | 2026-08-09 | Issue #197 answer-backed quote summaries, PR #196 non-blocking slash confirmations, and PR #199 authenticated multi-select/custom-answer forms |
