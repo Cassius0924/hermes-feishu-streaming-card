@@ -457,6 +457,7 @@ def test_session_tracks_pending_and_completed_interaction():
                 "kind": "approval",
                 "prompt": "允许执行命令吗？",
                 "description": "rm -rf /tmp/demo",
+                "allow_custom_input": False,
                 "options": [
                     {"label": "允许一次", "value": "once"},
                     {"label": "拒绝", "value": "deny", "style": "danger"},
@@ -469,6 +470,7 @@ def test_session_tracks_pending_and_completed_interaction():
     assert session.active_interaction.interaction_id == "approval-1"
     assert session.active_interaction.status == "pending"
     assert session.active_interaction.options[0].value == "once"
+    assert session.active_interaction.allow_custom_input is False
 
     assert session.apply(
         event(

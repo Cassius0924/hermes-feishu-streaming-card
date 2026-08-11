@@ -2332,7 +2332,10 @@ def build_interaction_event(
     timeout_seconds: float | None = None,
     fallback_policy: str = "",
     multi_select: bool = False,
+    allow_custom_input: bool | None = None,
 ) -> dict[str, Any] | None:
+    if allow_custom_input is None:
+        allow_custom_input = kind == "clarify"
     event_locals = {
         **local_vars,
         "_hfc_interaction_id": interaction_id,
@@ -2343,6 +2346,7 @@ def build_interaction_event(
         "_hfc_interaction_timeout_seconds": timeout_seconds,
         "_hfc_interaction_fallback_policy": fallback_policy,
         "_hfc_interaction_multi_select": bool(multi_select),
+        "_hfc_interaction_allow_custom_input": bool(allow_custom_input),
     }
     return build_event("interaction.requested", event_locals)
 
@@ -2358,6 +2362,7 @@ def request_interaction_from_hermes_locals(
     timeout_seconds: float | None = None,
     poll_interval_seconds: float | None = None,
     multi_select: bool = False,
+    allow_custom_input: bool | None = None,
 ) -> dict[str, Any] | None:
     try:
         config = load_runtime_config()
@@ -2383,6 +2388,7 @@ def request_interaction_from_hermes_locals(
             description=description,
             timeout_seconds=timeout_seconds,
             multi_select=multi_select,
+            allow_custom_input=allow_custom_input,
         )
         if payload is None:
             _hfc_warn(
@@ -7283,23 +7289,32 @@ def request_approval_choice_from_hermes_locals(
 ) -> str | None:
     command = str(approval_data.get("command") or "").strip()
     description = str(approval_data.get("description") or "dangerous command").strip()
+    smart_denied = approval_data.get("smart_denied") is True
+    allow_session = approval_data.get("allow_session", True) is not False
+    allow_permanent = approval_data.get("allow_permanent", True) is not False
+    allow_custom_input = approval_data.get("allow_custom_input") is True
+    options = [{"label": "允许一次", "value": "once", "style": "primary"}]
+    if not smart_denied and allow_session:
+        options.append({"label": "本会话允许", "value": "session"})
+        if allow_permanent:
+            options.append({"label": "始终允许", "value": "always"})
+    options.append({"label": "拒绝", "value": "deny", "style": "danger"})
     result = request_interaction_from_hermes_locals(
         local_vars,
         kind="approval",
         interaction_id=interaction_id,
         prompt="需要授权后继续执行",
         description=f"```\n{command[:3000]}\n```\n\n{description}",
-        options=[
-            {"label": "允许一次", "value": "once", "style": "primary"},
-            {"label": "本会话允许", "value": "session"},
-            {"label": "始终允许", "value": "always"},
-            {"label": "拒绝", "value": "deny", "style": "danger"},
-        ],
+        options=options,
         timeout_seconds=timeout_seconds,
+        allow_custom_input=allow_custom_input,
     )
     if isinstance(result, dict) and result.get("status") == "completed":
         choice = str(result.get("choice") or "").strip()
-        return choice or None
+        allowed_choices = {str(option["value"]) for option in options}
+        if allow_custom_input:
+            return choice or None
+        return choice if choice in allowed_choices else None
     return None
 
 
@@ -7601,6 +7616,7 @@ def request_clarify_response_from_hermes_locals(
         options=options,
         timeout_seconds=_interaction_timeout(timeout_seconds),
         multi_select=multi_select,
+        allow_custom_input=True,
     )
     if isinstance(result, dict) and result.get("status") == "completed":
         choice = str(result.get("choice") or "").strip()
@@ -8525,6 +8541,11 @@ def _event_data(
         if multi_select_value is None:
             multi_select_value = local_vars.get("multi_select")
         data["multi_select"] = bool(multi_select_value)
+        allow_custom_input = local_vars.get("_hfc_interaction_allow_custom_input")
+        if allow_custom_input is None:
+            allow_custom_input = local_vars.get("allow_custom_input")
+        if isinstance(allow_custom_input, bool):
+            data["allow_custom_input"] = allow_custom_input
         timeout_value = _finite_float(local_vars.get("_hfc_interaction_timeout_seconds"))
         if timeout_value is not None:
             data["timeout_seconds"] = timeout_value

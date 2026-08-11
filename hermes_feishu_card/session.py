@@ -59,6 +59,7 @@ class InteractionState:
     options: list[InteractionOption] = field(default_factory=list)
     callback_token: str = ""
     multi_select: bool = False
+    allow_custom_input: bool = False
     timeout_seconds: float = 300.0
     requested_at: float = field(default_factory=_now)
     choice: str = ""
@@ -419,14 +420,22 @@ def _interaction_from_event_data(data: dict[str, Any]) -> InteractionState:
     interaction_id = str(data.get("interaction_id") or "").strip()
     if not interaction_id:
         interaction_id = secrets.token_hex(8)
+    kind = str(data.get("kind") or "choice").strip() or "choice"
+    allow_custom_input = data.get("allow_custom_input")
+    if not isinstance(allow_custom_input, bool):
+        # Backward compatibility for interaction events emitted before the
+        # capability became explicit. Hermes clarify has always exposed an
+        # Other/free-text path; fixed-choice interactions have not.
+        allow_custom_input = kind == "clarify"
     return InteractionState(
         interaction_id=interaction_id,
-        kind=str(data.get("kind") or "choice").strip() or "choice",
+        kind=kind,
         prompt=str(data.get("prompt") or "").strip(),
         description=str(data.get("description") or "").strip(),
         options=_interaction_options(data.get("options")),
         callback_token=str(data.get("callback_token") or secrets.token_urlsafe(16)),
         multi_select=bool(data.get("multi_select", False)),
+        allow_custom_input=allow_custom_input,
         timeout_seconds=_safe_timeout_seconds(data.get("timeout_seconds")),
     )
 

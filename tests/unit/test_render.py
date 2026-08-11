@@ -521,6 +521,7 @@ def test_render_pending_interaction_as_buttons():
                 "kind": "approval",
                 "prompt": "允许执行命令吗？",
                 "description": "rm -rf /tmp/demo",
+                "allow_custom_input": False,
                 "options": [
                     {"label": "允许一次", "value": "once", "style": "primary"},
                     {"label": "拒绝", "value": "deny", "style": "danger"},
@@ -543,6 +544,41 @@ def test_render_pending_interaction_as_buttons():
     assert buttons[0]["behaviors"][0]["value"]["token"]
     assert "interaction_actions" not in str(card)
     assert "rm -rf /tmp/demo" in str(card)
+    assert "hfc_other" not in str(card)
+    assert "自定义" not in str(card)
+
+
+def test_render_clarify_custom_input_only_when_capability_is_enabled():
+    from hermes_feishu_card.events import SidecarEvent
+
+    session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
+    session.apply(
+        SidecarEvent(
+            schema_version="1",
+            event="interaction.requested",
+            conversation_id="chat-1",
+            message_id="msg-1",
+            chat_id="oc_abc",
+            platform="feishu",
+            sequence=1,
+            created_at=0.0,
+            data={
+                "interaction_id": "clarify-1",
+                "kind": "clarify",
+                "prompt": "请选择处理方式",
+                "allow_custom_input": True,
+                "options": [
+                    {"label": "继续", "value": "continue"},
+                    {"label": "取消", "value": "cancel"},
+                ],
+            },
+        )
+    )
+
+    card = render_card(session)
+
+    assert "hfc_other" in str(card)
+    assert "输入自定义内容" in str(card)
 
 
 def test_render_pending_interaction_as_text_choices_for_localhost_mode():
