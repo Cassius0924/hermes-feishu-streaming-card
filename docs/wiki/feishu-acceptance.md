@@ -2,6 +2,14 @@
 
 自动化测试不能完全证明 Feishu/Lark 客户端体验。涉及卡片 UX、topic、系统提示、命令卡片的版本，发布前需要真实飞书 smoke。
 
+## V4.2.12 审批能力与零工具时间线验收
+
+- approval 默认不显示或接受“其他”自定义输入；选项严格跟随 `smart_denied`、`allow_session`、`allow_permanent`，伪造固定值或 form input 返回拒绝且原 interaction 保持 pending。
+- clarify 单选、多选与“其他”自定义答案继续可用；旧事件缺少 `allow_custom_input` 时仅 `kind=clarify` 兼容启用自定义输入，truthy string 不提升权限。
+- 启用 reasoning timeline 时，无工具的初始加载态显示“等待工具事件…”，完成/失败态显示“暂无可展示的思考或工具记录。”，折叠 Header 始终为 0 次工具调用。
+- `show_reasoning=false` 时不显示折叠 timeline，继续使用普通 tool summary；raw `thinking.delta` 不进入任何可见空状态。
+- 本轮维护者不额外发送真实飞书测试消息。PR #205 描述中的真实飞书安装验收作为贡献者证据保留；PR #206 与两项组合结果由本地独立攻击测试、完整 pytest 和 GitHub 多平台 CI 覆盖，不把这些自动化写成维护者真实客户端复测。
+
 ## V4.2.11 旧交互卡接力快照验收
 
 - 在一张仍显示 clarify 或运行中工具 Header 的流式卡上触发 `interaction.requested`；新卡必须出现在聊天底部并保持按钮可用，旧卡必须变为绿色“已转入交互卡片”。

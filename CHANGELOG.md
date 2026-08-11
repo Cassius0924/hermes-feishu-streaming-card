@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.2.12 — 2026-08-11
+
+See also: [docs/release-notes-v4.2.12.md](docs/release-notes-v4.2.12.md)
+
+### Added
+- PR #206: approval cards derive their available choices from Hermes `smart_denied`, `allow_session`, and `allow_permanent` capabilities, while `allow_custom_input` explicitly separates approval from clarify input semantics.
+- PR #205: when reasoning display is enabled, zero-tool cards keep the same collapsed “思考与工具 · 0 次工具调用” timeline throughout running, completed, and failed states.
+
+### Safety
+- Approval cards default to protocol-defined choices only. The sidecar rejects forged choice values and custom form input unless the active interaction explicitly allows custom input; callback token, chat/operator binding, expiry, and idempotency remain unchanged.
+- Clarify keeps single-select, multi-select, and custom “Other” answers. Hidden raw thinking remains hidden, and `show_reasoning: false` keeps the compact non-timeline fallback.
+- This release does not modify the archived `legacy/` runtime or expand Hermes patch ownership.
+
+### Credits
+- Thanks @Cassius0924 for both PR #205 and PR #206.
+
 ## V4.2.11 — 2026-08-10
 
 See also: [docs/release-notes-v4.2.11.md](docs/release-notes-v4.2.11.md)

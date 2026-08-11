@@ -74,6 +74,9 @@ choice requests at the latest chat position, preserves a substantial streamed
 answer before a short terminal postscript, and repairs bare Feishu `/update`
 for standard venv symlinks, slow Git fetches, and Hermes 0.20 version reporting.
 
+V4.2.12 makes approval cards follow Hermes' declared approval capabilities,
+rejects undeclared custom input at the sidecar boundary, and keeps a stable
+collapsed timeline on zero-tool cards when reasoning display is enabled.
 V4.2.11 freezes superseded streaming cards as read-only interaction handoff
 snapshots while the newest interaction card remains authoritative. V4.2.10
 authenticates non-loopback sidecar callbacks and result reads, enforces
@@ -314,7 +317,7 @@ a privileged container, or mount host system-service directories.
 ```
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.11
+export HFC_VERSION=v4.2.12
 bash install-docker.sh
 ```
 

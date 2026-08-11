@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.2.11`. This cycle fixes Issue #202: after replacement delivery succeeds, each superseded streaming card becomes a green read-only “moved to the interaction card” snapshot that preserves visible content and tool history without pending controls; predecessor PATCH failure remains fail-open. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.2.12`. This cycle derives approval-card choices from Hermes `smart_denied`, `allow_session`, and `allow_permanent` capabilities and carries an explicit `allow_custom_input` contract through the hook, event, session, renderer, and sidecar callback boundary. With the reasoning timeline enabled, zero-tool cards retain one stable collapsed entry throughout their lifecycle. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -146,6 +146,16 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.2.12 Release Gates
+
+- PR #206 covers the default, `allow_permanent=false`, `allow_session=false`, and `smart_denied=true` approval capability matrix. Approval accepts only protocol choices declared by the current card by default, while clarify retains custom input.
+- The sidecar rejects forged fixed choices, approval custom forms, and truthy-string capabilities. Rejection keeps the interaction pending, while token/chat/operator/expiry/idempotency boundaries remain unchanged.
+- With the reasoning timeline enabled, PR #205 keeps the same collapsed zero-tool panel in running, completed, and failed cards with an explicit empty state. `show_reasoning=false` retains the plain tool summary, and raw thinking remains hidden.
+- GitHub multi-platform CI passed after both PRs were updated onto the same main. The merged runtime baseline full suite reported **`2481 passed, 6 skipped`**.
+- V4.2.12 candidate gates: docs/package **`94 passed`**, focused matrix **`830 passed`**, and full pytest **`2481 passed, 6 skipped`**; sdist/wheel, clean-venv `site-packages` provenance, CLI help, and `git diff --check`: **passed**.
+- This cycle sends no additional real Feishu test message. PR #205's real-Feishu result is contributor evidence; PR #206 and the combined result use automation, independent adversarial checks, and multi-platform CI and are not represented as a maintainer client smoke.
+- Exact merge SHA, annotated tag, public tag/install, and Release assets: **recorded during the publication flow**.
 
 ## V4.2.11 Release Gates
 
