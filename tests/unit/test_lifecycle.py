@@ -129,6 +129,32 @@ def test_completed_interaction_does_not_block_terminal_retention():
     assert _reason(session, now=3700.0, has_card=True) == "terminal_retention_expired"
 
 
+def test_expired_pending_interaction_does_not_block_terminal_retention():
+    session = _session(status="completed")
+    session.active_interaction = InteractionState(
+        interaction_id="interaction-expired",
+        kind="approval",
+        prompt="允许吗？",
+        timeout_seconds=5.0,
+        requested_at=100.0,
+    )
+
+    assert _reason(session, now=3700.0, has_card=True) == "terminal_retention_expired"
+
+
+def test_unexpired_pending_interaction_still_blocks_terminal_retention():
+    session = _session(status="completed")
+    session.active_interaction = InteractionState(
+        interaction_id="interaction-pending",
+        kind="approval",
+        prompt="允许吗？",
+        timeout_seconds=5000.0,
+        requested_at=100.0,
+    )
+
+    assert _reason(session, now=3700.0, has_card=True) is None
+
+
 def test_card_session_timestamps_only_advance_for_accepted_events(monkeypatch):
     times = iter((10.0, 11.0, 20.0))
     monkeypatch.setattr(session_module.time, "time", lambda: next(times))

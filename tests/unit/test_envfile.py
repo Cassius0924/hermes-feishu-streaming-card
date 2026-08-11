@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -133,13 +134,16 @@ def test_update_hfc_env_preserves_private_file_mode(tmp_path):
 
     update_hfc_env(env_path, {"HERMES_FEISHU_CARD_PROFILE_ID": "child"})
 
-    assert env_path.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert env_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_update_hfc_env_can_inject_bound_writer_without_changing_rendering(tmp_path):
     env_path = tmp_path / ".env"
     env_path.write_text("UNKNOWN=keep\n", encoding="utf-8")
     env_path.chmod(0o640)
+    expected_mode = env_path.stat().st_mode & 0o777
+    expected_newline = os.linesep
     calls = []
     committed = object()
 
@@ -157,8 +161,11 @@ def test_update_hfc_env_can_inject_bound_writer_without_changing_rendering(tmp_p
     assert calls == [
         (
             env_path,
-            "UNKNOWN=keep\nHERMES_FEISHU_CARD_INTEGRITY_MODE=safe\n",
-            0o640,
+            "UNKNOWN=keep"
+            + expected_newline
+            + "HERMES_FEISHU_CARD_INTEGRITY_MODE=safe"
+            + expected_newline,
+            expected_mode,
         )
     ]
     assert env_path.read_text(encoding="utf-8") == "UNKNOWN=keep\n"

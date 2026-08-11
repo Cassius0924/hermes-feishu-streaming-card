@@ -18,6 +18,8 @@ Hermes 最小 hook 向 sidecar 发送消息生命周期事件。第二阶段 hoo
 | `interaction.completed` | 用户点击卡片按钮后发出。sidecar 更新原卡片为已选择状态，并让 Hermes hook 轮询到选择结果后继续执行。 |
 | `interaction.failed` | 交互请求失败或超时。sidecar 保留失败状态，Hermes hook 可 fail-open 回到原生 Hermes 交互路径。 |
 
+`interaction.requested.data.allow_custom_input` 明确声明当前交互是否允许用户输入选项之外的内容。为 `true` 时卡片显示“其他”输入框；为 `false` 时只显示 Hermes 下发的固定选项。hook 对 Clarify 交互下发 `true`，对审批交互默认下发 `false`，因此审批卡片与 Hermes 原生 UI 保持一致。兼容旧事件时，仅 `kind=clarify` 会默认允许自定义输入。
+
 ## 路由字段
 
 所有事件都保留 `conversation_id`、`message_id` 和 `chat_id` 三个必填字段。V3.6.4 起，事件还可以携带可选 `thread_id` 字段；当它是飞书 `om_` / `omt_` thread 上下文时，sidecar 会在创建初始卡片时使用飞书 reply API，把卡片发回用户所在的同一 thread。后续更新仍然 PATCH 这条已创建的卡片消息。

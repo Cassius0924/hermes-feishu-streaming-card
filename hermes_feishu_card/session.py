@@ -59,11 +59,29 @@ class InteractionState:
     options: list[InteractionOption] = field(default_factory=list)
     callback_token: str = ""
     multi_select: bool = False
+    allow_custom_input: bool = False
     timeout_seconds: float = 300.0
+    requested_at: float = field(default_factory=_now)
     choice: str = ""
     choice_label: str = ""
     user_name: str = ""
     error: str = ""
+
+    @property
+    def expires_at(self) -> float:
+        return self.requested_at + max(0.0, float(self.timeout_seconds))
+
+    def is_expired(self, now: float | None = None) -> bool:
+        checked_at = _now() if now is None else float(now)
+        return self.status == "pending" and checked_at >= self.expires_at
+
+    def expire(self, now: float | None = None) -> bool:
+        checked_at = _now() if now is None else float(now)
+        if not self.is_expired(checked_at):
+            return False
+        self.status = "failed"
+        self.error = "交互已过期"
+        return True
 
 
 @dataclass
@@ -377,6 +395,8 @@ class CardSession:
             interaction_id and interaction_id != self.active_interaction.interaction_id
         ):
             return
+        if self.active_interaction.status != "pending":
+            return
         self.active_interaction.status = "completed"
         self.active_interaction.choice = str(data.get("choice") or "").strip()
         self.active_interaction.choice_label = str(
@@ -390,6 +410,8 @@ class CardSession:
             interaction_id and interaction_id != self.active_interaction.interaction_id
         ):
             return
+        if self.active_interaction.status != "pending":
+            return
         self.active_interaction.status = "failed"
         self.active_interaction.error = str(data.get("error") or "交互请求失败").strip()
 
@@ -398,14 +420,22 @@ def _interaction_from_event_data(data: dict[str, Any]) -> InteractionState:
     interaction_id = str(data.get("interaction_id") or "").strip()
     if not interaction_id:
         interaction_id = secrets.token_hex(8)
+    kind = str(data.get("kind") or "choice").strip() or "choice"
+    allow_custom_input = data.get("allow_custom_input")
+    if not isinstance(allow_custom_input, bool):
+        # Backward compatibility for interaction events emitted before the
+        # capability became explicit. Hermes clarify has always exposed an
+        # Other/free-text path; fixed-choice interactions have not.
+        allow_custom_input = kind == "clarify"
     return InteractionState(
         interaction_id=interaction_id,
-        kind=str(data.get("kind") or "choice").strip() or "choice",
+        kind=kind,
         prompt=str(data.get("prompt") or "").strip(),
         description=str(data.get("description") or "").strip(),
         options=_interaction_options(data.get("options")),
         callback_token=str(data.get("callback_token") or secrets.token_urlsafe(16)),
         multi_select=bool(data.get("multi_select", False)),
+        allow_custom_input=allow_custom_input,
         timeout_seconds=_safe_timeout_seconds(data.get("timeout_seconds")),
     )
 

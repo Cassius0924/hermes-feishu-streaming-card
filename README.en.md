@@ -141,7 +141,7 @@ For an existing Hermes container:
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.9
+export HFC_VERSION=v4.2.11
 bash install-docker.sh
 ```
 
@@ -178,10 +178,10 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 | `HERMES_FEISHU_CARD_DELTA_COALESCE_CHARS` | `600` | Flush pending delta when this character budget is reached |
 | `HERMES_FEISHU_CARD_DELTA_COALESCE_MAX_PENDING` | `128` | Pending delta session cap |
 ## Latest Releases
-![Feishu topic reply card continuity and reasoning/tool timeline showcase](docs/assets/feishu-topic-card-showcase-v389.png)
 | Version | Highlights |
 |---|---|
-| [v4.2.9](docs/release-notes-v4.2.9.en.md) | Fixes Issue #197 completed-card quote context, integrates PR #196 non-blocking slash confirmations and PR #199 multi-select/custom-answer forms, and preserves exact callback-token/chat binding plus single-attempt `/events` delivery |
+| [v4.2.11](docs/release-notes-v4.2.11.en.md) | Fixes Issue #202 by freezing each superseded streaming card as a green “moved to the interaction card” history snapshot after replacement delivery; predecessor PATCH failure remains fail-open and only the newest card receives choices and later updates |
+| [v4.2.10](docs/release-notes-v4.2.10.en.md) | Authenticates non-loopback sidecar callbacks and result reads with method/path/body-bound HMAC, enforces absolute interaction expiry with late-button/form rejection and same-card refresh, and adds cross-platform CI, CodeQL, Dependabot, and Node 24 Action SHA gates; see [v4.2.9](docs/release-notes-v4.2.9.en.md) for the preceding release |
 | [v4.2.8](docs/release-notes-v4.2.8.en.md) | Fixes the installer contract so `install.sh`, `install-docker.sh`, and `install.ps1` persist process-supplied Feishu credentials into the private `.env` instead of using them only for the current process |
 | [v4.2.7](docs/release-notes-v4.2.7.en.md) | Fixes Issue #193 Windows cold-import timeouts and legacy backslash manifest paths, integrates PR #180 parent `HERMES_HOME` discovery and PR #181 safe detached-runner PID rebinding, and propagates PowerShell installer failures |
 | [v4.2.6](docs/release-notes-v4.2.6.en.md) | Fixes Issue #187 repeated choice-card position, #188 short terminal postscripts replacing answers, #189/PR #190 exact Base compatibility for Hermes 0.20, and bare Feishu `/update` venv-symlink, slow-fetch, and version-reporting failures; see [v4.2.5](docs/release-notes-v4.2.5.en.md) for the preceding audit safety hotfix |

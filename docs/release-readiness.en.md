@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.2.9`. This cycle fixes Issue #197 and securely integrates the slash-confirm and clarify-form work from PRs #196/#199. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.2.11`. This cycle fixes Issue #202: after replacement delivery succeeds, each superseded streaming card becomes a green read-only “moved to the interaction card” snapshot that preserves visible content and tool history without pending controls; predecessor PATCH failure remains fail-open. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -147,6 +147,27 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
 
+## V4.2.11 Release Gates
+
+- The Issue #202 regression first observed that the predecessor received no final PATCH, then verified the green “moved to the interaction card” header/summary, visible content and tool preservation, and removal of transient runtime state and pending controls.
+- Repeated interactions final-PATCH every predecessor once. Old pending tokens and buttons do not remain, and only the newest card receives callbacks and later updates.
+- Replacement-send failure restores the pre-request session. Exhausting every predecessor PATCH attempt still promotes the replacement and records only the existing redacted update metrics/diagnostics.
+- Animation cancellation completes before predecessor PATCH, and canonical `turn_id` sessions retain their per-session card configuration.
+- Session/render/server/clarify focused matrix: **`450 passed`**; `git diff --check`: **passed**.
+- Full pytest in the isolated v4.2.11 candidate: **`2478 passed, 6 skipped`**.
+- Local sdist/wheel and fresh-venv candidate-wheel `site-packages` provenance/CLI smoke: **passed**.
+- PR CI, exact merge SHA, public tag/install, and Release assets: **recorded during the publication flow**.
+
+## V4.2.10 Release Gates
+
+- The sidecar request proof binds the HTTP method, canonical path, and raw body under the separate `hfc-sidecar-request-v1` domain. Missing, expired, cross-method/path/body, and replayed proofs fail closed; rejection responses and metrics contain no signatures, identifiers, bodies, or choices.
+- Default loopback deployments remain compatible. With non-loopback event authentication enabled, `/card/actions`, `/interactions/{id}`, and `/messages/{id}/summary` verify the proof before parsing or returning state.
+- The sidecar owns the interaction deadline from receipt time. Late direct buttons and form submits return an expired state, periodic expiry refreshes the original card, expired pending state no longer blocks cleanup forever, and Gateway poll timeout sends one distinct `interaction.failed` without replaying `interaction.requested`.
+- Session/lifecycle/render/hook unit regressions: **`556 passed`**; full server/clarify integration regression: **`297 passed`**; CI workflow contracts: **`15 passed`**.
+- GitHub Actions runs full pytest on Ubuntu Python 3.9/3.10/3.11/3.12, Windows 3.12, and macOS 3.12 while retaining Feishu SDK, PowerShell installer, and Docker Compose smoke jobs. Official Actions are pinned to verified immutable SHAs for Node 24-capable releases.
+- CodeQL scans Python on push, pull request, and weekly schedule; Dependabot checks pip and GitHub Actions weekly.
+- Full pytest in the isolated v4.2.10 runtime: **`2473 passed, 6 skipped`**. Exact PR merge, detached merge-SHA verification, public tag/install, and Release assets are recorded during the release process.
+
 ## V4.2.9 Release Gates
 
 - The original PR #196/#199 commits retain authorship. Additional regressions cover submission failure, duplicate resolution, callback token/chat authentication, old Hermes callback signatures, single-attempt `/events`, and redacted diagnostics.
@@ -154,7 +175,8 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 - Full pytest with an isolated v4.2.9 runtime: **`2452 passed, 6 skipped`**; `git diff --check`: **passed**.
 - Local sdist/wheel builds passed with metadata at `4.2.9`. A fresh venv installed the wheel and public dependencies, reported package/distribution versions of `4.2.9`, imported from venv `site-packages`, and exited 0 for the console entrypoint and CLI help.
 - GitHub Actions (Python 3.9/3.12, Feishu SDK, PowerShell, Docker): **passed** ([run 31318602152](https://github.com/baileyh8/hermes-feishu-streaming-card/actions/runs/31318602152)).
-- Exact merge SHA, tag, public tag/install, and Release assets: **pending release gates**.
+- Exact merge SHA `dc332212c14423abb3b42f524dce46ff0ff28479`; annotated tag `v4.2.9` and [Release](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v4.2.9): **released on 2026-08-09**.
+- Release-assets [run 31319394583](https://github.com/baileyh8/hermes-feishu-streaming-card/actions/runs/31319394583): **passed**; the macOS, Linux, Windows, and checksums assets are uploaded with GitHub SHA256 digests.
 
 ## V4.2.8 Release Gates
 

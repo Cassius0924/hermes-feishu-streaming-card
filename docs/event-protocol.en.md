@@ -18,6 +18,8 @@ The minimal Hermes hook sends message lifecycle events to the sidecar. The hook 
 | `interaction.completed` | A card button was clicked. The sidecar updates the original card with the selected option and lets the Hermes hook poll the result to continue. |
 | `interaction.failed` | The interaction failed or timed out. The sidecar preserves the failed state and the Hermes hook can fail open to native Hermes behavior. |
 
+`interaction.requested.data.allow_custom_input` explicitly declares whether the interaction accepts content outside the supplied options. When `true`, the card renders an Other input; when `false`, it renders only the fixed options supplied by Hermes. The hook emits `true` for Clarify interactions and defaults to `false` for approvals, keeping approval cards aligned with Hermes' native UI. For legacy events without this field, only `kind=clarify` defaults to custom input.
+
 ## Routing Fields
 
 All events keep the required `conversation_id`, `message_id`, and `chat_id` fields. From V3.6.4, events may also carry an optional `thread_id`; when it represents a Feishu `om_` / `omt_` thread context, the sidecar uses the Feishu reply API to create the initial card in the same thread where the user sent the message. Later updates still PATCH the created card message.

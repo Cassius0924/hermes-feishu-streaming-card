@@ -420,6 +420,31 @@ async def test_legacy_direct_button_click_still_works(client):
     assert result["choice_label"] == "选项A"
 
 
+async def test_expired_form_submit_cannot_complete_interaction(client):
+    app = await request_interaction(client, "clarify-form-expired", multi_select=True)
+    interaction = active_interaction(app)
+    interaction.timeout_seconds = 0.0
+    interaction.requested_at = 0.0
+
+    test_client, _, feishu_client = client
+    response = await test_client.post(
+        "/card/actions",
+        json=form_action_payload(
+            interaction.callback_token,
+            form_value={"hfc_multi": ["A"], "hfc_other": ""},
+        ),
+    )
+    body = await response.json()
+    result = await test_client.get("/interactions/clarify-form-expired")
+    result_body = await result.json()
+
+    assert response.status == 409
+    assert body["toast"] == {"type": "warning", "content": "交互已过期"}
+    assert result_body["status"] == "failed"
+    assert result_body["error"] == "交互已过期"
+    assert "已选择" not in str(feishu_client.updated[-1][1])
+
+
 async def test_noop_callback_acknowledged_quietly(client):
     test_client, _, _ = client
     response = await test_client.post(

@@ -22,6 +22,9 @@ NATIVE_HANDOFF_ACK_SIGNATURE_HEADER = "X-HFC-Native-Ack-Signature"
 NATIVE_HANDOFF_RECOVERY_TIMESTAMP_HEADER = "X-HFC-Native-Recovery-Timestamp"
 NATIVE_HANDOFF_RECOVERY_NONCE_HEADER = "X-HFC-Native-Recovery-Nonce"
 NATIVE_HANDOFF_RECOVERY_SIGNATURE_HEADER = "X-HFC-Native-Recovery-Signature"
+SIDECAR_REQUEST_TIMESTAMP_HEADER = "X-HFC-Sidecar-Timestamp"
+SIDECAR_REQUEST_NONCE_HEADER = "X-HFC-Sidecar-Nonce"
+SIDECAR_REQUEST_SIGNATURE_HEADER = "X-HFC-Sidecar-Signature"
 
 _ROOT_SECRET_BYTES = 32
 _PROOF_MAX_AGE_SECONDS = 30
@@ -29,6 +32,7 @@ _POLICY_PROOF_MAX_AGE_SECONDS = 5
 _EVENT_MAX_NONCES = 16_384
 _POLICY_MAX_NONCES = 512
 _NATIVE_HANDOFF_CONTROL_MAX_NONCES = 512
+_SIDECAR_REQUEST_MAX_NONCES = 16_384
 
 
 class EventAuthenticationError(ValueError):
@@ -44,6 +48,10 @@ class NativeHandoffAckAuthenticationError(ValueError):
 
 
 class NativeHandoffRecoveryAuthenticationError(ValueError):
+    pass
+
+
+class SidecarRequestAuthenticationError(ValueError):
     pass
 
 
@@ -124,6 +132,28 @@ def sign_native_handoff_recovery_request(
         timestamp=timestamp,
         nonce=nonce,
         label="native handoff recovery",
+    )
+
+
+def sign_sidecar_request(
+    secret: bytes,
+    method: str,
+    path: str,
+    body: bytes,
+    *,
+    timestamp: int | None = None,
+    nonce: str | None = None,
+) -> dict[str, str]:
+    return _sign_domain_request(
+        secret,
+        _sidecar_request_payload(method, path, body),
+        domain="hfc-sidecar-request-v1",
+        timestamp_header=SIDECAR_REQUEST_TIMESTAMP_HEADER,
+        nonce_header=SIDECAR_REQUEST_NONCE_HEADER,
+        signature_header=SIDECAR_REQUEST_SIGNATURE_HEADER,
+        timestamp=timestamp,
+        nonce=nonce,
+        label="sidecar request",
     )
 
 
@@ -221,6 +251,42 @@ class NativeHandoffRecoveryProofVerifier:
 
     def verify(self, headers: Mapping[str, str], body: bytes) -> None:
         self._verifier.verify(headers, body)
+
+
+class SidecarRequestProofVerifier:
+    def __init__(
+        self,
+        secret: bytes,
+        *,
+        now: Callable[[], float] = time.time,
+        max_nonces: int = _SIDECAR_REQUEST_MAX_NONCES,
+    ):
+        self._verifier = _DomainProofVerifier(
+            secret,
+            domain="hfc-sidecar-request-v1",
+            timestamp_header=SIDECAR_REQUEST_TIMESTAMP_HEADER,
+            nonce_header=SIDECAR_REQUEST_NONCE_HEADER,
+            signature_header=SIDECAR_REQUEST_SIGNATURE_HEADER,
+            max_age_seconds=_PROOF_MAX_AGE_SECONDS,
+            error_type=SidecarRequestAuthenticationError,
+            now=now,
+            max_nonces=max_nonces,
+        )
+
+    def verify(
+        self,
+        headers: Mapping[str, str],
+        method: str,
+        path: str,
+        body: bytes,
+    ) -> None:
+        try:
+            payload = _sidecar_request_payload(method, path, body)
+        except ValueError as exc:
+            raise SidecarRequestAuthenticationError(
+                "invalid sidecar-request proof"
+            ) from exc
+        self._verifier.verify(headers, payload)
 
 
 def _sign_domain_request(
@@ -354,6 +420,27 @@ def is_loopback_host(host: str) -> bool:
 def _validate_secret(secret: bytes) -> None:
     if not isinstance(secret, bytes) or len(secret) != _ROOT_SECRET_BYTES:
         raise ValueError("event transport root is invalid")
+
+
+def _sidecar_request_payload(method: str, path: str, body: bytes) -> bytes:
+    normalized_method = str(method or "").strip().upper()
+    normalized_path = str(path or "").strip()
+    if (
+        normalized_method not in {"GET", "POST"}
+        or not normalized_path.startswith("/")
+        or "?" in normalized_path
+        or "#" in normalized_path
+        or not isinstance(body, bytes)
+    ):
+        raise ValueError("sidecar request target is invalid")
+    normalized_path = normalized_path.rstrip("/") or "/"
+    return (
+        normalized_method.encode("ascii")
+        + b"\0"
+        + normalized_path.encode("utf-8")
+        + b"\0"
+        + body
+    )
 
 
 def _body_hash(body: bytes) -> str:

@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.2.11 — 2026-08-10
+
+See also: [docs/release-notes-v4.2.11.md](docs/release-notes-v4.2.11.md)
+
+### Fixed
+- Issue #202: after a replacement interaction card is delivered, the superseded streaming card is finalized as a green read-only `已转入交互卡片` history snapshot instead of retaining a transient clarify/tool header forever.
+- Repeated interactions finalize each predecessor once and remove pending buttons and callback tokens from old cards while only the newest card stays interactive.
+
+### Safety
+- Replacement delivery still succeeds before predecessor finalization starts; send failure restores the original session and card authority exactly as before.
+- Predecessor animation cancellation completes before the final PATCH. A failed predecessor PATCH uses existing bounded retry/diagnostic metrics and remains fail-open for the delivered interaction.
+- Callback authentication, chat/operator binding, expiry, sequence, topic/reply, native suppression, `legacy/`, and Hermes patch ownership are unchanged.
+
+## V4.2.10 — 2026-08-10
+
+See also: [docs/release-notes-v4.2.10.md](docs/release-notes-v4.2.10.md)
+
+### Added
+- Non-loopback sidecar callbacks and result reads use a domain-separated HMAC proof that binds the HTTP method, canonical path, and raw body.
+- Interaction state records an absolute sidecar-owned deadline and the cleanup loop expires stale pending interactions before normal retention cleanup.
+- CI runs full pytest on Ubuntu Python 3.9–3.12 and macOS 3.12. Windows 3.12 runs a fixed portable runtime/server suite plus dedicated PowerShell and migration contracts; POSIX `dir_fd`, mode-bit, systemd, and bash-only tests remain covered on POSIX runners. CodeQL and weekly Dependabot configuration are included.
+
+### Fixed
+- Late direct buttons and clarify form submits can no longer complete an expired interaction; the original card is refreshed with an expired result.
+- Gateway poll timeout sends one distinct `interaction.failed` event and never replays the original `interaction.requested`.
+- Official GitHub Actions are pinned to immutable Node 24-capable release SHAs, removing the Node 20 deprecation path.
+
+### Safety
+- Missing, expired, cross-method, cross-path, cross-body, and replayed sidecar proofs fail closed with a generic response and bounded rejection metric.
+- Default loopback deployments remain compatible, and callback token/chat checks remain defense in depth.
+
 ## V4.2.9 — 2026-08-09
 
 See also: [docs/release-notes-v4.2.9.md](docs/release-notes-v4.2.9.md)
