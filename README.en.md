@@ -16,6 +16,7 @@
 Hermes Feishu Streaming Card turns Hermes Agent Gateway replies in Feishu/Lark into one continuously updated interactive card. Reasoning, tool calls, final answers, approvals, choices, system notices, and runtime stats stay inside cards instead of spilling into scattered native gray text messages.<br><br>It targets the real pain points of running Hermes inside Feishu: missing or out-of-order streaming text, long tables/code blocks rendered as raw Markdown, invisible tool progress, manual approval replies, frozen topic timelines, multi-bot/profile troubleshooting, and uncertain hook compatibility after Hermes upgrades.
 ![Hermes Feishu card command interaction, command result feedback, and tool timeline showcase](docs/assets/feishu-card-showcase-v385.png)
 
+<h2>Optional web scraping service</h2><p>If an Agent workflow needs to retrieve public webpages affected by anti-bot restrictions, <a href="https://scrapingant.com/?ref=zwq4ngy">ScrapingAnt</a> is an optional web scraping service to consider. Its Web Scraping API includes 10,000 free API credits every month with no credit card required; it is not required by this plugin.</p><blockquote>Disclosure: This is an affiliate link. A qualifying first paid subscription may earn this project a commission.</blockquote>
 ## V4 Live Agent States
 
 | Running | Waiting for user |
