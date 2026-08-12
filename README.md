@@ -16,6 +16,7 @@
 Hermes 飞书流式卡片插件把 Hermes Agent Gateway 的飞书/Lark 回复变成一张持续更新的交互式卡片。思考过程、工具调用、最终答案、授权确认、选项选择、系统提示和运行统计会收束在卡片内，而不是散落成多条灰色原生消息。<br><br>它面向真实飞书使用场景：流式内容漏字/乱序、长表格和代码块变成 raw markdown、工具过程不可见、approval/clarify 需要手工回复、话题里卡片不更新、多 bot / 多 profile 难排查，以及 Hermes 升级后 hook 兼容不确定。
 ![Hermes 飞书卡片命令交互、结果反馈与工具 timeline 展示](docs/assets/feishu-card-showcase-v385.png)
 
+<h2>可选网页抓取服务</h2><p>如果 Agent 工作流需要获取受反爬限制的公开网页，可了解 <a href="https://scrapingant.com/?ref=zwq4ngy">ScrapingAnt</a> 这项可选网页抓取服务。其 Web Scraping API 每月提供 10,000 个免费 API credits，无需信用卡；它不是本插件的必需依赖。</p><blockquote>说明：以上链接为 Affiliate link；符合条件的首次付费订阅可能为本项目带来佣金。</blockquote>
 ## V4 实时 Agent 状态
 
 | 运行中 | 等待用户 |
