@@ -1,6 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event, Thread, current_thread
 
+import pytest
+
 from hermes_feishu_card.hermes_plugin_runtime import (
     IngressBinding,
     IngressBindingRegistry,
@@ -23,6 +25,10 @@ def binding(generation="generation-a", *, expires_at=200.0, profile_id="default"
         thread_id="",
         expires_at=expires_at,
     )
+
+
+class AcceptedDict(dict):
+    pass
 
 
 def test_new_generation_replaces_old_ingress_binding():
@@ -65,18 +71,69 @@ def test_started_requires_boolean_true_not_integer_values():
         assert turn.record_started_result(result) is TurnState.NATIVE_BYPASS
 
 
-def test_started_rejects_dict_subclasses_and_extra_fields():
-    class AcceptedDict(dict):
-        pass
-
+def test_started_accepts_exact_delivered_sidecar_response():
     registry = IngressBindingRegistry(now=lambda: 100.0)
-    for result in (
+    assert registry.bind(binding()) is True
+    turn = registry.claim("default", "session-1", "generation-a", "turn-1")
+    result = {
+        "ok": True,
+        "applied": True,
+        "delivery": {"outcome": "delivered"},
+    }
+    assert turn.record_started_result(result) is TurnState.CARD_ACTIVE
+
+
+@pytest.mark.parametrize(
+    "result",
+    (
         AcceptedDict(ok=True, applied=True),
+        AcceptedDict(
+            ok=True,
+            applied=True,
+            delivery={"outcome": "delivered"},
+        ),
+        {
+            "ok": True,
+            "applied": True,
+            "delivery": AcceptedDict(outcome="delivered"),
+        },
+        {
+            "ok": True,
+            "applied": True,
+            "delivery": {"outcome": "delivered", "extra": False},
+        },
+        {"ok": True, "applied": True, "delivery": {}},
+        {"ok": True, "applied": True, "delivery": {"outcome": 1}},
+        {
+            "ok": True,
+            "applied": True,
+            "delivery": {"outcome": "unknown"},
+        },
         {"ok": True, "applied": True, "extra": False},
-    ):
-        assert registry.bind(binding()) is True
-        turn = registry.claim("default", "session-1", "generation-a", "turn-1")
-        assert turn.record_started_result(result) is TurnState.NATIVE_BYPASS
+        {
+            "ok": True,
+            "applied": True,
+            "delivery": {"outcome": "delivered"},
+            "extra": False,
+        },
+    ),
+    ids=(
+        "top-level-dict-subclass-two-key",
+        "top-level-dict-subclass-with-delivery",
+        "delivery-dict-subclass",
+        "delivery-extra-key",
+        "delivery-missing-outcome",
+        "delivery-non-string-outcome",
+        "delivery-non-delivered-outcome",
+        "top-level-unknown-key",
+        "top-level-unknown-key-with-delivery",
+    ),
+)
+def test_started_rejects_non_allowlisted_sidecar_responses(result):
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(binding()) is True
+    turn = registry.claim("default", "session-1", "generation-a", "turn-1")
+    assert turn.record_started_result(result) is TurnState.NATIVE_BYPASS
 
 
 def test_card_active_turn_becomes_terminal_once_and_rejects_late_events():

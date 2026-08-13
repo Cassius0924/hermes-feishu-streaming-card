@@ -59,16 +59,32 @@ class TurnBinding:
         with self._lock:
             if self._state is not TurnState.PENDING_START:
                 return self._state
-            if (
-                type(result) is dict
-                and set(result) == {"ok", "applied"}
-                and result["ok"] is True
-                and result["applied"] is True
-            ):
+            if self._is_accepted_started_result(result):
                 self._state = TurnState.CARD_ACTIVE
             else:
                 self._state = TurnState.NATIVE_BYPASS
             return self._state
+
+    @staticmethod
+    def _is_accepted_started_result(result: object) -> bool:
+        if type(result) is not dict:
+            return False
+        keys = set(result)
+        if keys not in (
+            {"ok", "applied"},
+            {"ok", "applied", "delivery"},
+        ):
+            return False
+        if result["ok"] is not True or result["applied"] is not True:
+            return False
+        if "delivery" not in result:
+            return True
+        delivery = result["delivery"]
+        return (
+            type(delivery) is dict
+            and set(delivery) == {"outcome"}
+            and delivery["outcome"] == "delivered"
+        )
 
     def finish(self) -> bool:
         with self._lock:
