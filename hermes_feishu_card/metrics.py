@@ -10,6 +10,9 @@ class SidecarMetrics:
     events_ignored: int = 0
     events_rejected: int = 0
     event_auth_rejections: int = 0
+    event_id_replays: int = 0
+    event_id_conflicts: int = 0
+    event_id_evictions: int = 0
     sidecar_request_auth_rejections: int = 0
     runtime_control_events_received: int = 0
     runtime_control_events_accepted: int = 0

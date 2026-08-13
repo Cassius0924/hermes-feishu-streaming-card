@@ -35,6 +35,109 @@ def test_parses_optional_turn_id_and_exposes_canonical_turn_id():
     assert event.canonical_turn_id == "om_turn"
 
 
+def test_parses_strict_plugin_identity_and_subagent_event():
+    payload = valid_payload(event="subagent.updated", sequence=4)
+    payload.update(
+        {
+            "turn_id": " turn-1 ",
+            "event_id": " subagent:turn-1:child-1:started ",
+            "producer": " plugin ",
+            "phase": " started ",
+        }
+    )
+    payload["data"] = {
+        "child_id": "child-1",
+        "role": "research",
+        "status": "running",
+    }
+
+    event = SidecarEvent.from_dict(payload)
+
+    assert event.event_id == "subagent:turn-1:child-1:started"
+    assert event.producer == "plugin"
+    assert event.phase == "started"
+    assert event.turn_id == "turn-1"
+
+
+class _StringSubclass(str):
+    pass
+
+
+@pytest.mark.parametrize("field", ["event_id", "producer", "phase"])
+@pytest.mark.parametrize("value", [None, 1, [], {}, _StringSubclass("plugin")])
+def test_rejects_non_exact_optional_identity_strings(field, value):
+    payload = valid_payload()
+    payload[field] = value
+
+    with pytest.raises(EventValidationError, match=field):
+        SidecarEvent.from_dict(payload)
+
+
+@pytest.mark.parametrize("field", ["event_id", "producer", "phase"])
+def test_rejects_overlength_optional_identity_strings(field):
+    payload = valid_payload()
+    payload[field] = "x" * 257
+
+    with pytest.raises(EventValidationError, match=field):
+        SidecarEvent.from_dict(payload)
+
+
+def test_optional_identity_length_is_checked_after_stripping():
+    payload = valid_payload()
+    payload.update(
+        {
+            "turn_id": "turn-1",
+            "event_id": f" {'x' * 256} ",
+            "producer": " plugin ",
+            "phase": " update ",
+        }
+    )
+
+    event = SidecarEvent.from_dict(payload)
+
+    assert event.event_id == "x" * 256
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("producer", "other"), ("phase", "finished")],
+)
+def test_rejects_unknown_optional_identity_values(field, value):
+    payload = valid_payload()
+    payload[field] = value
+
+    with pytest.raises(EventValidationError, match=field):
+        SidecarEvent.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"event_id": "turn:turn-1:started"},
+        {"event_id": "turn:turn-1:started", "turn_id": "turn-1"},
+        {
+            "event_id": "turn:turn-1:started",
+            "turn_id": "turn-1",
+            "producer": "plugin",
+        },
+        {"producer": "plugin"},
+        {"phase": "started"},
+    ],
+)
+def test_rejects_partial_plugin_identity(identity):
+    payload = valid_payload()
+    payload.update(identity)
+
+    with pytest.raises(EventValidationError, match="identity"):
+        SidecarEvent.from_dict(payload)
+
+
+def test_legacy_event_identity_defaults_remain_empty():
+    event = SidecarEvent.from_dict(valid_payload())
+
+    assert (event.event_id, event.producer, event.phase) == ("", "", "")
+
+
 def test_missing_turn_id_falls_back_to_message_id():
     event = SidecarEvent.from_dict(valid_payload(event="answer.delta", sequence=1))
 

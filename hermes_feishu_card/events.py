@@ -17,7 +17,12 @@ SUPPORTED_EVENTS = {
     "interaction.requested",
     "interaction.completed",
     "interaction.failed",
+    "subagent.updated",
 }
+
+_EVENT_IDENTITY_MAX_CHARS = 256
+_EVENT_PRODUCERS = {"plugin", "patch", "legacy-patch"}
+_EVENT_PHASES = {"started", "terminal", "update"}
 
 
 class EventValidationError(ValueError):
@@ -37,6 +42,9 @@ class SidecarEvent:
     data: Dict[str, Any]
     thread_id: str = ""
     turn_id: str = ""
+    event_id: str = ""
+    producer: str = ""
+    phase: str = ""
 
     @property
     def canonical_turn_id(self) -> str:
@@ -101,6 +109,30 @@ class SidecarEvent:
         turn_id = payload.get("turn_id", "")
         if not isinstance(turn_id, str):
             raise EventValidationError("turn_id must be a string")
+        identity: dict[str, str] = {}
+        for key in ("event_id", "producer", "phase"):
+            value = payload.get(key, "")
+            if type(value) is not str:
+                raise EventValidationError(f"{key} must be an ordinary string")
+            canonical_value = value.strip()
+            if len(canonical_value) > _EVENT_IDENTITY_MAX_CHARS:
+                raise EventValidationError(f"{key} must be at most 256 characters")
+            identity[key] = canonical_value
+        if identity["producer"] and identity["producer"] not in _EVENT_PRODUCERS:
+            raise EventValidationError("unknown producer")
+        if identity["phase"] and identity["phase"] not in _EVENT_PHASES:
+            raise EventValidationError("unknown phase")
+        stripped_turn_id = turn_id.strip()
+        identity_present = any(identity.values())
+        if identity_present and not all(
+            (
+                identity["event_id"],
+                identity["producer"],
+                identity["phase"],
+                stripped_turn_id,
+            )
+        ):
+            raise EventValidationError("partial event identity")
         return cls(
             schema_version=payload["schema_version"],
             event=event,
@@ -112,5 +144,8 @@ class SidecarEvent:
             sequence=payload["sequence"],
             created_at=created_at,
             data=data,
-            turn_id=turn_id.strip(),
+            turn_id=stripped_turn_id,
+            event_id=identity["event_id"],
+            producer=identity["producer"],
+            phase=identity["phase"],
         )

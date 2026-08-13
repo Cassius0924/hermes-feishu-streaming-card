@@ -1560,6 +1560,90 @@ def test_render_tool_timeline_uses_compact_semantic_event_rows():
     assert timeline["border"]["corner_radius"] == "8px"
 
 
+def test_render_subagent_uses_dedicated_escaped_semantic_row():
+    from hermes_feishu_card.events import SidecarEvent
+
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        SidecarEvent(
+            schema_version="1",
+            event="subagent.updated",
+            conversation_id="chat-1",
+            message_id="msg-1",
+            chat_id="oc_abc",
+            platform="feishu",
+            sequence=1,
+            created_at=1.0,
+            data={
+                "child_id": "child-1",
+                "role": "研究 <Lead>",
+                "status": "running",
+                "goal_preview": "检查 <script>alert(1)</script>",
+            },
+        )
+    )
+
+    card = render_card(session, timeline_expanded=True)
+    timeline = next(
+        item
+        for item in card["body"]["elements"]
+        if item.get("element_id") == "auxiliary_timeline"
+    )
+    subagent = next(
+        item
+        for item in timeline["elements"]
+        if str(item.get("element_id", "")).startswith(
+            "auxiliary_timeline_subagententry_"
+        )
+    )
+    content = subagent["content"]
+    assert "子代理：研究 &lt;Lead&gt;" in content
+    assert "进行中" in content
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in content
+    assert "<script>" not in content
+    assert session.tool_count == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("queued", "等待中"),
+        ("completed", "已完成"),
+        ("failed", "失败"),
+        ("cancelled", "已取消"),
+    ],
+)
+def test_render_subagent_distinguishes_lifecycle_statuses(status, expected):
+    from hermes_feishu_card.card_timeline import TimelineEntry
+
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    session.timeline._entries.append(
+        TimelineEntry(
+            kind="subagent",
+            title="research",
+            status=status,
+            subagent_id="child-1",
+        )
+    )
+
+    card = render_card(session, timeline_expanded=True)
+    timeline = next(
+        item
+        for item in card["body"]["elements"]
+        if item.get("element_id") == "auxiliary_timeline"
+    )
+    subagent = next(
+        item
+        for item in timeline["elements"]
+        if str(item.get("element_id", "")).startswith(
+            "auxiliary_timeline_subagententry_"
+        )
+    )
+
+    assert expected in subagent["content"]
+    assert "子代理：research" in subagent["content"]
+
+
 def test_render_tool_timeline_removes_all_duration_lines_from_detail():
     from hermes_feishu_card.card_timeline import TimelineEntry
 

@@ -3,6 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 TERMINAL_TOOL_STATUSES = {"completed", "failed", "cancelled", "canceled"}
+TERMINAL_SUBAGENT_STATUSES = {
+    "completed",
+    "success",
+    "succeeded",
+    "failed",
+    "error",
+    "cancelled",
+    "canceled",
+    "timeout",
+    "blocked",
+}
 
 
 @dataclass
@@ -14,6 +25,7 @@ class TimelineEntry:
     detail: str = ""
     tool_id: str = ""
     notice_id: str = ""
+    subagent_id: str = ""
 
 
 @dataclass
@@ -23,6 +35,7 @@ class CardTimeline:
     _reasoning_count: int = 0
     _tool_entry_by_id: dict[str, int] = field(default_factory=dict)
     _notice_entry_by_id: dict[str, int] = field(default_factory=dict)
+    _subagent_entry_by_id: dict[str, int] = field(default_factory=dict)
 
     @property
     def entry_count(self) -> int:
@@ -125,6 +138,38 @@ class CardTimeline:
         if resolved_id:
             self._notice_entry_by_id[resolved_id] = len(self._entries) - 1
 
+    def record_subagent(
+        self,
+        child_id: str,
+        role: str,
+        status: str,
+        detail: str = "",
+    ) -> None:
+        if not child_id:
+            return
+        self._finish_open_reasoning()
+        title = role or "子代理"
+        normalized_status = status or "running"
+        index = self._subagent_entry_by_id.get(child_id)
+        if index is not None:
+            entry = self._entries[index]
+            if str(entry.status or "").lower() in TERMINAL_SUBAGENT_STATUSES:
+                return
+            entry.title = title
+            entry.status = normalized_status
+            entry.detail = detail or entry.detail
+            return
+        self._entries.append(
+            TimelineEntry(
+                kind="subagent",
+                title=title,
+                status=normalized_status,
+                detail=detail,
+                subagent_id=child_id,
+            )
+        )
+        self._subagent_entry_by_id[child_id] = len(self._entries) - 1
+
     def complete(self) -> None:
         self._finish_open_reasoning()
 
@@ -154,4 +199,9 @@ class CardTimeline:
             entry.notice_id: index
             for index, entry in enumerate(self._entries)
             if entry.kind == "notice" and entry.notice_id
+        }
+        self._subagent_entry_by_id = {
+            entry.subagent_id: index
+            for index, entry in enumerate(self._entries)
+            if entry.kind == "subagent" and entry.subagent_id
         }

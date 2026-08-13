@@ -831,6 +831,28 @@ def _render_timeline_elements(
                     ),
                 )
             )
+        elif item.kind == "subagent":
+            detail = _limit_text(
+                normalize_stream_text(item.detail),
+                max_tool_result_chars,
+                overflow_label="子代理详情过长，已截断",
+            )
+            panel_elements.extend(
+                _timeline_markdown_elements(
+                    _render_subagent_timeline_row(
+                        item.title,
+                        item.status,
+                        detail,
+                    ),
+                    f"auxiliary_timeline_subagententry_{index}",
+                    text_size=_role_text_size(
+                        text_sizes,
+                        "tool",
+                        default="x-small",
+                        used_roles=used_text_size_roles,
+                    ),
+                )
+            )
         elif item.kind == "notice":
             content = _limit_text(
                 normalize_stream_text(item.content),
@@ -929,6 +951,26 @@ def _render_tool_timeline_row(
     for line in str(detail or "").splitlines():
         safe_line = html.escape(line, quote=False)
         lines.append(f'<font color="grey">　{safe_line}</font>')
+    return "\n".join(lines)
+
+
+def _render_subagent_timeline_row(title: str, status: str, detail: str) -> str:
+    normalized_status = str(status or "running").strip().lower()
+    safe_title = html.escape(str(title or "子代理"), quote=False)
+    label = f"子代理：{safe_title}"
+    if normalized_status in {"completed", "success", "succeeded"}:
+        color, headline = "green", f"✓ **{label}** · 已完成"
+    elif normalized_status in {"failed", "error", "timeout", "blocked"}:
+        color, headline = "red", f"✕ **{label}** · 失败"
+    elif normalized_status in {"cancelled", "canceled"}:
+        color, headline = "grey", f"⊘ **{label}** · 已取消"
+    elif normalized_status in {"queued", "waiting"}:
+        color, headline = "grey", f"○ **{label}** · 等待中"
+    else:
+        color, headline = "blue", f"{_spinner_frame()} **{label}** · 进行中"
+    lines = [f'<font color="{color}">{headline}</font>']
+    for line in str(detail or "").splitlines():
+        lines.append(f'<font color="grey">　{html.escape(line, quote=False)}</font>')
     return "\n".join(lines)
 
 

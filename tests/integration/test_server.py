@@ -675,6 +675,292 @@ async def client(tmp_path):
         await test_client.close()
 
 
+def identified(payload, event_id, *, producer="plugin", phase="started"):
+    payload = dict(payload)
+    payload.update(
+        {
+            "turn_id": payload.get("turn_id") or "turn-1",
+            "event_id": event_id,
+            "producer": producer,
+            "phase": phase,
+        }
+    )
+    return payload
+
+
+async def test_identical_event_id_replay_returns_original_response_without_second_delivery(client):
+    test_client, feishu_client = client
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+
+    first_response = await test_client.post("/events", json=payload)
+    first_body = await first_response.json()
+    replay_response = await test_client.post("/events", json=payload)
+    replay_body = await replay_response.json()
+
+    assert (replay_response.status, replay_body) == (first_response.status, first_body)
+    assert len(feishu_client.sent) == 1
+    metrics = (await (await test_client.get("/health")).json())["metrics"]
+    assert metrics["events_received"] == 1
+    assert metrics["events_applied"] == 1
+    assert metrics["event_id_replays"] == 1
+
+
+async def test_concurrent_identical_event_id_is_single_flight(client):
+    test_client, feishu_client = client
+    feishu_client.send_delay = 0.05
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+
+    responses = await asyncio.gather(
+        test_client.post("/events", json=payload),
+        test_client.post("/events", json=payload),
+    )
+    bodies = [await response.json() for response in responses]
+
+    assert [response.status for response in responses] == [200, 200]
+    assert bodies[0] == bodies[1]
+    assert len(feishu_client.sent) == 1
+
+
+async def test_serial_and_concurrent_conflict_reject_before_session_mutation(client):
+    test_client, feishu_client = client
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+    conflict = dict(payload)
+    conflict["data"] = {"reply_to_message_id": "om_conflict"}
+
+    owner, racing_conflict = await asyncio.gather(
+        test_client.post("/events", json=payload),
+        test_client.post("/events", json=conflict),
+    )
+    assert sorted([owner.status, racing_conflict.status]) == [200, 409]
+    rejected = racing_conflict if racing_conflict.status == 409 else owner
+    assert await rejected.json() == {
+        "ok": False,
+        "error": "event_id payload conflict",
+    }
+    serial = await test_client.post("/events", json=conflict)
+    assert serial.status == 409
+    assert len(feishu_client.sent) == 1
+
+
+async def test_error_response_is_replayed_without_retrying_delivery(tmp_path):
+    feishu_client = FakeFeishuClient()
+    feishu_client.fail_send = True
+    app = create_app(
+        feishu_client,
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+    try:
+        first = await test_client.post("/events", json=payload)
+        first_body = await first.json()
+        replay = await test_client.post("/events", json=payload)
+        replay_body = await replay.json()
+    finally:
+        await test_client.close()
+
+    assert (first.status, replay.status) == (502, 502)
+    assert replay_body == first_body
+    assert app[METRICS_KEY].feishu_send_attempts == 1
+
+
+async def test_event_fence_exception_does_not_poison_retry(client, monkeypatch):
+    test_client, _ = client
+    original = sidecar_server._apply_event_locked
+    calls = 0
+
+    async def fail_once(request, event):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("injected apply failure")
+        return await original(request, event)
+
+    monkeypatch.setattr(sidecar_server, "_apply_event_locked", fail_once)
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+    failed = await test_client.post("/events", json=payload)
+    retried = await test_client.post("/events", json=payload)
+
+    assert failed.status == 500
+    assert retried.status == 200
+    assert calls == 2
+
+
+async def test_event_fence_never_evicts_pending_and_rejects_new_id_at_capacity(client):
+    test_client, _ = client
+    fence = test_client.app[sidecar_server.EVENT_ID_FENCE_KEY]
+    fence.max_entries = 2
+    owner_one = await fence.claim("pending-1", "fp-1")
+    owner_two = await fence.claim("pending-2", "fp-2")
+
+    full = await fence.claim("new", "fp-new")
+
+    assert owner_one.kind == owner_two.kind == "owner"
+    assert full.kind == "full"
+    assert set(fence.entries) == {"pending-1", "pending-2"}
+
+
+async def test_event_fence_ttl_and_capacity_evict_oldest_completed_and_metric(client):
+    test_client, _ = client
+    fence = test_client.app[sidecar_server.EVENT_ID_FENCE_KEY]
+    fence.max_entries = 2
+    fence.ttl_seconds = 10
+    now = [100.0]
+    fence.now = lambda: now[0]
+    first = await fence.claim("first", "fp-1")
+    await fence.finalize("first", first.entry, 200, {"ok": True, "first": True})
+    now[0] = 101.0
+    second = await fence.claim("second", "fp-2")
+    await fence.finalize("second", second.entry, 200, {"ok": True, "second": True})
+    now[0] = 102.0
+    third = await fence.claim("third", "fp-3")
+    assert third.kind == "owner"
+    assert list(fence.entries) == ["second", "third"]
+    now[0] = 112.0
+    fourth = await fence.claim("fourth", "fp-4")
+    assert fourth.kind == "owner"
+    assert list(fence.entries) == ["third", "fourth"]
+    assert test_client.app[METRICS_KEY].event_id_evictions == 2
+
+
+async def test_event_id_native_terminal_replays_exact_first_disposition(client):
+    test_client, feishu_client = client
+    sensitive = "SENSITIVE-IDENTIFIED-TERMINAL-" + ("密" * 40_000)
+    handoff = exact_handoff_metadata(
+        "1" * 32,
+        "2" * 64,
+        answer=sensitive,
+    )
+    payload = identified(
+        event_payload(
+            "message.completed",
+            0,
+            {
+                "answer": sensitive,
+                "attachments": [],
+                "native_delivery": "allowed",
+                "native_handoff": handoff,
+            },
+            turn_id="turn-native-1",
+            message_id="message-native-identified",
+        ),
+        "turn:turn-native-1:completed",
+        phase="terminal",
+    )
+
+    first = await test_client.post("/events", json=payload)
+    first_body = await first.json()
+    replay = await test_client.post("/events", json=payload)
+    replay_body = await replay.json()
+
+    assert first_body["ok"] is True
+    assert first_body["applied"] is False
+    assert first_body["disposition"] == "native"
+    assert first_body["native_handoff"]["protocol"] == "hfc-native-handoff-v2"
+    assert (replay.status, replay_body) == (first.status, first_body)
+    assert feishu_client.sent == []
+    metrics = (await (await test_client.get("/health")).json())["metrics"]
+    assert metrics["events_received"] == 1
+    assert metrics["events_applied"] == 1
+    assert metrics["event_id_replays"] == 1
+
+
+async def test_owner_cancellation_after_response_keeps_canonical_replay(client, monkeypatch):
+    test_client, _ = client
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+    finalized = asyncio.Event()
+    release = asyncio.Event()
+    original_finalize = sidecar_server.EventIdFence.finalize
+
+    async def blocked_finalize(self, *args, **kwargs):
+        await original_finalize(self, *args, **kwargs)
+        finalized.set()
+        await release.wait()
+
+    monkeypatch.setattr(sidecar_server.EventIdFence, "finalize", blocked_finalize)
+    owner = asyncio.create_task(test_client.post("/events", json=payload))
+    await asyncio.wait_for(finalized.wait(), timeout=1.0)
+    owner.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+
+    replay = await test_client.post("/events", json=payload)
+
+    assert replay.status == 200
+    assert await replay.json() == DELIVERED_RESPONSE
+
+
+async def test_owner_cancellation_before_response_releases_pending_claim(client, monkeypatch):
+    test_client, _ = client
+    payload = identified(
+        event_payload("message.started", 0),
+        "turn:turn-1:started",
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = sidecar_server._apply_event_locked
+
+    async def blocked_apply(request, event):
+        entered.set()
+        await release.wait()
+        return await original(request, event)
+
+    class DirectRequest:
+        app = test_client.app
+
+        async def json(self):
+            return payload
+
+    monkeypatch.setattr(sidecar_server, "_apply_event_locked", blocked_apply)
+    owner = asyncio.create_task(sidecar_server._events(DirectRequest()))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    assert payload["event_id"] not in test_client.app[
+        sidecar_server.EVENT_ID_FENCE_KEY
+    ].entries
+
+    release.set()
+    retried = await sidecar_server._events(DirectRequest())
+    assert retried.status == 200
+
+
+async def test_waiter_cancellation_does_not_remove_running_owner_claim(client):
+    test_client, _ = client
+    fence = test_client.app[sidecar_server.EVENT_ID_FENCE_KEY]
+    owner = await fence.claim("pending", "same")
+    waiter_claim = await fence.claim("pending", "same")
+    waiter = asyncio.create_task(fence.wait(waiter_claim.entry))
+    await asyncio.sleep(0)
+    waiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert fence.entries["pending"] is owner.entry
+    assert not owner.entry.future.cancelled()
+
+
 @pytest.fixture(autouse=True)
 def isolated_default_native_handoff_state(tmp_path, monkeypatch):
     """Keep direct create_app() calls away from the user's real state dir."""
@@ -1377,6 +1663,9 @@ async def test_health_reports_healthy_status_and_active_sessions(client):
         "events_ignored": 0,
         "events_rejected": 0,
         "event_auth_rejections": 0,
+        "event_id_replays": 0,
+        "event_id_conflicts": 0,
+        "event_id_evictions": 0,
         "sidecar_request_auth_rejections": 0,
         "runtime_control_events_received": 0,
         "runtime_control_events_accepted": 0,

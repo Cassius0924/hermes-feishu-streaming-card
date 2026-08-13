@@ -3,6 +3,10 @@ from hermes_feishu_card.session import CardSession, InteractionState
 import pytest
 
 
+class _StringSubclass(str):
+    pass
+
+
 def event(name, sequence, data, **overrides):
     payload = {
         "schema_version": "1",
@@ -192,6 +196,146 @@ def test_tool_count_tracks_invocations_instead_of_lifecycle_events():
     assert session.tool_count == 2
     assert len(session.tools) == 2
     assert session.tools["t1"].status == "completed"
+
+
+def test_subagent_start_stop_updates_one_distinct_timeline_item_without_tool_count():
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {
+                "child_id": "child-1",
+                "role": "research",
+                "status": "running",
+                "goal_preview": "分析 <风险>",
+                "goal": "raw alias must not appear",
+                "tool_history": [{"secret": "must not appear"}],
+            },
+        )
+    )
+    assert session.apply(
+        event(
+            "subagent.updated",
+            2,
+            {
+                "child_id": "child-1",
+                "role": "research",
+                "status": "completed",
+                "duration_ms": 12,
+                "summary_preview": "完成核验",
+                "summary": "raw summary must not appear",
+                "args": {"secret": "must not appear"},
+                "result": "must not appear",
+            },
+        )
+    )
+
+    entries = session.timeline.snapshot()
+    assert [(item.kind, item.status) for item in entries] == [
+        ("subagent", "completed")
+    ]
+    assert entries[0].subagent_id == "child-1"
+    assert "完成核验" in entries[0].detail
+    assert "12 ms" in entries[0].detail
+    assert "raw" not in entries[0].detail
+    assert "secret" not in entries[0].detail
+    assert session.tool_count == 0
+
+
+@pytest.mark.parametrize("child_id", [None, "", "   ", 123, _StringSubclass("child")])
+def test_subagent_requires_exact_nonblank_child_id(child_id):
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {"child_id": child_id, "status": "running"},
+        )
+    )
+    assert session.timeline.snapshot() == []
+    assert session.last_sequence == 1
+
+
+def test_terminal_subagent_cannot_be_reopened_by_late_running_update():
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {"child_id": "child-1", "status": "failed"},
+        )
+    )
+    assert session.apply(
+        event(
+            "subagent.updated",
+            2,
+            {"child_id": "child-1", "status": "running"},
+        )
+    )
+
+    entries = session.timeline.snapshot()
+    assert len(entries) == 1
+    assert entries[0].status == "failed"
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        "completed",
+        "success",
+        "succeeded",
+        "failed",
+        "error",
+        "cancelled",
+        "canceled",
+        "timeout",
+        "blocked",
+    ],
+)
+def test_all_terminal_subagent_statuses_reject_late_running_update(terminal_status):
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {"child_id": "child-1", "status": terminal_status},
+        )
+    )
+    assert session.apply(
+        event(
+            "subagent.updated",
+            2,
+            {"child_id": "child-1", "status": "running"},
+        )
+    )
+
+    entries = session.timeline.snapshot()
+    assert len(entries) == 1
+    assert entries[0].status == terminal_status
+
+
+@pytest.mark.parametrize(
+    "duration_ms",
+    [True, "12", -1, float("nan"), float("inf"), float("-inf")],
+)
+def test_subagent_ignores_non_numeric_or_non_finite_duration(duration_ms):
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {
+                "child_id": "child-1",
+                "status": "completed",
+                "duration_ms": duration_ms,
+                "summary_preview": "完成",
+            },
+        )
+    )
+
+    assert session.timeline.snapshot()[0].detail == "完成"
 
 
 def test_compaction_notice_sets_runtime_phase_without_changing_answer():

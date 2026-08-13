@@ -260,6 +260,43 @@ class CardSession:
             self.timeline.record_tool(tool_id, resolved_name, resolved_status, resolved_detail)
             if previous_tool is None or previous_is_terminal:
                 self._tool_call_count += 1
+        elif event.event == "subagent.updated":
+            child_id = event.data.get("child_id")
+            if type(child_id) is str and child_id.strip():
+                role = event.data.get("role")
+                status = event.data.get("status")
+                resolved_role = (
+                    normalize_stream_text(role).strip()[:240]
+                    if type(role) is str
+                    else ""
+                )
+                resolved_status = (
+                    status.strip().lower()[:64]
+                    if type(status) is str and status.strip()
+                    else "running"
+                )
+                detail_lines: list[str] = []
+                preview_key = (
+                    "summary_preview"
+                    if type(event.data.get("summary_preview")) is str
+                    else "goal_preview"
+                )
+                preview = event.data.get(preview_key)
+                if type(preview) is str:
+                    safe_preview = normalize_stream_text(preview).strip()[:240]
+                    if safe_preview:
+                        detail_lines.append(safe_preview)
+                duration_ms = _subagent_duration_milliseconds(
+                    event.data.get("duration_ms")
+                )
+                if duration_ms is not None:
+                    detail_lines.append(f"耗时: {_duration_milliseconds_text(duration_ms)}")
+                self.timeline.record_subagent(
+                    child_id.strip(),
+                    resolved_role,
+                    resolved_status,
+                    "\n".join(detail_lines),
+                )
         elif event.event == "message.started":
             delivery_kind = event.data.get("delivery_kind")
             if isinstance(delivery_kind, str) and delivery_kind.strip():
@@ -607,6 +644,22 @@ def _tool_duration_milliseconds(data: dict[str, Any]) -> float | None:
         if value >= 0:
             return value * 1000
     return None
+
+
+def _subagent_duration_milliseconds(value: Any) -> float | None:
+    if type(value) not in {int, float}:
+        return None
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return parsed
+
+
+def _duration_milliseconds_text(milliseconds: float) -> str:
+    if milliseconds < 1000:
+        return f"{int(round(milliseconds))} ms"
+    seconds = milliseconds / 1000.0
+    return f"{seconds:.2f}".rstrip("0").rstrip(".") + " s"
 
 
 def _notice_level(value: Any) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from contextlib import suppress
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -202,6 +203,10 @@ NATIVE_HANDOFF_REPAIR_TASKS_KEY = web.AppKey(
 NATIVE_HANDOFF_CURRENT_REPAIRS_KEY = web.AppKey(
     "native_handoff_current_repairs", dict
 )
+EVENT_ID_FENCE_KEY = web.AppKey("event_id_fence", object)
+EVENT_ID_FENCE_MAX_ENTRIES = 4096
+EVENT_ID_FENCE_TTL_SECONDS = 3600.0
+EVENT_ID_FENCE_WAIT_SECONDS = 30.0
 UPDATE_MAX_ATTEMPTS = 3
 UPDATE_MIN_INTERVAL_SECONDS = 0.2
 CARD_ANIMATION_INTERVAL_SECONDS = 0.8
@@ -246,6 +251,135 @@ class CardDeliveryResult:
 
 class _OperationsDiagnosticCapacityError(RuntimeError):
     pass
+
+
+@dataclass
+class EventIdFenceEntry:
+    fingerprint: str
+    future: asyncio.Future[tuple[int, dict[str, object]]]
+    response_status: int | None = None
+    response_payload: dict[str, object] | None = None
+    expires_at: float = 0.0
+
+    @property
+    def completed(self) -> bool:
+        return self.response_status is not None and self.response_payload is not None
+
+
+@dataclass(frozen=True)
+class EventIdFenceClaim:
+    kind: str
+    entry: EventIdFenceEntry | None = None
+
+
+class EventIdFence:
+    def __init__(
+        self,
+        metrics: SidecarMetrics,
+        *,
+        max_entries: int = EVENT_ID_FENCE_MAX_ENTRIES,
+        ttl_seconds: float = EVENT_ID_FENCE_TTL_SECONDS,
+        wait_seconds: float = EVENT_ID_FENCE_WAIT_SECONDS,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.metrics = metrics
+        self.max_entries = max_entries
+        self.ttl_seconds = ttl_seconds
+        self.wait_seconds = wait_seconds
+        self.now = now
+        self.entries: OrderedDict[str, EventIdFenceEntry] = OrderedDict()
+        self._lock = asyncio.Lock()
+
+    async def claim(self, event_id: str, fingerprint: str) -> EventIdFenceClaim:
+        async with self._lock:
+            self._evict_expired_completed_locked()
+            entry = self.entries.get(event_id)
+            if entry is not None:
+                if entry.fingerprint != fingerprint:
+                    self.metrics.event_id_conflicts += 1
+                    return EventIdFenceClaim("conflict", entry)
+                if entry.completed:
+                    self.metrics.event_id_replays += 1
+                    return EventIdFenceClaim("replay", entry)
+                return EventIdFenceClaim("wait", entry)
+            if len(self.entries) >= self.max_entries:
+                self._evict_oldest_completed_locked()
+            if len(self.entries) >= self.max_entries:
+                return EventIdFenceClaim("full")
+            future = asyncio.get_running_loop().create_future()
+            entry = EventIdFenceEntry(fingerprint=fingerprint, future=future)
+            self.entries[event_id] = entry
+            return EventIdFenceClaim("owner", entry)
+
+    async def wait(
+        self, entry: EventIdFenceEntry
+    ) -> tuple[int, dict[str, object]] | None:
+        try:
+            status, payload = await asyncio.wait_for(
+                asyncio.shield(entry.future),
+                timeout=self.wait_seconds,
+            )
+        except asyncio.TimeoutError:
+            return None
+        if payload.get("error") != "event unavailable":
+            self.metrics.event_id_replays += 1
+        return status, copy.deepcopy(payload)
+
+    async def finalize(
+        self,
+        event_id: str,
+        entry: EventIdFenceEntry,
+        status: int,
+        payload: dict[str, object],
+    ) -> None:
+        canonical_payload = copy.deepcopy(payload)
+        async with self._lock:
+            if self.entries.get(event_id) is not entry or entry.completed:
+                return
+            entry.response_status = int(status)
+            entry.response_payload = canonical_payload
+            entry.expires_at = self.now() + self.ttl_seconds
+            if not entry.future.done():
+                entry.future.set_result((int(status), copy.deepcopy(canonical_payload)))
+
+    async def abandon(self, event_id: str, entry: EventIdFenceEntry) -> None:
+        async with self._lock:
+            if self.entries.get(event_id) is not entry or entry.completed:
+                return
+            self.entries.pop(event_id, None)
+            if not entry.future.done():
+                entry.future.set_result((503, {"ok": False, "error": "event unavailable"}))
+
+    def replay_response(self, entry: EventIdFenceEntry) -> web.Response:
+        assert entry.response_status is not None
+        assert entry.response_payload is not None
+        return web.json_response(
+            copy.deepcopy(entry.response_payload),
+            status=entry.response_status,
+        )
+
+    def _evict_expired_completed_locked(self) -> None:
+        now = self.now()
+        expired = [
+            event_id
+            for event_id, entry in self.entries.items()
+            if entry.completed and entry.expires_at <= now
+        ]
+        for event_id in expired:
+            self.entries.pop(event_id, None)
+            self.metrics.event_id_evictions += 1
+
+    def _evict_oldest_completed_locked(self) -> None:
+        completed = [
+            (entry.expires_at, index, event_id)
+            for index, (event_id, entry) in enumerate(self.entries.items())
+            if entry.completed
+        ]
+        if not completed:
+            return
+        _expires_at, _index, event_id = min(completed)
+        self.entries.pop(event_id, None)
+        self.metrics.event_id_evictions += 1
 
 
 class _AfterEofJsonResponse(web.Response):
@@ -329,6 +463,7 @@ def create_app(
     app[PYTHON_IDENTITY_KEY] = str(python_identity)
     app[SHUTDOWN_CALLBACK_KEY] = shutdown_callback
     app[METRICS_KEY] = SidecarMetrics()
+    app[EVENT_ID_FENCE_KEY] = EventIdFence(app[METRICS_KEY])
     app[NOOP_MODE_KEY] = bool(noop_mode)
     app[EVENT_AUTH_REQUIRED_KEY] = bool(event_auth_required)
     if event_auth_required:
@@ -3050,15 +3185,76 @@ async def _events(request: web.Request) -> web.Response:
         metrics.events_rejected += 1
         return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
+    fence_claim: EventIdFenceClaim | None = None
+    fence = request.app[EVENT_ID_FENCE_KEY]
+    if event.event_id:
+        try:
+            fingerprint = _event_id_fingerprint(event)
+        except (TypeError, ValueError):
+            metrics.events_rejected += 1
+            return web.json_response(
+                {"ok": False, "error": "event payload is not canonicalizable"},
+                status=400,
+            )
+        fence_claim = await fence.claim(event.event_id, fingerprint)
+        if fence_claim.kind == "conflict":
+            return web.json_response(
+                {"ok": False, "error": "event_id payload conflict"},
+                status=409,
+            )
+        if fence_claim.kind == "replay":
+            assert fence_claim.entry is not None
+            return fence.replay_response(fence_claim.entry)
+        if fence_claim.kind == "wait":
+            assert fence_claim.entry is not None
+            waited = await fence.wait(fence_claim.entry)
+            if waited is None:
+                return web.json_response(
+                    {"ok": False, "error": "event_id owner pending"},
+                    status=503,
+                )
+            status, response_payload = waited
+            return web.json_response(response_payload, status=status)
+        if fence_claim.kind == "full":
+            return web.json_response(
+                {"ok": False, "error": "event_id fence unavailable"},
+                status=503,
+            )
+        assert fence_claim.kind == "owner" and fence_claim.entry is not None
+
     metrics.events_received += 1
     message_locks: Dict[str, asyncio.Lock] = request.app[MESSAGE_LOCKS_KEY]
     lock_users: Dict[str, int] = request.app[MESSAGE_LOCK_USERS_KEY]
     lock_key = _session_key(event)
     lock = message_locks.setdefault(lock_key, asyncio.Lock())
     lock_users[lock_key] = lock_users.get(lock_key, 0) + 1
+    response_finalized = False
     try:
         async with lock:
             response, post_lock_task = await _apply_event_locked(request, event)
+        if fence_claim is not None:
+            response_payload = _json_response_payload(response)
+            finalize_task = asyncio.create_task(
+                fence.finalize(
+                    event.event_id,
+                    fence_claim.entry,
+                    response.status,
+                    response_payload,
+                )
+            )
+            try:
+                await asyncio.shield(finalize_task)
+            except asyncio.CancelledError:
+                await finalize_task
+                response_finalized = True
+                raise
+            response_finalized = True
+    except BaseException:
+        if fence_claim is not None and not response_finalized:
+            await asyncio.shield(
+                fence.abandon(event.event_id, fence_claim.entry)
+            )
+        raise
     finally:
         remaining_users = lock_users.get(lock_key, 1) - 1
         if remaining_users > 0:
@@ -3071,6 +3267,41 @@ async def _events(request: web.Request) -> web.Response:
     if _event_is_terminal(event) and post_lock_task is None:
         cleanup_runtime_state(request.app, time.time())
     return response
+
+
+def _event_id_fingerprint(event: SidecarEvent) -> str:
+    canonical = {
+        "schema_version": event.schema_version,
+        "event": event.event,
+        "turn_id": event.canonical_turn_id,
+        "conversation_id": event.conversation_id,
+        "message_id": event.message_id,
+        "chat_id": event.chat_id,
+        "thread_id": event.thread_id,
+        "sequence": event.sequence,
+        "created_at": event.created_at,
+        "producer": event.producer,
+        "phase": event.phase,
+        "data": event.data,
+    }
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _json_response_payload(response: web.Response) -> dict[str, object]:
+    body = response.body
+    if not isinstance(body, bytes):
+        raise ValueError("event response body is not JSON")
+    payload = json.loads(body.decode(response.charset or "utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("event response body is not an object")
+    return copy.deepcopy(payload)
 
 
 def _normalize_hfc_command(value: Any) -> str:
