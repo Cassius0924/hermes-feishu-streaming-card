@@ -4,6 +4,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from math import isfinite
 import queue
 import threading
 from threading import Lock, RLock
@@ -30,6 +31,7 @@ class TurnState(str, Enum):
 class IngressBinding:
     profile_id: str
     session_id: str
+    gateway_session_key: str
     generation: str
     chat_id: str
     incoming_message_id: str
@@ -256,6 +258,22 @@ class IngressBindingRegistry:
                 return None
             return TurnBinding(ingress=binding, turn_id=turn_id)
 
+    def claim_unique_session(self, session_id: str, turn_id: str) -> TurnBinding | None:
+        if not all(self._is_exact_nonblank(value) for value in (session_id, turn_id)):
+            return None
+        with self._lock:
+            self._prune_expired(self._now())
+            candidates = [
+                (key, binding)
+                for key, binding in self._bindings.items()
+                if binding.session_id == session_id
+            ]
+            if len(candidates) != 1:
+                return None
+            key, binding = candidates[0]
+            del self._bindings[key]
+            return TurnBinding(ingress=binding, turn_id=turn_id)
+
     def clear(self) -> None:
         with self._lock:
             self._bindings.clear()
@@ -264,20 +282,34 @@ class IngressBindingRegistry:
     def _is_nonblank(value: object) -> bool:
         return isinstance(value, str) and bool(value.strip())
 
+    @staticmethod
+    def _is_exact_nonblank(value: object) -> bool:
+        return type(value) is str and bool(value.strip())
+
     @classmethod
     def _is_valid_binding(cls, binding: object) -> bool:
-        if not isinstance(binding, IngressBinding):
+        if type(binding) is not IngressBinding:
             return False
-        return all(
-            cls._is_nonblank(value)
+        if not all(
+            cls._is_exact_nonblank(value)
             for value in (
                 binding.profile_id,
                 binding.session_id,
+                binding.gateway_session_key,
                 binding.generation,
                 binding.chat_id,
                 binding.incoming_message_id,
                 binding.reply_to_message_id,
             )
+        ):
+            return False
+        if type(binding.thread_id) is not str:
+            return False
+        expires_at = binding.expires_at
+        return (
+            isinstance(expires_at, (int, float))
+            and not isinstance(expires_at, bool)
+            and isfinite(expires_at)
         )
 
     def _prune_expired(self, now: float) -> None:

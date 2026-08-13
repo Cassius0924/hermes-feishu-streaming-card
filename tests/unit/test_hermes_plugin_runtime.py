@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from threading import Barrier, Event, Thread, current_thread
 
 import pytest
@@ -14,10 +15,18 @@ from hermes_feishu_card.hermes_plugin_runtime import (
 from tests.fixtures.hermes_v020_plugin_api import PluginContext
 
 
-def binding(generation="generation-a", *, expires_at=200.0, profile_id="default"):
+def binding(
+    generation="generation-a",
+    *,
+    profile_id="default",
+    session_id="session-1",
+    gateway_session_key="gateway-session-1",
+    expires_at=200.0,
+):
     return IngressBinding(
         profile_id=profile_id,
-        session_id="session-1",
+        session_id=session_id,
+        gateway_session_key=gateway_session_key,
         generation=generation,
         chat_id="oc_1",
         incoming_message_id="om_1",
@@ -47,6 +56,10 @@ class PretendsKey:
         return other == self.target
 
 
+class StringSubclass(str):
+    pass
+
+
 def test_new_generation_replaces_old_ingress_binding():
     registry = IngressBindingRegistry(now=lambda: 100.0)
     assert registry.bind(binding("generation-a")) is True
@@ -65,6 +78,75 @@ def test_claim_requires_exact_unique_binding_and_never_uses_recent_chat():
     assert registry.claim("default", "session-1", "generation-a", "") is None
     assert registry.claim("default", "session-1", "generation-a", "turn-1") is not None
     assert registry.claim("default", "session-1", "generation-a", "turn-2") is None
+
+
+def test_official_pre_llm_claims_only_one_unambiguous_agent_session():
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(binding()) is True
+    turn = registry.claim_unique_session("session-1", "turn-1")
+    assert turn is not None
+    assert turn.turn_id == "turn-1"
+    assert turn.ingress.gateway_session_key == "gateway-session-1"
+    assert registry.claim_unique_session("session-1", "turn-2") is None
+
+
+def test_official_pre_llm_refuses_ambiguity_without_consuming_either_binding():
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(binding(profile_id="profile-a")) is True
+    assert registry.bind(binding(profile_id="profile-b")) is True
+    assert registry.claim_unique_session("session-1", "turn-1") is None
+    assert registry.claim("profile-a", "session-1", "generation-a", "turn-a") is not None
+    assert registry.claim("profile-b", "session-1", "generation-a", "turn-b") is not None
+
+
+def test_expiry_resolves_ambiguous_agent_session_before_unique_claim():
+    now = [100.0]
+    registry = IngressBindingRegistry(now=lambda: now[0])
+    assert registry.bind(binding(profile_id="profile-a", expires_at=101.0)) is True
+    assert registry.bind(binding(profile_id="profile-b", expires_at=200.0)) is True
+    assert registry.claim_unique_session("session-1", "turn-early") is None
+    now[0] = 101.0
+    turn = registry.claim_unique_session("session-1", "turn-after-expiry")
+    assert turn is not None
+    assert turn.ingress.profile_id == "profile-b"
+
+
+def test_concurrent_unique_session_claims_consume_exactly_once():
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(binding()) is True
+    barrier = Barrier(16)
+
+    def claim(index):
+        barrier.wait()
+        return registry.claim_unique_session("session-1", f"turn-{index}")
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        results = list(executor.map(claim, range(16)))
+
+    claimed = [turn for turn in results if turn is not None]
+    assert len(claimed) == 1
+    assert claimed[0].turn_id.startswith("turn-")
+
+
+@pytest.mark.parametrize(
+    ("session_id", "turn_id"),
+    (
+        ("", "turn-1"),
+        ("  ", "turn-1"),
+        (StringSubclass("session-1"), "turn-1"),
+        (1, "turn-1"),
+        ("session-1", ""),
+        ("session-1", StringSubclass("turn-1")),
+        ("session-1", None),
+    ),
+)
+def test_unique_session_claim_rejects_nonordinary_or_blank_identities_without_consuming(
+    session_id, turn_id
+):
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(binding()) is True
+    assert registry.claim_unique_session(session_id, turn_id) is None
+    assert registry.claim_unique_session("session-1", "turn-valid") is not None
 
 
 def test_started_transitions_only_on_explicit_sidecar_acceptance():
@@ -233,6 +315,40 @@ def test_bind_rejects_blank_identity_and_expired_bindings():
     assert registry.bind(binding(generation="  ")) is False
     assert registry.bind(binding(expires_at=100.0)) is False
     assert registry.claim("default", "session-1", "generation-a", "turn-1") is None
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("profile_id", ""),
+        ("session_id", "  "),
+        ("gateway_session_key", ""),
+        ("generation", StringSubclass("generation-a")),
+        ("chat_id", StringSubclass("oc_1")),
+        ("incoming_message_id", 1),
+        ("reply_to_message_id", None),
+        ("thread_id", StringSubclass("")),
+    ),
+)
+def test_bind_rejects_blank_nonstring_or_string_subclass_identity_fields(
+    field_name, invalid_value
+):
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(replace(binding(), **{field_name: invalid_value})) is False
+
+
+@pytest.mark.parametrize("expires_at", (True, float("nan"), float("inf"), -float("inf"), "200", None))
+def test_bind_rejects_non_numeric_or_nonfinite_expiry(expires_at):
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(binding(expires_at=expires_at)) is False
+
+
+def test_bind_rejects_ingress_binding_subclasses():
+    class DerivedIngressBinding(IngressBinding):
+        pass
+
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(DerivedIngressBinding(**binding().__dict__)) is False
 
 
 def test_expired_binding_is_pruned_before_claim():
