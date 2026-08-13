@@ -1,9 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event
 
 from hermes_feishu_card.hermes_plugin_runtime import (
     IngressBinding,
     IngressBindingRegistry,
+    TurnEventCoordinator,
     TurnState,
     register_callbacks,
     reset_plugin_runtime_state,
@@ -162,3 +163,132 @@ def test_reset_clears_module_state_without_breaking_callback_registration():
     assert register_callbacks(context) is None
     assert set(context.registered) == {"pre_llm_call"}
     assert reset_plugin_runtime_state() is None
+
+
+def test_event_ids_match_the_public_deterministic_contract():
+    coordinator = TurnEventCoordinator("turn-1", max_pending=2)
+    assert coordinator.event_id("started") == "turn:turn-1:started"
+    assert coordinator.event_id("tool", item_id="call-1", phase="started") == "tool:turn-1:call-1:started"
+    assert coordinator.event_id("approval", item_id="fp-1", phase="terminal") == "approval:turn-1:fp-1:terminal"
+    assert coordinator.event_id("subagent", item_id="child-1", phase="started") == "subagent:turn-1:child-1:started"
+    assert coordinator.event_id("completed") == "turn:turn-1:completed"
+    assert coordinator.event_id("failed") == "turn:turn-1:failed"
+
+
+def test_event_identity_rejects_blank_or_invalid_public_values():
+    import pytest
+
+    with pytest.raises(ValueError, match="turn"):
+        TurnEventCoordinator("  ")
+    coordinator = TurnEventCoordinator("turn-1")
+    with pytest.raises(ValueError, match="identity"):
+        coordinator.event_id("unknown")
+    with pytest.raises(ValueError, match="identity"):
+        coordinator.event_id("tool", phase="started")
+    with pytest.raises(ValueError, match="phase"):
+        coordinator.event_id("tool", item_id="call-1", phase="updated")
+
+
+def test_plugin_and_patch_share_one_monotonic_sequence():
+    coordinator = TurnEventCoordinator("turn-1", max_pending=4)
+    assert coordinator.next_sequence("plugin") == 0
+    assert coordinator.next_sequence("patch") == 1
+    assert coordinator.next_sequence("plugin") == 2
+
+
+def test_unknown_producer_is_rejected_at_sequence_and_submission_boundaries():
+    import pytest
+
+    coordinator = TurnEventCoordinator("turn-1")
+    with pytest.raises(ValueError, match="producer"):
+        coordinator.next_sequence("unknown")
+    with pytest.raises(ValueError, match="producer"):
+        coordinator.submit_observer({"event": "tool.updated"}, producer="unknown")
+
+
+def test_nonpositive_max_pending_is_rejected():
+    import pytest
+
+    with pytest.raises(ValueError, match="max_pending"):
+        TurnEventCoordinator("turn-1", max_pending=0)
+    with pytest.raises(ValueError, match="max_pending"):
+        TurnEventCoordinator("turn-1", max_pending=-1)
+
+
+def test_terminal_barrier_rejects_late_items_and_terminal_is_after_accepted_items():
+    coordinator = TurnEventCoordinator("turn-1", max_pending=4, start_worker=False)
+    assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is True
+    assert coordinator.submit_observer({"event": "subagent.updated"}, producer="plugin") is True
+    barrier = coordinator.close_terminal_barrier()
+    assert barrier == 1
+    assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is False
+    assert coordinator.next_terminal_sequence() == 2
+
+
+def test_queue_full_drops_observer_work_without_raising_and_can_leave_sequence_gap():
+    coordinator = TurnEventCoordinator("turn-1", max_pending=1, start_worker=False)
+    assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is True
+    assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is False
+    assert coordinator.next_sequence("patch") == 2
+
+
+def test_worker_delivery_exception_always_marks_work_done_and_drain_returns():
+    delivery_started = Event()
+
+    def fail_delivery(_event):
+        delivery_started.set()
+        raise RuntimeError("delivery failed")
+
+    coordinator = TurnEventCoordinator("turn-1", deliver=fail_delivery)
+    assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is True
+    assert delivery_started.wait(timeout=0.5)
+    coordinator.drain_before_terminal(timeout_seconds=0.5)
+    assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is False
+
+
+def test_drain_timeout_closes_admission_without_waiting_for_an_unstarted_worker():
+    coordinator = TurnEventCoordinator("turn-1", start_worker=False)
+    assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is True
+    coordinator.drain_before_terminal(timeout_seconds=0)
+    assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is False
+
+
+def test_concurrent_barrier_and_submit_never_accept_an_event_after_barrier():
+    coordinator = TurnEventCoordinator("turn-1", max_pending=4, start_worker=False)
+    start = Barrier(2)
+
+    def submit():
+        start.wait()
+        return coordinator.submit_observer({"event": "tool.updated"}, producer="plugin")
+
+    def close_barrier():
+        start.wait()
+        return coordinator.close_terminal_barrier()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        submit_future = executor.submit(submit)
+        barrier_future = executor.submit(close_barrier)
+        accepted = submit_future.result()
+        barrier = barrier_future.result()
+
+    assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is False
+    assert (barrier == 0) is accepted
+
+
+def test_close_is_idempotent_and_does_not_wait_for_a_blocked_daemon_delivery():
+    delivery_started = Event()
+    release_delivery = Event()
+
+    def block_delivery(_event):
+        delivery_started.set()
+        assert release_delivery.wait(timeout=0.5)
+
+    coordinator = TurnEventCoordinator("turn-1", deliver=block_delivery)
+    assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is True
+    assert delivery_started.wait(timeout=0.5)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        assert executor.submit(coordinator.close).result(timeout=0.25) is None
+    assert coordinator.close() is None
+    assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is False
+    release_delivery.set()
+    coordinator.drain_before_terminal(timeout_seconds=0.5)
