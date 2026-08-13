@@ -68,30 +68,36 @@ LEGACY_REQUIRED_PATCH_GROUPS = HYBRID_REQUIRED_PATCH_GROUPS | frozenset({
 class NativeHookCapabilities:
     available: frozenset[str]
 
-    @classmethod
-    def from_names(cls, names: Iterable[str]) -> "NativeHookCapabilities":
-        values = frozenset(str(name) for name in names)
+    def __post_init__(self) -> None:
+        values = frozenset(str(name) for name in self.available)
         unknown = values - KNOWN_NATIVE_CAPABILITIES
         if unknown:
             raise ValueError(
                 "unknown native capabilities: " + ", ".join(sorted(unknown))
             )
-        return cls(values)
+        object.__setattr__(self, "available", values)
+
+    @classmethod
+    def from_names(cls, names: Iterable[str]) -> "NativeHookCapabilities":
+        return cls(names)
 
 
 @dataclass(frozen=True)
 class PatchCapabilities:
     available: frozenset[str]
 
-    @classmethod
-    def from_names(cls, names: Iterable[str]) -> "PatchCapabilities":
-        values = frozenset(str(name) for name in names)
+    def __post_init__(self) -> None:
+        values = frozenset(str(name) for name in self.available)
         unknown = values - KNOWN_PATCH_GROUPS
         if unknown:
             raise ValueError(
                 "unknown patch groups: " + ", ".join(sorted(unknown))
             )
-        return cls(values)
+        object.__setattr__(self, "available", values)
+
+    @classmethod
+    def from_names(cls, names: Iterable[str]) -> "PatchCapabilities":
+        return cls(names)
 
 
 @dataclass(frozen=True)

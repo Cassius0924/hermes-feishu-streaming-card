@@ -76,3 +76,15 @@ def test_fingerprint_is_order_independent_and_domain_separated():
 def test_capability_models_reject_unknown_names(factory):
     with pytest.raises(ValueError, match="unknown"):
         factory(["invented_capability"])
+
+
+@pytest.mark.parametrize(
+    ("factory", "name"),
+    [
+        (NativeHookCapabilities, "invented_capability"),
+        (PatchCapabilities, "invented_group"),
+    ],
+)
+def test_capability_models_reject_unknown_names_from_direct_construction(factory, name):
+    with pytest.raises(ValueError, match="unknown"):
+        factory(frozenset({name}))
