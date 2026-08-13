@@ -4,6 +4,8 @@ from threading import Barrier, Event, Thread, current_thread
 
 import pytest
 
+import hermes_feishu_card.hermes_plugin_runtime as plugin_runtime
+
 from hermes_feishu_card.hermes_plugin_runtime import (
     IngressBinding,
     IngressBindingRegistry,
@@ -698,3 +700,840 @@ def test_close_is_idempotent_and_does_not_wait_for_a_blocked_daemon_delivery():
     assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is False
     release_delivery.set()
     coordinator.drain_before_terminal(timeout_seconds=0.5)
+
+
+def task4_runtime(posted, *, responses=None, now=None, max_pending=64):
+    queued_responses = list(responses or ())
+
+    def post(payload, timeout_seconds):
+        posted.append(payload)
+        if queued_responses:
+            response = queued_responses.pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            return response
+        return {"ok": True, "applied": True}
+
+    runtime = plugin_runtime.PluginRuntime(
+        post=post,
+        now=now or (lambda: 100.0),
+        max_pending_observers=max_pending,
+    )
+    assert runtime.bind_ingress_from_values(
+        "default",
+        "fallback_default",
+        "session-1",
+        "gateway-session-1",
+        "generation-1",
+        "oc_1",
+        "om_1",
+        "om_parent",
+        "thread-1",
+    ) is True
+    return runtime
+
+
+def active_task4_runtime(posted, **kwargs):
+    runtime = task4_runtime(posted, **kwargs)
+    assert runtime.handle_pre_llm_call(
+        session_id="session-1",
+        task_id="task-1",
+        turn_id="turn-1",
+        platform="feishu",
+        user_message="USER-CANARY",
+        conversation_history=[{"content": "HISTORY-CANARY"}],
+        sender_id="SENDER-CANARY",
+        telemetry_schema_version="future-1",
+    ) is None
+    assert runtime.turn_state("turn-1") is TurnState.CARD_ACTIVE
+    posted.clear()
+    return runtime
+
+
+def test_task4_real_pre_llm_kwargs_without_generation_build_honest_started_payload():
+    posted = []
+    runtime = task4_runtime(posted)
+
+    assert runtime.handle_pre_llm_call(
+        session_id="session-1",
+        task_id="task-1",
+        turn_id="turn-1",
+        platform="feishu",
+        user_message="USER-CANARY",
+        conversation_history=[{"content": "HISTORY-CANARY"}],
+        sender_id="SENDER-CANARY",
+        telemetry_schema_version="future-1",
+    ) is None
+
+    assert posted == [
+        {
+            "schema_version": "1",
+            "event": "message.started",
+            "conversation_id": "thread-1",
+            "message_id": "om_1",
+            "chat_id": "oc_1",
+            "thread_id": "thread-1",
+            "platform": "feishu",
+            "turn_id": "turn-1",
+            "sequence": 0,
+            "created_at": 100.0,
+            "event_id": "turn:turn-1:started",
+            "producer": "plugin",
+            "phase": "started",
+            "data": {
+                "profile_id": "default",
+                "profile_source": "fallback_default",
+                "reply_to_message_id": "om_parent",
+            },
+        }
+    ]
+    assert runtime.turn_state("turn-1") is TurnState.CARD_ACTIVE
+    assert "USER-CANARY" not in repr(runtime)
+    assert "HISTORY-CANARY" not in repr(runtime)
+    assert "SENDER-CANARY" not in repr(runtime)
+
+
+def test_task4_started_unknown_retries_exact_payload_but_rejection_does_not_retry():
+    retried = []
+    runtime = task4_runtime(
+        retried,
+        responses=[TimeoutError("unavailable"), {"ok": True, "applied": True}],
+    )
+    runtime.handle_pre_llm_call(
+        session_id="session-1", turn_id="turn-1", platform="feishu"
+    )
+    assert len(retried) == 2
+    assert retried[0] == retried[1]
+    assert runtime.turn_state("turn-1") is TurnState.CARD_ACTIVE
+
+    rejected = []
+    runtime = task4_runtime(
+        rejected,
+        responses=[{"ok": True, "applied": False, "disposition": "native"}],
+    )
+    runtime.handle_pre_llm_call(
+        session_id="session-1", turn_id="turn-2", platform="feishu"
+    )
+    assert len(rejected) == 1
+    assert runtime.turn_state("turn-2") is TurnState.NATIVE_BYPASS
+
+
+def test_task4_post_llm_is_cache_only_and_failed_end_ignores_nonempty_explanation():
+    posted = []
+    runtime = active_task4_runtime(posted)
+
+    assert runtime.handle_post_llm_call(
+        session_id="session-1",
+        turn_id="turn-1",
+        assistant_response="FAILURE-EXPLANATION-CANARY",
+        user_message="USER-CANARY",
+        conversation_history=[{"content": "HISTORY-CANARY"}],
+    ) is None
+    assert posted == []
+    assert runtime.handle_on_session_end(
+        session_id="session-1",
+        turn_id="turn-1",
+        completed=False,
+        failed=True,
+        interrupted=False,
+        turn_exit_reason="local_processing_error(PRIVATE-TRACE-CANARY)",
+    ) is None
+
+    assert len(posted) == 1
+    assert posted[0]["event"] == "message.failed"
+    assert posted[0]["event_id"] == "turn:turn-1:failed"
+    assert posted[0]["data"] == {
+        "error": "消息处理失败",
+        "turn_exit_reason": "runtime_error",
+    }
+    assert "FAILURE-EXPLANATION-CANARY" not in repr(posted)
+    assert "PRIVATE-TRACE-CANARY" not in repr(posted)
+
+
+def test_task4_only_literal_success_flags_with_exact_cached_answer_complete():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    answer = "exact final answer"
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response=answer)
+
+    assert runtime.handle_on_session_end(
+        session_id="session-1",
+        turn_id="turn-1",
+        completed=True,
+        failed=False,
+        interrupted=False,
+        turn_exit_reason="text_response(finish_reason=stop)",
+    ) is None
+
+    assert posted == [
+        {
+            "schema_version": "1",
+            "event": "message.completed",
+            "conversation_id": "thread-1",
+            "message_id": "om_1",
+            "chat_id": "oc_1",
+            "thread_id": "thread-1",
+            "platform": "feishu",
+            "turn_id": "turn-1",
+            "sequence": 1,
+            "created_at": 100.0,
+            "event_id": "turn:turn-1:completed",
+            "producer": "plugin",
+            "phase": "terminal",
+            "data": {"answer": answer},
+        }
+    ]
+    assert runtime.take_terminal_disposition("turn-1") == {
+        "ok": True,
+        "applied": True,
+    }
+    assert runtime.take_terminal_disposition("turn-1") is None
+
+
+@pytest.mark.parametrize(
+    ("completed", "failed", "interrupted"),
+    (
+        (1, False, False),
+        (True, 0, False),
+        (True, False, 0),
+        ("true", False, False),
+        (True, "false", False),
+        (True, False, "false"),
+    ),
+)
+def test_task4_nonliteral_terminal_flags_never_guess_completion(
+    completed, failed, interrupted
+):
+    posted = []
+    runtime = active_task4_runtime(posted)
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    runtime.handle_on_session_end(
+        turn_id="turn-1",
+        completed=completed,
+        failed=failed,
+        interrupted=interrupted,
+    )
+    assert posted == []
+    assert runtime.take_terminal_disposition("turn-1") is None
+
+
+def test_task4_official_tool_kwargs_drop_every_raw_canary_and_map_statuses():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    runtime.handle_pre_tool_call(
+        tool_name="shell",
+        args={"secret": "ARGS-CANARY"},
+        task_id="task-1",
+        session_id="session-1",
+        tool_call_id="call-1",
+        turn_id="turn-1",
+        api_request_id="API-CANARY",
+        middleware_trace=[{"raw": "TRACE-CANARY"}],
+        detail="DETAIL-CANARY",
+    )
+    runtime.handle_post_tool_call(
+        tool_name="shell",
+        args={"secret": "ARGS-CANARY"},
+        result={"body": "RESULT-CANARY"},
+        task_id="task-1",
+        session_id="session-1",
+        tool_call_id="call-1",
+        turn_id="turn-1",
+        api_request_id="API-CANARY",
+        duration_ms=9,
+        status="error",
+        error_type="ERROR-TYPE-CANARY",
+        error_message="ERROR-MESSAGE-CANARY",
+        middleware_trace=[{"raw": "TRACE-CANARY"}],
+    )
+    runtime.drain_observers(1.0)
+
+    assert [payload["data"] for payload in posted] == [
+        {"tool_id": "call-1", "name": "shell", "status": "pending"},
+        {
+            "tool_id": "call-1",
+            "name": "shell",
+            "status": "failed",
+            "duration_ms": 9,
+        },
+    ]
+    serialized = repr(posted)
+    for canary in (
+        "ARGS-CANARY",
+        "RESULT-CANARY",
+        "API-CANARY",
+        "ERROR-TYPE-CANARY",
+        "ERROR-MESSAGE-CANARY",
+        "TRACE-CANARY",
+        "DETAIL-CANARY",
+    ):
+        assert canary not in serialized
+
+
+@pytest.mark.parametrize(
+    ("official", "safe"),
+    (
+        ("ok", "completed"),
+        ("error", "failed"),
+        ("blocked", "blocked"),
+        ("timeout", "timeout"),
+        ("cancelled", "cancelled"),
+        ("canceled", "cancelled"),
+        ("unknown", "failed"),
+    ),
+)
+def test_task4_tool_status_mapping_never_guesses_unknown_success(official, safe):
+    posted = []
+    runtime = active_task4_runtime(posted)
+    runtime.handle_post_tool_call(
+        turn_id="turn-1",
+        tool_call_id="call-1",
+        tool_name="shell",
+        status=official,
+    )
+    runtime.drain_observers(1.0)
+    assert posted[0]["data"]["status"] == safe
+
+
+def test_task4_approval_five_part_key_prevents_cross_consumption():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    for tool_call_id in ("approval-call-1", "approval-call-2"):
+        runtime.handle_pre_approval_request(
+            session_key="gateway-session-1",
+            turn_id="turn-1",
+            tool_call_id=tool_call_id,
+            command="  git   status  ",
+            description="DESCRIPTION-CANARY",
+            surface="gateway",
+        )
+    runtime.drain_observers(1.0)
+
+    assert runtime.take_pending_approval(
+        "gateway-session-1",
+        "turn-1",
+        "approval-call-1",
+        "git status",
+        "gateway",
+    ) is not None
+    assert runtime.take_pending_approval(
+        "gateway-session-1",
+        "turn-1",
+        "approval-call-1",
+        "git status",
+        "gateway",
+    ) is None
+    assert runtime.take_pending_approval(
+        "gateway-session-1",
+        "turn-1",
+        "approval-call-2",
+        "git status",
+        "gateway",
+    ) is not None
+    serialized = repr(posted)
+    assert "git status" not in serialized
+    assert "DESCRIPTION-CANARY" not in serialized
+
+
+def test_task4_same_command_two_tool_calls_have_distinct_event_ids():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    for tool_call_id in ("approval-call-1", "approval-call-2"):
+        runtime.handle_pre_approval_request(
+            session_key="gateway-session-1",
+            turn_id="turn-1",
+            tool_call_id=tool_call_id,
+            command="git status",
+            surface="gateway",
+        )
+    runtime.drain_observers(1.0)
+    assert len(posted) == 2
+    assert posted[0]["event_id"] != posted[1]["event_id"]
+    assert "approval-call-1" in posted[0]["event_id"]
+    assert "approval-call-2" in posted[1]["event_id"]
+
+
+def test_task4_take_claim_is_one_shot_but_official_post_still_closes_interaction():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    exact = {
+        "session_key": "gateway-session-1",
+        "turn_id": "turn-1",
+        "tool_call_id": "approval-call-1",
+        "command": "git status",
+        "surface": "gateway",
+    }
+    runtime.handle_pre_approval_request(**exact)
+    assert runtime.take_pending_approval(*exact.values()) is not None
+    assert runtime.take_pending_approval(*exact.values()) is None
+    runtime.handle_post_approval_response(**exact, choice="once")
+    runtime.drain_observers(1.0)
+    assert [payload["event"] for payload in posted] == [
+        "interaction.requested",
+        "interaction.completed",
+    ]
+    assert posted[0]["data"]["interaction_id"] == posted[1]["data"]["interaction_id"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"session_key": "wrong"},
+        {"turn_id": "wrong"},
+        {"tool_call_id": ""},
+        {"surface": "cli"},
+    ),
+)
+def test_task4_approval_mismatch_and_missing_ids_are_noop(overrides):
+    posted = []
+    runtime = active_task4_runtime(posted)
+    values = {
+        "session_key": "gateway-session-1",
+        "turn_id": "turn-1",
+        "tool_call_id": "approval-call-1",
+        "command": "git status",
+        "surface": "gateway",
+    }
+    values.update(overrides)
+    runtime.handle_pre_approval_request(**values)
+    runtime.drain_observers(1.0)
+    assert posted == []
+
+
+def test_task4_subagent_stop_reuses_start_id_and_drops_tool_history():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    runtime.handle_subagent_start(
+        parent_session_id="session-1",
+        parent_turn_id="turn-1",
+        parent_subagent_id="parent",
+        child_session_id="child-session",
+        child_subagent_id="child-1",
+        child_role="research",
+        child_goal=("safe goal " * 100) + "GOAL-CANARY",
+    )
+    runtime.handle_subagent_stop(
+        parent_session_id="session-1",
+        parent_turn_id="turn-1",
+        child_session_id="child-session",
+        child_role="research",
+        child_summary=("safe summary " * 100) + "SUMMARY-CANARY",
+        child_status="completed",
+        tool_call_history=[{"secret": "TOOL-HISTORY-CANARY"}],
+        duration_ms=4,
+    )
+    runtime.drain_observers(1.0)
+
+    assert [payload["data"]["child_id"] for payload in posted] == [
+        "child-1",
+        "child-1",
+    ]
+    assert len(posted[0]["data"]["goal_preview"]) <= 240
+    assert len(posted[1]["data"]["summary_preview"]) <= 240
+    assert "TOOL-HISTORY-CANARY" not in repr(posted)
+
+
+def test_task4_concurrent_session_end_has_one_terminal_owner_and_take_once():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    start = Barrier(8)
+
+    def end_once(_index):
+        start.wait()
+        return runtime.handle_on_session_end(
+            turn_id="turn-1", completed=True, failed=False, interrupted=False
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        assert list(executor.map(end_once, range(8))) == [None] * 8
+
+    assert [payload["event"] for payload in posted] == ["message.completed"]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        dispositions = list(
+            executor.map(lambda _: runtime.take_terminal_disposition("turn-1"), range(2))
+        )
+    assert dispositions.count({"ok": True, "applied": True}) == 1
+    assert dispositions.count(None) == 1
+
+
+def test_task4_reset_uses_old_session_and_finalize_uses_exact_closing_session():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="ANSWER-CANARY")
+
+    runtime.handle_on_session_reset(
+        session_id="new-session",
+        old_session_id="wrong-old-session",
+        new_session_id="new-session",
+    )
+    assert runtime.turn_state("turn-1") is TurnState.CARD_ACTIVE
+    runtime.handle_on_session_finalize(session_id="session-1")
+    assert runtime.turn_state("turn-1") is None
+    assert "ANSWER-CANARY" not in repr(runtime)
+
+
+def test_task4_module_callbacks_dispatch_dynamically_and_always_return_none():
+    posted = []
+    runtime = task4_runtime(posted)
+    plugin_runtime.configure_plugin_runtime(runtime)
+    context = PluginContext()
+    register_callbacks(context)
+    try:
+        for name, callback in context.registered.items():
+            assert callback(telemetry_schema_version="future-1") is None, name
+    finally:
+        reset_plugin_runtime_state()
+    assert posted == []
+
+
+def test_task4_platform_equality_spoof_cannot_claim_ingress():
+    class PretendsFeishu:
+        def __eq__(self, other):
+            return other == "feishu"
+
+    posted = []
+    runtime = task4_runtime(posted)
+    runtime.handle_pre_llm_call(
+        session_id="session-1",
+        turn_id="turn-spoofed",
+        platform=PretendsFeishu(),
+    )
+    assert posted == []
+    runtime.handle_pre_llm_call(
+        session_id="session-1", turn_id="turn-real", platform="feishu"
+    )
+    assert [payload["turn_id"] for payload in posted] == ["turn-real"]
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    (
+        AcceptedDict(ok=True, applied=False),
+        {"ok": True, "applied": False, "extra": "bad"},
+        {PretendsKey("ok"): True, "applied": False},
+        {"ok": True, "applied": False, "disposition": PretendsDelivered()},
+    ),
+)
+def test_task4_malformed_started_response_retries_before_native_bypass(malformed):
+    posted = []
+    runtime = task4_runtime(
+        posted,
+        responses=[malformed, {"ok": True, "applied": True}],
+    )
+    runtime.handle_pre_llm_call(
+        session_id="session-1", turn_id="turn-1", platform="feishu"
+    )
+    assert len(posted) == 2
+    assert posted[0] == posted[1]
+    assert runtime.turn_state("turn-1") is TurnState.CARD_ACTIVE
+
+
+@pytest.mark.parametrize(
+    "not_explicit",
+    (
+        {"ok": False, "applied": True},
+        {"ok": True, "applied": False},
+        {"ok": True, "applied": True, "delivery": {"outcome": "unknown"}},
+        {"ok": True, "applied": True, "delivery": {"outcome": "accepted"}},
+    ),
+)
+def test_task4_only_exact_started_success_or_native_rejection_stops_retry(not_explicit):
+    posted = []
+    runtime = task4_runtime(
+        posted,
+        responses=[not_explicit, {"ok": True, "applied": True}],
+    )
+    runtime.handle_pre_llm_call(
+        session_id="session-1", turn_id="turn-1", platform="feishu"
+    )
+    assert len(posted) == 2
+    assert runtime.turn_state("turn-1") is TurnState.CARD_ACTIVE
+
+
+def test_task4_missing_answer_cleanup_closes_coordinator_outside_runtime_lock():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    coordinator = runtime._coordinators["turn-1"]
+    original_close = coordinator.close
+
+    def checked_close():
+        assert not runtime._lock._is_owned()
+        return original_close()
+
+    coordinator.close = checked_close
+    runtime.handle_on_session_end(
+        turn_id="turn-1", completed=True, failed=False, interrupted=False
+    )
+    assert runtime.turn_state("turn-1") is None
+    assert posted == []
+
+
+def test_task4_duplicate_turn_closes_discarded_coordinator_outside_runtime_lock(monkeypatch):
+    posted = []
+    runtime = active_task4_runtime(posted)
+    assert runtime.bind_ingress_from_values(
+        "second",
+        "fallback_default",
+        "session-2",
+        "gateway-session-2",
+        "generation-2",
+        "oc_2",
+        "om_2",
+        "om_2",
+        "",
+    )
+    real_close = TurnEventCoordinator.close
+
+    def checked_close(coordinator):
+        assert not runtime._lock._is_owned()
+        return real_close(coordinator)
+
+    monkeypatch.setattr(TurnEventCoordinator, "close", checked_close)
+    runtime.handle_pre_llm_call(
+        session_id="session-2", turn_id="turn-1", platform="feishu"
+    )
+    assert posted == []
+
+
+def test_task4_finalize_during_terminal_transport_cannot_resurrect_disposition():
+    posted = []
+    transport_entered = Event()
+    release_transport = Event()
+
+    def post(payload, timeout_seconds):
+        posted.append(payload)
+        if payload["event"] == "message.completed":
+            transport_entered.set()
+            assert release_transport.wait(timeout=1.0)
+        return {"ok": True, "applied": True}
+
+    runtime = plugin_runtime.PluginRuntime(post=post, now=lambda: 100.0)
+    runtime.bind_ingress_from_values(
+        "default", "fallback_default", "session-1", "gateway-session-1",
+        "generation-1", "oc_1", "om_1", "om_parent", "thread-1",
+    )
+    runtime.handle_pre_llm_call(
+        session_id="session-1", turn_id="turn-1", platform="feishu"
+    )
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    terminal = Thread(
+        target=lambda: runtime.handle_on_session_end(
+            turn_id="turn-1", completed=True, failed=False, interrupted=False
+        )
+    )
+    terminal.start()
+    assert transport_entered.wait(timeout=0.5)
+    runtime.handle_on_session_finalize(session_id="session-1")
+    release_transport.set()
+    terminal.join(timeout=1.0)
+    assert not terminal.is_alive()
+    assert runtime.take_terminal_disposition("turn-1") is None
+    assert "answer" not in repr(runtime)
+
+
+def test_task4_terminal_native_response_is_copied_but_descriptor_validation_is_deferred():
+    descriptor = {
+        "future": ["structured", {"opaque": "descriptor"}],
+        "protocol": "future-protocol",
+    }
+    response = {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+        "native_handoff": descriptor,
+    }
+    posted = []
+    runtime = active_task4_runtime(posted, responses=[{"ok": True, "applied": True}, response])
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    runtime.handle_on_session_end(
+        turn_id="turn-1", completed=True, failed=False, interrupted=False
+    )
+    descriptor["future"][1]["opaque"] = "mutated"
+    response["disposition"] = "card"
+    disposition = runtime.take_terminal_disposition("turn-1")
+    assert disposition == {
+        "ok": True,
+        "applied": False,
+        "disposition": "native",
+        "native_handoff": {
+            "future": ["structured", {"opaque": "descriptor"}],
+            "protocol": "future-protocol",
+        },
+    }
+
+
+def test_task4_terminal_delivery_accepted_is_malformed_and_retries_exact_payload():
+    posted = []
+    runtime = active_task4_runtime(
+        posted,
+        responses=[
+            {"ok": True, "applied": True},
+            {"ok": True, "applied": True, "delivery": {"outcome": "accepted"}},
+            {"ok": True, "applied": True},
+        ],
+    )
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    runtime.handle_on_session_end(
+        turn_id="turn-1", completed=True, failed=False, interrupted=False
+    )
+    assert len(posted) == 2
+    assert posted[0] == posted[1]
+    assert runtime.take_terminal_disposition("turn-1") == {
+        "ok": True,
+        "applied": True,
+    }
+
+
+def test_task4_answer_cache_expires_and_reset_finalize_clear_exact_state():
+    now = [100.0]
+    posted = []
+    runtime = active_task4_runtime(posted, now=lambda: now[0])
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="EXPIRED-ANSWER")
+    now[0] += runtime._ANSWER_TTL_SECONDS
+    runtime.handle_on_session_end(
+        turn_id="turn-1", completed=True, failed=False, interrupted=False
+    )
+    assert posted == []
+    assert runtime.turn_state("turn-1") is None
+    assert "EXPIRED-ANSWER" not in repr(runtime)
+
+    assert runtime.bind_ingress_from_values(
+        "default", "fallback_default", "old-session", "gateway-old",
+        "generation-old", "oc_old", "om_old", "om_old", "",
+    )
+    runtime.handle_pre_llm_call(
+        session_id="old-session", turn_id="turn-old", platform="feishu"
+    )
+    runtime.handle_post_llm_call(turn_id="turn-old", assistant_response="RESET-ANSWER")
+    posted.clear()
+    runtime.handle_on_session_reset(
+        session_id="new-session", old_session_id="old-session"
+    )
+    assert runtime.turn_state("turn-old") is None
+    assert "RESET-ANSWER" not in repr(runtime)
+
+
+def test_task4_queue_saturation_and_terminal_barrier_drop_late_observers():
+    posted = []
+    runtime = active_task4_runtime(posted, max_pending=1)
+    coordinator = runtime._coordinators["turn-1"]
+    coordinator._deliver = lambda _event: None
+    coordinator._queue = __import__("queue").Queue(maxsize=1)
+
+    runtime.handle_pre_tool_call(
+        turn_id="turn-1", tool_call_id="call-1", tool_name="shell"
+    )
+    runtime.handle_pre_tool_call(
+        turn_id="turn-1", tool_call_id="call-2", tool_name="shell"
+    )
+    assert coordinator._queue.qsize() == 1
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    runtime.handle_on_session_end(
+        turn_id="turn-1", completed=True, failed=False, interrupted=False
+    )
+    runtime.handle_post_tool_call(
+        turn_id="turn-1", tool_call_id="call-late", tool_name="shell", status="ok"
+    )
+    assert [payload["event"] for payload in posted] == ["message.completed"]
+
+
+def test_task4_missing_turn_session_end_never_closes_another_turn():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    runtime.handle_on_session_end(
+        session_id="session-1", completed=True, failed=False, interrupted=False
+    )
+    assert runtime.turn_state("turn-1") is TurnState.CARD_ACTIVE
+    assert posted == []
+
+
+def test_task4_terminal_retry_reuses_one_payload_and_native_remains_native():
+    native = {"ok": True, "applied": False, "disposition": "native"}
+    posted = []
+    runtime = active_task4_runtime(
+        posted,
+        responses=[{"ok": True, "applied": True}, None, native],
+    )
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    runtime.handle_on_session_end(
+        turn_id="turn-1", completed=True, failed=False, interrupted=False
+    )
+    assert len(posted) == 2
+    assert posted[0] == posted[1]
+    assert runtime.take_terminal_disposition("turn-1") == native
+
+
+def test_task4_post_approval_real_official_kwargs_exactly_close_pending():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    official = {
+        "command": "git status",
+        "description": "check state",
+        "pattern_key": "git status",
+        "pattern_keys": ["git status"],
+        "session_key": "gateway-session-1",
+        "surface": "gateway",
+        "turn_id": "turn-1",
+        "tool_call_id": "approval-call-1",
+    }
+    runtime.handle_pre_approval_request(**official)
+    runtime.handle_post_approval_response(**official, choice="deny")
+    runtime.drain_observers(1.0)
+    assert [payload["event"] for payload in posted] == [
+        "interaction.requested",
+        "interaction.completed",
+    ]
+
+
+def test_task4_all_runtime_maps_are_explicitly_bounded_to_1024():
+    runtime = plugin_runtime.PluginRuntime(post=lambda payload, timeout: None)
+    assert runtime._MAX_ENTRIES <= 1024
+    assert runtime._registry._MAX_BINDINGS <= 1024
+
+
+def test_task4_runtime_reset_closes_coordinator_and_restores_inert_callbacks():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    coordinator = runtime._coordinators["turn-1"]
+    plugin_runtime.configure_plugin_runtime(runtime)
+
+    assert reset_plugin_runtime_state() is None
+    assert coordinator.submit_observer(
+        {"event": "tool.updated"}, producer="plugin"
+    ) is False
+    assert plugin_runtime.handle_pre_llm_call(
+        session_id="session-1", turn_id="turn-new", platform="feishu"
+    ) is None
+    assert posted == []
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    (
+        AcceptedDict(ok=True, applied=True),
+        {"ok": True, "applied": True, "extra": False},
+        {PretendsKey("ok"): True, "applied": True},
+        {"ok": True, "applied": 1},
+        {"ok": True, "applied": False, "disposition": PretendsDelivered()},
+        {"ok": True, "applied": False, "disposition": "native", "extra": False},
+        {
+            "ok": True,
+            "applied": False,
+            "disposition": "native",
+            "native_handoff": AcceptedDict(protocol="future"),
+        },
+    ),
+)
+def test_task4_malformed_terminal_response_is_not_cached(malformed):
+    posted = []
+    runtime = active_task4_runtime(
+        posted,
+        responses=[{"ok": True, "applied": True}, malformed, malformed],
+    )
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    runtime.handle_on_session_end(
+        turn_id="turn-1", completed=True, failed=False, interrupted=False
+    )
+    assert runtime.take_terminal_disposition("turn-1") is None
