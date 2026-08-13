@@ -60,6 +60,14 @@ class StringSubclass(str):
     pass
 
 
+class FloatSubclass(float):
+    pass
+
+
+class IntSubclass(int):
+    pass
+
+
 def test_new_generation_replaces_old_ingress_binding():
     registry = IngressBindingRegistry(now=lambda: 100.0)
     assert registry.bind(binding("generation-a")) is True
@@ -147,6 +155,17 @@ def test_unique_session_claim_rejects_nonordinary_or_blank_identities_without_co
     assert registry.bind(binding()) is True
     assert registry.claim_unique_session(session_id, turn_id) is None
     assert registry.claim_unique_session("session-1", "turn-valid") is not None
+
+
+@pytest.mark.parametrize("invalid_value", ("", StringSubclass("session-1"), None))
+def test_invalid_unique_session_claim_still_prunes_expired_bindings(invalid_value):
+    now = [100.0]
+    registry = IngressBindingRegistry(now=lambda: now[0])
+    assert registry.bind(binding(expires_at=101.0)) is True
+    now[0] = 101.0
+    assert registry.claim_unique_session(invalid_value, "turn-1") is None
+    now[0] = 100.0
+    assert registry.claim_unique_session("session-1", "turn-valid") is None
 
 
 def test_started_transitions_only_on_explicit_sidecar_acceptance():
@@ -343,12 +362,60 @@ def test_bind_rejects_non_numeric_or_nonfinite_expiry(expires_at):
     assert registry.bind(binding(expires_at=expires_at)) is False
 
 
+@pytest.mark.parametrize(
+    "expires_at",
+    (FloatSubclass(200.0), IntSubclass(200), 10**10000),
+    ids=("float-subclass", "int-subclass", "huge-int"),
+)
+def test_bind_rejects_numeric_subclasses_and_overflowing_expiry(expires_at):
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(binding(expires_at=expires_at)) is False
+
+
+def test_invalid_bind_still_prunes_expired_bindings():
+    now = [100.0]
+    registry = IngressBindingRegistry(now=lambda: now[0])
+    assert registry.bind(binding(expires_at=101.0)) is True
+    now[0] = 101.0
+    assert registry.bind(binding(gateway_session_key="")) is False
+    now[0] = 100.0
+    assert registry.claim("default", "session-1", "generation-a", "turn-1") is None
+
+
 def test_bind_rejects_ingress_binding_subclasses():
     class DerivedIngressBinding(IngressBinding):
         pass
 
     registry = IngressBindingRegistry(now=lambda: 100.0)
     assert registry.bind(DerivedIngressBinding(**binding().__dict__)) is False
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "session_id", "generation", "turn_id"),
+    (
+        (StringSubclass("default"), "session-1", "generation-a", "turn-1"),
+        ("default", StringSubclass("session-1"), "generation-a", "turn-1"),
+        ("default", "session-1", StringSubclass("generation-a"), "turn-1"),
+        ("default", "session-1", "generation-a", StringSubclass("turn-1")),
+    ),
+)
+def test_explicit_claim_rejects_string_subclasses_without_consuming(
+    profile_id, session_id, generation, turn_id
+):
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(binding()) is True
+    assert registry.claim(profile_id, session_id, generation, turn_id) is None
+    assert registry.claim("default", "session-1", "generation-a", "turn-valid") is not None
+
+
+def test_invalid_explicit_claim_still_prunes_expired_bindings():
+    now = [100.0]
+    registry = IngressBindingRegistry(now=lambda: now[0])
+    assert registry.bind(binding(expires_at=101.0)) is True
+    now[0] = 101.0
+    assert registry.claim("", "session-1", "generation-a", "turn-1") is None
+    now[0] = 100.0
+    assert registry.claim("default", "session-1", "generation-a", "turn-valid") is None
 
 
 def test_expired_binding_is_pruned_before_claim():

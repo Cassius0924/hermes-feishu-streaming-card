@@ -229,11 +229,11 @@ class IngressBindingRegistry:
         self._lock = RLock()
 
     def bind(self, binding: IngressBinding) -> bool:
-        if not self._is_valid_binding(binding):
-            return False
         with self._lock:
             now = self._now()
             self._prune_expired(now)
+            if not self._is_valid_binding(binding):
+                return False
             if binding.expires_at <= now:
                 return False
             pair = (binding.profile_id, binding.session_id)
@@ -249,20 +249,23 @@ class IngressBindingRegistry:
     def claim(
         self, profile_id: str, session_id: str, generation: str, turn_id: str
     ) -> TurnBinding | None:
-        if not all(self._is_nonblank(value) for value in (profile_id, session_id, generation, turn_id)):
-            return None
         with self._lock:
             self._prune_expired(self._now())
+            if not all(
+                self._is_exact_nonblank(value)
+                for value in (profile_id, session_id, generation, turn_id)
+            ):
+                return None
             binding = self._bindings.pop((profile_id, session_id, generation), None)
             if binding is None:
                 return None
             return TurnBinding(ingress=binding, turn_id=turn_id)
 
     def claim_unique_session(self, session_id: str, turn_id: str) -> TurnBinding | None:
-        if not all(self._is_exact_nonblank(value) for value in (session_id, turn_id)):
-            return None
         with self._lock:
             self._prune_expired(self._now())
+            if not all(self._is_exact_nonblank(value) for value in (session_id, turn_id)):
+                return None
             candidates = [
                 (key, binding)
                 for key, binding in self._bindings.items()
@@ -277,10 +280,6 @@ class IngressBindingRegistry:
     def clear(self) -> None:
         with self._lock:
             self._bindings.clear()
-
-    @staticmethod
-    def _is_nonblank(value: object) -> bool:
-        return isinstance(value, str) and bool(value.strip())
 
     @staticmethod
     def _is_exact_nonblank(value: object) -> bool:
@@ -306,11 +305,12 @@ class IngressBindingRegistry:
         if type(binding.thread_id) is not str:
             return False
         expires_at = binding.expires_at
-        return (
-            isinstance(expires_at, (int, float))
-            and not isinstance(expires_at, bool)
-            and isfinite(expires_at)
-        )
+        if type(expires_at) not in (int, float):
+            return False
+        try:
+            return isfinite(expires_at)
+        except (OverflowError, TypeError, ValueError):
+            return False
 
     def _prune_expired(self, now: float) -> None:
         for key, binding in tuple(self._bindings.items()):
