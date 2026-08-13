@@ -1332,7 +1332,7 @@ def test_task4_finalize_during_terminal_transport_cannot_resurrect_disposition()
     assert "answer" not in repr(runtime)
 
 
-def test_task4_terminal_native_response_is_copied_but_descriptor_validation_is_deferred():
+def test_task4_unknown_structured_native_descriptor_is_strictly_rejected():
     descriptor = {
         "future": ["structured", {"opaque": "descriptor"}],
         "protocol": "future-protocol",
@@ -1344,23 +1344,16 @@ def test_task4_terminal_native_response_is_copied_but_descriptor_validation_is_d
         "native_handoff": descriptor,
     }
     posted = []
-    runtime = active_task4_runtime(posted, responses=[{"ok": True, "applied": True}, response])
+    runtime = active_task4_runtime(
+        posted,
+        responses=[{"ok": True, "applied": True}, response, response],
+    )
     runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
     runtime.handle_on_session_end(
         turn_id="turn-1", completed=True, failed=False, interrupted=False
     )
-    descriptor["future"][1]["opaque"] = "mutated"
-    response["disposition"] = "card"
-    disposition = runtime.take_terminal_disposition("turn-1")
-    assert disposition == {
-        "ok": True,
-        "applied": False,
-        "disposition": "native",
-        "native_handoff": {
-            "future": ["structured", {"opaque": "descriptor"}],
-            "protocol": "future-protocol",
-        },
-    }
+    assert runtime.take_terminal_disposition("turn-1") is None
+    assert runtime.take_terminal_record("turn-1")["response"] is None
 
 
 def test_task4_terminal_delivery_accepted_is_malformed_and_retries_exact_payload():
@@ -1462,7 +1455,8 @@ def test_task4_terminal_retry_reuses_one_payload_and_native_remains_native():
     )
     assert len(posted) == 2
     assert posted[0] == posted[1]
-    assert runtime.take_terminal_disposition("turn-1") == native
+    assert runtime.take_terminal_disposition("turn-1") is None
+    assert runtime.take_terminal_record("turn-1")["response"] == native
 
 
 def test_task4_post_approval_real_official_kwargs_exactly_close_pending():
@@ -1507,6 +1501,255 @@ def test_task4_runtime_reset_closes_coordinator_and_restores_inert_callbacks():
         session_id="session-1", turn_id="turn-new", platform="feishu"
     ) is None
     assert posted == []
+
+
+def test_task4_finalize_linearizes_with_claim_and_pre_cannot_resurrect_turn(monkeypatch):
+    posted = []
+    runtime = task4_runtime(posted)
+    claimed = Event()
+    release_claim = Event()
+    original_claim = runtime._registry.claim_unique_session
+
+    def gated_claim(session_id, turn_id):
+        turn = original_claim(session_id, turn_id)
+        claimed.set()
+        assert release_claim.wait(timeout=1.0)
+        return turn
+
+    monkeypatch.setattr(runtime._registry, "claim_unique_session", gated_claim)
+    pre = Thread(
+        target=lambda: runtime.handle_pre_llm_call(
+            session_id="session-1", turn_id="turn-race", platform="feishu"
+        )
+    )
+    pre.start()
+    assert claimed.wait(timeout=0.5)
+    finalized = Event()
+    cleanup = Thread(
+        target=lambda: (
+            runtime.handle_on_session_finalize(session_id="session-1"),
+            finalized.set(),
+        )
+    )
+    cleanup.start()
+    cleanup_finished_early = finalized.wait(timeout=0.05)
+    try:
+        assert not cleanup_finished_early
+    finally:
+        release_claim.set()
+        pre.join(timeout=1.0)
+        cleanup.join(timeout=1.0)
+    assert not pre.is_alive() and not cleanup.is_alive()
+    assert runtime.turn_state("turn-race") is None
+    assert len(posted) <= 1
+
+
+def test_task4_capacity_never_evicts_live_terminal_owner_and_all_owner_refuses_admission():
+    entered = Event()
+    release = Event()
+    posted = []
+
+    def post(payload, timeout):
+        posted.append(payload)
+        if payload["event"] == "message.completed":
+            entered.set()
+            assert release.wait(timeout=1.0)
+        return {"ok": True, "applied": True}
+
+    runtime = plugin_runtime.PluginRuntime(post=post, now=lambda: 100.0)
+    runtime._MAX_ENTRIES = 1
+    assert runtime.bind_ingress_from_values(
+        "default", "fallback_default", "session-1", "gateway-session-1",
+        "generation-1", "oc_1", "om_1", "om_1", "",
+    )
+    runtime.handle_pre_llm_call(
+        session_id="session-1", turn_id="turn-owner", platform="feishu"
+    )
+    runtime.handle_post_llm_call(turn_id="turn-owner", assistant_response="answer")
+    terminal = Thread(
+        target=lambda: runtime.handle_on_session_end(
+            turn_id="turn-owner", completed=True, failed=False, interrupted=False
+        )
+    )
+    terminal.start()
+    assert entered.wait(timeout=0.5)
+    assert runtime.bind_ingress_from_values(
+        "second", "fallback_default", "session-2", "gateway-session-2",
+        "generation-2", "oc_2", "om_2", "om_2", "",
+    )
+    runtime.handle_pre_llm_call(
+        session_id="session-2", turn_id="turn-refused", platform="feishu"
+    )
+    assert "turn-owner" in runtime._terminal_owners
+    assert runtime.turn_state("turn-refused") is None
+    assert runtime._registry.claim_unique_session(
+        "session-2", "turn-still-unclaimed"
+    ) is not None
+    release.set()
+    terminal.join(timeout=1.0)
+    assert not terminal.is_alive()
+
+
+def test_task4_capacity_evicts_oldest_nonowner_and_cleans_all_cross_map_state():
+    posted = []
+    runtime = plugin_runtime.PluginRuntime(post=lambda payload, timeout: posted.append(payload) or {"ok": True, "applied": True}, now=lambda: 100.0)
+    runtime._MAX_ENTRIES = 1
+    for index in (1, 2):
+        assert runtime.bind_ingress_from_values(
+            f"p-{index}", "fallback_default", f"session-{index}",
+            f"gateway-{index}", f"generation-{index}", f"oc_{index}",
+            f"om_{index}", f"om_{index}", "",
+        )
+        runtime.handle_pre_llm_call(
+            session_id=f"session-{index}", turn_id=f"turn-{index}", platform="feishu"
+        )
+        if index == 1:
+            runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="secret")
+    assert runtime.turn_state("turn-1") is None
+    assert "turn-1" not in runtime._coordinators
+    assert "turn-1" not in runtime._answers
+    assert "turn-1" not in runtime._terminal_owners
+    assert runtime.turn_state("turn-2") is TurnState.CARD_ACTIVE
+
+
+def test_task4_coordinator_close_reaps_idle_workers_without_thread_leak():
+    baseline = sum(t.name == "hfc-turn-observer" for t in __import__("threading").enumerate())
+    coordinators = [TurnEventCoordinator(f"turn-close-{i}") for i in range(40)]
+    for coordinator in coordinators:
+        coordinator.close()
+    deadline = __import__("time").monotonic() + 1.0
+    while __import__("time").monotonic() < deadline:
+        live = sum(t.name == "hfc-turn-observer" for t in __import__("threading").enumerate())
+        if live <= baseline:
+            break
+        Event().wait(0.01)
+    assert live <= baseline
+
+
+def test_task4_coordinator_close_is_bounded_when_delivery_is_blocked():
+    entered = Event()
+    release = Event()
+    coordinator = TurnEventCoordinator(
+        "turn-blocked-close",
+        deliver=lambda event: (entered.set(), release.wait(timeout=1.0)),
+    )
+    assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin")
+    assert entered.wait(timeout=0.5)
+    started = __import__("time").monotonic()
+    coordinator.close()
+    assert __import__("time").monotonic() - started < 0.25
+    release.set()
+
+
+def native_terminal_response(descriptor=None):
+    response = {"ok": True, "applied": False, "disposition": "native"}
+    if descriptor is not None:
+        response["native_handoff"] = descriptor
+    return response
+
+
+def exact_native_descriptor(*, expires_at=3700.0):
+    return {
+        "protocol": "hfc-native-handoff-v2",
+        "id": "a" * 64,
+        "uuid_seed": "b" * 32,
+        "expires_at": expires_at,
+    }
+
+
+@pytest.mark.parametrize(
+    "descriptor",
+    (
+        AcceptedDict(exact_native_descriptor()),
+        {**exact_native_descriptor(), "extra": False},
+        {key: value for key, value in exact_native_descriptor().items() if key != "id"},
+        {PretendsKey("protocol"): "hfc-native-handoff-v2", "id": "a" * 64, "uuid_seed": "b" * 32, "expires_at": 3700.0},
+        {**exact_native_descriptor(), "protocol": StringSubclass("hfc-native-handoff-v2")},
+        {**exact_native_descriptor(), "id": "A" * 64},
+        {**exact_native_descriptor(), "uuid_seed": "g" * 32},
+        exact_native_descriptor(expires_at=True),
+        exact_native_descriptor(expires_at=100.0),
+        exact_native_descriptor(expires_at=3731.0),
+        exact_native_descriptor(expires_at=float("inf")),
+    ),
+)
+def test_task4_rejects_malformed_native_descriptor(descriptor):
+    posted = []
+    malformed = native_terminal_response(descriptor)
+    runtime = active_task4_runtime(
+        posted,
+        responses=[{"ok": True, "applied": True}, malformed, malformed],
+        now=lambda: 100.0,
+    )
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    runtime.handle_on_session_end(
+        turn_id="turn-1", completed=True, failed=False, interrupted=False
+    )
+    assert runtime.take_terminal_record("turn-1")["response"] is None
+
+
+def test_task4_accepts_exact_native_descriptor_and_plain_native_fallback():
+    for response in (
+        native_terminal_response(),
+        native_terminal_response(exact_native_descriptor(expires_at=3730.0)),
+    ):
+        posted = []
+        runtime = active_task4_runtime(
+            posted,
+            responses=[{"ok": True, "applied": True}, response],
+            now=lambda: 100.0,
+        )
+        runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+        runtime.handle_on_session_end(
+            turn_id="turn-1", completed=True, failed=False, interrupted=False
+        )
+        assert runtime.take_terminal_record("turn-1")["response"] == response
+
+
+def test_task4_terminal_record_is_deep_copied_one_shot_and_concurrent_take_once():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    runtime.handle_on_session_end(
+        turn_id="turn-1", completed=True, failed=False, interrupted=False
+    )
+    barrier = Barrier(2)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        records = list(executor.map(lambda _: (barrier.wait(), runtime.take_terminal_record("turn-1"))[1], range(2)))
+    assert sum(record is not None for record in records) == 1
+    record = next(record for record in records if record is not None)
+    assert record["payload"]["data"] == {"answer": "answer"}
+    record["payload"]["data"]["answer"] = "mutated"
+    assert runtime.take_terminal_record("turn-1") is None
+    assert runtime.take_terminal_disposition("turn-1") is None
+
+
+def test_task4_failed_terminal_never_exposes_card_suppression_disposition():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    runtime.handle_on_session_end(
+        turn_id="turn-1", completed=False, failed=True, interrupted=False,
+        turn_exit_reason="runtime_error",
+    )
+    assert runtime.take_terminal_disposition("turn-1") is None
+    record = runtime.take_terminal_record("turn-1")
+    assert record["payload"]["event"] == "message.failed"
+    assert record["response"] == {"ok": True, "applied": True}
+
+
+def test_task4_completed_native_is_available_only_through_full_terminal_record():
+    posted = []
+    native = native_terminal_response(exact_native_descriptor())
+    runtime = active_task4_runtime(
+        posted,
+        responses=[{"ok": True, "applied": True}, native],
+    )
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    runtime.handle_on_session_end(
+        turn_id="turn-1", completed=True, failed=False, interrupted=False
+    )
+    assert runtime.take_terminal_disposition("turn-1") is None
+    assert runtime.take_terminal_record("turn-1")["response"] == native
 
 
 @pytest.mark.parametrize(

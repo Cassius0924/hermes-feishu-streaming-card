@@ -8,6 +8,7 @@ from enum import Enum
 from hashlib import sha256
 from math import isfinite
 import queue
+import re
 import threading
 from threading import Lock, RLock
 from time import monotonic, time
@@ -115,6 +116,8 @@ class TurnEventCoordinator:
     """Allocate one turn-local sequence and bound asynchronous observer work."""
 
     _PRODUCERS = frozenset({"plugin", "patch", "legacy-patch"})
+    _WORKER_POLL_SECONDS = 0.05
+    _CLOSE_JOIN_SECONDS = 0.1
 
     def __init__(
         self,
@@ -200,10 +203,19 @@ class TurnEventCoordinator:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            worker = self._worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=self._CLOSE_JOIN_SECONDS)
 
     def _deliver_observer_events(self) -> None:
         while True:
-            event = self._queue.get()
+            try:
+                event = self._queue.get(timeout=self._WORKER_POLL_SECONDS)
+            except queue.Empty:
+                with self._lock:
+                    if self._closed:
+                        return
+                continue
             try:
                 self._deliver(event)
             except Exception:
@@ -227,10 +239,15 @@ class IngressBindingRegistry:
     _MAX_BINDINGS = 1024
     _PROFILE_SOURCES = frozenset({"env", "locals", "hermes_home", "fallback_default"})
 
-    def __init__(self, now: Callable[[], float] = time) -> None:
+    def __init__(
+        self,
+        now: Callable[[], float] = time,
+        *,
+        lock: RLock | None = None,
+    ) -> None:
         self._now = now
         self._bindings: OrderedDict[tuple[str, str, str], IngressBinding] = OrderedDict()
-        self._lock = RLock()
+        self._lock = lock or RLock()
 
     def bind(self, binding: IngressBinding) -> bool:
         with self._lock:
@@ -371,6 +388,10 @@ class PluginRuntime:
     _MAX_ENTRIES = 1024
     _ANSWER_TTL_SECONDS = 30.0
     _STATE_TTL_SECONDS = 300.0
+    _NATIVE_HANDOFF_PROTOCOL = "hfc-native-handoff-v2"
+    _NATIVE_HANDOFF_MAX_FUTURE_SECONDS = 3630.0
+    _HANDOFF_ID_RE = re.compile(r"[0-9a-f]{64}")
+    _UUID_SEED_RE = re.compile(r"[0-9a-f]{32}")
 
     def __init__(
         self,
@@ -394,7 +415,8 @@ class PluginRuntime:
         self._observer_timeout_seconds = max(0.0, float(observer_timeout_seconds))
         self._terminal_timeout_seconds = max(0.0, float(terminal_timeout_seconds))
         self._max_pending_observers = max_pending_observers
-        self._registry = IngressBindingRegistry(now=now)
+        self._lock = RLock()
+        self._registry = IngressBindingRegistry(now=now, lock=self._lock)
         self._turns: OrderedDict[str, TurnBinding] = OrderedDict()
         self._coordinators: OrderedDict[str, TurnEventCoordinator] = OrderedDict()
         self._answers: OrderedDict[str, _AnswerEntry] = OrderedDict()
@@ -406,7 +428,6 @@ class PluginRuntime:
         self._claimed_approvals: set[tuple[str, str, str, str, str]] = set()
         self._subagents: OrderedDict[tuple[str, str], tuple[str, float]] = OrderedDict()
         self._terminal_owners: OrderedDict[str, object] = OrderedDict()
-        self._lock = RLock()
 
     def bind_ingress_from_values(
         self,
@@ -432,7 +453,8 @@ class PluginRuntime:
             thread_id=thread_id,
             expires_at=self._now() + self._STATE_TTL_SECONDS,
         )
-        return self._registry.bind(binding)
+        with self._lock:
+            return self._registry.bind(binding)
 
     def turn_state(self, turn_id: object) -> TurnState | None:
         with self._lock:
@@ -447,14 +469,35 @@ class PluginRuntime:
             return None
         if not all(self._exact_nonblank(value) for value in (session_id, turn_id)):
             return None
-        turn = self._registry.claim_unique_session(session_id, turn_id)
-        if turn is None:
-            return None
         coordinator = TurnEventCoordinator(
             turn_id,
             max_pending=self._max_pending_observers,
             deliver=self._deliver_observer,
         )
+        turn: TurnBinding | None = None
+        admitted = False
+        evicted_coordinators: list[TurnEventCoordinator] = []
+        with self._lock:
+            self._expire_locked(self._now())
+            if turn_id not in self._turns:
+                admitted, evicted_coordinators = self._make_turn_room_locked()
+            if admitted:
+                turn = self._registry.claim_unique_session(session_id, turn_id)
+                if turn is not None:
+                    self._turns[turn_id] = turn
+                    self._coordinators[turn_id] = coordinator
+                else:
+                    admitted = False
+        for evicted in evicted_coordinators:
+            evicted.close()
+        if not admitted or turn is None:
+            coordinator.close()
+            return None
+        with self._lock:
+            cleaned_before_transport = self._turns.get(turn_id) is not turn
+        if cleaned_before_transport:
+            coordinator.close()
+            return None
         payload = self._base_payload(
             turn,
             sequence=coordinator.next_sequence("plugin"),
@@ -470,22 +513,6 @@ class PluginRuntime:
                 "reply_to_message_id": turn.ingress.reply_to_message_id,
             },
         )
-        duplicate = False
-        evicted_coordinators: list[TurnEventCoordinator] = []
-        with self._lock:
-            self._expire_locked(self._now())
-            if turn_id in self._turns:
-                duplicate = True
-            else:
-                self._turns[turn_id] = turn
-                self._coordinators[turn_id] = coordinator
-                self._trim_locked(self._turns)
-                evicted_coordinators = self._trim_coordinators_locked()
-        for evicted in evicted_coordinators:
-            evicted.close()
-        if duplicate:
-            coordinator.close()
-            return None
         result = self._post_retry_unknown(
             payload,
             self._observer_timeout_seconds,
@@ -586,12 +613,14 @@ class PluginRuntime:
                 }
             ),
         )
+        validation_time = self._now()
         response = self._post_retry_unknown(
             payload,
             self._terminal_timeout_seconds,
-            lambda value: self._valid_terminal_response(value) is not None,
+            lambda value: self._valid_terminal_response(value, now=validation_time)
+            is not None,
         )
-        valid_response = self._valid_terminal_response(response)
+        valid_response = self._valid_terminal_response(response, now=validation_time)
         with self._lock:
             now = self._now()
             still_owner = self._terminal_owners.get(turn_id) is owner_token
@@ -605,7 +634,11 @@ class PluginRuntime:
                 )
                 self._terminal_records[turn_id] = record
                 self._terminal_records.move_to_end(turn_id)
-                if response_copy is not None:
+                if (
+                    response_copy is not None
+                    and payload_copy.get("event") == "message.completed"
+                    and response_copy == {"ok": True, "applied": True}
+                ):
                     self._dispositions[turn_id] = deepcopy(response_copy)
                     self._dispositions.move_to_end(turn_id)
                 self._cleanup_turn_locked(turn_id, keep_disposition=True)
@@ -806,8 +839,31 @@ class PluginRuntime:
             return None
         with self._lock:
             self._expire_locked(self._now())
-            disposition = self._dispositions.pop(turn_id, None)
+            record = self._terminal_records.get(turn_id)
+            disposition = self._dispositions.get(turn_id)
+            if (
+                record is None
+                or record.payload.get("event") != "message.completed"
+                or disposition != {"ok": True, "applied": True}
+            ):
+                return None
+            self._terminal_records.pop(turn_id, None)
+            self._dispositions.pop(turn_id, None)
             return deepcopy(disposition)
+
+    def take_terminal_record(self, turn_id: object) -> dict[str, object] | None:
+        if not self._exact_nonblank(turn_id):
+            return None
+        with self._lock:
+            self._expire_locked(self._now())
+            record = self._terminal_records.pop(turn_id, None)
+            self._dispositions.pop(turn_id, None)
+            if record is None:
+                return None
+            return {
+                "payload": deepcopy(record.payload),
+                "response": deepcopy(record.response),
+            }
 
     def drain_observers(self, timeout_seconds: float) -> None:
         with self._lock:
@@ -1030,23 +1086,18 @@ class PluginRuntime:
         return False
 
     @classmethod
-    def _valid_terminal_response(cls, value: object) -> dict[str, object] | None:
+    def _valid_terminal_response(
+        cls,
+        value: object,
+        *,
+        now: float,
+    ) -> dict[str, object] | None:
         if type(value) is not dict or not all(type(key) is str for key in value):
             return None
         keys = set(value)
-        if keys in ({"ok", "applied"}, {"ok", "applied", "delivery"}):
+        if keys == {"ok", "applied"}:
             if value.get("ok") is not True or value.get("applied") is not True:
                 return None
-            if "delivery" in value:
-                delivery = value["delivery"]
-                if (
-                    type(delivery) is not dict
-                    or not all(type(key) is str for key in delivery)
-                    or set(delivery) != {"outcome"}
-                    or type(delivery["outcome"]) is not str
-                    or delivery["outcome"] != "delivered"
-                ):
-                    return None
             return deepcopy(value)
         if keys not in (
             {"ok", "applied", "disposition"},
@@ -1062,9 +1113,35 @@ class PluginRuntime:
             return None
         if "native_handoff" in value:
             descriptor = value["native_handoff"]
-            if type(descriptor) is not dict or not all(type(key) is str for key in descriptor):
+            if not cls._valid_native_handoff_descriptor(descriptor, now=now):
                 return None
         return deepcopy(value)
+
+    @classmethod
+    def _valid_native_handoff_descriptor(cls, value: object, *, now: float) -> bool:
+        if type(value) is not dict or not all(type(key) is str for key in value):
+            return False
+        if set(value) != {"protocol", "id", "uuid_seed", "expires_at"}:
+            return False
+        protocol = value["protocol"]
+        handoff_id = value["id"]
+        uuid_seed = value["uuid_seed"]
+        expires_at = value["expires_at"]
+        if type(protocol) is not str or protocol != cls._NATIVE_HANDOFF_PROTOCOL:
+            return False
+        if type(handoff_id) is not str or cls._HANDOFF_ID_RE.fullmatch(handoff_id) is None:
+            return False
+        if type(uuid_seed) is not str or cls._UUID_SEED_RE.fullmatch(uuid_seed) is None:
+            return False
+        if type(expires_at) not in (int, float):
+            return False
+        try:
+            return (
+                isfinite(expires_at)
+                and now < expires_at <= now + cls._NATIVE_HANDOFF_MAX_FUTURE_SECONDS
+            )
+        except (OverflowError, TypeError, ValueError):
+            return False
 
     def _base_payload(
         self, turn: TurnBinding, *, sequence: int, created_at: float
@@ -1088,13 +1165,13 @@ class PluginRuntime:
         }
 
     def _cleanup_session(self, session_id: object) -> None:
-        self._registry.remove_session(session_id)
         if not self._exact_nonblank(session_id):
             with self._lock:
                 self._expire_locked(self._now())
             return
         with self._lock:
             self._expire_locked(self._now())
+            self._registry.remove_session(session_id)
             turn_ids = [
                 turn_id
                 for turn_id, turn in self._turns.items()
@@ -1155,14 +1232,23 @@ class PluginRuntime:
             key, _pending = self._pending_approvals.popitem(last=False)
             self._claimed_approvals.discard(key)
 
-    def _trim_coordinators_locked(self) -> list[TurnEventCoordinator]:
+    def _make_turn_room_locked(self) -> tuple[bool, list[TurnEventCoordinator]]:
         evicted: list[TurnEventCoordinator] = []
-        while len(self._coordinators) > self._MAX_ENTRIES:
-            turn_id, coordinator = self._coordinators.popitem(last=False)
-            self._turns.pop(turn_id, None)
-            self._answers.pop(turn_id, None)
-            evicted.append(coordinator)
-        return evicted
+        while len(self._turns) >= self._MAX_ENTRIES:
+            victim = next(
+                (
+                    turn_id
+                    for turn_id in self._turns
+                    if turn_id not in self._terminal_owners
+                ),
+                None,
+            )
+            if victim is None:
+                return False, evicted
+            coordinator = self._cleanup_turn_locked(victim, keep_disposition=False)
+            if coordinator is not None:
+                evicted.append(coordinator)
+        return True, evicted
 
     @staticmethod
     def _exact_nonblank(value: object) -> bool:
