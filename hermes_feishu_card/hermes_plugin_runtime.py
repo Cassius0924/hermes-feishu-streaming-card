@@ -105,6 +105,7 @@ class TurnEventCoordinator:
         self.turn_id = turn_id
         self._next = 0
         self._barrier: int | None = None
+        self._terminal_sequence: int | None = None
         self._closed = False
         self._lock = Lock()
         self._queue: queue.Queue[ObserverEvent] = queue.Queue(maxsize=max_pending)
@@ -134,7 +135,10 @@ class TurnEventCoordinator:
         with self._lock:
             if self._barrier is None:
                 raise ValueError("terminal barrier is not closed")
+            if self._terminal_sequence is not None:
+                return self._terminal_sequence
             value, self._next = self._next, self._next + 1
+            self._terminal_sequence = value
             self._closed = True
             return value
 
@@ -162,10 +166,10 @@ class TurnEventCoordinator:
 
     def drain_before_terminal(self, timeout_seconds: float) -> None:
         deadline = monotonic() + max(0.0, timeout_seconds)
-        while self._queue.unfinished_tasks and monotonic() < deadline:
-            threading.Event().wait(0.001)
         with self._lock:
             self._closed = True
+        while self._queue.unfinished_tasks and monotonic() < deadline:
+            threading.Event().wait(0.001)
 
     def close(self) -> None:
         with self._lock:

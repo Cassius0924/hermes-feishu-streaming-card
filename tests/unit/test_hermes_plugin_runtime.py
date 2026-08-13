@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event
+from threading import Barrier, Event, Thread, current_thread
 
 from hermes_feishu_card.hermes_plugin_runtime import (
     IngressBinding,
@@ -225,6 +225,30 @@ def test_terminal_barrier_rejects_late_items_and_terminal_is_after_accepted_item
     assert coordinator.next_terminal_sequence() == 2
 
 
+def test_terminal_sequence_is_reused_without_advancing_shared_sequence_on_retry():
+    coordinator = TurnEventCoordinator("turn-1", start_worker=False)
+    coordinator.close_terminal_barrier()
+    assert coordinator.next_terminal_sequence() == 0
+    assert coordinator.next_terminal_sequence() == 0
+    assert coordinator.next_sequence("patch") == 1
+
+
+def test_concurrent_terminal_sequence_retries_all_reuse_one_value():
+    coordinator = TurnEventCoordinator("turn-1", start_worker=False)
+    coordinator.close_terminal_barrier()
+    start = Barrier(8)
+
+    def get_terminal_sequence():
+        start.wait()
+        return coordinator.next_terminal_sequence()
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        sequences = list(executor.map(lambda _: get_terminal_sequence(), range(8)))
+
+    assert sequences == [0] * 8
+    assert coordinator.next_sequence("plugin") == 1
+
+
 def test_queue_full_drops_observer_work_without_raising_and_can_leave_sequence_gap():
     coordinator = TurnEventCoordinator("turn-1", max_pending=1, start_worker=False)
     assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is True
@@ -251,6 +275,58 @@ def test_drain_timeout_closes_admission_without_waiting_for_an_unstarted_worker(
     assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is True
     coordinator.drain_before_terminal(timeout_seconds=0)
     assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin") is False
+
+
+def test_drain_race_never_returns_after_accepting_undrained_observer_work():
+    import queue
+
+    class DrainGateQueue(queue.Queue):
+        def __init__(self):
+            super().__init__(maxsize=1)
+            self.drain_checked_empty = Event()
+            self.release_drain_check = Event()
+            self._first_drain_check = True
+
+        @property
+        def unfinished_tasks(self):
+            if current_thread().name == "drainer" and self._first_drain_check:
+                self._first_drain_check = False
+                self.drain_checked_empty.set()
+                assert self.release_drain_check.wait(timeout=0.5)
+            return self._unfinished_tasks
+
+        @unfinished_tasks.setter
+        def unfinished_tasks(self, value):
+            self._unfinished_tasks = value
+
+    coordinator = TurnEventCoordinator("turn-1", max_pending=1, start_worker=False)
+    gate = DrainGateQueue()
+    coordinator._queue = gate
+    drain_returned = Event()
+    submit_finished = Event()
+    result = []
+
+    def drain():
+        coordinator.drain_before_terminal(timeout_seconds=0)
+        drain_returned.set()
+
+    def submit():
+        result.append(coordinator.submit_observer({"event": "tool.updated"}, producer="plugin"))
+        submit_finished.set()
+
+    drainer = Thread(target=drain, name="drainer")
+    drainer.start()
+    assert gate.drain_checked_empty.wait(timeout=0.5)
+    submitter = Thread(target=submit, name="submitter")
+    submitter.start()
+    accepted_before_drain_close = submit_finished.wait(timeout=0.5)
+    gate.release_drain_check.set()
+    drainer.join(timeout=0.5)
+    submitter.join(timeout=0.5)
+    assert drain_returned.is_set()
+    assert submit_finished.is_set()
+    assert not (accepted_before_drain_close and gate.unfinished_tasks)
+    assert result == [False]
 
 
 def test_concurrent_barrier_and_submit_never_accept_an_event_after_barrier():
