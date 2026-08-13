@@ -681,9 +681,25 @@ def test_render_completed_interaction_replaces_buttons_with_choice():
 
     card = render_card(session)
 
-    assert not any(element.get("tag") == "button" for element in card["body"]["elements"])
+    # No interactive choice buttons remain after completion...
+    assert not any(
+        element.get("tag") == "button" and element.get("behaviors")
+        for element in card["body"]["elements"]
+    )
     assert "已选择：允许一次" in str(card)
     assert "Bailey" in str(card)
+    # ...but the '已选择' line is rendered as a borderless text-style button
+    # whose PC hover tooltip keeps the original question + options reachable
+    hover = next(
+        element
+        for element in card["body"]["elements"]
+        if element.get("element_id") == "interaction_hover"
+    )
+    assert hover["tag"] == "button"
+    assert hover["type"] == "text"
+    assert hover["text"]["content"] == "已选择：允许一次 by Bailey"
+    assert hover["hover_tips"]["tag"] == "plain_text"
+    assert hover["hover_tips"]["content"] == "❓ 允许执行命令吗？\n📋 ① 允许一次"
 
 
 def test_render_completed_card_shows_attachment_summary():
