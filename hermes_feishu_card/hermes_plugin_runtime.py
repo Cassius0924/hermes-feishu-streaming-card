@@ -369,8 +369,9 @@ def _callback(handler_name: str) -> Callable[..., None]:
 
 
 def register_callbacks(ctx: Any) -> None:
-    valid = set(getattr(ctx, "VALID_HOOKS", ()))
     for name, handler_name in HOOK_HANDLERS.items():
-        if name in valid:
+        try:
             ctx.register_hook(name, _callback(handler_name))
+        except Exception:
+            continue
     return None

@@ -254,9 +254,14 @@ def test_registry_evicts_oldest_binding_when_capacity_is_exceeded():
 
 def test_reset_clears_module_state_without_breaking_callback_registration():
     reset_plugin_runtime_state()
-    context = PluginContext(valid_hooks={"pre_llm_call"})
+    context = PluginContext()
     assert register_callbacks(context) is None
-    assert set(context.registered) == {"pre_llm_call"}
+    assert set(context.registered) == {
+        "pre_llm_call", "post_llm_call", "on_session_end",
+        "on_session_reset", "on_session_finalize", "pre_tool_call",
+        "post_tool_call", "pre_approval_request", "post_approval_response",
+        "subagent_start", "subagent_stop",
+    }
     assert reset_plugin_runtime_state() is None
 
 

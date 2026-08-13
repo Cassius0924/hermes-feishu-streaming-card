@@ -63,20 +63,27 @@ def test_register_lazily_delegates_to_runtime_bridge(monkeypatch):
     assert requested == [(".hermes_plugin_runtime", "hermes_feishu_card")]
 
 
-def test_register_registers_only_supported_official_hook_names():
-    context = PluginContext(valid_hooks=EXPECTED_HOOKS | {"unrelated"})
+def test_register_registers_exactly_the_verified_v020_official_hook_names():
+    context = PluginContext()
     assert hermes_plugin.register(context) is None
     assert set(context.registered) == EXPECTED_HOOKS
 
 
-def test_register_ignores_unknown_or_unavailable_hook_names():
-    context = PluginContext(valid_hooks={"pre_llm_call", "post_llm_call"})
+def test_register_context_matches_v020_and_has_no_valid_hooks_attribute():
+    context = PluginContext()
     assert hermes_plugin.register(context) is None
-    assert set(context.registered) == {"pre_llm_call", "post_llm_call"}
+    assert not hasattr(context, "VALID_HOOKS")
+
+
+def test_one_host_registration_error_does_not_abort_later_hooks():
+    context = PluginContext(reject_hooks={"post_llm_call"})
+    assert hermes_plugin.register(context) is None
+    assert "post_llm_call" not in context.registered
+    assert set(context.registered) == EXPECTED_HOOKS - {"post_llm_call"}
 
 
 def test_registered_callback_returns_none_when_runtime_callback_raises(monkeypatch):
-    context = PluginContext(valid_hooks=EXPECTED_HOOKS)
+    context = PluginContext()
     hermes_plugin.register(context)
     monkeypatch.setattr(
         "hermes_feishu_card.hermes_plugin_runtime.handle_pre_llm_call",
