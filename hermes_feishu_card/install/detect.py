@@ -7,6 +7,12 @@ import re
 import subprocess
 
 from . import patcher
+from .native_hooks import (
+    FixedTagNativeHookProvenance,
+    NativeHookCapabilityProbe,
+    PluginManagerSubprocessEvidence,
+    probe_native_hook_capabilities,
+)
 from .patcher import apply_base_patch, remove_base_patch
 
 
@@ -49,6 +55,22 @@ class HermesDetection:
     capabilities: dict[str, bool] = field(default_factory=dict)
     suggested_root: Path | None = None
     suggestion_reason: str = ""
+
+
+def detect_native_hook_capabilities(
+    root: str | Path,
+    *,
+    expected_commit: str,
+    provenance: FixedTagNativeHookProvenance,
+    plugin_evidence: PluginManagerSubprocessEvidence | None,
+) -> NativeHookCapabilityProbe:
+    """Consume explicit fixed-source and subprocess facts; never infer hooks."""
+    return probe_native_hook_capabilities(
+        root,
+        expected_commit=expected_commit,
+        provenance=provenance,
+        plugin_evidence=plugin_evidence,
+    )
 
 
 def detect_hermes(root: str | Path) -> HermesDetection:
