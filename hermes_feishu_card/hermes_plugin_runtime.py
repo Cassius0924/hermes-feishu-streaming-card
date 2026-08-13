@@ -377,6 +377,12 @@ class _TerminalRecord:
     expires_at: float
 
 
+@dataclass
+class _StartedTransport:
+    completion: threading.Event = field(default_factory=threading.Event)
+    cancelled: bool = False
+
+
 class PluginRuntime:
     """Bounded official-hook coordinator.
 
@@ -428,6 +434,7 @@ class PluginRuntime:
         self._claimed_approvals: set[tuple[str, str, str, str, str]] = set()
         self._subagents: OrderedDict[tuple[str, str], tuple[str, float]] = OrderedDict()
         self._terminal_owners: OrderedDict[str, object] = OrderedDict()
+        self._started_transports: OrderedDict[str, _StartedTransport] = OrderedDict()
 
     def bind_ingress_from_values(
         self,
@@ -475,27 +482,28 @@ class PluginRuntime:
             deliver=self._deliver_observer,
         )
         turn: TurnBinding | None = None
+        started_transport = _StartedTransport()
         admitted = False
         evicted_coordinators: list[TurnEventCoordinator] = []
+        evicted_started: list[threading.Event] = []
         with self._lock:
             self._expire_locked(self._now())
             if turn_id not in self._turns:
-                admitted, evicted_coordinators = self._make_turn_room_locked()
+                admitted, evicted_coordinators, evicted_started = (
+                    self._make_turn_room_locked()
+                )
             if admitted:
                 turn = self._registry.claim_unique_session(session_id, turn_id)
                 if turn is not None:
                     self._turns[turn_id] = turn
                     self._coordinators[turn_id] = coordinator
+                    self._started_transports[turn_id] = started_transport
                 else:
                     admitted = False
+        self._wait_started_transports(evicted_started)
         for evicted in evicted_coordinators:
             evicted.close()
         if not admitted or turn is None:
-            coordinator.close()
-            return None
-        with self._lock:
-            cleaned_before_transport = self._turns.get(turn_id) is not turn
-        if cleaned_before_transport:
             coordinator.close()
             return None
         payload = self._base_payload(
@@ -513,12 +521,25 @@ class PluginRuntime:
                 "reply_to_message_id": turn.ingress.reply_to_message_id,
             },
         )
-        result = self._post_retry_unknown(
-            payload,
-            self._observer_timeout_seconds,
-            self._is_exact_started_response,
-        )
-        turn.record_started_result(result)
+        with self._lock:
+            may_post = (
+                self._turns.get(turn_id) is turn
+                and self._started_transports.get(turn_id) is started_transport
+                and not started_transport.cancelled
+            )
+        try:
+            if may_post:
+                result = self._post_retry_unknown(
+                    payload,
+                    self._observer_timeout_seconds,
+                    self._is_exact_started_response,
+                )
+                turn.record_started_result(result)
+        finally:
+            with self._lock:
+                if self._started_transports.get(turn_id) is started_transport:
+                    self._started_transports.pop(turn_id, None)
+            started_transport.completion.set()
         return None
 
     def handle_post_llm_call(self, **kwargs: object) -> None:
@@ -613,16 +634,15 @@ class PluginRuntime:
                 }
             ),
         )
-        validation_time = self._now()
         response = self._post_retry_unknown(
             payload,
             self._terminal_timeout_seconds,
-            lambda value: self._valid_terminal_response(value, now=validation_time)
+            lambda value: self._valid_terminal_response(value, now=self._now())
             is not None,
         )
-        valid_response = self._valid_terminal_response(response, now=validation_time)
         with self._lock:
             now = self._now()
+            valid_response = self._valid_terminal_response(response, now=now)
             still_owner = self._terminal_owners.get(turn_id) is owner_token
             if still_owner:
                 self._terminal_owners.pop(turn_id, None)
@@ -875,6 +895,9 @@ class PluginRuntime:
     def close(self) -> None:
         with self._lock:
             coordinators = tuple(self._coordinators.values())
+            started = tuple(self._started_transports.values())
+            for transport in started:
+                transport.cancelled = True
             self._turns.clear()
             self._coordinators.clear()
             self._answers.clear()
@@ -884,7 +907,11 @@ class PluginRuntime:
             self._claimed_approvals.clear()
             self._subagents.clear()
             self._terminal_owners.clear()
+            self._started_transports.clear()
             self._registry.clear()
+        self._wait_started_transports(
+            [transport.completion for transport in started]
+        )
         for coordinator in coordinators:
             coordinator.close()
         return None
@@ -1178,20 +1205,33 @@ class PluginRuntime:
                 if turn.ingress.session_id == session_id
             ]
             coordinators = [self._coordinators.get(turn_id) for turn_id in turn_ids]
+            started: list[threading.Event] = []
             for turn_id in turn_ids:
                 turn = self._turns.get(turn_id)
-                self._cleanup_turn_locked(turn_id, keep_disposition=False)
+                self._cleanup_turn_locked(
+                    turn_id, keep_disposition=False, started_waits=started
+                )
                 if turn is not None:
                     turn.finish()
+        self._wait_started_transports(started)
         for coordinator in coordinators:
             if coordinator is not None:
                 coordinator.close()
 
     def _cleanup_turn_locked(
-        self, turn_id: str, *, keep_disposition: bool
+        self,
+        turn_id: str,
+        *,
+        keep_disposition: bool,
+        started_waits: list[threading.Event] | None = None,
     ) -> TurnEventCoordinator | None:
         self._turns.pop(turn_id, None)
         coordinator = self._coordinators.pop(turn_id, None)
+        started = self._started_transports.pop(turn_id, None)
+        if started is not None:
+            started.cancelled = True
+            if started_waits is not None:
+                started_waits.append(started.completion)
         self._answers.pop(turn_id, None)
         self._terminal_owners.pop(turn_id, None)
         for key in tuple(self._pending_approvals):
@@ -1232,8 +1272,11 @@ class PluginRuntime:
             key, _pending = self._pending_approvals.popitem(last=False)
             self._claimed_approvals.discard(key)
 
-    def _make_turn_room_locked(self) -> tuple[bool, list[TurnEventCoordinator]]:
+    def _make_turn_room_locked(
+        self,
+    ) -> tuple[bool, list[TurnEventCoordinator], list[threading.Event]]:
         evicted: list[TurnEventCoordinator] = []
+        started: list[threading.Event] = []
         while len(self._turns) >= self._MAX_ENTRIES:
             victim = next(
                 (
@@ -1244,11 +1287,18 @@ class PluginRuntime:
                 None,
             )
             if victim is None:
-                return False, evicted
-            coordinator = self._cleanup_turn_locked(victim, keep_disposition=False)
+                return False, evicted, started
+            coordinator = self._cleanup_turn_locked(
+                victim, keep_disposition=False, started_waits=started
+            )
             if coordinator is not None:
                 evicted.append(coordinator)
-        return True, evicted
+        return True, evicted, started
+
+    def _wait_started_transports(self, completions: list[threading.Event]) -> None:
+        timeout = max(0.1, (2 * self._observer_timeout_seconds) + 0.1)
+        for completion in completions:
+            completion.wait(timeout=timeout)
 
     @staticmethod
     def _exact_nonblank(value: object) -> bool:

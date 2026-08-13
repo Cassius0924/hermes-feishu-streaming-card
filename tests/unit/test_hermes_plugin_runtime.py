@@ -1752,6 +1752,86 @@ def test_task4_completed_native_is_available_only_through_full_terminal_record()
     assert runtime.take_terminal_record("turn-1")["response"] == native
 
 
+def test_task4_terminal_descriptor_expiring_during_transport_is_not_recorded():
+    clock = {"now": 100.0}
+    posted = []
+    native = native_terminal_response(exact_native_descriptor(expires_at=101.0))
+
+    def post(payload, timeout_seconds):
+        posted.append(payload)
+        if payload["event"] == "message.started":
+            return {"ok": True, "applied": True}
+        clock["now"] = 102.0
+        return native
+
+    runtime = plugin_runtime.PluginRuntime(post=post, now=lambda: clock["now"])
+    assert runtime.bind_ingress_from_values(
+        "default", "fallback_default", "session-1", "gateway-session-1",
+        "generation-1", "oc_1", "om_1", "om_parent", "thread-1",
+    )
+    runtime.handle_pre_llm_call(
+        session_id="session-1", turn_id="turn-1", platform="feishu"
+    )
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    runtime.handle_on_session_end(
+        turn_id="turn-1", completed=True, failed=False, interrupted=False
+    )
+
+    record = runtime.take_terminal_record("turn-1")
+    assert record["response"] is None
+    assert [payload["event"] for payload in posted].count("message.completed") == 2
+
+
+def test_task4_finalize_waits_for_claimed_started_transport_before_return(monkeypatch):
+    order = []
+
+    def post(payload, timeout_seconds):
+        order.append("started-posted")
+        return {"ok": True, "applied": True}
+
+    runtime = plugin_runtime.PluginRuntime(post=post, now=lambda: 100.0)
+    assert runtime.bind_ingress_from_values(
+        "default", "fallback_default", "session-1", "gateway-session-1",
+        "generation-1", "oc_1", "om_1", "om_parent", "thread-1",
+    )
+    payload_entered = Event()
+    release_payload = Event()
+    original_base_payload = runtime._base_payload
+
+    def gated_base_payload(turn, *, sequence, created_at):
+        payload_entered.set()
+        assert release_payload.wait(timeout=1.0)
+        return original_base_payload(turn, sequence=sequence, created_at=created_at)
+
+    monkeypatch.setattr(runtime, "_base_payload", gated_base_payload)
+    pre = Thread(
+        target=lambda: runtime.handle_pre_llm_call(
+            session_id="session-1", turn_id="turn-1", platform="feishu"
+        )
+    )
+    pre.start()
+    assert payload_entered.wait(timeout=0.5)
+    finalized = Event()
+
+    def finalize():
+        runtime.handle_on_session_finalize(session_id="session-1")
+        order.append("finalize-returned")
+        finalized.set()
+
+    cleanup = Thread(target=finalize)
+    cleanup.start()
+    cleanup_finished_early = finalized.wait(timeout=0.05)
+    try:
+        assert not cleanup_finished_early
+    finally:
+        release_payload.set()
+        pre.join(timeout=1.0)
+        cleanup.join(timeout=1.0)
+    assert not pre.is_alive() and not cleanup.is_alive()
+    assert order == ["finalize-returned"]
+    assert runtime.turn_state("turn-1") is None
+
+
 @pytest.mark.parametrize(
     "malformed",
     (
