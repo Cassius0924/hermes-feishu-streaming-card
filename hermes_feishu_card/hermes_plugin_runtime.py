@@ -30,6 +30,7 @@ class TurnState(str, Enum):
 @dataclass(frozen=True)
 class IngressBinding:
     profile_id: str
+    profile_source: str
     session_id: str
     gateway_session_key: str
     generation: str
@@ -222,6 +223,7 @@ class IngressBindingRegistry:
     """A bounded, one-shot registry for Feishu ingress bindings."""
 
     _MAX_BINDINGS = 1024
+    _PROFILE_SOURCES = frozenset({"env", "locals", "hermes_home", "fallback_default"})
 
     def __init__(self, now: Callable[[], float] = time) -> None:
         self._now = now
@@ -300,6 +302,11 @@ class IngressBindingRegistry:
                 binding.incoming_message_id,
                 binding.reply_to_message_id,
             )
+        ):
+            return False
+        if (
+            type(binding.profile_source) is not str
+            or binding.profile_source not in cls._PROFILE_SOURCES
         ):
             return False
         if type(binding.thread_id) is not str:

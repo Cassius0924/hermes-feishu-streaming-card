@@ -19,12 +19,14 @@ def binding(
     generation="generation-a",
     *,
     profile_id="default",
+    profile_source="fallback_default",
     session_id="session-1",
     gateway_session_key="gateway-session-1",
     expires_at=200.0,
 ):
     return IngressBinding(
         profile_id=profile_id,
+        profile_source=profile_source,
         session_id=session_id,
         gateway_session_key=gateway_session_key,
         generation=generation,
@@ -95,7 +97,17 @@ def test_official_pre_llm_claims_only_one_unambiguous_agent_session():
     assert turn is not None
     assert turn.turn_id == "turn-1"
     assert turn.ingress.gateway_session_key == "gateway-session-1"
+    assert turn.ingress.profile_source == "fallback_default"
     assert registry.claim_unique_session("session-1", "turn-2") is None
+
+
+@pytest.mark.parametrize("profile_source", ("env", "locals", "hermes_home", "fallback_default"))
+def test_bind_and_unique_claim_preserve_allowed_profile_source(profile_source):
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(binding(profile_source=profile_source)) is True
+    turn = registry.claim_unique_session("session-1", "turn-1")
+    assert turn is not None
+    assert turn.ingress.profile_source == profile_source
 
 
 def test_official_pre_llm_refuses_ambiguity_without_consuming_either_binding():
@@ -354,6 +366,41 @@ def test_bind_rejects_blank_nonstring_or_string_subclass_identity_fields(
 ):
     registry = IngressBindingRegistry(now=lambda: 100.0)
     assert registry.bind(replace(binding(), **{field_name: invalid_value})) is False
+
+
+@pytest.mark.parametrize(
+    "profile_source",
+    (
+        "",
+        "unknown",
+        StringSubclass("env"),
+        "sanitized_env",
+        "sanitized_locals",
+        "sanitized_hermes_home",
+        "sanitized_fallback_default",
+    ),
+)
+def test_bind_rejects_unverified_profile_sources_without_consuming_valid_binding(
+    profile_source
+):
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(binding()) is True
+    assert registry.bind(
+        binding(generation="generation-b", profile_source=profile_source)
+    ) is False
+    turn = registry.claim_unique_session("session-1", "turn-1")
+    assert turn is not None
+    assert turn.ingress.profile_source == "fallback_default"
+
+
+def test_invalid_profile_source_bind_still_prunes_expired_bindings():
+    now = [100.0]
+    registry = IngressBindingRegistry(now=lambda: now[0])
+    assert registry.bind(binding(expires_at=101.0)) is True
+    now[0] = 101.0
+    assert registry.bind(binding(profile_source="sanitized_env")) is False
+    now[0] = 100.0
+    assert registry.claim_unique_session("session-1", "turn-1") is None
 
 
 @pytest.mark.parametrize("expires_at", (True, float("nan"), float("inf"), -float("inf"), "200", None))
