@@ -1,6 +1,7 @@
 from hermes_feishu_card import __version__
 from pathlib import Path
 import re
+import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -40,3 +41,10 @@ def test_pyproject_has_open_source_package_metadata():
     assert '[project.urls]' in pyproject
     assert 'Repository = "https://github.com/baileyh8/hermes-feishu-streaming-card"' in pyproject
     assert 'Issues = "https://github.com/baileyh8/hermes-feishu-streaming-card/issues"' in pyproject
+
+
+def test_declares_exact_hermes_plugin_entry_point():
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text())
+    assert pyproject["project"]["entry-points"]["hermes_agent.plugins"] == {
+        "hermes-feishu-card": "hermes_feishu_card.hermes_plugin"
+    }

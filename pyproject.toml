@@ -34,6 +34,9 @@ test = [
 [project.scripts]
 hermes-feishu-card = "hermes_feishu_card.cli:main"
 
+[project.entry-points."hermes_agent.plugins"]
+hermes-feishu-card = "hermes_feishu_card.hermes_plugin"
+
 [project.urls]
 Repository = "https://github.com/baileyh8/hermes-feishu-streaming-card"
 Issues = "https://github.com/baileyh8/hermes-feishu-streaming-card/issues"
