@@ -69,6 +69,8 @@ class TurnBinding:
     def _is_accepted_started_result(result: object) -> bool:
         if type(result) is not dict:
             return False
+        if not all(type(key) is str for key in result):
+            return False
         keys = set(result)
         if keys not in (
             {"ok", "applied"},
@@ -80,11 +82,14 @@ class TurnBinding:
         if "delivery" not in result:
             return True
         delivery = result["delivery"]
-        return (
-            type(delivery) is dict
-            and set(delivery) == {"outcome"}
-            and delivery["outcome"] == "delivered"
-        )
+        if type(delivery) is not dict:
+            return False
+        if not all(type(key) is str for key in delivery):
+            return False
+        if set(delivery) != {"outcome"}:
+            return False
+        outcome = delivery["outcome"]
+        return type(outcome) is str and outcome == "delivered"
 
     def finish(self) -> bool:
         with self._lock:

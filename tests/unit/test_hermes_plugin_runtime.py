@@ -31,6 +31,22 @@ class AcceptedDict(dict):
     pass
 
 
+class PretendsDelivered:
+    def __eq__(self, other):
+        return other == "delivered"
+
+
+class PretendsKey:
+    def __init__(self, target):
+        self.target = target
+
+    def __hash__(self):
+        return hash(self.target)
+
+    def __eq__(self, other):
+        return other == self.target
+
+
 def test_new_generation_replaces_old_ingress_binding():
     registry = IngressBindingRegistry(now=lambda: 100.0)
     assert registry.bind(binding("generation-a")) is True
@@ -109,6 +125,23 @@ def test_started_accepts_exact_delivered_sidecar_response():
             "applied": True,
             "delivery": {"outcome": "unknown"},
         },
+        {
+            "ok": True,
+            "applied": True,
+            "delivery": {"outcome": PretendsDelivered()},
+        },
+        {PretendsKey("ok"): True, "applied": True},
+        {"ok": True, PretendsKey("applied"): True},
+        {
+            "ok": True,
+            "applied": True,
+            PretendsKey("delivery"): {"outcome": "delivered"},
+        },
+        {
+            "ok": True,
+            "applied": True,
+            "delivery": {PretendsKey("outcome"): "delivered"},
+        },
         {"ok": True, "applied": True, "extra": False},
         {
             "ok": True,
@@ -125,6 +158,11 @@ def test_started_accepts_exact_delivered_sidecar_response():
         "delivery-missing-outcome",
         "delivery-non-string-outcome",
         "delivery-non-delivered-outcome",
+        "delivery-equality-spoofed-outcome",
+        "top-level-spoofed-ok-key",
+        "top-level-spoofed-applied-key",
+        "top-level-spoofed-delivery-key",
+        "delivery-spoofed-outcome-key",
         "top-level-unknown-key",
         "top-level-unknown-key-with-delivery",
     ),
