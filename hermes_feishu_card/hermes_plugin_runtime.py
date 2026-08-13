@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
+from threading import RLock
+from time import time
 from typing import Any
 
 
@@ -10,6 +15,133 @@ OFFICIAL_HOOKS = (
     "post_tool_call", "pre_approval_request", "post_approval_response",
     "subagent_start", "subagent_stop",
 )
+
+
+class TurnState(str, Enum):
+    PENDING_START = "pending-start"
+    CARD_ACTIVE = "card-active"
+    NATIVE_BYPASS = "native-bypass"
+    TERMINAL = "terminal"
+
+
+@dataclass(frozen=True)
+class IngressBinding:
+    profile_id: str
+    session_id: str
+    generation: str
+    chat_id: str
+    incoming_message_id: str
+    reply_to_message_id: str
+    thread_id: str
+    expires_at: float
+
+
+@dataclass
+class TurnBinding:
+    ingress: IngressBinding
+    turn_id: str
+    state: TurnState = TurnState.PENDING_START
+
+    @property
+    def accepts_observer_events(self) -> bool:
+        return self.state is TurnState.CARD_ACTIVE
+
+    def record_started_result(self, result: object) -> TurnState:
+        if self.state is not TurnState.PENDING_START:
+            return self.state
+        if (
+            isinstance(result, dict)
+            and result.get("ok") is True
+            and result.get("applied") is True
+        ):
+            self.state = TurnState.CARD_ACTIVE
+        else:
+            self.state = TurnState.NATIVE_BYPASS
+        return self.state
+
+    def finish(self) -> bool:
+        if self.state is TurnState.TERMINAL:
+            return False
+        self.state = TurnState.TERMINAL
+        return True
+
+
+class IngressBindingRegistry:
+    """A bounded, one-shot registry for Feishu ingress bindings."""
+
+    _MAX_BINDINGS = 1024
+
+    def __init__(self, now: Callable[[], float] = time) -> None:
+        self._now = now
+        self._bindings: OrderedDict[tuple[str, str, str], IngressBinding] = OrderedDict()
+        self._lock = RLock()
+
+    def bind(self, binding: IngressBinding) -> bool:
+        if not self._is_valid_binding(binding):
+            return False
+        with self._lock:
+            now = self._now()
+            self._prune_expired(now)
+            if binding.expires_at <= now:
+                return False
+            pair = (binding.profile_id, binding.session_id)
+            for key in tuple(self._bindings):
+                if key[:2] == pair:
+                    del self._bindings[key]
+            key = (*pair, binding.generation)
+            self._bindings[key] = binding
+            while len(self._bindings) > self._MAX_BINDINGS:
+                self._bindings.popitem(last=False)
+            return True
+
+    def claim(
+        self, profile_id: str, session_id: str, generation: str, turn_id: str
+    ) -> TurnBinding | None:
+        if not all(self._is_nonblank(value) for value in (profile_id, session_id, generation, turn_id)):
+            return None
+        with self._lock:
+            self._prune_expired(self._now())
+            binding = self._bindings.pop((profile_id, session_id, generation), None)
+            if binding is None:
+                return None
+            return TurnBinding(ingress=binding, turn_id=turn_id)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._bindings.clear()
+
+    @staticmethod
+    def _is_nonblank(value: object) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    @classmethod
+    def _is_valid_binding(cls, binding: object) -> bool:
+        if not isinstance(binding, IngressBinding):
+            return False
+        return all(
+            cls._is_nonblank(value)
+            for value in (
+                binding.profile_id,
+                binding.session_id,
+                binding.generation,
+                binding.chat_id,
+                binding.incoming_message_id,
+                binding.reply_to_message_id,
+            )
+        )
+
+    def _prune_expired(self, now: float) -> None:
+        for key, binding in tuple(self._bindings.items()):
+            if binding.expires_at <= now:
+                del self._bindings[key]
+
+
+_ingress_registry = IngressBindingRegistry()
+
+
+def reset_plugin_runtime_state() -> None:
+    _ingress_registry.clear()
+    return None
 
 
 def _no_op(**kwargs: Any) -> None:
