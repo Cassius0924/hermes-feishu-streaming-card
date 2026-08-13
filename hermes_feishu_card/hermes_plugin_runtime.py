@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from threading import RLock
+from threading import Lock, RLock
 from time import time
 from typing import Any
 
@@ -40,30 +40,40 @@ class IngressBinding:
 class TurnBinding:
     ingress: IngressBinding
     turn_id: str
-    state: TurnState = TurnState.PENDING_START
+    _state: TurnState = field(default=TurnState.PENDING_START, init=False, repr=False, compare=False)
+    _lock: Lock = field(default_factory=Lock, init=False, repr=False, compare=False)
+
+    @property
+    def state(self) -> TurnState:
+        with self._lock:
+            return self._state
 
     @property
     def accepts_observer_events(self) -> bool:
-        return self.state is TurnState.CARD_ACTIVE
+        with self._lock:
+            return self._state is TurnState.CARD_ACTIVE
 
     def record_started_result(self, result: object) -> TurnState:
-        if self.state is not TurnState.PENDING_START:
-            return self.state
-        if (
-            isinstance(result, dict)
-            and result.get("ok") is True
-            and result.get("applied") is True
-        ):
-            self.state = TurnState.CARD_ACTIVE
-        else:
-            self.state = TurnState.NATIVE_BYPASS
-        return self.state
+        with self._lock:
+            if self._state is not TurnState.PENDING_START:
+                return self._state
+            if (
+                type(result) is dict
+                and set(result) == {"ok", "applied"}
+                and result["ok"] is True
+                and result["applied"] is True
+            ):
+                self._state = TurnState.CARD_ACTIVE
+            else:
+                self._state = TurnState.NATIVE_BYPASS
+            return self._state
 
     def finish(self) -> bool:
-        if self.state is TurnState.TERMINAL:
-            return False
-        self.state = TurnState.TERMINAL
-        return True
+        with self._lock:
+            if self._state is TurnState.TERMINAL:
+                return False
+            self._state = TurnState.TERMINAL
+            return True
 
 
 class IngressBindingRegistry:

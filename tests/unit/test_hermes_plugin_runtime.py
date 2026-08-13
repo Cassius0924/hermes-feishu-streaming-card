@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 from hermes_feishu_card.hermes_plugin_runtime import (
     IngressBinding,
     IngressBindingRegistry,
@@ -61,6 +64,20 @@ def test_started_requires_boolean_true_not_integer_values():
         assert turn.record_started_result(result) is TurnState.NATIVE_BYPASS
 
 
+def test_started_rejects_dict_subclasses_and_extra_fields():
+    class AcceptedDict(dict):
+        pass
+
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    for result in (
+        AcceptedDict(ok=True, applied=True),
+        {"ok": True, "applied": True, "extra": False},
+    ):
+        assert registry.bind(binding()) is True
+        turn = registry.claim("default", "session-1", "generation-a", "turn-1")
+        assert turn.record_started_result(result) is TurnState.NATIVE_BYPASS
+
+
 def test_card_active_turn_becomes_terminal_once_and_rejects_late_events():
     registry = IngressBindingRegistry(now=lambda: 100.0)
     registry.bind(binding())
@@ -71,6 +88,47 @@ def test_card_active_turn_becomes_terminal_once_and_rejects_late_events():
     assert turn.state is TurnState.TERMINAL
     assert turn.accepts_observer_events is False
     assert turn.record_started_result({"ok": True, "applied": True}) is TurnState.TERMINAL
+
+
+def test_finish_is_atomic_when_many_threads_finish_one_active_turn():
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(binding()) is True
+    turn = registry.claim("default", "session-1", "generation-a", "turn-1")
+    assert turn.record_started_result({"ok": True, "applied": True}) is TurnState.CARD_ACTIVE
+    barrier = Barrier(16)
+
+    def finish_at_once():
+        barrier.wait()
+        return turn.finish()
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        results = list(executor.map(lambda _: finish_at_once(), range(16)))
+
+    assert results.count(True) == 1
+    assert turn.state is TurnState.TERMINAL
+
+
+def test_started_result_racing_finish_cannot_reopen_terminal():
+    registry = IngressBindingRegistry(now=lambda: 100.0)
+    assert registry.bind(binding()) is True
+    turn = registry.claim("default", "session-1", "generation-a", "turn-1")
+    barrier = Barrier(2)
+
+    def record_started():
+        barrier.wait()
+        return turn.record_started_result({"ok": True, "applied": True})
+
+    def finish():
+        barrier.wait()
+        return turn.finish()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        started = executor.submit(record_started)
+        finished = executor.submit(finish)
+        started.result()
+        assert finished.result() is True
+
+    assert turn.state is TurnState.TERMINAL
 
 
 def test_bind_rejects_blank_identity_and_expired_bindings():
