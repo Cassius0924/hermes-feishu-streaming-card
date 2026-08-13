@@ -1,6 +1,17 @@
 import importlib
 import sys
 
+from hermes_feishu_card import hermes_plugin
+from tests.fixtures.hermes_v020_plugin_api import PluginContext
+
+
+EXPECTED_HOOKS = {
+    "pre_llm_call", "post_llm_call", "on_session_end",
+    "on_session_reset", "on_session_finalize", "pre_tool_call",
+    "post_tool_call", "pre_approval_request", "post_approval_response",
+    "subagent_start", "subagent_stop",
+}
+
 
 def test_plugin_import_does_not_import_hermes_or_runtime_bridge():
     sys.modules.pop("hermes_feishu_card.hermes_plugin", None)
@@ -50,3 +61,25 @@ def test_register_lazily_delegates_to_runtime_bridge(monkeypatch):
     assert module.register(ctx) is None
     assert received == [ctx]
     assert requested == [(".hermes_plugin_runtime", "hermes_feishu_card")]
+
+
+def test_register_registers_only_supported_official_hook_names():
+    context = PluginContext(valid_hooks=EXPECTED_HOOKS | {"unrelated"})
+    assert hermes_plugin.register(context) is None
+    assert set(context.registered) == EXPECTED_HOOKS
+
+
+def test_register_ignores_unknown_or_unavailable_hook_names():
+    context = PluginContext(valid_hooks={"pre_llm_call", "post_llm_call"})
+    assert hermes_plugin.register(context) is None
+    assert set(context.registered) == {"pre_llm_call", "post_llm_call"}
+
+
+def test_registered_callback_returns_none_when_runtime_callback_raises(monkeypatch):
+    context = PluginContext(valid_hooks=EXPECTED_HOOKS)
+    hermes_plugin.register(context)
+    monkeypatch.setattr(
+        "hermes_feishu_card.hermes_plugin_runtime.handle_pre_llm_call",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("bridge failure")),
+    )
+    assert context.registered["pre_llm_call"](turn_id="turn-1") is None
