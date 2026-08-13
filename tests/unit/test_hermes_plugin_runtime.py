@@ -1782,7 +1782,7 @@ def test_task4_terminal_descriptor_expiring_during_transport_is_not_recorded():
     assert [payload["event"] for payload in posted].count("message.completed") == 2
 
 
-def test_task4_finalize_waits_for_claimed_started_transport_before_return(monkeypatch):
+def test_task4_finalize_cancels_unclaimed_started_transport_without_waiting(monkeypatch):
     order = []
 
     def post(payload, timeout_seconds):
@@ -1820,15 +1820,74 @@ def test_task4_finalize_waits_for_claimed_started_transport_before_return(monkey
 
     cleanup = Thread(target=finalize)
     cleanup.start()
-    cleanup_finished_early = finalized.wait(timeout=0.05)
+    cleanup_finished_early = finalized.wait(timeout=0.25)
     try:
-        assert not cleanup_finished_early
+        assert cleanup_finished_early
     finally:
         release_payload.set()
         pre.join(timeout=1.0)
         cleanup.join(timeout=1.0)
     assert not pre.is_alive() and not cleanup.is_alive()
     assert order == ["finalize-returned"]
+    assert runtime.turn_state("turn-1") is None
+
+
+@pytest.mark.parametrize("cleanup_kind", ("finalize", "close"))
+def test_task4_cleanup_serializes_started_check_to_call_transport(
+    monkeypatch, cleanup_kind
+):
+    order = []
+
+    def post(payload, timeout_seconds):
+        order.append("started-posted")
+        return {"ok": True, "applied": True}
+
+    runtime = plugin_runtime.PluginRuntime(
+        post=post, now=lambda: 100.0, observer_timeout_seconds=0.0
+    )
+    assert runtime.bind_ingress_from_values(
+        "default", "fallback_default", "session-1", "gateway-session-1",
+        "generation-1", "oc_1", "om_1", "om_parent", "thread-1",
+    )
+    transport_entered = Event()
+    release_transport = Event()
+    original_post_retry = runtime._post_retry_unknown
+
+    def gated_post_retry(payload, timeout, is_explicit):
+        if payload["event"] == "message.started":
+            transport_entered.set()
+            assert release_transport.wait(timeout=1.0)
+        return original_post_retry(payload, timeout, is_explicit)
+
+    monkeypatch.setattr(runtime, "_post_retry_unknown", gated_post_retry)
+    pre = Thread(
+        target=lambda: runtime.handle_pre_llm_call(
+            session_id="session-1", turn_id="turn-1", platform="feishu"
+        )
+    )
+    pre.start()
+    assert transport_entered.wait(timeout=0.5)
+    cleanup_returned = Event()
+
+    def cleanup():
+        if cleanup_kind == "finalize":
+            runtime.handle_on_session_finalize(session_id="session-1")
+        else:
+            runtime.close()
+        order.append("cleanup-returned")
+        cleanup_returned.set()
+
+    cleanup_thread = Thread(target=cleanup)
+    cleanup_thread.start()
+    cleanup_finished_early = cleanup_returned.wait(timeout=0.25)
+    try:
+        assert not cleanup_finished_early
+    finally:
+        release_transport.set()
+        pre.join(timeout=1.0)
+        cleanup_thread.join(timeout=1.0)
+    assert not pre.is_alive() and not cleanup_thread.is_alive()
+    assert order == ["started-posted", "cleanup-returned"]
     assert runtime.turn_state("turn-1") is None
 
 
