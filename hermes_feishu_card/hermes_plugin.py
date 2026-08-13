@@ -9,7 +9,7 @@ def register(ctx: Any) -> None:
         runtime = importlib.import_module(
             ".hermes_plugin_runtime", package=__package__
         )
-        runtime.register_callbacks(ctx)
+        runtime.bootstrap_plugin_runtime(ctx)
     except Exception:
         return None
     return None

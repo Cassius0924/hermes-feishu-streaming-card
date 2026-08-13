@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
+from time import monotonic
 
 import pytest
 
@@ -16,10 +19,18 @@ from hermes_feishu_card.runtime_control import (
     RuntimeIntegrityFenceBinding,
     RuntimeIntegritySupervisor,
     RuntimeProofVerifier,
+    acquire_runtime_control,
     inspect_runtime_integrity_review,
     runtime_events_url,
     sign_runtime_request,
 )
+
+
+@pytest.fixture(autouse=True)
+def reset_runtime_control_owners():
+    runtime_control.reset_runtime_control_for_tests()
+    yield
+    runtime_control.reset_runtime_control_for_tests()
 
 
 def _payload(**changes):
@@ -974,3 +985,147 @@ def test_existing_startup_adapter_call_starts_runtime_control_without_new_patch(
             "drain_home_verified_provider": hook_runtime.gateway_drain_home_verified,
         }
     ]
+
+
+def test_runtime_control_concurrent_acquire_shares_one_worker_until_last_release(
+    monkeypatch,
+):
+    created = []
+    running = Event()
+    stopped = Event()
+    counter_lock = Lock()
+
+    class FakeEmitter:
+        def __init__(self, **kwargs):
+            with counter_lock:
+                created.append(kwargs)
+
+        def run(self, stop_event, interval_seconds):
+            running.set()
+            stop_event.wait()
+            stopped.set()
+
+    monkeypatch.setattr(runtime_control, "RuntimeControlEmitter", FakeEmitter)
+
+    def acquire(_index):
+        return acquire_runtime_control(
+            event_url="http://127.0.0.1:18765/events",
+            package_version="4.3.0",
+            interval_seconds=30.0,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        leases = list(executor.map(acquire, range(8)))
+
+    assert all(lease is not None for lease in leases)
+    assert running.wait(timeout=0.5)
+    assert len(created) == 1
+    for lease in leases[:-1]:
+        assert lease.close() is None
+    assert stopped.is_set() is False
+    assert leases[-1].close() is None
+    assert stopped.wait(timeout=0.5)
+
+
+def test_runtime_control_refuses_different_live_config_and_double_close_is_noop(
+    monkeypatch,
+):
+    stopped = Event()
+
+    class FakeEmitter:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self, stop_event, interval_seconds):
+            stop_event.wait()
+            stopped.set()
+
+    monkeypatch.setattr(runtime_control, "RuntimeControlEmitter", FakeEmitter)
+    first = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+    )
+    assert first is not None
+    assert acquire_runtime_control(
+        event_url="http://127.0.0.1:28765/events",
+        package_version="4.3.0",
+    ) is None
+
+    assert first.close() is None
+    assert stopped.wait(timeout=0.5)
+    before = monotonic()
+    assert first.close() is None
+    assert monotonic() - before < 0.1
+
+
+def test_runtime_control_same_lease_concurrent_close_releases_owner_once(monkeypatch):
+    release_calls = []
+    owner = object()
+    lease = runtime_control.RuntimeControlLease(owner)
+    monkeypatch.setattr(
+        runtime_control,
+        "_release_runtime_control",
+        lambda released: release_calls.append(released),
+    )
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        assert list(executor.map(lambda _index: lease.close(), range(32))) == [None] * 32
+
+    assert release_calls == [owner]
+
+
+def test_runtime_control_thread_start_failure_leaves_no_worker_or_owner(monkeypatch):
+    class FakeEmitter:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self, stop_event, interval_seconds):
+            raise AssertionError("thread must not run")
+
+    class FailingThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(runtime_control, "RuntimeControlEmitter", FakeEmitter)
+    monkeypatch.setattr(runtime_control.threading, "Thread", FailingThread)
+
+    assert acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+    ) is None
+    assert runtime_control._CONTROL_EMITTER is None
+    assert runtime_control._CONTROL_STOP is None
+    assert runtime_control._CONTROL_THREAD is None
+    assert runtime_control._CONTROL_CONFIG is None
+    assert runtime_control._CONTROL_OWNERS == set()
+
+
+def test_legacy_start_owner_survives_temporary_shared_lease_rollback(monkeypatch):
+    stopped = Event()
+    starts = []
+
+    class FakeEmitter:
+        def __init__(self, **kwargs):
+            starts.append(kwargs)
+
+        def run(self, stop_event, interval_seconds):
+            stop_event.wait()
+            stopped.set()
+
+    monkeypatch.setattr(runtime_control, "RuntimeControlEmitter", FakeEmitter)
+    options = {
+        "event_url": "http://127.0.0.1:18765/events",
+        "package_version": "4.3.0",
+    }
+    assert runtime_control.start_runtime_control(**options) is True
+    temporary = acquire_runtime_control(**options)
+    assert temporary is not None
+    assert temporary.close() is None
+    assert stopped.is_set() is False
+    assert len(starts) == 1
+
+    runtime_control.reset_runtime_control_for_tests()
+    assert stopped.wait(timeout=0.5)

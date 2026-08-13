@@ -1,7 +1,15 @@
 import importlib
+import json
 import sys
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
+
+import pytest
 
 from hermes_feishu_card import hermes_plugin
+from hermes_feishu_card import hermes_plugin_runtime as plugin_runtime
+from hermes_feishu_card.event_auth import EventProofVerifier
 from tests.fixtures.hermes_v020_plugin_api import PluginContext
 
 
@@ -47,7 +55,7 @@ def test_register_lazily_delegates_to_runtime_bridge(monkeypatch):
 
     class Runtime:
         @staticmethod
-        def register_callbacks(callback_ctx):
+        def bootstrap_plugin_runtime(callback_ctx):
             received.append(callback_ctx)
 
     def runtime_import(name, package=None):
@@ -90,3 +98,516 @@ def test_registered_callback_returns_none_when_runtime_callback_raises(monkeypat
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("bridge failure")),
     )
     assert context.registered["pre_llm_call"](turn_id="turn-1") is None
+
+
+class CountingPluginContext(PluginContext):
+    def __init__(self, reject_hooks=()):
+        super().__init__(reject_hooks=reject_hooks)
+        self.register_calls = []
+
+    def register_hook(self, name, callback):
+        self.register_calls.append(name)
+        return super().register_hook(name, callback)
+
+
+@pytest.fixture(autouse=True)
+def reset_production_plugin_runtime(monkeypatch):
+    plugin_runtime.reset_production_plugin_runtime_for_tests()
+    plugin_runtime.reset_plugin_runtime_state()
+    monkeypatch.delenv("HERMES_FEISHU_CARD_ENABLED", raising=False)
+    monkeypatch.delenv("HERMES_FEISHU_CARD_EVENT_URL", raising=False)
+    monkeypatch.delenv("HERMES_FEISHU_CARD_TIMEOUT_MS", raising=False)
+    monkeypatch.setattr(plugin_runtime, "read_transport_root_secret", lambda: None)
+    yield
+    plugin_runtime.reset_production_plugin_runtime_for_tests()
+    plugin_runtime.reset_plugin_runtime_state()
+
+
+def test_real_entry_register_bootstraps_before_callbacks_and_is_process_idempotent(
+    monkeypatch,
+):
+    configured = []
+    acquired = []
+    atexit_handlers = []
+
+    class Lease:
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    lease = Lease()
+    events = []
+    real_swap = plugin_runtime._swap_active_runtime
+
+    def checked_swap(runtime):
+        configured.append(runtime)
+        events.append("configured")
+        return real_swap(runtime)
+
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_EVENT_URL", "http://127.0.0.1:18765/events"
+    )
+    monkeypatch.setattr(
+        plugin_runtime, "read_transport_root_secret", lambda: b"r" * 32
+    )
+    monkeypatch.setattr(plugin_runtime, "_swap_active_runtime", checked_swap)
+    monkeypatch.setattr(
+        plugin_runtime,
+        "acquire_runtime_control",
+        lambda **kwargs: acquired.append(kwargs) or lease,
+    )
+    monkeypatch.setattr(
+        plugin_runtime.atexit, "register", lambda callback: atexit_handlers.append(callback)
+    )
+    context = CountingPluginContext()
+    real_register = context.register_hook
+
+    def checked_register(name, callback):
+        events.append(f"registered:{name}")
+        return real_register(name, callback)
+
+    monkeypatch.setattr(context, "register_hook", checked_register)
+
+    assert hermes_plugin.register(context) is None
+    assert configured and configured[0] is plugin_runtime._ACTIVE_RUNTIME
+    assert events[0] == "configured"
+    assert set(context.registered) == EXPECTED_HOOKS
+    assert len(context.register_calls) == len(EXPECTED_HOOKS)
+    assert len(acquired) == 1
+    assert len(atexit_handlers) == 1
+
+    assert hermes_plugin.register(context) is None
+    assert len(context.register_calls) == len(EXPECTED_HOOKS)
+    assert len(acquired) == 1
+    assert len(atexit_handlers) == 1
+    assert lease.close_calls == 0
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_missing_secret_or_disabled_registers_exact_inert_callbacks_without_lease(
+    monkeypatch, disabled
+):
+    acquired = []
+    if disabled:
+        monkeypatch.setenv("HERMES_FEISHU_CARD_ENABLED", "0")
+        monkeypatch.setattr(
+            plugin_runtime, "read_transport_root_secret", lambda: b"r" * 32
+        )
+    monkeypatch.setattr(
+        plugin_runtime,
+        "acquire_runtime_control",
+        lambda **kwargs: acquired.append(kwargs),
+    )
+    context = CountingPluginContext()
+
+    assert hermes_plugin.register(context) is None
+    assert set(context.registered) == EXPECTED_HOOKS
+    assert len(context.register_calls) == len(EXPECTED_HOOKS)
+    assert plugin_runtime._ACTIVE_RUNTIME is None
+    assert acquired == []
+    for callback in context.registered.values():
+        assert callback(turn_id="turn-1", platform="feishu") is None
+
+    assert hermes_plugin.register(context) is None
+    assert len(context.register_calls) == len(EXPECTED_HOOKS)
+
+
+def test_partial_bootstrap_restores_inert_callbacks_and_releases_only_its_lease(
+    monkeypatch,
+):
+    closed = []
+
+    class Lease:
+        def close(self):
+            closed.append("lease")
+
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_EVENT_URL", "http://127.0.0.1:18765/events"
+    )
+    monkeypatch.setattr(
+        plugin_runtime, "read_transport_root_secret", lambda: b"r" * 32
+    )
+    monkeypatch.setattr(
+        plugin_runtime, "acquire_runtime_control", lambda **_kwargs: Lease()
+    )
+    monkeypatch.setattr(plugin_runtime.atexit, "register", lambda _callback: None)
+    context = CountingPluginContext(reject_hooks={"post_llm_call"})
+
+    assert hermes_plugin.register(context) is None
+    assert plugin_runtime._ACTIVE_RUNTIME is None
+    assert closed == ["lease"]
+    assert context.registered["pre_llm_call"](
+        session_id="session-1", turn_id="turn-1", platform="feishu"
+    ) is None
+
+
+def test_atexit_registration_failure_rolls_back_runtime_and_heartbeat(monkeypatch):
+    closed = []
+
+    class Lease:
+        def close(self):
+            closed.append("lease")
+
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_EVENT_URL", "http://127.0.0.1:18765/events"
+    )
+    monkeypatch.setattr(
+        plugin_runtime, "read_transport_root_secret", lambda: b"r" * 32
+    )
+    monkeypatch.setattr(
+        plugin_runtime, "acquire_runtime_control", lambda **_kwargs: Lease()
+    )
+    monkeypatch.setattr(
+        plugin_runtime.atexit,
+        "register",
+        lambda _callback: (_ for _ in ()).throw(RuntimeError("atexit unavailable")),
+    )
+
+    assert hermes_plugin.register(CountingPluginContext()) is None
+    assert plugin_runtime._ACTIVE_RUNTIME is None
+    assert plugin_runtime._PRODUCTION_BOOTSTRAP is None
+    assert closed == ["lease"]
+
+
+def test_replacement_and_process_close_each_runtime_and_lease_once(monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_EVENT_URL", "http://127.0.0.1:18765/events"
+    )
+    monkeypatch.setattr(
+        plugin_runtime, "read_transport_root_secret", lambda: b"r" * 32
+    )
+    monkeypatch.setattr(plugin_runtime.atexit, "register", lambda _callback: None)
+    leases = []
+
+    class Lease:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    def acquire(**_kwargs):
+        lease = Lease()
+        leases.append(lease)
+        return lease
+
+    monkeypatch.setattr(plugin_runtime, "acquire_runtime_control", acquire)
+    first_context = CountingPluginContext()
+    second_context = CountingPluginContext()
+    assert hermes_plugin.register(first_context) is None
+    first_runtime = plugin_runtime._ACTIVE_RUNTIME
+    first_close_calls = []
+    real_first_close = first_runtime.close
+
+    def close_first():
+        first_close_calls.append(True)
+        return real_first_close()
+
+    monkeypatch.setattr(first_runtime, "close", close_first)
+    assert hermes_plugin.register(second_context) is None
+    second_runtime = plugin_runtime._ACTIVE_RUNTIME
+    second_close_calls = []
+    real_second_close = second_runtime.close
+
+    def close_second():
+        second_close_calls.append(True)
+        return real_second_close()
+
+    monkeypatch.setattr(second_runtime, "close", close_second)
+
+    assert first_close_calls == [True]
+    assert leases[0].close_calls == 1
+    plugin_runtime._close_process_plugin_runtime()
+    plugin_runtime._close_process_plugin_runtime()
+    assert second_close_calls == [True]
+    assert leases[1].close_calls == 1
+
+
+def test_replacement_lease_failure_keeps_old_runtime_and_owner(monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_EVENT_URL", "http://127.0.0.1:18765/events"
+    )
+    monkeypatch.setattr(
+        plugin_runtime, "read_transport_root_secret", lambda: b"r" * 32
+    )
+    monkeypatch.setattr(plugin_runtime.atexit, "register", lambda _callback: None)
+
+    class Lease:
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    old_lease = Lease()
+    leases = iter((old_lease, None))
+    monkeypatch.setattr(
+        plugin_runtime, "acquire_runtime_control", lambda **_kwargs: next(leases)
+    )
+    first = CountingPluginContext()
+    second = CountingPluginContext()
+    hermes_plugin.register(first)
+    old_runtime = plugin_runtime._ACTIVE_RUNTIME
+    old_close_calls = []
+    real_close = old_runtime.close
+    monkeypatch.setattr(
+        old_runtime,
+        "close",
+        lambda: old_close_calls.append(True) or real_close(),
+    )
+
+    assert hermes_plugin.register(second) is None
+    assert plugin_runtime._ACTIVE_RUNTIME is old_runtime
+    assert plugin_runtime._PRODUCTION_BOOTSTRAP.runtime is old_runtime
+    assert old_close_calls == []
+    assert old_lease.close_calls == 0
+    assert set(second.registered) == EXPECTED_HOOKS
+    assert second.registered["pre_llm_call"](
+        session_id="session-new", turn_id="turn-new", platform="feishu"
+    ) is None
+    assert old_runtime.turn_state("turn-new") is None
+
+
+def test_replacement_callback_failure_restores_old_and_new_callbacks_are_inert(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_EVENT_URL", "http://127.0.0.1:18765/events"
+    )
+    monkeypatch.setattr(
+        plugin_runtime, "read_transport_root_secret", lambda: b"r" * 32
+    )
+    monkeypatch.setattr(plugin_runtime.atexit, "register", lambda _callback: None)
+
+    class Lease:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    old_lease = Lease()
+    new_lease = Lease()
+    leases = iter((old_lease, new_lease))
+    monkeypatch.setattr(
+        plugin_runtime, "acquire_runtime_control", lambda **_kwargs: next(leases)
+    )
+    first = CountingPluginContext()
+    hermes_plugin.register(first)
+    old_runtime = plugin_runtime._ACTIVE_RUNTIME
+    old_close_calls = []
+    real_close = old_runtime.close
+    monkeypatch.setattr(
+        old_runtime,
+        "close",
+        lambda: old_close_calls.append(True) or real_close(),
+    )
+    second = CountingPluginContext(reject_hooks={"post_llm_call"})
+
+    assert hermes_plugin.register(second) is None
+    assert plugin_runtime._ACTIVE_RUNTIME is old_runtime
+    assert plugin_runtime._PRODUCTION_BOOTSTRAP.runtime is old_runtime
+    assert old_close_calls == []
+    assert old_lease.close_calls == 0
+    assert new_lease.close_calls == 1
+    assert second.registered["pre_llm_call"](
+        session_id="session-new", turn_id="turn-new", platform="feishu"
+    ) is None
+    assert old_runtime.turn_state("turn-new") is None
+
+
+def test_replacement_heartbeat_snapshot_reads_new_active_runtime(monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_EVENT_URL", "http://127.0.0.1:18765/events"
+    )
+    monkeypatch.setattr(
+        plugin_runtime, "read_transport_root_secret", lambda: b"r" * 32
+    )
+    monkeypatch.setattr(plugin_runtime.atexit, "register", lambda _callback: None)
+    providers = []
+
+    class Lease:
+        def close(self):
+            return None
+
+    def acquire(**kwargs):
+        providers.append(kwargs["active_work_snapshot_provider"])
+        return Lease()
+
+    monkeypatch.setattr(plugin_runtime, "acquire_runtime_control", acquire)
+    hermes_plugin.register(CountingPluginContext())
+    first_runtime = plugin_runtime._ACTIVE_RUNTIME
+    monkeypatch.setattr(first_runtime, "runtime_activity_snapshot", lambda: (1, True))
+    hermes_plugin.register(CountingPluginContext())
+    second_runtime = plugin_runtime._ACTIVE_RUNTIME
+    monkeypatch.setattr(second_runtime, "runtime_activity_snapshot", lambda: (2, True))
+
+    assert providers[0] is plugin_runtime._runtime_activity_snapshot
+    assert providers[1] is plugin_runtime._runtime_activity_snapshot
+    assert providers[0]() == (2, True)
+
+
+def test_session_callbacks_do_not_close_process_runtime_or_heartbeat(monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_EVENT_URL", "http://127.0.0.1:18765/events"
+    )
+    monkeypatch.setattr(
+        plugin_runtime, "read_transport_root_secret", lambda: b"r" * 32
+    )
+    monkeypatch.setattr(plugin_runtime.atexit, "register", lambda _callback: None)
+
+    class Lease:
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    lease = Lease()
+    monkeypatch.setattr(
+        plugin_runtime, "acquire_runtime_control", lambda **_kwargs: lease
+    )
+    context = CountingPluginContext()
+    hermes_plugin.register(context)
+    runtime = plugin_runtime._ACTIVE_RUNTIME
+
+    assert context.registered["on_session_reset"](old_session_id="session-1") is None
+    assert context.registered["on_session_finalize"](session_id="session-1") is None
+    assert plugin_runtime._ACTIVE_RUNTIME is runtime
+    assert lease.close_calls == 0
+
+
+@contextmanager
+def signed_event_server(secret, response_body=b'{"applied":true,"ok":true}'):
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            received.append((self.path, body, dict(self.headers)))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response_body)))
+            self.end_headers()
+            self.wfile.write(response_body)
+
+        def log_message(self, _format, *_args):
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server, received
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1.0)
+
+
+def test_production_transport_posts_canonical_signed_json_to_real_loopback_server():
+    secret = b"s" * 32
+    with signed_event_server(secret) as (server, received):
+        transport = plugin_runtime.SignedEventTransport(
+            event_url=f"http://127.0.0.1:{server.server_port}/events",
+            timeout_seconds=0.5,
+            secret_reader=lambda: secret,
+        )
+        payload = {"z": "对象", "a": {"value": 1}}
+        assert transport(payload, 10.0) == {"applied": True, "ok": True}
+
+    path, body, headers = received[0]
+    assert path == "/events"
+    assert body == json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    EventProofVerifier(secret).verify(headers, body)
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "https://127.0.0.1:18765/events",
+        "http://example.com/events",
+        "http://192.168.1.2/events",
+        "http://127.0.0.1:18765/api/events",
+        "http://user:secret@127.0.0.1:18765/events",
+        "http://127.0.0.1:18765/events?token=x",
+    ),
+)
+def test_production_transport_rejects_non_loopback_or_noncanonical_event_url(url):
+    with pytest.raises(ValueError, match="event URL"):
+        plugin_runtime.SignedEventTransport(
+            event_url=url,
+            timeout_seconds=0.5,
+            secret_reader=lambda: b"s" * 32,
+        )
+
+
+@pytest.mark.parametrize(
+    ("url", "canonical"),
+    (
+        ("http://localhost/events", "http://localhost/events"),
+        ("http://127.0.0.2/events", "http://127.0.0.2/events"),
+        ("http://[::1]/events", "http://[::1]/events"),
+    ),
+)
+def test_production_transport_accepts_only_canonical_http_loopback_forms(
+    url, canonical
+):
+    transport = plugin_runtime.SignedEventTransport(
+        event_url=url,
+        timeout_seconds=0.5,
+        secret_reader=lambda: b"s" * 32,
+    )
+    assert transport.event_url == canonical
+
+
+def test_production_transport_bounds_response_and_accepts_only_json_object(monkeypatch):
+    class Response:
+        status = 200
+
+        def __init__(self, body, content_length=None):
+            self.body = body
+            self.headers = {}
+            if content_length is not None:
+                self.headers["Content-Length"] = str(content_length)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, limit):
+            return self.body[:limit]
+
+    responses = iter(
+        (
+            Response(b"{}", plugin_runtime.MAX_EVENT_RESPONSE_BYTES + 1),
+            Response(b"[1,2]"),
+            Response(b"{" + b"x" * plugin_runtime.MAX_EVENT_RESPONSE_BYTES + b"}"),
+        )
+    )
+
+    class Opener:
+        def open(self, req, timeout):
+            return next(responses)
+
+    monkeypatch.setattr(plugin_runtime, "_NO_PROXY_EVENT_OPENER", Opener())
+    monkeypatch.setattr(
+        plugin_runtime.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("production loopback event transport used environment proxy")
+        ),
+    )
+    transport = plugin_runtime.SignedEventTransport(
+        event_url="http://127.0.0.1:18765/events",
+        timeout_seconds=0.5,
+        secret_reader=lambda: b"s" * 32,
+    )
+
+    assert transport({"event": "one"}, 1.0) is None
+    assert transport({"event": "two"}, 1.0) is None
+    assert transport({"event": "three"}, 1.0) is None

@@ -908,6 +908,112 @@ _CONTROL_LOCK = threading.Lock()
 _CONTROL_EMITTER: RuntimeControlEmitter | None = None
 _CONTROL_STOP: threading.Event | None = None
 _CONTROL_THREAD: threading.Thread | None = None
+_CONTROL_CONFIG: tuple[object, ...] | None = None
+_CONTROL_OWNERS: set[object] = set()
+_LEGACY_CONTROL_LEASE: "RuntimeControlLease | None" = None
+
+
+class RuntimeControlLease:
+    """One process-local owner of the shared runtime-control worker."""
+
+    def __init__(self, owner: object):
+        self._owner = owner
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return None
+            self._closed = True
+        _release_runtime_control(self._owner)
+        return None
+
+
+def acquire_runtime_control(
+    *,
+    event_url: str,
+    package_version: str,
+    hook_generation: str = RUNTIME_HOOK_GENERATION,
+    interval_seconds: float = 15.0,
+    active_work_snapshot_provider: Callable[[], tuple[int, bool]] | None = None,
+    admission_draining_provider: Callable[[], bool] | None = None,
+    drain_home_verified_provider: Callable[[], bool] | None = None,
+) -> RuntimeControlLease | None:
+    """Acquire the one shared worker only when its exact config matches."""
+    global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD, _CONTROL_CONFIG
+    try:
+        if interval_seconds <= 0:
+            return None
+        config = (
+            runtime_events_url(event_url),
+            _bounded_text(hook_generation, "hook generation"),
+            _bounded_text(package_version, "package version"),
+            float(interval_seconds),
+        )
+        owner = object()
+        with _CONTROL_LOCK:
+            if _CONTROL_CONFIG is not None:
+                if _CONTROL_CONFIG != config:
+                    return None
+                if _CONTROL_THREAD is None or not _CONTROL_THREAD.is_alive():
+                    return None
+                _CONTROL_OWNERS.add(owner)
+                return RuntimeControlLease(owner)
+            emitter = RuntimeControlEmitter(
+                event_url=event_url,
+                hook_generation=hook_generation,
+                package_version=package_version,
+                active_work_snapshot_provider=active_work_snapshot_provider,
+                admission_draining_provider=admission_draining_provider,
+                drain_home_verified_provider=drain_home_verified_provider,
+            )
+            stop_event = threading.Event()
+            thread = threading.Thread(
+                target=emitter.run,
+                args=(stop_event, float(interval_seconds)),
+                name="hfc-runtime-control",
+                daemon=True,
+            )
+            _CONTROL_EMITTER = emitter
+            _CONTROL_STOP = stop_event
+            _CONTROL_THREAD = thread
+            _CONTROL_CONFIG = config
+            _CONTROL_OWNERS.add(owner)
+            try:
+                thread.start()
+            except Exception:
+                _CONTROL_OWNERS.discard(owner)
+                _CONTROL_EMITTER = None
+                _CONTROL_STOP = None
+                _CONTROL_THREAD = None
+                _CONTROL_CONFIG = None
+                stop_event.set()
+                return None
+        return RuntimeControlLease(owner)
+    except Exception:
+        return None
+
+
+def _release_runtime_control(owner: object) -> None:
+    global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD, _CONTROL_CONFIG
+    with _CONTROL_LOCK:
+        if owner not in _CONTROL_OWNERS:
+            return None
+        _CONTROL_OWNERS.remove(owner)
+        if _CONTROL_OWNERS:
+            return None
+        stop_event = _CONTROL_STOP
+        thread = _CONTROL_THREAD
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        _CONTROL_EMITTER = None
+        _CONTROL_STOP = None
+        _CONTROL_THREAD = None
+        _CONTROL_CONFIG = None
+    return None
 
 
 def start_runtime_control(
@@ -920,45 +1026,38 @@ def start_runtime_control(
     admission_draining_provider: Callable[[], bool] | None = None,
     drain_home_verified_provider: Callable[[], bool] | None = None,
 ) -> bool:
-    global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD
-    try:
-        if interval_seconds <= 0:
-            return False
-        with _CONTROL_LOCK:
-            if _CONTROL_THREAD is not None and _CONTROL_THREAD.is_alive():
-                return True
-            emitter = RuntimeControlEmitter(
-                event_url=event_url,
-                hook_generation=hook_generation,
-                package_version=package_version,
-                active_work_snapshot_provider=active_work_snapshot_provider,
-                admission_draining_provider=admission_draining_provider,
-                drain_home_verified_provider=drain_home_verified_provider,
-            )
-            stop_event = threading.Event()
-            thread = threading.Thread(
-                target=emitter.run,
-                args=(stop_event, interval_seconds),
-                name="hfc-runtime-control",
-                daemon=True,
-            )
-            _CONTROL_EMITTER = emitter
-            _CONTROL_STOP = stop_event
-            _CONTROL_THREAD = thread
-            thread.start()
-        return True
-    except Exception:
+    global _LEGACY_CONTROL_LEASE
+    lease = acquire_runtime_control(
+        event_url=event_url,
+        package_version=package_version,
+        hook_generation=hook_generation,
+        interval_seconds=interval_seconds,
+        active_work_snapshot_provider=active_work_snapshot_provider,
+        admission_draining_provider=admission_draining_provider,
+        drain_home_verified_provider=drain_home_verified_provider,
+    )
+    if lease is None:
         return False
+    with _CONTROL_LOCK:
+        if _LEGACY_CONTROL_LEASE is None:
+            _LEGACY_CONTROL_LEASE = lease
+            return True
+    lease.close()
+    return True
 
 
 def reset_runtime_control_for_tests() -> None:
-    global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD
+    global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD, _CONTROL_CONFIG
+    global _LEGACY_CONTROL_LEASE
     with _CONTROL_LOCK:
         stop_event = _CONTROL_STOP
         thread = _CONTROL_THREAD
         _CONTROL_EMITTER = None
         _CONTROL_STOP = None
         _CONTROL_THREAD = None
+        _CONTROL_CONFIG = None
+        _CONTROL_OWNERS.clear()
+        _LEGACY_CONTROL_LEASE = None
     if stop_event is not None:
         stop_event.set()
     if thread is not None and thread is not threading.current_thread():

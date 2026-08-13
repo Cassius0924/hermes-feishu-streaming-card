@@ -6,13 +6,23 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
+from ipaddress import ip_address
 from math import isfinite
+import atexit
+import json
+import os
 import queue
 import re
 import threading
 from threading import Lock, RLock
 from time import monotonic, time
 from typing import Any
+from urllib import parse, request
+
+from . import __version__
+from .event_auth import sign_event_request
+from .operations_transport import read_transport_root_secret
+from .runtime_control import RuntimeControlLease, acquire_runtime_control
 
 
 OFFICIAL_HOOKS = (
@@ -21,6 +31,143 @@ OFFICIAL_HOOKS = (
     "post_tool_call", "pre_approval_request", "post_approval_response",
     "subagent_start", "subagent_stop",
 )
+
+DEFAULT_EVENT_URL = "http://127.0.0.1:8765/events"
+DEFAULT_EVENT_TIMEOUT_SECONDS = 0.8
+MAX_EVENT_RESPONSE_BYTES = 64 * 1024
+_NO_PROXY_EVENT_OPENER = request.build_opener(request.ProxyHandler({}))
+
+
+@dataclass(frozen=True)
+class ProductionRuntimeConfig:
+    enabled: bool
+    event_url: str
+    timeout_seconds: float
+
+
+class SignedEventTransport:
+    """Canonical, signed, bounded loopback transport for production hooks."""
+
+    def __init__(
+        self,
+        *,
+        event_url: str,
+        timeout_seconds: float,
+        secret_reader: Callable[[], bytes | None] | None = None,
+    ) -> None:
+        self.event_url = _canonical_loopback_event_url(event_url)
+        if (
+            type(timeout_seconds) not in (int, float)
+            or not isfinite(timeout_seconds)
+            or not 0.05 <= float(timeout_seconds) <= 5.0
+        ):
+            raise ValueError("event timeout is invalid")
+        if secret_reader is not None and not callable(secret_reader):
+            raise ValueError("event secret reader is invalid")
+        self._timeout_seconds = float(timeout_seconds)
+        self._secret_reader = secret_reader or read_transport_root_secret
+
+    def __call__(
+        self, payload: dict[str, object], timeout_seconds: float
+    ) -> dict[str, object] | None:
+        try:
+            if type(payload) is not dict:
+                return None
+            body = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            secret = self._secret_reader()
+            if type(secret) is not bytes or len(secret) != 32:
+                return None
+            requested_timeout = float(timeout_seconds)
+            if not isfinite(requested_timeout) or requested_timeout <= 0:
+                return None
+            timeout = min(requested_timeout, self._timeout_seconds)
+            headers = {"Content-Type": "application/json"}
+            headers.update(sign_event_request(secret, body))
+            req = request.Request(
+                self.event_url,
+                data=body,
+                headers=headers,
+                method="POST",
+            )
+            with _NO_PROXY_EVENT_OPENER.open(req, timeout=timeout) as response:
+                status = int(getattr(response, "status", 0))
+                if not 200 <= status < 300:
+                    return None
+                content_length = response.headers.get("Content-Length")
+                if content_length is not None:
+                    try:
+                        declared_length = int(content_length)
+                    except (TypeError, ValueError):
+                        return None
+                    if not 0 <= declared_length <= MAX_EVENT_RESPONSE_BYTES:
+                        return None
+                raw = response.read(MAX_EVENT_RESPONSE_BYTES + 1)
+            if not isinstance(raw, bytes) or len(raw) > MAX_EVENT_RESPONSE_BYTES:
+                return None
+            value = json.loads(raw.decode("utf-8"))
+            if type(value) is not dict or not all(type(key) is str for key in value):
+                return None
+            return value
+        except Exception:
+            return None
+
+
+def _canonical_loopback_event_url(value: object) -> str:
+    if type(value) is not str:
+        raise ValueError("event URL is invalid")
+    try:
+        parsed = parse.urlsplit(value.strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("event URL is invalid") from exc
+    if (
+        parsed.scheme.lower() != "http"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != "/events"
+    ):
+        raise ValueError("event URL is invalid")
+    hostname = parsed.hostname.strip().lower()
+    if hostname != "localhost":
+        try:
+            if not ip_address(hostname).is_loopback:
+                raise ValueError("event URL is invalid")
+        except ValueError as exc:
+            raise ValueError("event URL is invalid") from exc
+    normalized_host = f"[{hostname}]" if ":" in hostname else hostname
+    netloc = f"{normalized_host}:{port}" if port is not None else normalized_host
+    return parse.urlunsplit(("http", netloc, "/events", "", ""))
+
+
+def _load_production_runtime_config() -> ProductionRuntimeConfig:
+    enabled_text = os.environ.get("HERMES_FEISHU_CARD_ENABLED", "1").strip().lower()
+    enabled = enabled_text not in {"0", "false", "no", "off"}
+    event_url = os.environ.get(
+        "HERMES_FEISHU_CARD_EVENT_URL", DEFAULT_EVENT_URL
+    ).strip()
+    timeout_text = os.environ.get("HERMES_FEISHU_CARD_TIMEOUT_MS")
+    timeout_seconds = DEFAULT_EVENT_TIMEOUT_SECONDS
+    if timeout_text is not None:
+        try:
+            timeout_ms = int(timeout_text)
+        except (TypeError, ValueError):
+            timeout_ms = 0
+        if 50 <= timeout_ms <= 5000:
+            timeout_seconds = timeout_ms / 1000.0
+    return ProductionRuntimeConfig(
+        enabled=enabled,
+        event_url=_canonical_loopback_event_url(event_url or DEFAULT_EVENT_URL),
+        timeout_seconds=timeout_seconds,
+    )
 
 
 class TurnState(str, Enum):
@@ -897,6 +1044,12 @@ class PluginRuntime:
             coordinator.drain_before_terminal(timeout_seconds)
         return None
 
+    def runtime_activity_snapshot(self) -> tuple[int, bool]:
+        """Return bounded counts only; runtime-control never receives identities."""
+        with self._lock:
+            self._expire_locked(self._now())
+            return min(len(self._turns), self._MAX_ENTRIES), True
+
     def close(self) -> None:
         with self._lock:
             coordinators = tuple(self._coordinators.values())
@@ -1330,13 +1483,18 @@ _ingress_registry = IngressBindingRegistry()
 
 
 def configure_plugin_runtime(runtime: PluginRuntime | None) -> None:
+    old_runtime = _swap_active_runtime(runtime)
+    if old_runtime is not None and old_runtime is not runtime:
+        old_runtime.close()
+    return None
+
+
+def _swap_active_runtime(runtime: PluginRuntime | None) -> PluginRuntime | None:
     global _ACTIVE_RUNTIME
     with _ACTIVE_RUNTIME_LOCK:
         old_runtime = _ACTIVE_RUNTIME
         _ACTIVE_RUNTIME = runtime
-    if old_runtime is not None and old_runtime is not runtime:
-        old_runtime.close()
-    return None
+    return old_runtime
 
 
 def reset_plugin_runtime_state() -> None:
@@ -1433,4 +1591,167 @@ def register_callbacks(ctx: Any) -> None:
             ctx.register_hook(name, _callback(handler_name))
         except Exception:
             continue
+    return None
+
+
+@dataclass
+class _ProductionBootstrap:
+    context: object
+    runtime: PluginRuntime
+    lease: RuntimeControlLease
+    _closed: bool = False
+
+    def close(self) -> None:
+        if self._closed:
+            return None
+        self._closed = True
+        with _ACTIVE_RUNTIME_LOCK:
+            active = _ACTIVE_RUNTIME
+        if active is self.runtime:
+            configure_plugin_runtime(None)
+        else:
+            self.runtime.close()
+        self.lease.close()
+        return None
+
+
+_BOOTSTRAP_LOCK = RLock()
+_PRODUCTION_BOOTSTRAP: _ProductionBootstrap | None = None
+_ATEXIT_REGISTERED = False
+_INERT_CONTEXTS: list[object] = []
+
+
+def bootstrap_plugin_runtime(ctx: Any) -> None:
+    """Install one production runtime before exposing official callbacks."""
+    global _PRODUCTION_BOOTSTRAP, _ATEXIT_REGISTERED
+    try:
+        with _BOOTSTRAP_LOCK:
+            current = _PRODUCTION_BOOTSTRAP
+            if current is not None and current.context is ctx:
+                return None
+            config = _load_production_runtime_config()
+            if not config.enabled:
+                _register_inert_callbacks_once(ctx)
+                return None
+            secret = read_transport_root_secret()
+            if type(secret) is not bytes or len(secret) != 32:
+                _register_inert_callbacks_once(ctx)
+                return None
+            transport = SignedEventTransport(
+                event_url=config.event_url,
+                timeout_seconds=config.timeout_seconds,
+                secret_reader=read_transport_root_secret,
+            )
+            runtime = PluginRuntime(
+                post=transport,
+                observer_timeout_seconds=config.timeout_seconds,
+            )
+            lease = acquire_runtime_control(
+                event_url=config.event_url,
+                package_version=__version__,
+                active_work_snapshot_provider=_runtime_activity_snapshot,
+            )
+            if lease is None:
+                runtime.close()
+                _register_inert_callbacks_once(ctx)
+                return None
+            try:
+                if not _ATEXIT_REGISTERED:
+                    atexit.register(_close_process_plugin_runtime)
+                    _ATEXIT_REGISTERED = True
+                _swap_active_runtime(runtime)
+                if not _register_callbacks_checked(ctx, runtime):
+                    raise RuntimeError("official callback registration incomplete")
+            except Exception:
+                _swap_active_runtime(current.runtime if current is not None else None)
+                runtime.close()
+                lease.close()
+                return None
+            bootstrap = _ProductionBootstrap(ctx, runtime, lease)
+            _PRODUCTION_BOOTSTRAP = bootstrap
+            if current is not None:
+                current.close()
+        return None
+    except Exception:
+        try:
+            _register_inert_callbacks_once(ctx)
+        except Exception:
+            pass
+        return None
+
+
+def _register_callbacks_checked(ctx: Any, runtime: PluginRuntime) -> bool:
+    complete = True
+    for name, handler_name in HOOK_HANDLERS.items():
+        try:
+            ctx.register_hook(name, _runtime_callback(handler_name, runtime))
+        except Exception:
+            complete = False
+    return complete
+
+
+def _runtime_callback(
+    handler_name: str, expected_runtime: PluginRuntime
+) -> Callable[..., None]:
+    def invoke(**kwargs: Any) -> None:
+        try:
+            with _ACTIVE_RUNTIME_LOCK:
+                if _ACTIVE_RUNTIME is not expected_runtime:
+                    return None
+            globals()[handler_name](**kwargs)
+        except Exception:
+            return None
+        return None
+
+    return invoke
+
+
+def _register_inert_callbacks_once(ctx: Any) -> None:
+    if any(known is ctx for known in _INERT_CONTEXTS):
+        return None
+    for name in HOOK_HANDLERS:
+        try:
+            ctx.register_hook(name, _inert_callback())
+        except Exception:
+            continue
+    _INERT_CONTEXTS.append(ctx)
+    if len(_INERT_CONTEXTS) > 64:
+        del _INERT_CONTEXTS[0]
+    return None
+
+
+def _inert_callback() -> Callable[..., None]:
+    def invoke(**_kwargs: Any) -> None:
+        return None
+
+    return invoke
+
+
+def _runtime_activity_snapshot() -> tuple[int, bool]:
+    with _ACTIVE_RUNTIME_LOCK:
+        runtime = _ACTIVE_RUNTIME
+    if runtime is None:
+        return 0, True
+    try:
+        return runtime.runtime_activity_snapshot()
+    except Exception:
+        return 0, False
+
+
+def _close_process_plugin_runtime() -> None:
+    global _PRODUCTION_BOOTSTRAP
+    with _BOOTSTRAP_LOCK:
+        bootstrap = _PRODUCTION_BOOTSTRAP
+        _PRODUCTION_BOOTSTRAP = None
+        if bootstrap is not None:
+            bootstrap.close()
+    return None
+
+
+def reset_production_plugin_runtime_for_tests() -> None:
+    global _ATEXIT_REGISTERED
+    _close_process_plugin_runtime()
+    with _BOOTSTRAP_LOCK:
+        _ATEXIT_REGISTERED = False
+        _INERT_CONTEXTS.clear()
     return None
