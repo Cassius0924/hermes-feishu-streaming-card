@@ -292,6 +292,7 @@ def test_terminal_subagent_cannot_be_reopened_by_late_running_update():
         "canceled",
         "timeout",
         "blocked",
+        "interrupted",
     ],
 )
 def test_all_terminal_subagent_statuses_reject_late_running_update(terminal_status):

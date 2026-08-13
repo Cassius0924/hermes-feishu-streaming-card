@@ -1611,6 +1611,7 @@ def test_render_subagent_uses_dedicated_escaped_semantic_row():
         ("completed", "已完成"),
         ("failed", "失败"),
         ("cancelled", "已取消"),
+        ("interrupted", "已中断"),
     ],
 )
 def test_render_subagent_distinguishes_lifecycle_statuses(status, expected):
@@ -1642,6 +1643,8 @@ def test_render_subagent_distinguishes_lifecycle_statuses(status, expected):
 
     assert expected in subagent["content"]
     assert "子代理：research" in subagent["content"]
+    if status == "interrupted":
+        assert "进行中" not in subagent["content"]
 
 
 def test_render_tool_timeline_removes_all_duration_lines_from_detail():

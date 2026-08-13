@@ -13,6 +13,7 @@ TERMINAL_SUBAGENT_STATUSES = {
     "canceled",
     "timeout",
     "blocked",
+    "interrupted",
 }
 
 

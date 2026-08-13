@@ -964,6 +964,8 @@ def _render_subagent_timeline_row(title: str, status: str, detail: str) -> str:
         color, headline = "red", f"✕ **{label}** · 失败"
     elif normalized_status in {"cancelled", "canceled"}:
         color, headline = "grey", f"⊘ **{label}** · 已取消"
+    elif normalized_status == "interrupted":
+        color, headline = "grey", f"⊘ **{label}** · 已中断"
     elif normalized_status in {"queued", "waiting"}:
         color, headline = "grey", f"○ **{label}** · 等待中"
     else:
