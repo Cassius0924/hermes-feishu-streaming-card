@@ -35,6 +35,7 @@ from hermes_feishu_card.install.native_hooks import (
 )
 from hermes_feishu_card.integration import (
     HYBRID_REQUIRED_PATCH_GROUPS,
+    IntegrationMode,
     PatchCapabilities,
     select_integration_mode,
 )
@@ -449,7 +450,10 @@ def test_real_regular_wheel_plugin_manager_probe_reports_exactly_four_capabiliti
         native_hooks.NativeHookCapabilities.from_names(result["available"]),
         PatchCapabilities.from_names(HYBRID_REQUIRED_PATCH_GROUPS),
     )
-    assert decision.mode is None
+    assert decision.supported is True
+    assert decision.mode is IntegrationMode.HYBRID
+    assert decision.required_native_capabilities == frozenset(expected)
+    assert "subagent_parent_identity" in decision.required_patch_groups
 
 
 def test_detector_wrapper_uses_runtime_probe_without_version_guessing(

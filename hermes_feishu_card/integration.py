@@ -37,6 +37,7 @@ KNOWN_PATCH_GROUPS = frozenset({
     "hfc_command", "cron_delivery", "exact_base_no_text",
     "exact_base_final_delivery", "message_start", "message_terminal",
     "queued_terminal", "stable_tool_lifecycle", "legacy_tool_lifecycle",
+    "subagent_parent_identity",
 })
 
 NATIVE_REQUIRED_CAPABILITIES = KNOWN_NATIVE_CAPABILITIES
@@ -45,7 +46,6 @@ HYBRID_REQUIRED_NATIVE_CAPABILITIES = frozenset({
     "turn_terminal_result",
     "stable_tool_lifecycle",
     "approval_observe",
-    "subagent_lifecycle",
 })
 HYBRID_REQUIRED_PATCH_GROUPS = frozenset({
     "ingress_binding", "terminal_disposition", "answer_delta",
@@ -53,7 +53,7 @@ HYBRID_REQUIRED_PATCH_GROUPS = frozenset({
     "status_notice", "slash_confirm", "command_card_startup",
     "command_card_adapter", "native_redelivery", "platform_notice",
     "hfc_command", "cron_delivery", "exact_base_no_text",
-    "exact_base_final_delivery",
+    "exact_base_final_delivery", "subagent_parent_identity",
 })
 LEGACY_REQUIRED_PATCH_GROUPS = HYBRID_REQUIRED_PATCH_GROUPS | frozenset({
     "message_start",
