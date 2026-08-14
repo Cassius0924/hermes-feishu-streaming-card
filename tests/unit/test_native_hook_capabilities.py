@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
+import os
 from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from types import SimpleNamespace
+import zipfile
 
 import pytest
 
@@ -11,6 +19,7 @@ from hermes_feishu_card.install import native_hooks
 from hermes_feishu_card.install.native_hooks import (
     FIXED_TAG_COMMIT,
     FIXED_TAG_PROVENANCE_PATH,
+    FIXED_TAG_PROVENANCE_SHA256,
     HFC_REGISTERED_HOOKS,
     FixedTagNativeHookProvenance,
     NativeHookAnchorProvenance,
@@ -18,15 +27,12 @@ from hermes_feishu_card.install.native_hooks import (
     NativeCapabilityStatus,
     NativeHookCapabilityProbe,
     NativeHookSourceDigest,
-    PluginManagerSubprocessEvidence,
     load_fixed_tag_native_hook_provenance,
     probe_native_hook_capabilities,
     verify_provenance_slices,
 )
 from hermes_feishu_card.integration import (
-    HYBRID_REQUIRED_NATIVE_CAPABILITIES,
     HYBRID_REQUIRED_PATCH_GROUPS,
-    IntegrationMode,
     PatchCapabilities,
     select_integration_mode,
 )
@@ -211,375 +217,385 @@ def _sha256(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def _commit_source_root(tmp_path: Path) -> tuple[Path, FixedTagNativeHookProvenance]:
-    root = tmp_path / "hermes"
-    relative_paths = {
-        "plugin_manager": "hermes_cli/plugins.py",
-        "turn_context": "agent/turn_context.py",
-        "turn_finalizer": "agent/turn_finalizer.py",
-        "tool_hooks": "model_tools.py",
-        "approval": "tools/approval.py",
-        "subagent": "tools/delegate_tool.py",
-        "gateway": "gateway/run.py",
-        "cron": "cron/scheduler.py",
-        "base": "gateway/platforms/base.py",
-    }
-    sources = []
-    for target, relative_path in relative_paths.items():
-        path = root / relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = _SOURCE_BY_TARGET[target].lstrip().encode("utf-8")
-        path.write_bytes(data)
-        sources.append(
-            NativeHookSourceProvenance(
-                target=target,
-                relative_path=relative_path,
-                sha256=_sha256(data),
-            )
-        )
-    return root, FixedTagNativeHookProvenance(
-        commit=FIXED_TAG_COMMIT,
-        sources=tuple(sources),
+FIXED_SOURCE_ROOT = Path("/private/tmp/hermes-agent-v2026.8.3-v430-audit")
+
+
+def _wheel_digest(data: bytes) -> str:
+    import base64
+
+    return "sha256=" + base64.urlsafe_b64encode(
+        hashlib.sha256(data).digest()
+    ).rstrip(b"=").decode("ascii")
+
+
+def _build_regular_hfc_wheel(output_dir: Path) -> Path:
+    repo_root = Path(__file__).resolve().parents[2]
+    package_root = repo_root / "hermes_feishu_card"
+    version_match = re.search(
+        r'(?m)^version = "([0-9]+(?:\.[0-9]+)+)"$',
+        (repo_root / "pyproject.toml").read_text(encoding="utf-8"),
     )
+    assert version_match is not None
+    version = version_match.group(1)
+    dist_info = f"hermes_feishu_streaming_card-{version}.dist-info"
+    members = {}
+    for path in sorted(package_root.rglob("*")):
+        if path.is_file() and not path.is_symlink() and "__pycache__" not in path.parts:
+            members[path.relative_to(repo_root).as_posix()] = path.read_bytes()
+    members[f"{dist_info}/METADATA"] = (
+        "Metadata-Version: 2.1\n"
+        "Name: hermes-feishu-streaming-card\n"
+        f"Version: {version}\n"
+        "Requires-Python: >=3.9\n\n"
+    ).encode("ascii")
+    members[f"{dist_info}/WHEEL"] = (
+        "Wheel-Version: 1.0\n"
+        "Generator: hfc-fixed-tag-test\n"
+        "Root-Is-Purelib: true\n"
+        "Tag: py3-none-any\n\n"
+    ).encode("ascii")
+    members[f"{dist_info}/entry_points.txt"] = (
+        "[console_scripts]\n"
+        "hermes-feishu-card = hermes_feishu_card.cli:main\n\n"
+        "[hermes_agent.plugins]\n"
+        "hermes-feishu-card = hermes_feishu_card.hermes_plugin\n"
+    ).encode("ascii")
+    record_path = f"{dist_info}/RECORD"
+    record_lines = [
+        f"{name},{_wheel_digest(data)},{len(data)}\n"
+        for name, data in sorted(members.items())
+    ]
+    record_lines.append(f"{record_path},,\n")
+    members[record_path] = "".join(record_lines).encode("utf-8")
+    wheel = output_dir / f"hermes_feishu_streaming_card-{version}-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data in sorted(members.items()):
+            archive.writestr(name, data)
+    return wheel
 
 
-@pytest.fixture(autouse=True)
-def _fixed_source_commit(monkeypatch):
-    real_git_head = native_hooks._git_head
+@pytest.fixture(scope="module")
+def installed_fixed_runtime(tmp_path_factory) -> Path:
+    root = tmp_path_factory.mktemp("fixed-runtime")
+    wheel = _build_regular_hfc_wheel(root)
+    runtime = root / "runtime"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--system-site-packages", str(runtime)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    python = runtime / "bin" / "python"
+    import yaml
 
-    def git_head(root: Path) -> str:
-        if root.name == "hermes" and root.parent.name.startswith("test_"):
-            return FIXED_TAG_COMMIT
-        return real_git_head(root)
-
-    monkeypatch.setattr(native_hooks, "_git_head", git_head)
-
-
-def _plugin_evidence(commit: str, **changes) -> PluginManagerSubprocessEvidence:
-    values = {
-        "source_commit": commit,
-        "attestation_verified": True,
-        "subprocess_completed": True,
-        "runtime_binding_verified": True,
-        "entrypoint_identity_verified": True,
-        "plugins_enabled_exact": True,
-        "registration_verified": True,
-        "entrypoint_group": "hermes_agent.plugins",
-        "entrypoint_key": "hermes-feishu-card",
-        "entrypoint_value": "hermes_feishu_card.hermes_plugin",
-        "distribution_name": "hermes-feishu-streaming-card",
-        "matching_entrypoint_count": 1,
-        "matching_enabled_count": 1,
-        "registered_hooks": HFC_REGISTERED_HOOKS,
-        "runtime_executable_sha256": "sha256:" + "1" * 64,
-        "runtime_purelib_sha256": "sha256:" + "2" * 64,
-        "entrypoint_origin_sha256": "sha256:" + "3" * 64,
-        "attestation_sha256": "sha256:" + "4" * 64,
-    }
-    values.update(changes)
-    return PluginManagerSubprocessEvidence(**values)
+    purelib = runtime / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    shutil.copytree(Path(yaml.__file__).resolve().parent, purelib / "yaml")
+    subprocess.run(
+        [
+            str(python), "-m", "pip", "install", "--no-deps", "--no-index",
+            str(wheel),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={"HOME": str(root), "PYTHONNOUSERSITE": "1"},
+    )
+    return python
 
 
-def test_fixed_tag_provenance_is_bound_to_exact_commit_hashes_and_slices():
+def test_fixed_tag_provenance_is_one_canonical_manifest_with_24_slices():
+    raw = FIXED_TAG_PROVENANCE_PATH.read_bytes()
     provenance = load_fixed_tag_native_hook_provenance(FIXED_TAG_PROVENANCE_PATH)
 
+    assert _sha256(raw) == FIXED_TAG_PROVENANCE_SHA256
     assert provenance.commit == FIXED_TAG_COMMIT
     assert len(provenance.sources) == 9
-    assert all(source.sha256.startswith("sha256:") for source in provenance.sources)
+    assert sum(len(source.anchors) for source in provenance.sources) == 24
+    assert all(source.anchors for source in provenance.sources)
     assert verify_provenance_slices(
-        provenance,
-        fixture_root=FIXED_TAG_PROVENANCE_PATH.parent,
+        provenance, fixture_root=FIXED_TAG_PROVENANCE_PATH.parent
     ) is True
 
 
-def test_exact_source_and_verified_plugin_manager_produce_only_lifecycle_capabilities(tmp_path):
-    root, provenance = _commit_source_root(tmp_path)
-
+def test_real_regular_wheel_plugin_manager_probe_reports_exactly_four_capabilities(
+    installed_fixed_runtime,
+):
+    assert FIXED_SOURCE_ROOT.is_dir()
     result = probe_native_hook_capabilities(
-        root,
-        expected_commit=provenance.commit,
-        provenance=provenance,
-        plugin_evidence=_plugin_evidence(provenance.commit),
+        FIXED_SOURCE_ROOT,
+        expected_commit=FIXED_TAG_COMMIT,
+        runtime_python=installed_fixed_runtime,
     )
 
-    assert result.capabilities.available == HYBRID_REQUIRED_NATIVE_CAPABILITIES
-    assert {status.name for status in result.statuses if status.available} == {
+    expected = {
         "turn_start",
         "turn_terminal_result",
         "stable_tool_lifecycle",
         "approval_observe",
-        "subagent_lifecycle",
     }
-    unavailable = {status.name: status.reason_code for status in result.statuses if not status.available}
-    assert unavailable == {
-        "authenticated_ingress": "authenticated_ingress_missing",
-        "answer_delta": "answer_delta_missing",
-        "thinking_delta": "thinking_delta_missing",
-        "interaction_round_trip": "interaction_resolver_missing",
-        "final_delivery_disposition": "terminal_consumer_missing",
-        "command_platform_notice": "command_platform_notice_missing",
-        "cron_delivery": "cron_hook_missing",
-        "exact_native_delivery": "exact_native_delivery_missing",
-    }
-    assert all("/" not in status.reason_code for status in result.statuses)
-    assert {item.target for item in result.source_digests} == set(_SOURCE_BY_TARGET)
-    assert all(item.sha256.startswith("sha256:") for item in result.source_digests)
+    assert result.reason_code == "verified"
+    assert result.capabilities.available == expected
+    assert result.plugin_evidence_sha256.startswith("sha256:")
+    assert {status.name for status in result.statuses if status.available} == expected
+    subagent = next(
+        status for status in result.statuses if status.name == "subagent_lifecycle"
+    )
+    assert subagent.reason_code == "callsite_contract_mismatch"
+    assert len(result.source_digests) == 9
 
     decision = select_integration_mode(
         result.capabilities,
         PatchCapabilities.from_names(HYBRID_REQUIRED_PATCH_GROUPS),
     )
-    assert decision.mode is IntegrationMode.HYBRID
-    without_patches = select_integration_mode(
-        result.capabilities,
-        PatchCapabilities.from_names(()),
-    )
-    assert without_patches.mode is None
+    assert decision.mode is None
 
 
-@pytest.mark.parametrize(
-    ("changes", "reason_code"),
-    [
-        ({"attestation_verified": False}, "plugin_attestation_unverified"),
-        ({"plugins_enabled_exact": False}, "plugin_not_enabled"),
-        ({"matching_entrypoint_count": 2}, "entrypoint_ambiguous"),
-        ({"registered_hooks": frozenset({"pre_llm_call"})}, "registration_incomplete"),
-    ],
-)
-def test_unverified_or_ambiguous_plugin_evidence_closes_all_hook_capabilities(
-    tmp_path, changes, reason_code,
+def test_detector_wrapper_uses_runtime_probe_without_version_guessing(
+    installed_fixed_runtime,
 ):
-    root, provenance = _commit_source_root(tmp_path)
+    result = detect.detect_native_hook_capabilities(
+        FIXED_SOURCE_ROOT,
+        expected_commit=FIXED_TAG_COMMIT,
+        runtime_python=installed_fixed_runtime,
+    )
+    assert result.capabilities.available == {
+        "turn_start", "turn_terminal_result", "stable_tool_lifecycle",
+        "approval_observe",
+    }
+
+
+def test_review_attack_caller_forged_evidence_and_manifest_are_not_public_inputs():
+    parameters = inspect.signature(probe_native_hook_capabilities).parameters
+    assert set(parameters) == {"hermes_root", "expected_commit", "runtime_python"}
+    assert "PluginManagerSubprocessEvidence" not in vars(native_hooks)
+
+
+def test_review_attack_zero_anchor_rehashed_manifest_cannot_substitute(
+    tmp_path, monkeypatch,
+):
+    payload = json.loads(FIXED_TAG_PROVENANCE_PATH.read_text(encoding="utf-8"))
+    for item in payload["files"]:
+        item["anchors"] = []
+    substitute = tmp_path / "provenance.json"
+    substitute.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(native_hooks, "FIXED_TAG_PROVENANCE_PATH", substitute)
 
     result = probe_native_hook_capabilities(
-        root,
-        expected_commit=provenance.commit,
-        provenance=provenance,
-        plugin_evidence=_plugin_evidence(provenance.commit, **changes),
+        FIXED_SOURCE_ROOT,
+        expected_commit=FIXED_TAG_COMMIT,
+        runtime_python=tmp_path / "missing-python",
     )
 
     assert result.capabilities.available == frozenset()
-    assert result.reason_code == reason_code
+    assert result.reason_code == "provenance_invalid"
 
 
-def test_plugin_evidence_rejects_unstructured_identity_digest():
-    with pytest.raises(ValueError, match="digest"):
-        _plugin_evidence(FIXED_TAG_COMMIT, runtime_purelib_sha256="not-a-digest")
-
-
-def test_missing_plugin_evidence_fails_closed(tmp_path):
-    root, provenance = _commit_source_root(tmp_path)
-
-    result = probe_native_hook_capabilities(
-        root,
-        expected_commit=provenance.commit,
-        provenance=provenance,
-        plugin_evidence=None,
+def _payload_template(runtime: Path, hermes_root: Path) -> dict[str, object]:
+    version = [3, 12, 0]
+    prefix = runtime.parent.parent
+    purelib = prefix / "lib" / "python3.12" / "site-packages"
+    payload = {
+        "schema": 1,
+        "python_version": version,
+        "executable": str(runtime),
+        "prefix": str(prefix),
+        "base_prefix": "/base",
+        "purelib": str(purelib),
+        "platlib": str(purelib),
+        "manager_origin": str(hermes_root / "hermes_cli" / "plugins.py"),
+        "distribution_name": "hermes-feishu-streaming-card",
+        "distribution_version": "4.2.12",
+        "distribution_metadata_path": str(
+            purelib / "hermes_feishu_streaming_card-4.2.12.dist-info"
+        ),
+        "record_path": str(
+            purelib / "hermes_feishu_streaming_card-4.2.12.dist-info" / "RECORD"
+        ),
+        "record_sha256": "sha256:" + "0" * 64,
+        "entrypoint_group": "hermes_agent.plugins",
+        "entrypoint_key": "hermes-feishu-card",
+        "entrypoint_value": "hermes_feishu_card.hermes_plugin",
+        "entrypoint_origin": str(purelib / "hermes_feishu_card" / "hermes_plugin.py"),
+        "package_origin": str(purelib / "hermes_feishu_card" / "__init__.py"),
+        "enabled_config": ["hermes-feishu-card"],
+        "matching_entrypoint_count": 1,
+        "matching_discovered_count": 1,
+        "matching_enabled_count": 1,
+        "matching_loaded_count": 1,
+        "registered_hooks": sorted(HFC_REGISTERED_HOOKS),
+    }
+    payload["attestation_sha256"] = _sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
     )
-
-    assert result.capabilities.available == frozenset()
-    assert result.reason_code == "plugin_evidence_missing"
+    return payload
 
 
-def test_capability_status_is_closed_and_sanitized():
+def test_review_attack_entrypoint_equality_spoof_is_rejected(tmp_path):
+    class EqualitySpoof(str):
+        def __eq__(self, other):
+            return True
+
+        def __ne__(self, other):
+            return False
+
+    runtime = tmp_path / "runtime" / "bin" / "python"
+    payload = _payload_template(runtime, tmp_path)
+    payload["entrypoint_group"] = EqualitySpoof("attacker.group")
+
+    assert native_hooks._validate_plugin_manager_payload(
+        payload, runtime_python=runtime, hermes_root=tmp_path
+    ) == "plugin_evidence_invalid"
+
+
+def test_review_attack_duplicate_child_json_keys_are_rejected():
+    with pytest.raises(ValueError, match="object"):
+        native_hooks._decode_canonical_json_object(b'{"a":1,"a":1}\n')
+
+
+def test_review_attack_subagent_cross_turn_parent_is_unavailable():
+    check = native_hooks._probe_subagent_lifecycle(_SOURCE_BY_TARGET)
+    assert check.available is False
+    assert check.reason_code == "callsite_contract_mismatch"
+
+
+def test_review_attack_ancestor_symlink_is_rejected(tmp_path):
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    child = real_parent / "child"
+    child.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        native_hooks._open_absolute_directory(alias / "child")
+
+
+def test_review_attack_parent_swap_is_detected(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    parent = root / "parent"
+    replacement = root / "replacement"
+    parent.mkdir(parents=True)
+    replacement.mkdir()
+    (parent / "source.py").write_text("value = 1\n", encoding="utf-8")
+    (replacement / "source.py").write_text("value = 1\n", encoding="utf-8")
+    root_descriptor = native_hooks._open_absolute_directory(root)
+    real_open = native_hooks.os.open
+    swapped = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if path == "parent" and not swapped:
+            swapped = True
+            parent.rename(root / "old-parent")
+            replacement.rename(parent)
+        return descriptor
+
+    monkeypatch.setattr(native_hooks.os, "open", swapping_open)
+    try:
+        with pytest.raises(ValueError, match="identity"):
+            native_hooks._read_bound_relative_file(
+                root_descriptor, "parent/source.py", 1024
+            )
+    finally:
+        os.close(root_descriptor)
+    assert swapped is True
+
+
+def test_review_attack_symlink_hardlink_and_oversize_source_are_rejected(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    original = root / "original.py"
+    original.write_bytes(b"x")
+    symlink = root / "symlink.py"
+    symlink.symlink_to(original.name)
+    hardlink = root / "hardlink.py"
+    hardlink.hardlink_to(original)
+    oversized = root / "oversized.py"
+    oversized.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+    descriptor = native_hooks._open_absolute_directory(root)
+    try:
+        for relative in ("symlink.py", "hardlink.py", "oversized.py"):
+            with pytest.raises((OSError, ValueError)):
+                native_hooks._read_bound_relative_file(
+                    descriptor, relative, 2 * 1024 * 1024
+                )
+    finally:
+        os.close(descriptor)
+
+
+def test_review_attack_bool_lines_and_malformed_primitives_are_rejected():
+    with pytest.raises(ValueError, match="lines"):
+        NativeHookAnchorProvenance(
+            name="attack",
+            line_start=True,
+            line_end=True,
+            slice_path="slices/attack.py",
+            slice_sha256="sha256:" + "0" * 64,
+        )
     with pytest.raises(ValueError, match="boolean"):
         NativeCapabilityStatus(
             name="turn_start",
-            available="yes",
+            available=1,
             reason_code="verified",
             callsite_signature="sha256:" + "0" * 64,
         )
-    with pytest.raises(ValueError, match="reason"):
-        NativeCapabilityStatus(
-            name="turn_start",
-            available=False,
-            reason_code="leaked/path",
-            callsite_signature="sha256:" + "0" * 64,
-        )
-    with pytest.raises(ValueError, match="reason"):
-        NativeCapabilityStatus(
-            name="turn_start",
-            available=False,
-            reason_code="future_unknown_reason",
-            callsite_signature="sha256:" + "0" * 64,
-        )
 
 
-def test_probe_result_rejects_duplicate_statuses_and_invalid_source_digest():
-    status = NativeCapabilityStatus(
-        name="turn_start",
-        available=False,
-        reason_code="callsite_contract_mismatch",
-        callsite_signature="sha256:" + "0" * 64,
-    )
-    with pytest.raises(ValueError, match="statuses"):
-        NativeHookCapabilityProbe(
-            capabilities=native_hooks.NativeHookCapabilities.from_names(()),
-            statuses=(status, status),
-            source_commit=FIXED_TAG_COMMIT,
-            source_digests=(),
-            plugin_evidence_sha256="",
-            reason_code="verified",
-        )
-    with pytest.raises(ValueError, match="digest"):
-        NativeHookSourceDigest(target="approval", sha256="not-a-digest")
-
-
-@pytest.mark.parametrize(
-    ("target", "before", "after", "capability"),
-    [
-        (
-            "turn_finalizer",
-            'if final_response and not interrupted:\n        invoke_hook(',
-            'if final_response:\n        invoke_hook(',
-            "turn_terminal_result",
-        ),
-        (
-            "tool_hooks",
-            "block_message = resolve_pre_tool_block(",
-            "block_message = passthrough_pre_tool_block(",
-            "stable_tool_lifecycle",
-        ),
-        (
-            "approval",
-            'kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())',
-            'kwargs.setdefault("tool_call_id", "")',
-            "approval_observe",
-        ),
-        (
-            "subagent",
-            "child_subagent_id=subagent_id,",
-            "child_subagent_id=None,",
-            "subagent_lifecycle",
-        ),
-    ],
-)
-def test_callsite_kwargs_and_timing_drift_closes_only_dependent_capability(
-    tmp_path, target, before, after, capability,
-):
-    mutated = dict(_SOURCE_BY_TARGET)
-    mutated[target] = mutated[target].replace(before, after)
-    assert mutated[target] != _SOURCE_BY_TARGET[target]
-    original = _SOURCE_BY_TARGET[target]
-    _SOURCE_BY_TARGET[target] = mutated[target]
-    try:
-        root, provenance = _commit_source_root(tmp_path)
-        result = probe_native_hook_capabilities(
-            root,
-            expected_commit=provenance.commit,
-            provenance=provenance,
-            plugin_evidence=_plugin_evidence(provenance.commit),
-        )
-    finally:
-        _SOURCE_BY_TARGET[target] = original
-
-    status = next(item for item in result.statuses if item.name == capability)
-    assert status.available is False
-    assert status.reason_code == "callsite_contract_mismatch"
-
-
-def test_source_drift_closes_only_capabilities_that_depend_on_that_target(tmp_path):
-    root, provenance = _commit_source_root(tmp_path)
-    (root / "tools" / "approval.py").write_text("def changed():\n    pass\n")
-
-    result = probe_native_hook_capabilities(
-        root,
-        expected_commit=provenance.commit,
-        provenance=provenance,
-        plugin_evidence=_plugin_evidence(provenance.commit),
-    )
-
-    assert result.capabilities.available == (
-        HYBRID_REQUIRED_NATIVE_CAPABILITIES - {"approval_observe"}
-    )
-    approval = next(status for status in result.statuses if status.name == "approval_observe")
-    assert approval.reason_code == "source_digest_mismatch"
-
-
-def test_anchor_line_drift_closes_capabilities_that_depend_on_target(tmp_path):
-    root, provenance = _commit_source_root(tmp_path)
-    turn_source = next(item for item in provenance.sources if item.target == "turn_context")
-    anchor = NativeHookAnchorProvenance(
-        name="pre_llm_call",
-        line_start=1,
-        line_end=1,
-        slice_path="slices/pre_llm_call.py",
-        slice_sha256="sha256:" + "0" * 64,
-    )
-    sources = tuple(
-        NativeHookSourceProvenance(
-            target=item.target,
-            relative_path=item.relative_path,
-            sha256=item.sha256,
-            anchors=(anchor,) if item is turn_source else item.anchors,
-        )
-        for item in provenance.sources
+def test_review_attack_commit_mismatch_reports_observed_commit(tmp_path, monkeypatch):
+    observed = "1" * 40
+    monkeypatch.setattr(
+        native_hooks, "_git_source_state", lambda _root: (observed, True)
     )
 
     result = probe_native_hook_capabilities(
-        root,
+        tmp_path,
         expected_commit=FIXED_TAG_COMMIT,
-        provenance=FixedTagNativeHookProvenance(
-            commit=FIXED_TAG_COMMIT,
-            sources=sources,
-        ),
-        plugin_evidence=_plugin_evidence(FIXED_TAG_COMMIT),
+        runtime_python=tmp_path / "missing-python",
     )
 
-    status = next(item for item in result.statuses if item.name == "turn_start")
-    assert status.available is False
-    assert status.reason_code == "source_anchor_mismatch"
+    assert result.reason_code == "source_commit_mismatch"
+    assert result.source_commit == observed
 
 
-def test_no_follow_source_symlink_fails_closed_without_leaking_path(tmp_path):
-    root, provenance = _commit_source_root(tmp_path)
-    approval = root / "tools" / "approval.py"
-    real = root / "tools" / "approval-real.py"
-    approval.rename(real)
-    approval.symlink_to(real.name)
-
+def test_dirty_fixed_source_checkout_closes_all_capabilities(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        native_hooks,
+        "_git_source_state",
+        lambda _root: (FIXED_TAG_COMMIT, False),
+    )
     result = probe_native_hook_capabilities(
-        root,
-        expected_commit=provenance.commit,
-        provenance=provenance,
-        plugin_evidence=_plugin_evidence(provenance.commit),
+        tmp_path,
+        expected_commit=FIXED_TAG_COMMIT,
+        runtime_python=tmp_path / "missing-python",
     )
-
-    status = next(status for status in result.statuses if status.name == "approval_observe")
-    assert status.available is False
-    assert status.reason_code == "source_not_regular"
-    assert str(root) not in repr(result)
-
-
-def test_expected_commit_mismatch_fails_closed_before_source_claims(tmp_path):
-    root, provenance = _commit_source_root(tmp_path)
-
-    result = probe_native_hook_capabilities(
-        root,
-        expected_commit="0" * 40,
-        provenance=provenance,
-        plugin_evidence=_plugin_evidence(provenance.commit),
-    )
-
+    assert result.reason_code == "source_dirty"
     assert result.capabilities.available == frozenset()
-    assert result.reason_code == "expected_commit_unsupported"
-    assert result.source_digests == ()
 
 
-def test_detector_consumes_probe_without_version_or_valid_hooks_guessing(tmp_path):
-    root, provenance = _commit_source_root(tmp_path)
-
-    result = detect.detect_native_hook_capabilities(
-        root,
-        expected_commit=provenance.commit,
-        provenance=provenance,
-        plugin_evidence=_plugin_evidence(provenance.commit),
+def test_forged_subprocess_output_cannot_open_capabilities(
+    installed_fixed_runtime, monkeypatch,
+):
+    payload = _payload_template(installed_fixed_runtime, FIXED_SOURCE_ROOT)
+    payload["matching_loaded_count"] = True
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+    monkeypatch.setattr(
+        native_hooks.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout=raw, stderr=b""
+        ),
     )
 
-    assert result.capabilities.available == HYBRID_REQUIRED_NATIVE_CAPABILITIES
+    evidence, reason = native_hooks._produce_plugin_manager_evidence(
+        FIXED_SOURCE_ROOT, installed_fixed_runtime
+    )
+
+    assert evidence is None
+    assert reason == "plugin_evidence_invalid"
 
 
-def test_provenance_rejects_duplicate_or_unknown_targets():
+def test_dataclasses_reject_duplicate_targets_path_aliases_and_bad_digest():
     source = NativeHookSourceProvenance(
         target="plugin_manager",
         relative_path="hermes_cli/plugins.py",
@@ -587,25 +603,11 @@ def test_provenance_rejects_duplicate_or_unknown_targets():
     )
     with pytest.raises(ValueError, match="targets"):
         FixedTagNativeHookProvenance(commit="0" * 40, sources=(source, source))
-
-
-def test_provenance_rejects_target_mapped_to_wrong_relative_path():
-    provenance = load_fixed_tag_native_hook_provenance(FIXED_TAG_PROVENANCE_PATH)
-    source = next(item for item in provenance.sources if item.target == "approval")
-
     with pytest.raises(ValueError, match="path"):
         NativeHookSourceProvenance(
-            target="approval",
-            relative_path="tools/not-approval.py",
-            sha256=source.sha256,
-            anchors=source.anchors,
+            target="plugin_manager",
+            relative_path="hermes_cli/../plugins.py",
+            sha256="sha256:" + "0" * 64,
         )
-
-
-def test_manifest_contains_no_absolute_paths_or_raw_source():
-    payload = json.loads(FIXED_TAG_PROVENANCE_PATH.read_text())
-    encoded = json.dumps(payload, sort_keys=True)
-
-    assert "/private/tmp" not in encoded
-    assert "source" not in payload
-    assert all(not Path(item["relative_path"]).is_absolute() for item in payload["files"])
+    with pytest.raises(ValueError, match="digest"):
+        NativeHookSourceDigest(target="approval", sha256="not-a-digest")

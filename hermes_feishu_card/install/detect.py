@@ -8,9 +8,7 @@ import subprocess
 
 from . import patcher
 from .native_hooks import (
-    FixedTagNativeHookProvenance,
     NativeHookCapabilityProbe,
-    PluginManagerSubprocessEvidence,
     probe_native_hook_capabilities,
 )
 from .patcher import apply_base_patch, remove_base_patch
@@ -61,15 +59,13 @@ def detect_native_hook_capabilities(
     root: str | Path,
     *,
     expected_commit: str,
-    provenance: FixedTagNativeHookProvenance,
-    plugin_evidence: PluginManagerSubprocessEvidence | None,
+    runtime_python: str | Path,
 ) -> NativeHookCapabilityProbe:
-    """Consume explicit fixed-source and subprocess facts; never infer hooks."""
+    """Produce fixed-source and real PluginManager facts; never infer hooks."""
     return probe_native_hook_capabilities(
         root,
         expected_commit=expected_commit,
-        provenance=provenance,
-        plugin_evidence=plugin_evidence,
+        runtime_python=runtime_python,
     )
 
 
