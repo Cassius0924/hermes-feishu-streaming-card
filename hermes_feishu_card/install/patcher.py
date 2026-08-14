@@ -1,5 +1,20 @@
 import ast
 
+from .patch_descriptors import (
+    HYBRID_PATCH_DESCRIPTORS,
+    HYBRID_PATCH_GROUPS,
+    HYBRID_PATCH_REGISTRY,
+    HYBRID_PATCH_TARGET_ORDER,
+    HYBRID_PATCH_TARGETS,
+    LegacyTargetPatchAdapter,
+    PatchDescriptorRegistry,
+    PatchFragmentDescriptor,
+    PatchGroupDescriptor,
+    detect_patch_groups_by_target as _detect_patch_groups_by_target,
+    remove_patch_snapshots as _remove_patch_snapshots,
+    render_patch_snapshots_from_verified_originals as _render_patch_snapshots_from_verified_originals,
+)
+
 
 PATCH_BEGIN = "# HERMES_FEISHU_CARD_PATCH_BEGIN"
 PATCH_END = "# HERMES_FEISHU_CARD_PATCH_END"
@@ -54,8 +69,65 @@ _NO_FINAL_NEWLINE = "# HERMES_FEISHU_CARD_NO_FINAL_NEWLINE"
 _SUPPORTED_STRATEGIES = {"legacy_gateway_run", "gateway_run_013_plus"}
 
 
-def apply_patch(content: str, strategy: str = "legacy_gateway_run") -> str:
+def _require_single_target_legacy_mode(integration_mode: str) -> None:
+    if type(integration_mode) is not str:
+        raise TypeError("integration_mode must be an ordinary str")
+    if integration_mode == "legacy-patch":
+        return
+    if integration_mode in {"hybrid", "native-hooks"}:
+        raise ValueError(
+            f"{integration_mode} requires the aggregate patch API with all targets"
+        )
+    raise ValueError(f"unsupported integration mode: {integration_mode}")
+
+
+def detect_patch_groups_by_target(
+    snapshots,
+    *,
+    registry=HYBRID_PATCH_REGISTRY,
+):
+    """Strictly detect a complete logical patch matrix in byte snapshots."""
+    return _detect_patch_groups_by_target(snapshots, registry=registry)
+
+
+def remove_patch_snapshots(
+    snapshots,
+    *,
+    expected_groups=None,
+    registry=HYBRID_PATCH_REGISTRY,
+):
+    """Strictly remove a complete aggregate patch set in memory."""
+    return _remove_patch_snapshots(
+        snapshots,
+        expected_groups=expected_groups,
+        registry=registry,
+    )
+
+
+def render_patch_snapshots_from_verified_originals(
+    verified_originals,
+    *,
+    integration_mode,
+    required_patch_groups,
+    registry=HYBRID_PATCH_REGISTRY,
+):
+    """Render only from an externally verified, complete original snapshot."""
+    return _render_patch_snapshots_from_verified_originals(
+        verified_originals,
+        integration_mode=integration_mode,
+        required_patch_groups=required_patch_groups,
+        registry=registry,
+    )
+
+
+def apply_patch(
+    content: str,
+    strategy: str = "legacy_gateway_run",
+    *,
+    integration_mode: str = "legacy-patch",
+) -> str:
     """Insert the Feishu card hook block into a safe Hermes message handler."""
+    _require_single_target_legacy_mode(integration_mode)
     if strategy not in _SUPPORTED_STRATEGIES:
         raise ValueError(f"unsupported patch strategy: {strategy}")
     content = _apply_start_patch(content, strategy=strategy)
@@ -167,12 +239,21 @@ def apply_patch(content: str, strategy: str = "legacy_gateway_run") -> str:
     return content
 
 
-def apply_cron_patch(content: str) -> str:
+def apply_cron_patch(
+    content: str,
+    *,
+    integration_mode: str = "legacy-patch",
+) -> str:
     """Insert the Feishu card cron hook into a safe Hermes cron delivery function."""
+    _require_single_target_legacy_mode(integration_mode)
     return _apply_cron_patch(content)
 
 
-def apply_base_patch(content: str) -> str:
+def apply_base_patch(
+    content: str,
+    *,
+    integration_mode: str = "legacy-patch",
+) -> str:
     """Patch Hermes' exact final-delivery pipeline without reimplementing it.
 
     This entry point is intentionally separate from :func:`apply_patch`: it
@@ -181,6 +262,7 @@ def apply_base_patch(content: str) -> str:
     either hook on the wrong side of the delivery ledger can create a crash
     window or acknowledge content that Hermes never attempted to send.
     """
+    _require_single_target_legacy_mode(integration_mode)
     owned = _find_owned_exact_base_blocks(content, strict=True)
     tree = _parse_exact_base_content(content)
     lines = content.splitlines(keepends=True)
@@ -3477,3 +3559,65 @@ def _strip_line_ending(line: str) -> str:
 
 def _leading_whitespace(line: str) -> str:
     return line[: len(line) - len(line.lstrip(" \t"))]
+
+
+def _render_legacy_run_target(content: str) -> str:
+    return apply_patch(
+        content,
+        strategy="gateway_run_013_plus",
+        integration_mode="legacy-patch",
+    )
+
+
+def _render_legacy_cron_target(content: str) -> str:
+    return apply_cron_patch(content, integration_mode="legacy-patch")
+
+
+def _render_legacy_base_target(content: str) -> str:
+    return apply_base_patch(content, integration_mode="legacy-patch")
+
+
+LEGACY_TARGET_PATCH_ADAPTERS = (
+    LegacyTargetPatchAdapter(
+        target="gateway/run.py",
+        renderer=_render_legacy_run_target,
+        strict_remover=remove_patch,
+        owned_markers=(
+            (PATCH_BEGIN, PATCH_END),
+            (COMPLETE_PATCH_BEGIN, COMPLETE_PATCH_END),
+            (QUEUED_COMPLETE_PATCH_BEGIN, QUEUED_COMPLETE_PATCH_END),
+            (TOOL_PATCH_BEGIN, TOOL_PATCH_END),
+            (STABLE_TOOL_PATCH_BEGIN, STABLE_TOOL_PATCH_END),
+            (ANSWER_DELTA_PATCH_BEGIN, ANSWER_DELTA_PATCH_END),
+            (THINKING_DELTA_PATCH_BEGIN, THINKING_DELTA_PATCH_END),
+            (CLARIFY_PATCH_BEGIN, CLARIFY_PATCH_END),
+            (APPROVAL_PATCH_BEGIN, APPROVAL_PATCH_END),
+            (STATUS_PATCH_BEGIN, STATUS_PATCH_END),
+            (CRON_PATCH_BEGIN, CRON_PATCH_END),
+            (SLASH_CONFIRM_PATCH_BEGIN, SLASH_CONFIRM_PATCH_END),
+            (COMMAND_CARD_PATCH_BEGIN, COMMAND_CARD_PATCH_END),
+            (COMMAND_CARD_STARTUP_PATCH_BEGIN, COMMAND_CARD_STARTUP_PATCH_END),
+            (NATIVE_REDELIVERY_PATCH_BEGIN, NATIVE_REDELIVERY_PATCH_END),
+            (PLATFORM_NOTICE_PATCH_BEGIN, PLATFORM_NOTICE_PATCH_END),
+            (HFC_COMMAND_PATCH_BEGIN, HFC_COMMAND_PATCH_END),
+        ),
+    ),
+    LegacyTargetPatchAdapter(
+        target="cron/scheduler.py",
+        renderer=_render_legacy_cron_target,
+        strict_remover=remove_cron_patch,
+        owned_markers=((CRON_PATCH_BEGIN, CRON_PATCH_END),),
+    ),
+    LegacyTargetPatchAdapter(
+        target="gateway/platforms/base.py",
+        renderer=_render_legacy_base_target,
+        strict_remover=remove_base_patch,
+        owned_markers=(
+            (EXACT_BASE_NO_TEXT_PATCH_BEGIN, EXACT_BASE_NO_TEXT_PATCH_END),
+            (
+                EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN,
+                EXACT_BASE_FINAL_DELIVERY_PATCH_END,
+            ),
+        ),
+    ),
+)

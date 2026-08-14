@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from hermes_feishu_card.install import patcher
+from hermes_feishu_card.integration import HYBRID_REQUIRED_PATCH_GROUPS
 
 
 TURN_RUNNER_FIXTURE = (
@@ -2181,3 +2182,574 @@ def test_base_patch_rejects_partial_or_ambiguous_owned_markers():
             patcher.apply_base_patch(content)
         with pytest.raises(ValueError, match="corrupt exact base patch markers"):
             patcher.remove_base_patch_lenient(content)
+
+
+def test_hybrid_descriptor_registry_has_exact_groups_targets_and_expansion():
+    assert patcher.HYBRID_PATCH_GROUPS == HYBRID_REQUIRED_PATCH_GROUPS
+    assert patcher.HYBRID_PATCH_TARGETS == frozenset(
+        {
+            "gateway/run.py",
+            "agent/turn_context.py",
+            "agent/turn_finalizer.py",
+            "tools/approval.py",
+            "tools/delegate_tool.py",
+            "cron/scheduler.py",
+            "gateway/platforms/base.py",
+        }
+    )
+
+    target_groups = patcher.HYBRID_PATCH_REGISTRY.target_groups(
+        HYBRID_REQUIRED_PATCH_GROUPS
+    )
+
+    assert set(target_groups) == patcher.HYBRID_PATCH_TARGETS
+    assert {
+        target
+        for target, groups in target_groups.items()
+        if "ingress_binding" in groups
+    } == {
+        "gateway/run.py",
+        "agent/turn_context.py",
+        "agent/turn_finalizer.py",
+    }
+    assert {
+        target
+        for target, groups in target_groups.items()
+        if "approval_round_trip" in groups
+    } == {"tools/approval.py"}
+    assert {
+        target
+        for target, groups in target_groups.items()
+        if "subagent_parent_identity" in groups
+    } == {"tools/delegate_tool.py"}
+    assert target_groups["cron/scheduler.py"] == frozenset({"cron_delivery"})
+    assert target_groups["gateway/platforms/base.py"] == frozenset(
+        {"exact_base_no_text", "exact_base_final_delivery"}
+    )
+    assert frozenset().union(*target_groups.values()) == HYBRID_REQUIRED_PATCH_GROUPS
+
+
+def test_hybrid_descriptor_registry_tracks_ordered_fragment_completeness():
+    fragments = patcher.HYBRID_PATCH_REGISTRY.target_fragments(
+        HYBRID_REQUIRED_PATCH_GROUPS
+    )
+
+    assert fragments["gateway/run.py"][:2] == (
+        ("ingress_binding", "authenticated_ingress"),
+        ("ingress_binding", "canonical_turn_consume"),
+    )
+    assert (
+        "ingress_binding",
+        "canonical_turn_publish",
+    ) in fragments["agent/turn_context.py"]
+    assert (
+        "ingress_binding",
+        "canonical_turn_clear",
+    ) in fragments["agent/turn_finalizer.py"]
+    assert fragments["tools/approval.py"] == (
+        ("approval_round_trip", "approval_register"),
+        ("approval_round_trip", "approval_resolve"),
+    )
+
+
+def test_structural_hybrid_descriptors_do_not_claim_renderer_capability():
+    assert patcher.HYBRID_PATCH_REGISTRY.available_groups == frozenset()
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "/gateway/run.py",
+        "../gateway/run.py",
+        "./gateway/run.py",
+        "gateway//run.py",
+        "gateway\\run.py",
+        "gateway/../gateway/run.py",
+        "gateway/RUN.py",
+    ],
+)
+def test_patch_group_descriptor_rejects_nonexact_targets(target):
+    fragment = patcher.PatchFragmentDescriptor(
+        name="fragment",
+        begin_marker=b"# HERMES_FEISHU_CARD_TEST_PATCH_BEGIN",
+        end_marker=b"# HERMES_FEISHU_CARD_TEST_PATCH_END",
+    )
+
+    with pytest.raises(ValueError, match="patch target"):
+        patcher.PatchGroupDescriptor(
+            group="ingress_binding",
+            target=target,
+            fragments=(fragment,),
+        )
+
+
+def test_patch_descriptors_reject_scalar_subclasses_and_duplicate_markers():
+    class SpoofedStr(str):
+        def __eq__(self, other):
+            return True
+
+        __hash__ = str.__hash__
+
+    with pytest.raises(TypeError, match="ordinary str"):
+        patcher.PatchFragmentDescriptor(
+            name=SpoofedStr("fragment"),
+            begin_marker=b"# HERMES_FEISHU_CARD_TEST_PATCH_BEGIN",
+            end_marker=b"# HERMES_FEISHU_CARD_TEST_PATCH_END",
+        )
+
+    with pytest.raises(ValueError, match="distinct"):
+        patcher.PatchFragmentDescriptor(
+            name="fragment",
+            begin_marker=b"# HERMES_FEISHU_CARD_TEST_PATCH_BEGIN",
+            end_marker=b"# HERMES_FEISHU_CARD_TEST_PATCH_BEGIN",
+        )
+
+
+def test_patch_fragment_descriptor_requires_canonical_paired_ascii_markers():
+    with pytest.raises(ValueError, match="same marker stem"):
+        patcher.PatchFragmentDescriptor(
+            name="fragment",
+            begin_marker=b"# HERMES_FEISHU_CARD_ONE_PATCH_BEGIN",
+            end_marker=b"# HERMES_FEISHU_CARD_TWO_PATCH_END",
+        )
+
+    with pytest.raises(ValueError, match="canonical ASCII"):
+        patcher.PatchFragmentDescriptor(
+            name="fragment",
+            begin_marker=b"# HERMES_FEISHU_CARD_\xff_PATCH_BEGIN",
+            end_marker=b"# HERMES_FEISHU_CARD_\xff_PATCH_END",
+        )
+
+
+def test_descriptor_registry_rejects_required_group_container_subclasses():
+    class SpoofedFrozenSet(frozenset):
+        pass
+
+    fragment = _aggregate_fragment("required_group_exactness")
+    descriptor = patcher.PatchGroupDescriptor(
+        group="ingress_binding",
+        target="gateway/run.py",
+        fragments=(fragment,),
+    )
+
+    with pytest.raises(TypeError, match="ordinary frozenset"):
+        patcher.PatchDescriptorRegistry(
+            descriptors=(descriptor,),
+            required_groups=SpoofedFrozenSet({"ingress_binding"}),
+        )
+
+
+def test_default_and_explicit_legacy_outputs_are_byte_identical_for_all_targets():
+    run_source = (
+        "async def _handle_message_with_agent(message):\n"
+        "    response = await run_agent(message)\n"
+        "    _response_time = 1\n"
+        "    agent_result = {}\n"
+        "    return response\n"
+    )
+    cron_source = (
+        "def _deliver_result(job, content):\n"
+        "    adapters = {}\n"
+        "    loop = None\n"
+        "    return content\n"
+    )
+
+    assert patcher.apply_patch(run_source) == patcher.apply_patch(
+        run_source,
+        integration_mode="legacy-patch",
+    )
+    assert patcher.apply_cron_patch(cron_source) == patcher.apply_cron_patch(
+        cron_source,
+        integration_mode="legacy-patch",
+    )
+    assert patcher.apply_base_patch(_EXACT_BASE_SOURCE) == patcher.apply_base_patch(
+        _EXACT_BASE_SOURCE,
+        integration_mode="legacy-patch",
+    )
+
+
+def test_single_target_legacy_api_refuses_hybrid_or_native_mode():
+    source = (
+        "async def _handle_message_with_agent(message):\n"
+        "    response = await run_agent(message)\n"
+        "    _response_time = 1\n"
+        "    agent_result = {}\n"
+        "    return response\n"
+    )
+
+    for mode in ("hybrid", "native-hooks"):
+        with pytest.raises(ValueError, match="aggregate patch API"):
+            patcher.apply_patch(source, integration_mode=mode)
+
+
+def _aggregate_snapshots():
+    return {
+        target: f"# clean {target}\n".encode("utf-8")
+        for target in patcher.HYBRID_PATCH_TARGET_ORDER
+    }
+
+
+def _aggregate_fragment(name):
+    token = name.upper()
+    return patcher.PatchFragmentDescriptor(
+        name=name,
+        begin_marker=f"# HERMES_FEISHU_CARD_TEST_{token}_PATCH_BEGIN".encode(),
+        end_marker=f"# HERMES_FEISHU_CARD_TEST_{token}_PATCH_END".encode(),
+    )
+
+
+def _exact_block_renderer(*fragments, fail=False, calls=None):
+    blocks = tuple(
+        fragment.begin_marker
+        + b"\nreviewed:"
+        + fragment.name.encode("ascii")
+        + b"\n"
+        + fragment.end_marker
+        + b"\n"
+        for fragment in fragments
+    )
+    suffix = b"".join(blocks)
+
+    def render(content):
+        if calls is not None:
+            calls.append("render")
+        if fail:
+            raise RuntimeError("renderer failed")
+        return content + suffix
+
+    def remove(content):
+        if calls is not None:
+            calls.append("remove")
+        if not content.endswith(suffix) or content.count(suffix) != 1:
+            raise ValueError("owned body or placement changed")
+        return content[: -len(suffix)]
+
+    return render, remove
+
+
+def _aggregate_registry(*, failing_second_renderer=False, calls=None):
+    ingress_one = _aggregate_fragment("ingress_one")
+    ingress_two = _aggregate_fragment("ingress_two")
+    ingress_context = _aggregate_fragment("ingress_context")
+    approval = _aggregate_fragment("approval")
+    run_render, run_remove = _exact_block_renderer(
+        ingress_one,
+        ingress_two,
+        calls=calls,
+    )
+    context_render, context_remove = _exact_block_renderer(
+        ingress_context,
+        fail=failing_second_renderer,
+        calls=calls,
+    )
+    approval_render, approval_remove = _exact_block_renderer(approval, calls=calls)
+    descriptors = (
+        patcher.PatchGroupDescriptor(
+            group="ingress_binding",
+            target="gateway/run.py",
+            fragments=(ingress_one, ingress_two),
+            renderer=run_render,
+            remover=run_remove,
+            renderer_revision="unit-test-reviewed-renderer-v1",
+        ),
+        patcher.PatchGroupDescriptor(
+            group="ingress_binding",
+            target="agent/turn_context.py",
+            fragments=(ingress_context,),
+            renderer=context_render,
+            remover=context_remove,
+            renderer_revision="unit-test-reviewed-renderer-v1",
+        ),
+        patcher.PatchGroupDescriptor(
+            group="approval_round_trip",
+            target="tools/approval.py",
+            fragments=(approval,),
+            renderer=approval_render,
+            remover=approval_remove,
+            renderer_revision="unit-test-reviewed-renderer-v1",
+        ),
+    )
+    return patcher.PatchDescriptorRegistry(
+        descriptors=descriptors,
+        required_groups=frozenset({"ingress_binding", "approval_round_trip"}),
+    )
+
+
+def test_descriptor_registry_rejects_duplicate_descriptors_fragments_and_markers():
+    one = _aggregate_fragment("one")
+    duplicate_name = patcher.PatchGroupDescriptor(
+        group="ingress_binding",
+        target="gateway/run.py",
+        fragments=(one,),
+    )
+
+    with pytest.raises(ValueError, match="duplicate patch group descriptor"):
+        patcher.PatchDescriptorRegistry(
+            descriptors=(duplicate_name, duplicate_name),
+            required_groups=frozenset({"ingress_binding"}),
+        )
+
+    same_markers = patcher.PatchFragmentDescriptor(
+        name="two",
+        begin_marker=one.begin_marker,
+        end_marker=one.end_marker,
+    )
+    with pytest.raises(ValueError, match="duplicate fragment marker"):
+        patcher.PatchGroupDescriptor(
+            group="ingress_binding",
+            target="gateway/run.py",
+            fragments=(one, same_markers),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda snapshots: {k: v for k, v in snapshots.items() if k != "tools/approval.py"},
+        lambda snapshots: {**snapshots, "gateway/./run.py": b"alias\n"},
+        lambda snapshots: {**snapshots, "gateway/run.py": "not bytes"},
+    ],
+)
+def test_aggregate_snapshot_boundary_requires_exact_complete_bytes_mapping(mutate):
+    registry = _aggregate_registry()
+
+    with pytest.raises((TypeError, ValueError), match="snapshot|target"):
+        patcher.detect_patch_groups_by_target(mutate(_aggregate_snapshots()), registry=registry)
+
+
+def test_aggregate_render_detect_remove_round_trip_is_target_and_fragment_complete():
+    registry = _aggregate_registry()
+    originals = _aggregate_snapshots()
+
+    rendered = patcher.render_patch_snapshots_from_verified_originals(
+        originals,
+        integration_mode="hybrid",
+        required_patch_groups=registry.required_groups,
+        registry=registry,
+    )
+    detected = patcher.detect_patch_groups_by_target(rendered, registry=registry)
+
+    assert originals == _aggregate_snapshots()
+    assert detected == registry.target_groups(registry.required_groups)
+    assert frozenset().union(*detected.values()) == registry.required_groups
+    assert patcher.remove_patch_snapshots(
+        rendered,
+        expected_groups=registry.required_groups,
+        registry=registry,
+    ) == originals
+
+
+def test_native_aggregate_render_is_a_byte_identical_noop():
+    registry = _aggregate_registry()
+    originals = _aggregate_snapshots()
+
+    rendered = patcher.render_patch_snapshots_from_verified_originals(
+        originals,
+        integration_mode="native-hooks",
+        required_patch_groups=frozenset(),
+        registry=registry,
+    )
+
+    assert rendered == originals
+    assert all(rendered[target] is originals[target] for target in originals)
+
+
+def test_production_hybrid_renderer_refuses_structural_only_descriptors():
+    with pytest.raises(ValueError, match="reviewed renderer unavailable"):
+        patcher.render_patch_snapshots_from_verified_originals(
+            _aggregate_snapshots(),
+            integration_mode="hybrid",
+            required_patch_groups=HYBRID_REQUIRED_PATCH_GROUPS,
+        )
+
+
+def test_aggregate_render_rejects_mismatched_decision_before_any_renderer_call():
+    calls = []
+    registry = _aggregate_registry(calls=calls)
+
+    with pytest.raises(ValueError, match="required patch groups"):
+        patcher.render_patch_snapshots_from_verified_originals(
+            _aggregate_snapshots(),
+            integration_mode="hybrid",
+            required_patch_groups=frozenset({"ingress_binding"}),
+            registry=registry,
+        )
+
+    assert calls == []
+
+
+def test_cross_mode_render_rejects_patched_input_instead_of_deriving_originals():
+    registry = _aggregate_registry()
+    rendered = patcher.render_patch_snapshots_from_verified_originals(
+        _aggregate_snapshots(),
+        integration_mode="hybrid",
+        required_patch_groups=registry.required_groups,
+        registry=registry,
+    )
+
+    with pytest.raises(ValueError, match="verified originals must be marker-clean"):
+        patcher.render_patch_snapshots_from_verified_originals(
+            rendered,
+            integration_mode="hybrid",
+            required_patch_groups=registry.required_groups,
+            registry=registry,
+        )
+
+
+def _mutated_rendered_snapshots(kind):
+    registry = _aggregate_registry()
+    rendered = patcher.render_patch_snapshots_from_verified_originals(
+        _aggregate_snapshots(),
+        integration_mode="hybrid",
+        required_patch_groups=registry.required_groups,
+        registry=registry,
+    )
+    descriptor = registry.descriptors[0]
+    first, second = descriptor.fragments
+    content = rendered[descriptor.target]
+    if kind == "partial_fragment":
+        content = content.replace(second.end_marker + b"\n", b"", 1)
+    elif kind == "partial_target":
+        content = _aggregate_snapshots()[descriptor.target]
+    elif kind == "duplicate":
+        content += first.begin_marker + b"\n"
+    elif kind == "reversed":
+        content = content.replace(first.begin_marker, b"__TEMP__", 1)
+        content = content.replace(first.end_marker, first.begin_marker, 1)
+        content = content.replace(b"__TEMP__", first.end_marker, 1)
+    elif kind == "nested":
+        first_block = (
+            first.begin_marker
+            + b"\nreviewed:"
+            + first.name.encode()
+            + b"\n"
+            + first.end_marker
+            + b"\n"
+        )
+        second_block = (
+            second.begin_marker
+            + b"\nreviewed:"
+            + second.name.encode()
+            + b"\n"
+            + second.end_marker
+            + b"\n"
+        )
+        nested = (
+            first.begin_marker
+            + b"\n"
+            + second_block
+            + b"reviewed:"
+            + first.name.encode()
+            + b"\n"
+            + first.end_marker
+            + b"\n"
+        )
+        content = content.replace(first_block + second_block, nested, 1)
+    elif kind == "misplaced":
+        suffix = content[len(_aggregate_snapshots()[descriptor.target]) :]
+        content = suffix + _aggregate_snapshots()[descriptor.target]
+    elif kind == "edited":
+        content = content.replace(b"reviewed:ingress_one", b"edited:ingress_one", 1)
+    elif kind == "unknown":
+        content += b"# HERMES_FEISHU_CARD_UNKNOWN_PATCH_BEGIN\n"
+        content += b"# HERMES_FEISHU_CARD_UNKNOWN_PATCH_END\n"
+    elif kind == "edited_markers":
+        approval_descriptor = registry.descriptors[2]
+        approval_fragment = approval_descriptor.fragments[0]
+        approval_content = rendered[approval_descriptor.target]
+        approval_content = approval_content.replace(
+            approval_fragment.begin_marker,
+            approval_fragment.begin_marker.replace(b"_BEGIN", b"_BEGIX"),
+            1,
+        )
+        approval_content = approval_content.replace(
+            approval_fragment.end_marker,
+            approval_fragment.end_marker.replace(b"_END", b"_ENX"),
+            1,
+        )
+        rendered[approval_descriptor.target] = approval_content
+    else:
+        raise AssertionError(kind)
+    rendered[descriptor.target] = content
+    return registry, rendered
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "partial_fragment",
+        "partial_target",
+        "duplicate",
+        "reversed",
+        "nested",
+        "misplaced",
+        "edited",
+        "unknown",
+        "edited_markers",
+    ],
+)
+def test_strict_aggregate_detector_rejects_incomplete_or_corrupt_owned_markers(kind):
+    registry, rendered = _mutated_rendered_snapshots(kind)
+
+    with pytest.raises(ValueError, match="patch marker|patch group|owned patch"):
+        patcher.detect_patch_groups_by_target(rendered, registry=registry)
+    with pytest.raises(ValueError, match="patch marker|patch group|owned patch"):
+        patcher.remove_patch_snapshots(rendered, registry=registry)
+
+
+def test_aggregate_render_failure_is_all_target_atomic_in_memory():
+    calls = []
+    registry = _aggregate_registry(failing_second_renderer=True, calls=calls)
+    originals = _aggregate_snapshots()
+    before = dict(originals)
+
+    with pytest.raises(RuntimeError, match="renderer failed"):
+        patcher.render_patch_snapshots_from_verified_originals(
+            originals,
+            integration_mode="hybrid",
+            required_patch_groups=registry.required_groups,
+            registry=registry,
+        )
+
+    assert calls == ["render", "render"]
+    assert originals == before
+
+
+def test_aggregate_strict_remove_never_uses_manifestless_lenient_removers(monkeypatch):
+    registry = _aggregate_registry()
+    rendered = patcher.render_patch_snapshots_from_verified_originals(
+        _aggregate_snapshots(),
+        integration_mode="hybrid",
+        required_patch_groups=registry.required_groups,
+        registry=registry,
+    )
+
+    monkeypatch.setattr(
+        patcher,
+        "remove_patch_lenient",
+        lambda _content: pytest.fail("aggregate path used lenient run removal"),
+    )
+    monkeypatch.setattr(
+        patcher,
+        "remove_base_patch_lenient",
+        lambda _content: pytest.fail("aggregate path used lenient base removal"),
+    )
+
+    assert patcher.remove_patch_snapshots(rendered, registry=registry) == _aggregate_snapshots()
+
+
+def test_legacy_target_adapters_expose_only_strict_removal():
+    adapters = {adapter.target: adapter for adapter in patcher.LEGACY_TARGET_PATCH_ADAPTERS}
+
+    assert set(adapters) == {
+        "gateway/run.py",
+        "cron/scheduler.py",
+        "gateway/platforms/base.py",
+    }
+    assert adapters["gateway/run.py"].strict_remover is patcher.remove_patch
+    assert adapters["cron/scheduler.py"].strict_remover is patcher.remove_cron_patch
+    assert adapters["gateway/platforms/base.py"].strict_remover is patcher.remove_base_patch
+    assert all(
+        not hasattr(adapter, "manifestless_lenient_remover")
+        for adapter in adapters.values()
+    )
