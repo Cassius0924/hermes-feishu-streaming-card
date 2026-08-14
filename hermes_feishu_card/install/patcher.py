@@ -84,22 +84,31 @@ def _require_single_target_legacy_mode(integration_mode: str) -> None:
 def detect_patch_groups_by_target(
     snapshots,
     *,
+    expected_groups,
+    expected_fragment_matrix,
     registry=HYBRID_PATCH_REGISTRY,
 ):
     """Strictly detect a complete logical patch matrix in byte snapshots."""
-    return _detect_patch_groups_by_target(snapshots, registry=registry)
+    return _detect_patch_groups_by_target(
+        snapshots,
+        expected_groups=expected_groups,
+        expected_fragment_matrix=expected_fragment_matrix,
+        registry=registry,
+    )
 
 
 def remove_patch_snapshots(
     snapshots,
     *,
-    expected_groups=None,
+    expected_groups,
+    expected_fragment_matrix,
     registry=HYBRID_PATCH_REGISTRY,
 ):
     """Strictly remove a complete aggregate patch set in memory."""
     return _remove_patch_snapshots(
         snapshots,
         expected_groups=expected_groups,
+        expected_fragment_matrix=expected_fragment_matrix,
         registry=registry,
     )
 
@@ -107,15 +116,19 @@ def remove_patch_snapshots(
 def render_patch_snapshots_from_verified_originals(
     verified_originals,
     *,
+    verified_original_sha256,
     integration_mode,
     required_patch_groups,
+    expected_fragment_matrix,
     registry=HYBRID_PATCH_REGISTRY,
 ):
     """Render only from an externally verified, complete original snapshot."""
     return _render_patch_snapshots_from_verified_originals(
         verified_originals,
+        verified_original_sha256=verified_original_sha256,
         integration_mode=integration_mode,
         required_patch_groups=required_patch_groups,
+        expected_fragment_matrix=expected_fragment_matrix,
         registry=registry,
     )
 

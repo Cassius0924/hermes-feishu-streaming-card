@@ -1,4 +1,5 @@
 import ast
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -2389,6 +2390,17 @@ def _aggregate_snapshots():
     }
 
 
+def _aggregate_sha256(snapshots):
+    return {
+        target: hashlib.sha256(content).hexdigest()
+        for target, content in snapshots.items()
+    }
+
+
+def _aggregate_expected_matrix(registry, groups):
+    return registry.target_fragments(groups)
+
+
 def _aggregate_fragment(name):
     token = name.upper()
     return patcher.PatchFragmentDescriptor(
@@ -2475,6 +2487,62 @@ def _aggregate_registry(*, failing_second_renderer=False, calls=None):
     )
 
 
+def _render_aggregate(
+    registry,
+    originals=None,
+    *,
+    integration_mode="hybrid",
+    required_groups=None,
+):
+    if originals is None:
+        originals = _aggregate_snapshots()
+    if required_groups is None:
+        required_groups = (
+            frozenset()
+            if integration_mode == "native-hooks"
+            else registry.required_groups
+        )
+    return patcher.render_patch_snapshots_from_verified_originals(
+        originals,
+        verified_original_sha256=_aggregate_sha256(originals),
+        integration_mode=integration_mode,
+        required_patch_groups=required_groups,
+        expected_fragment_matrix=_aggregate_expected_matrix(
+            registry,
+            required_groups,
+        ),
+        registry=registry,
+    )
+
+
+def _detect_aggregate(registry, snapshots, *, expected_groups=None):
+    if expected_groups is None:
+        expected_groups = registry.required_groups
+    return patcher.detect_patch_groups_by_target(
+        snapshots,
+        expected_groups=expected_groups,
+        expected_fragment_matrix=_aggregate_expected_matrix(
+            registry,
+            expected_groups,
+        ),
+        registry=registry,
+    )
+
+
+def _remove_aggregate(registry, snapshots, *, expected_groups=None):
+    if expected_groups is None:
+        expected_groups = registry.required_groups
+    return patcher.remove_patch_snapshots(
+        snapshots,
+        expected_groups=expected_groups,
+        expected_fragment_matrix=_aggregate_expected_matrix(
+            registry,
+            expected_groups,
+        ),
+        registry=registry,
+    )
+
+
 def test_descriptor_registry_rejects_duplicate_descriptors_fragments_and_markers():
     one = _aggregate_fragment("one")
     duplicate_name = patcher.PatchGroupDescriptor(
@@ -2514,40 +2582,34 @@ def test_aggregate_snapshot_boundary_requires_exact_complete_bytes_mapping(mutat
     registry = _aggregate_registry()
 
     with pytest.raises((TypeError, ValueError), match="snapshot|target"):
-        patcher.detect_patch_groups_by_target(mutate(_aggregate_snapshots()), registry=registry)
+        _detect_aggregate(
+            registry,
+            mutate(_aggregate_snapshots()),
+            expected_groups=frozenset(),
+        )
 
 
 def test_aggregate_render_detect_remove_round_trip_is_target_and_fragment_complete():
     registry = _aggregate_registry()
     originals = _aggregate_snapshots()
 
-    rendered = patcher.render_patch_snapshots_from_verified_originals(
-        originals,
-        integration_mode="hybrid",
-        required_patch_groups=registry.required_groups,
-        registry=registry,
-    )
-    detected = patcher.detect_patch_groups_by_target(rendered, registry=registry)
+    rendered = _render_aggregate(registry, originals)
+    detected = _detect_aggregate(registry, rendered)
 
     assert originals == _aggregate_snapshots()
     assert detected == registry.target_groups(registry.required_groups)
     assert frozenset().union(*detected.values()) == registry.required_groups
-    assert patcher.remove_patch_snapshots(
-        rendered,
-        expected_groups=registry.required_groups,
-        registry=registry,
-    ) == originals
+    assert _remove_aggregate(registry, rendered) == originals
 
 
 def test_native_aggregate_render_is_a_byte_identical_noop():
     registry = _aggregate_registry()
     originals = _aggregate_snapshots()
 
-    rendered = patcher.render_patch_snapshots_from_verified_originals(
+    rendered = _render_aggregate(
+        registry,
         originals,
         integration_mode="native-hooks",
-        required_patch_groups=frozenset(),
-        registry=registry,
     )
 
     assert rendered == originals
@@ -2556,10 +2618,9 @@ def test_native_aggregate_render_is_a_byte_identical_noop():
 
 def test_production_hybrid_renderer_refuses_structural_only_descriptors():
     with pytest.raises(ValueError, match="reviewed renderer unavailable"):
-        patcher.render_patch_snapshots_from_verified_originals(
-            _aggregate_snapshots(),
-            integration_mode="hybrid",
-            required_patch_groups=HYBRID_REQUIRED_PATCH_GROUPS,
+        _render_aggregate(
+            patcher.HYBRID_PATCH_REGISTRY,
+            required_groups=HYBRID_REQUIRED_PATCH_GROUPS,
         )
 
 
@@ -2570,8 +2631,13 @@ def test_aggregate_render_rejects_mismatched_decision_before_any_renderer_call()
     with pytest.raises(ValueError, match="required patch groups"):
         patcher.render_patch_snapshots_from_verified_originals(
             _aggregate_snapshots(),
+            verified_original_sha256=_aggregate_sha256(_aggregate_snapshots()),
             integration_mode="hybrid",
             required_patch_groups=frozenset({"ingress_binding"}),
+            expected_fragment_matrix=_aggregate_expected_matrix(
+                registry,
+                frozenset({"ingress_binding"}),
+            ),
             registry=registry,
         )
 
@@ -2580,30 +2646,117 @@ def test_aggregate_render_rejects_mismatched_decision_before_any_renderer_call()
 
 def test_cross_mode_render_rejects_patched_input_instead_of_deriving_originals():
     registry = _aggregate_registry()
-    rendered = patcher.render_patch_snapshots_from_verified_originals(
-        _aggregate_snapshots(),
-        integration_mode="hybrid",
-        required_patch_groups=registry.required_groups,
-        registry=registry,
-    )
+    originals = _aggregate_snapshots()
+    rendered = _render_aggregate(registry, originals)
 
-    with pytest.raises(ValueError, match="verified originals must be marker-clean"):
+    with pytest.raises(ValueError, match="verified original SHA-256 mismatch"):
         patcher.render_patch_snapshots_from_verified_originals(
             rendered,
+            verified_original_sha256=_aggregate_sha256(originals),
             integration_mode="hybrid",
             required_patch_groups=registry.required_groups,
+            expected_fragment_matrix=_aggregate_expected_matrix(
+                registry,
+                registry.required_groups,
+            ),
             registry=registry,
         )
 
 
+def test_aggregate_installed_detection_requires_external_expected_matrix():
+    registry = _aggregate_registry()
+
+    with pytest.raises(TypeError, match="expected_groups|expected_fragment_matrix"):
+        patcher.detect_patch_groups_by_target(
+            _aggregate_snapshots(),
+            registry=registry,
+        )
+
+
+def test_expected_matrix_rejects_both_owner_prefixes_mutated_to_near_namespace():
+    calls = []
+    registry = _aggregate_registry(calls=calls)
+    originals = _aggregate_snapshots()
+    rendered = _render_aggregate(registry, originals)
+    approval_descriptor = registry.descriptors[2]
+    target = approval_descriptor.target
+    mutated = dict(rendered)
+    mutated[target] = mutated[target].replace(
+        b"HERMES_FEISHU_CARD",
+        b"XERMES_FEISHU_CARD",
+    )
+    expected_matrix = _aggregate_expected_matrix(
+        registry,
+        registry.required_groups,
+    )
+    calls.clear()
+
+    with pytest.raises(ValueError, match="expected patch fragment matrix"):
+        patcher.detect_patch_groups_by_target(
+            mutated,
+            expected_groups=registry.required_groups,
+            expected_fragment_matrix=expected_matrix,
+            registry=registry,
+        )
+    assert calls == []
+    with pytest.raises(ValueError, match="expected patch fragment matrix"):
+        patcher.remove_patch_snapshots(
+            mutated,
+            expected_groups=registry.required_groups,
+            expected_fragment_matrix=expected_matrix,
+            registry=registry,
+        )
+    assert calls == []
+    assert mutated[target].count(b"XERMES_FEISHU_CARD") == 2
+
+
+def test_verified_original_render_rejects_wrong_external_sha256_before_renderer():
+    calls = []
+    registry = _aggregate_registry(calls=calls)
+    originals = _aggregate_snapshots()
+    digests = _aggregate_sha256(originals)
+    digests["gateway/run.py"] = "0" * 64
+
+    with pytest.raises(ValueError, match="verified original SHA-256 mismatch"):
+        patcher.render_patch_snapshots_from_verified_originals(
+            originals,
+            verified_original_sha256=digests,
+            integration_mode="hybrid",
+            required_patch_groups=registry.required_groups,
+            expected_fragment_matrix=_aggregate_expected_matrix(
+                registry,
+                registry.required_groups,
+            ),
+            registry=registry,
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("mutation", ["move", "duplicate"])
+def test_strict_aggregate_rejects_globally_known_marker_on_wrong_target(mutation):
+    registry = _aggregate_registry()
+    originals = _aggregate_snapshots()
+    rendered = _render_aggregate(registry, originals)
+    approval_target = "tools/approval.py"
+    wrong_target = "gateway/run.py"
+    approval_block = rendered[approval_target][len(originals[approval_target]) :]
+    if mutation == "move":
+        rendered[approval_target] = originals[approval_target]
+    gateway_blocks = rendered[wrong_target][len(originals[wrong_target]) :]
+    rendered[wrong_target] = (
+        originals[wrong_target] + approval_block + gateway_blocks
+    )
+
+    with pytest.raises(ValueError, match="misplaced patch marker"):
+        _detect_aggregate(registry, rendered)
+    with pytest.raises(ValueError, match="misplaced patch marker"):
+        _remove_aggregate(registry, rendered)
+
+
 def _mutated_rendered_snapshots(kind):
     registry = _aggregate_registry()
-    rendered = patcher.render_patch_snapshots_from_verified_originals(
-        _aggregate_snapshots(),
-        integration_mode="hybrid",
-        required_patch_groups=registry.required_groups,
-        registry=registry,
-    )
+    rendered = _render_aggregate(registry)
     descriptor = registry.descriptors[0]
     first, second = descriptor.fragments
     content = rendered[descriptor.target]
@@ -2692,9 +2845,9 @@ def test_strict_aggregate_detector_rejects_incomplete_or_corrupt_owned_markers(k
     registry, rendered = _mutated_rendered_snapshots(kind)
 
     with pytest.raises(ValueError, match="patch marker|patch group|owned patch"):
-        patcher.detect_patch_groups_by_target(rendered, registry=registry)
+        _detect_aggregate(registry, rendered)
     with pytest.raises(ValueError, match="patch marker|patch group|owned patch"):
-        patcher.remove_patch_snapshots(rendered, registry=registry)
+        _remove_aggregate(registry, rendered)
 
 
 def test_aggregate_render_failure_is_all_target_atomic_in_memory():
@@ -2706,8 +2859,13 @@ def test_aggregate_render_failure_is_all_target_atomic_in_memory():
     with pytest.raises(RuntimeError, match="renderer failed"):
         patcher.render_patch_snapshots_from_verified_originals(
             originals,
+            verified_original_sha256=_aggregate_sha256(originals),
             integration_mode="hybrid",
             required_patch_groups=registry.required_groups,
+            expected_fragment_matrix=_aggregate_expected_matrix(
+                registry,
+                registry.required_groups,
+            ),
             registry=registry,
         )
 
@@ -2717,12 +2875,7 @@ def test_aggregate_render_failure_is_all_target_atomic_in_memory():
 
 def test_aggregate_strict_remove_never_uses_manifestless_lenient_removers(monkeypatch):
     registry = _aggregate_registry()
-    rendered = patcher.render_patch_snapshots_from_verified_originals(
-        _aggregate_snapshots(),
-        integration_mode="hybrid",
-        required_patch_groups=registry.required_groups,
-        registry=registry,
-    )
+    rendered = _render_aggregate(registry)
 
     monkeypatch.setattr(
         patcher,
@@ -2735,7 +2888,7 @@ def test_aggregate_strict_remove_never_uses_manifestless_lenient_removers(monkey
         lambda _content: pytest.fail("aggregate path used lenient base removal"),
     )
 
-    assert patcher.remove_patch_snapshots(rendered, registry=registry) == _aggregate_snapshots()
+    assert _remove_aggregate(registry, rendered) == _aggregate_snapshots()
 
 
 def test_legacy_target_adapters_expose_only_strict_removal():

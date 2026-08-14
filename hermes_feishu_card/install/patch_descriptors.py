@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import hashlib
 import re
 from typing import Callable, Iterable
 
@@ -30,6 +31,7 @@ _OWNED_MARKER_RE = re.compile(
 _CANONICAL_MARKER_RE = re.compile(
     rb"# HERMES_FEISHU_CARD_[A-Z0-9_]+_PATCH_(?:BEGIN|END)\Z"
 )
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _require_ordinary_str(value: object, *, label: str) -> str:
@@ -223,6 +225,57 @@ class PatchDescriptorRegistry:
             target: tuple(by_target[target]) for target in HYBRID_PATCH_TARGET_ORDER
         }
 
+    def validate_expected_fragment_matrix(
+        self,
+        expected_groups: Iterable[str],
+        expected_fragment_matrix: Mapping[str, tuple[tuple[str, str], ...]],
+    ) -> dict[str, tuple[tuple[str, str], ...]]:
+        selected = self._selected_groups(expected_groups)
+        if not isinstance(expected_fragment_matrix, Mapping):
+            raise TypeError("expected patch fragment matrix must be an ordinary Mapping")
+        try:
+            items = tuple(expected_fragment_matrix.items())
+        except Exception as exc:
+            raise TypeError(
+                "expected patch fragment matrix must expose ordinary mapping items"
+            ) from exc
+        normalized: dict[str, tuple[tuple[str, str], ...]] = {}
+        for target, fragments in items:
+            if type(target) is not str:
+                raise TypeError(
+                    "expected patch fragment matrix target must be ordinary str"
+                )
+            if type(fragments) is not tuple:
+                raise TypeError(
+                    "expected patch fragment matrix values must be ordinary tuples"
+                )
+            normalized_fragments: list[tuple[str, str]] = []
+            for identity in fragments:
+                if type(identity) is not tuple or len(identity) != 2:
+                    raise TypeError(
+                        "expected patch fragment identities must be ordinary two-tuples"
+                    )
+                group, fragment = identity
+                if type(group) is not str or type(fragment) is not str:
+                    raise TypeError(
+                        "expected patch fragment identities must contain ordinary str"
+                    )
+                normalized_fragments.append((group, fragment))
+            normalized[target] = tuple(normalized_fragments)
+        if (
+            frozenset(normalized) != self.required_targets
+            or len(items) != len(self.required_targets)
+        ):
+            raise ValueError("expected patch fragment matrix target set mismatch")
+        canonical = self.target_fragments(selected)
+        if normalized != canonical:
+            raise ValueError(
+                "expected patch fragment matrix does not match descriptor registry"
+            )
+        return {
+            target: normalized[target] for target in HYBRID_PATCH_TARGET_ORDER
+        }
+
     @property
     def available_groups(self) -> frozenset[str]:
         availability = {
@@ -256,6 +309,43 @@ class PatchDescriptorRegistry:
             )
         return {target: snapshots[target] for target in HYBRID_PATCH_TARGET_ORDER}
 
+    def validate_verified_original_sha256(
+        self,
+        snapshots: Mapping[str, bytes],
+        verified_original_sha256: Mapping[str, str],
+    ) -> None:
+        contents = self.validate_snapshots(snapshots)
+        if not isinstance(verified_original_sha256, Mapping):
+            raise TypeError("verified original SHA-256 must be an ordinary Mapping")
+        try:
+            items = tuple(verified_original_sha256.items())
+        except Exception as exc:
+            raise TypeError(
+                "verified original SHA-256 must expose ordinary mapping items"
+            ) from exc
+        normalized: dict[str, str] = {}
+        for target, digest in items:
+            if type(target) is not str:
+                raise TypeError("verified original SHA-256 target must be ordinary str")
+            if type(digest) is not str:
+                raise TypeError("verified original SHA-256 digest must be ordinary str")
+            if not _SHA256_RE.fullmatch(digest):
+                raise ValueError(
+                    "verified original SHA-256 digest must be lowercase 64-hex"
+                )
+            normalized[target] = digest
+        if (
+            frozenset(normalized) != self.required_targets
+            or len(items) != len(self.required_targets)
+        ):
+            raise ValueError("verified original SHA-256 target set mismatch")
+        for target in HYBRID_PATCH_TARGET_ORDER:
+            observed = hashlib.sha256(contents[target]).hexdigest()
+            if observed != normalized[target]:
+                raise ValueError(
+                    f"verified original SHA-256 mismatch for target {target}"
+                )
+
     @property
     def _known_markers(self) -> frozenset[bytes]:
         return frozenset(
@@ -281,9 +371,18 @@ class PatchDescriptorRegistry:
     ) -> dict[tuple[str, str], bool]:
         known_markers = self._known_markers
         observed_owned_markers = tuple(_OWNED_MARKER_RE.findall(content))
-        unknown = frozenset(observed_owned_markers) - known_markers
+        observed = frozenset(observed_owned_markers)
+        unknown = observed - known_markers
         if unknown:
             raise ValueError(f"unknown owned patch marker in target {target}")
+        target_markers = frozenset(
+            marker
+            for descriptor in descriptors
+            for fragment in descriptor.fragments
+            for marker in (fragment.begin_marker, fragment.end_marker)
+        )
+        if observed - target_markers:
+            raise ValueError(f"misplaced patch marker in target {target}")
 
         events: list[tuple[int, str, tuple[str, str]]] = []
         fragment_presence: dict[tuple[str, str], bool] = {}
@@ -330,9 +429,20 @@ class PatchDescriptorRegistry:
     def detect(
         self,
         snapshots: Mapping[str, bytes],
+        *,
+        expected_groups: Iterable[str],
+        expected_fragment_matrix: Mapping[str, tuple[tuple[str, str], ...]],
     ) -> dict[str, frozenset[str]]:
+        selected = self._selected_groups(expected_groups)
+        expected_matrix = self.validate_expected_fragment_matrix(
+            selected,
+            expected_fragment_matrix,
+        )
         contents = self.validate_snapshots(snapshots)
         presence: dict[tuple[str, str], bool] = {}
+        observed_matrix: dict[str, list[tuple[str, str]]] = {
+            target: [] for target in HYBRID_PATCH_TARGET_ORDER
+        }
         descriptors_by_target = {
             target: tuple(
                 descriptor
@@ -355,23 +465,10 @@ class PatchDescriptorRegistry:
                 presence[(descriptor.group, descriptor.target)] = descriptor_present
                 if not descriptor_present:
                     continue
-                if not descriptor.has_reviewed_renderer:
-                    raise ValueError(
-                        f"reviewed renderer unavailable for patch group {descriptor.group}"
-                    )
-                try:
-                    removed = descriptor.remover(contents[target])
-                    if type(removed) is not bytes:
-                        raise TypeError("patch remover must return ordinary bytes")
-                    rerendered = descriptor.renderer(removed)
-                except Exception as exc:
-                    raise ValueError(
-                        f"owned patch body or placement changed for group {descriptor.group}"
-                    ) from exc
-                if type(rerendered) is not bytes or rerendered != contents[target]:
-                    raise ValueError(
-                        f"owned patch body or placement changed for group {descriptor.group}"
-                    )
+                observed_matrix[target].extend(
+                    (descriptor.group, fragment.name)
+                    for fragment in descriptor.fragments
+                )
 
         detected_groups: set[str] = set()
         for group in self.required_groups:
@@ -387,6 +484,36 @@ class PatchDescriptorRegistry:
             if states and all(states):
                 detected_groups.add(group)
 
+        normalized_observed_matrix = {
+            target: tuple(observed_matrix[target])
+            for target in HYBRID_PATCH_TARGET_ORDER
+        }
+        if normalized_observed_matrix != expected_matrix:
+            raise ValueError("expected patch fragment matrix does not match installed snapshot")
+        if frozenset(detected_groups) != selected:
+            raise ValueError("expected patch groups do not match installed snapshot")
+
+        for descriptor in self.descriptors:
+            if not presence[(descriptor.group, descriptor.target)]:
+                continue
+            if not descriptor.has_reviewed_renderer:
+                raise ValueError(
+                    f"reviewed renderer unavailable for patch group {descriptor.group}"
+                )
+            try:
+                removed = descriptor.remover(contents[descriptor.target])
+                if type(removed) is not bytes:
+                    raise TypeError("patch remover must return ordinary bytes")
+                rerendered = descriptor.renderer(removed)
+            except Exception as exc:
+                raise ValueError(
+                    f"owned patch body or placement changed for group {descriptor.group}"
+                ) from exc
+            if type(rerendered) is not bytes or rerendered != contents[descriptor.target]:
+                raise ValueError(
+                    f"owned patch body or placement changed for group {descriptor.group}"
+                )
+
         result = self.target_groups(frozenset(detected_groups))
         if frozenset().union(*result.values()) != frozenset(detected_groups):
             raise ValueError("detected patch group union is inconsistent")
@@ -396,12 +523,27 @@ class PatchDescriptorRegistry:
         self,
         verified_originals: Mapping[str, bytes],
         required_groups: Iterable[str],
+        *,
+        expected_fragment_matrix: Mapping[str, tuple[tuple[str, str], ...]],
+        verified_original_sha256: Mapping[str, str],
     ) -> dict[str, bytes]:
         selected = self._selected_groups(required_groups)
+        expected_matrix = self.validate_expected_fragment_matrix(
+            selected,
+            expected_fragment_matrix,
+        )
         originals = self.validate_snapshots(verified_originals)
-        detected = self.detect(originals)
-        if any(detected.values()):
-            raise ValueError("verified originals must be marker-clean")
+        self.validate_verified_original_sha256(
+            originals,
+            verified_original_sha256,
+        )
+        clean_groups = frozenset()
+        clean_matrix = self.target_fragments(clean_groups)
+        self.detect(
+            originals,
+            expected_groups=clean_groups,
+            expected_fragment_matrix=clean_matrix,
+        )
         unavailable = selected - self.available_groups
         if unavailable:
             raise ValueError(
@@ -419,7 +561,11 @@ class PatchDescriptorRegistry:
             rendered[descriptor.target] = result
 
         expected = self.target_groups(selected)
-        if self.detect(rendered) != expected:
+        if self.detect(
+            rendered,
+            expected_groups=selected,
+            expected_fragment_matrix=expected_matrix,
+        ) != expected:
             raise ValueError("rendered patch target/group/fragment matrix is incomplete")
         return rendered
 
@@ -427,15 +573,23 @@ class PatchDescriptorRegistry:
         self,
         snapshots: Mapping[str, bytes],
         *,
-        expected_groups: Iterable[str] | None = None,
+        expected_groups: Iterable[str],
+        expected_fragment_matrix: Mapping[str, tuple[tuple[str, str], ...]],
     ) -> dict[str, bytes]:
         contents = self.validate_snapshots(snapshots)
-        detected = self.detect(contents)
+        selected = self._selected_groups(expected_groups)
+        expected_matrix = self.validate_expected_fragment_matrix(
+            selected,
+            expected_fragment_matrix,
+        )
+        detected = self.detect(
+            contents,
+            expected_groups=selected,
+            expected_fragment_matrix=expected_matrix,
+        )
         flat_detected = frozenset().union(*detected.values())
-        if expected_groups is not None:
-            expected = self._selected_groups(expected_groups)
-            if flat_detected != expected:
-                raise ValueError("detected patch groups do not match expected patch groups")
+        if flat_detected != selected:
+            raise ValueError("detected patch groups do not match expected patch groups")
 
         removed = dict(contents)
         for descriptor in reversed(self.descriptors):
@@ -445,7 +599,15 @@ class PatchDescriptorRegistry:
             if type(result) is not bytes:
                 raise TypeError("patch remover must return ordinary bytes")
             removed[descriptor.target] = result
-        if any(self.detect(removed).values()):
+        clean_groups = frozenset()
+        clean_matrix = self.target_fragments(clean_groups)
+        if any(
+            self.detect(
+                removed,
+                expected_groups=clean_groups,
+                expected_fragment_matrix=clean_matrix,
+            ).values()
+        ):
             raise ValueError("strict aggregate removal left owned patch markers")
         return removed
 
@@ -482,29 +644,42 @@ class LegacyTargetPatchAdapter:
 def detect_patch_groups_by_target(
     snapshots: Mapping[str, bytes],
     *,
+    expected_groups: Iterable[str],
+    expected_fragment_matrix: Mapping[str, tuple[tuple[str, str], ...]],
     registry: PatchDescriptorRegistry,
 ) -> dict[str, frozenset[str]]:
     if type(registry) is not PatchDescriptorRegistry:
         raise TypeError("registry must be an exact PatchDescriptorRegistry")
-    return registry.detect(snapshots)
+    return registry.detect(
+        snapshots,
+        expected_groups=expected_groups,
+        expected_fragment_matrix=expected_fragment_matrix,
+    )
 
 
 def remove_patch_snapshots(
     snapshots: Mapping[str, bytes],
     *,
-    expected_groups: Iterable[str] | None = None,
+    expected_groups: Iterable[str],
+    expected_fragment_matrix: Mapping[str, tuple[tuple[str, str], ...]],
     registry: PatchDescriptorRegistry,
 ) -> dict[str, bytes]:
     if type(registry) is not PatchDescriptorRegistry:
         raise TypeError("registry must be an exact PatchDescriptorRegistry")
-    return registry.remove(snapshots, expected_groups=expected_groups)
+    return registry.remove(
+        snapshots,
+        expected_groups=expected_groups,
+        expected_fragment_matrix=expected_fragment_matrix,
+    )
 
 
 def render_patch_snapshots_from_verified_originals(
     verified_originals: Mapping[str, bytes],
     *,
+    verified_original_sha256: Mapping[str, str],
     integration_mode: str,
     required_patch_groups: Iterable[str],
+    expected_fragment_matrix: Mapping[str, tuple[tuple[str, str], ...]],
     registry: PatchDescriptorRegistry,
 ) -> dict[str, bytes]:
     if type(registry) is not PatchDescriptorRegistry:
@@ -512,12 +687,23 @@ def render_patch_snapshots_from_verified_originals(
     if type(integration_mode) is not str:
         raise TypeError("integration mode must be an ordinary str")
     selected = registry._selected_groups(required_patch_groups)
+    expected_matrix = registry.validate_expected_fragment_matrix(
+        selected,
+        expected_fragment_matrix,
+    )
     if integration_mode == "native-hooks":
         if selected:
             raise ValueError("native-hooks required patch groups must be empty")
         originals = registry.validate_snapshots(verified_originals)
-        if any(registry.detect(originals).values()):
-            raise ValueError("verified originals must be marker-clean")
+        registry.validate_verified_original_sha256(
+            originals,
+            verified_original_sha256,
+        )
+        registry.detect(
+            originals,
+            expected_groups=selected,
+            expected_fragment_matrix=expected_matrix,
+        )
         return dict(originals)
     if integration_mode != "hybrid":
         raise ValueError(
@@ -525,7 +711,12 @@ def render_patch_snapshots_from_verified_originals(
         )
     if selected != registry.required_groups:
         raise ValueError("required patch groups do not match the descriptor registry")
-    return registry.render_verified_originals(verified_originals, selected)
+    return registry.render_verified_originals(
+        verified_originals,
+        selected,
+        expected_fragment_matrix=expected_matrix,
+        verified_original_sha256=verified_original_sha256,
+    )
 
 
 def _hybrid_marker(group: str, fragment: str, edge: str) -> bytes:
