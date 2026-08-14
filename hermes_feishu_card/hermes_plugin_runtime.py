@@ -401,13 +401,21 @@ class TurnEventCoordinator:
             raise ValueError("invalid event phase")
         return f"{kind}:{self.turn_id}:{item_id}:{phase}"
 
-    def submit_observer(self, payload: dict[str, object], *, producer: str) -> bool:
+    def submit_observer(
+        self,
+        payload: dict[str, object],
+        *,
+        producer: str,
+        event_id_for_sequence: Callable[[int], str] | None = None,
+    ) -> bool:
         self._validate_producer(producer)
         with self._lock:
             if self._closed or self._barrier is not None:
                 return False
             sequence, self._next = self._next, self._next + 1
             event = ObserverEvent(sequence, producer, dict(payload, sequence=sequence))
+            if event_id_for_sequence is not None:
+                event.payload["event_id"] = event_id_for_sequence(sequence)
             try:
                 self._queue.put_nowait(event)
             except queue.Full:
@@ -598,6 +606,14 @@ class _TerminalRecord:
     expires_at: float
 
 
+@dataclass(repr=False)
+class _PatchInteraction:
+    turn_id: str
+    pending_handle: object
+    selected_value: str | None
+    expires_at: float
+
+
 @dataclass
 class _StartedTransport:
     gate: Lock = field(default_factory=Lock)
@@ -621,6 +637,12 @@ class PluginRuntime:
     _NATIVE_HANDOFF_MAX_FUTURE_SECONDS = 3630.0
     _HANDOFF_ID_RE = re.compile(r"[0-9a-f]{64}")
     _UUID_SEED_RE = re.compile(r"[0-9a-f]{32}")
+    _PATCH_INTERACTION_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+    _PATCH_INTERACTION_KINDS = frozenset({"approval", "clarify", "slash"})
+    _MAX_PATCH_INTERACTIONS = 1024
+    _PATCH_INTERACTION_TTL_SECONDS = 300.0
+    _MAX_PATCH_DELTA_BYTES = 64 * 1024
+    _MAX_PATCH_SELECTED_BYTES = 4096
 
     def __init__(
         self,
@@ -658,6 +680,7 @@ class PluginRuntime:
         self._subagents: OrderedDict[tuple[str, str], tuple[str, float]] = OrderedDict()
         self._terminal_owners: OrderedDict[str, object] = OrderedDict()
         self._started_transports: OrderedDict[str, _StartedTransport] = OrderedDict()
+        self._patch_interactions: OrderedDict[str, _PatchInteraction] = OrderedDict()
 
     def bind_ingress_from_values(
         self,
@@ -691,6 +714,173 @@ class PluginRuntime:
             self._expire_locked(self._now())
             turn = self._turns.get(turn_id) if self._exact_nonblank(turn_id) else None
         return turn.state if turn is not None else None
+
+    def submit_patch_delta(
+        self,
+        turn_id: object,
+        event_name: object,
+        text: object,
+        mode: object,
+    ) -> bool:
+        try:
+            if (
+                not self._exact_nonblank(turn_id)
+                or type(event_name) is not str
+                or type(mode) is not str
+                or type(text) is not str
+                or not text
+                or len(text) > self._MAX_PATCH_DELTA_BYTES
+                or (event_name, mode)
+                not in {
+                    ("answer.delta", "delta"),
+                    ("thinking.delta", "append_block"),
+                }
+                or len(text.encode("utf-8")) > self._MAX_PATCH_DELTA_BYTES
+            ):
+                return False
+            with self._lock:
+                self._expire_locked(self._now())
+                turn = self._turns.get(turn_id)
+                coordinator = self._coordinators.get(turn_id)
+                if (
+                    turn is None
+                    or turn.state is not TurnState.CARD_ACTIVE
+                    or turn_id in self._terminal_owners
+                    or coordinator is None
+                    or coordinator.turn_id != turn_id
+                ):
+                    return False
+                payload = self._base_payload(
+                    turn, sequence=0, created_at=self._now()
+                )
+                payload.update(
+                    event=event_name,
+                    event_id="",
+                    producer="patch",
+                    phase="delta",
+                    data={"text": text, "mode": mode},
+                )
+                return coordinator.submit_observer(
+                    payload,
+                    producer="patch",
+                    event_id_for_sequence=lambda sequence: (
+                        f"patch:{turn_id}:{event_name}:{sequence}"
+                    ),
+                )
+        except Exception:
+            return False
+
+    def register_patch_interaction(
+        self,
+        kind: object,
+        session_identity: object,
+        turn_id: object,
+        interaction_id: object,
+        fingerprint: object,
+        pending_handle: object,
+    ) -> bool:
+        try:
+            with self._lock:
+                now = self._now()
+                self._expire_locked(now)
+                key = self._patch_interaction_key_locked(
+                    kind,
+                    session_identity,
+                    turn_id,
+                    interaction_id,
+                    fingerprint,
+                )
+                if key is None or pending_handle is None:
+                    return False
+                existing = self._patch_interactions.get(key)
+                if existing is not None:
+                    return existing.pending_handle is pending_handle
+                if any(
+                    state.pending_handle is pending_handle
+                    for state in self._patch_interactions.values()
+                ):
+                    return False
+                if len(self._patch_interactions) >= self._MAX_PATCH_INTERACTIONS:
+                    return False
+                self._patch_interactions[key] = _PatchInteraction(
+                    turn_id=turn_id,
+                    pending_handle=pending_handle,
+                    selected_value=None,
+                    expires_at=now + self._PATCH_INTERACTION_TTL_SECONDS,
+                )
+                return True
+        except Exception:
+            return False
+
+    def resolve_patch_interaction(
+        self,
+        kind: object,
+        session_identity: object,
+        turn_id: object,
+        interaction_id: object,
+        fingerprint: object,
+        pending_handle: object,
+        selected_value: object,
+    ) -> bool:
+        try:
+            with self._lock:
+                self._expire_locked(self._now())
+                key = self._patch_interaction_key_locked(
+                    kind,
+                    session_identity,
+                    turn_id,
+                    interaction_id,
+                    fingerprint,
+                )
+                if (
+                    key is None
+                    or pending_handle is None
+                    or not self._valid_patch_selected_value(selected_value)
+                ):
+                    return False
+                state = self._patch_interactions.get(key)
+                if state is None or state.pending_handle is not pending_handle:
+                    return False
+                if state.selected_value is None:
+                    state.selected_value = selected_value
+                    return True
+                return state.selected_value == selected_value
+        except Exception:
+            return False
+
+    def claim_patch_interaction(
+        self,
+        kind: object,
+        session_identity: object,
+        turn_id: object,
+        interaction_id: object,
+        fingerprint: object,
+        pending_handle: object,
+    ) -> str | None:
+        try:
+            with self._lock:
+                self._expire_locked(self._now())
+                key = self._patch_interaction_key_locked(
+                    kind,
+                    session_identity,
+                    turn_id,
+                    interaction_id,
+                    fingerprint,
+                )
+                if key is None or pending_handle is None:
+                    return None
+                state = self._patch_interactions.get(key)
+                if (
+                    state is None
+                    or state.pending_handle is not pending_handle
+                    or state.selected_value is None
+                ):
+                    return None
+                selected_value = state.selected_value
+                del self._patch_interactions[key]
+                return selected_value
+        except Exception:
+            return None
 
     def handle_pre_llm_call(self, **kwargs: object) -> None:
         session_id = kwargs.get("session_id")
@@ -1140,6 +1330,7 @@ class PluginRuntime:
             self._subagents.clear()
             self._terminal_owners.clear()
             self._started_transports.clear()
+            self._patch_interactions.clear()
             self._registry.clear()
         self._wait_started_transports(list(started))
         for coordinator in coordinators:
@@ -1250,9 +1441,70 @@ class PluginRuntime:
         self, turn_id: str
     ) -> TurnEventCoordinator | None:
         turn = self._turns.get(turn_id)
-        if turn is None or not turn.accepts_observer_events:
+        if (
+            turn is None
+            or not turn.accepts_observer_events
+            or turn_id in self._terminal_owners
+        ):
             return None
-        return self._coordinators.get(turn_id)
+        coordinator = self._coordinators.get(turn_id)
+        if coordinator is None or coordinator.turn_id != turn_id:
+            return None
+        return coordinator
+
+    def _patch_interaction_key_locked(
+        self,
+        kind: object,
+        session_identity: object,
+        turn_id: object,
+        interaction_id: object,
+        fingerprint: object,
+    ) -> str | None:
+        if (
+            type(kind) is not str
+            or kind not in self._PATCH_INTERACTION_KINDS
+            or not self._exact_nonblank(session_identity)
+            or not self._exact_nonblank(turn_id)
+            or type(interaction_id) is not str
+            or self._PATCH_INTERACTION_ID_RE.fullmatch(interaction_id) is None
+            or type(fingerprint) is not str
+            or self._HANDOFF_ID_RE.fullmatch(fingerprint) is None
+        ):
+            return None
+        coordinator = self._card_active_coordinator_locked(turn_id)
+        turn = self._turns.get(turn_id)
+        if (
+            coordinator is None
+            or turn is None
+            or turn.ingress.gateway_session_key != session_identity
+        ):
+            return None
+        digest = sha256(b"hfc-patch-interaction-v1\0")
+        for value in (
+            session_identity,
+            kind,
+            turn_id,
+            interaction_id,
+            fingerprint,
+        ):
+            encoded = value.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        return digest.hexdigest()
+
+    @classmethod
+    def _valid_patch_selected_value(cls, value: object) -> bool:
+        if (
+            type(value) is not str
+            or not value
+            or len(value) > cls._MAX_PATCH_SELECTED_BYTES
+            or not value.strip()
+        ):
+            return False
+        try:
+            return len(value.encode("utf-8")) <= cls._MAX_PATCH_SELECTED_BYTES
+        except (UnicodeEncodeError, ValueError):
+            return False
 
     @staticmethod
     def _preview(value: object) -> str:
@@ -1471,6 +1723,9 @@ class PluginRuntime:
         for key in tuple(self._subagents):
             if key[0] == turn_id:
                 del self._subagents[key]
+        for key, state in tuple(self._patch_interactions.items()):
+            if state.turn_id == turn_id:
+                del self._patch_interactions[key]
         if not keep_disposition:
             self._terminal_records.pop(turn_id, None)
             self._dispositions.pop(turn_id, None)
@@ -1491,6 +1746,9 @@ class PluginRuntime:
         for key, (_child_id, expires_at) in tuple(self._subagents.items()):
             if expires_at <= now:
                 del self._subagents[key]
+        for key, state in tuple(self._patch_interactions.items()):
+            if state.expires_at <= now:
+                del self._patch_interactions[key]
 
     @classmethod
     def _trim_locked(cls, mapping: OrderedDict) -> None:

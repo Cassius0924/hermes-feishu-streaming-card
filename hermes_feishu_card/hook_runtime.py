@@ -731,10 +731,29 @@ def claim_pending_interaction_from_hermes_locals(
     kind: object,
     interaction_data: object,
     pending_handle: object,
-) -> bool:
-    return _delegate_pending_interaction(
-        "claim", local_vars, kind, interaction_data, pending_handle
-    )
+) -> str | None:
+    try:
+        values = _thin_interaction_values(
+            local_vars, kind, interaction_data, pending_handle
+        )
+        if values is None:
+            return None
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "claim_patch_interaction", None)
+        if not callable(method):
+            return None
+        selected_value = method(*values)
+        if (
+            type(selected_value) is not str
+            or not selected_value
+            or len(selected_value) > 4096
+            or not selected_value.strip()
+            or len(selected_value.encode("utf-8")) > 4096
+        ):
+            return None
+        return selected_value
+    except Exception:
+        return None
 
 
 def _is_ordinary_json_value(value: object) -> bool:

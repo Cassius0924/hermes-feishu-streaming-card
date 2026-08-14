@@ -59,7 +59,7 @@ class _ThinBridgeRuntime:
 
     def claim_patch_interaction(self, *values):
         self.calls.append(("claim", values))
-        return True
+        return "selected"
 
     def take_terminal_record(self, turn_id):
         self.calls.append(("terminal", (turn_id,)))
@@ -520,7 +520,11 @@ def test_thin_interaction_facades_delegate_exact_original_pending_handle(
             result = function(_thin_bridge_locals(), kind, data, pending_handle)
     finally:
         hook_runtime.clear_canonical_turn_id(token)
-    assert result is True
+    if operation == "claim":
+        assert result == "selected"
+        assert type(result) is str
+    else:
+        assert result is True
     expected = (
         kind,
         "gateway-session-1",
@@ -557,9 +561,11 @@ def test_thin_interaction_facades_reject_mismatch_spoof_and_inexact_metadata(
     try:
         for function in (
             hook_runtime.register_pending_interaction_from_hermes_locals,
-            hook_runtime.claim_pending_interaction_from_hermes_locals,
         ):
             assert function(local_vars, kind, data, pending_handle) is False
+        assert hook_runtime.claim_pending_interaction_from_hermes_locals(
+            local_vars, kind, data, pending_handle
+        ) is None
         assert hook_runtime.resolve_pending_interaction_from_hermes_locals(
             local_vars, kind, data, pending_handle, "selected"
         ) is False
@@ -692,6 +698,26 @@ def test_thin_facades_require_literal_true_from_runtime(monkeypatch):
         assert hook_runtime.emit_delta_from_hermes_locals_threadsafe(
             _thin_bridge_locals(text="x"), "answer.delta"
         ) is False
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+
+
+@pytest.mark.parametrize(
+    "runtime_result",
+    (True, False, None, "", StringSubclass("selected")),
+)
+def test_thin_claim_requires_exact_selected_string_result(monkeypatch, runtime_result):
+    runtime = _ThinBridgeRuntime()
+    runtime.claim_patch_interaction = lambda *_args: runtime_result
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.claim_pending_interaction_from_hermes_locals(
+            _thin_bridge_locals(),
+            "approval",
+            _thin_interaction_data(),
+            object(),
+        ) is None
     finally:
         hook_runtime.clear_canonical_turn_id(token)
 

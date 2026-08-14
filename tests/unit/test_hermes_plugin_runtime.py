@@ -1919,3 +1919,470 @@ def test_task4_malformed_terminal_response_is_not_cached(malformed):
         turn_id="turn-1", completed=True, failed=False, interrupted=False
     )
     assert runtime.take_terminal_disposition("turn-1") is None
+
+
+def patch_interaction_args(
+    pending_handle,
+    *,
+    kind="approval",
+    session_identity="gateway-session-1",
+    turn_id="turn-1",
+    interaction_id="interaction-1",
+    fingerprint="a" * 64,
+):
+    return (
+        kind,
+        session_identity,
+        turn_id,
+        interaction_id,
+        fingerprint,
+        pending_handle,
+    )
+
+
+def test_task6_patch_delta_uses_shared_sequence_and_exact_patch_payload(monkeypatch):
+    posted = []
+    runtime = active_task4_runtime(posted)
+    coordinator = runtime._coordinators["turn-1"]
+    monkeypatch.setattr(
+        coordinator,
+        "next_sequence",
+        lambda *_args, **_kwargs: pytest.fail("delta must not allocate a second sequence"),
+    )
+
+    assert runtime.submit_patch_delta(
+        "turn-1", "answer.delta", "answer text", "delta"
+    ) is True
+    assert runtime.submit_patch_delta(
+        "turn-1", "thinking.delta", "thinking text", "append_block"
+    ) is True
+    runtime.drain_observers(1.0)
+
+    assert posted == [
+        {
+            "schema_version": "1",
+            "event": "answer.delta",
+            "conversation_id": "thread-1",
+            "message_id": "om_1",
+            "chat_id": "oc_1",
+            "thread_id": "thread-1",
+            "platform": "feishu",
+            "turn_id": "turn-1",
+            "sequence": 1,
+            "created_at": 100.0,
+            "event_id": "patch:turn-1:answer.delta:1",
+            "producer": "patch",
+            "phase": "delta",
+            "data": {"text": "answer text", "mode": "delta"},
+        },
+        {
+            "schema_version": "1",
+            "event": "thinking.delta",
+            "conversation_id": "thread-1",
+            "message_id": "om_1",
+            "chat_id": "oc_1",
+            "thread_id": "thread-1",
+            "platform": "feishu",
+            "turn_id": "turn-1",
+            "sequence": 2,
+            "created_at": 100.0,
+            "event_id": "patch:turn-1:thinking.delta:2",
+            "producer": "patch",
+            "phase": "delta",
+            "data": {"text": "thinking text", "mode": "append_block"},
+        },
+    ]
+
+
+def test_task6_patch_delta_accepts_exact_64_kib_utf8_boundary():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    text = "界" * 21845 + "a"
+    assert len(text.encode("utf-8")) == 64 * 1024
+
+    assert runtime.submit_patch_delta(
+        "turn-1", "answer.delta", text, "delta"
+    ) is True
+    runtime.drain_observers(1.0)
+    assert posted[0]["data"] == {"text": text, "mode": "delta"}
+
+
+@pytest.mark.parametrize(
+    ("turn_id", "event_name", "text", "mode"),
+    (
+        ("", "answer.delta", "x", "delta"),
+        (StringSubclass("turn-1"), "answer.delta", "x", "delta"),
+        ("turn-1", StringSubclass("answer.delta"), "x", "delta"),
+        ("turn-1", "message.completed", "x", "delta"),
+        ("turn-1", "answer.delta", "x", "append_block"),
+        ("turn-1", "thinking.delta", "x", "delta"),
+        ("turn-1", "answer.delta", "", "delta"),
+        ("turn-1", "answer.delta", StringSubclass("x"), "delta"),
+        ("turn-1", "answer.delta", "界" * 21846, "delta"),
+        ("turn-1", "answer.delta", "x", StringSubclass("delta")),
+    ),
+)
+def test_task6_patch_delta_rejects_inexact_spoofed_or_oversize_inputs(
+    turn_id, event_name, text, mode
+):
+    posted = []
+    runtime = active_task4_runtime(posted)
+
+    assert runtime.submit_patch_delta(turn_id, event_name, text, mode) is False
+    runtime.close()
+    assert posted == []
+
+
+def test_task6_patch_delta_requires_exact_card_active_turn_and_live_coordinator():
+    posted = []
+    runtime = task4_runtime(posted)
+    assert runtime.submit_patch_delta(
+        "turn-missing", "answer.delta", "x", "delta"
+    ) is False
+
+    runtime.handle_pre_llm_call(
+        session_id="session-1", turn_id="turn-1", platform="feishu"
+    )
+    turn = runtime._turns["turn-1"]
+    with turn._lock:
+        turn._state = TurnState.PENDING_START
+    assert runtime.submit_patch_delta(
+        "turn-1", "answer.delta", "x", "delta"
+    ) is False
+    with turn._lock:
+        turn._state = TurnState.NATIVE_BYPASS
+    assert runtime.submit_patch_delta(
+        "turn-1", "answer.delta", "x", "delta"
+    ) is False
+    with turn._lock:
+        turn._state = TurnState.CARD_ACTIVE
+    original = runtime._coordinators["turn-1"]
+    wrong = TurnEventCoordinator("turn-other", start_worker=False)
+    runtime._coordinators["turn-1"] = wrong
+    try:
+        assert runtime.submit_patch_delta(
+            "turn-1", "answer.delta", "x", "delta"
+        ) is False
+    finally:
+        runtime._coordinators["turn-1"] = original
+        wrong.close()
+    turn.finish()
+    assert runtime.submit_patch_delta(
+        "turn-1", "answer.delta", "x", "delta"
+    ) is False
+    runtime.close()
+
+
+def test_task6_patch_delta_queue_saturation_barrier_and_exception_fail_closed(
+    monkeypatch,
+):
+    posted = []
+    runtime = active_task4_runtime(posted, max_pending=1)
+    original = runtime._coordinators["turn-1"]
+    coordinator = TurnEventCoordinator("turn-1", max_pending=1, start_worker=False)
+    runtime._coordinators["turn-1"] = coordinator
+    original.close()
+    assert runtime.submit_patch_delta(
+        "turn-1", "answer.delta", "first", "delta"
+    ) is True
+    assert runtime.submit_patch_delta(
+        "turn-1", "answer.delta", "full", "delta"
+    ) is False
+    coordinator.close_terminal_barrier()
+    assert runtime.submit_patch_delta(
+        "turn-1", "answer.delta", "late", "delta"
+    ) is False
+
+    other_posted = []
+    other = active_task4_runtime(other_posted)
+    monkeypatch.setattr(
+        other._coordinators["turn-1"],
+        "submit_observer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("canary")),
+    )
+    assert other.submit_patch_delta(
+        "turn-1", "answer.delta", "safe", "delta"
+    ) is False
+    other.close()
+    runtime.close()
+    assert other_posted == []
+
+
+@pytest.mark.parametrize("kind", ("approval", "clarify", "slash"))
+def test_task6_patch_interaction_register_resolve_and_claim_once(kind):
+    posted = []
+    runtime = active_task4_runtime(posted)
+    pending_handle = object()
+    values = patch_interaction_args(
+        pending_handle, kind=kind, interaction_id=f"{kind}:safe_1"
+    )
+
+    assert runtime.register_patch_interaction(*values) is True
+    assert runtime.register_patch_interaction(*values) is True
+    assert runtime.resolve_patch_interaction(*values, " selected value ") is True
+    assert runtime.resolve_patch_interaction(*values, " selected value ") is True
+    assert runtime.resolve_patch_interaction(*values, "conflict") is False
+    assert runtime.claim_patch_interaction(*values) == " selected value "
+    assert runtime.claim_patch_interaction(*values) is None
+    assert posted == []
+    assert runtime._coordinators["turn-1"]._queue.qsize() == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    (
+        ("kind", "other"),
+        ("kind", StringSubclass("approval")),
+        ("session_identity", ""),
+        ("session_identity", "gateway-session-other"),
+        ("session_identity", StringSubclass("gateway-session-1")),
+        ("turn_id", "turn-missing"),
+        ("turn_id", StringSubclass("turn-1")),
+        ("interaction_id", ""),
+        ("interaction_id", "x" * 129),
+        ("interaction_id", "unsafe/value"),
+        ("interaction_id", StringSubclass("interaction-1")),
+        ("fingerprint", "A" * 64),
+        ("fingerprint", "a" * 63),
+        ("fingerprint", StringSubclass("a" * 64)),
+        ("pending_handle", None),
+    ),
+)
+def test_task6_patch_interaction_rejects_inexact_or_spoofed_binding_fields(
+    field, invalid
+):
+    posted = []
+    runtime = active_task4_runtime(posted)
+    pending_handle = object()
+    values = (
+        patch_interaction_args(invalid)
+        if field == "pending_handle"
+        else patch_interaction_args(pending_handle, **{field: invalid})
+    )
+
+    assert runtime.register_patch_interaction(*values) is False
+    assert runtime.resolve_patch_interaction(*values, "selected") is False
+    assert runtime.claim_patch_interaction(*values) is None
+    assert posted == []
+
+
+@pytest.mark.parametrize(
+    "selected",
+    (
+        "",
+        "   ",
+        StringSubclass("selected"),
+        "界" * 1366 + "xxx",
+        None,
+    ),
+)
+def test_task6_patch_interaction_rejects_invalid_selected_values(selected):
+    posted = []
+    runtime = active_task4_runtime(posted)
+    pending_handle = object()
+    values = patch_interaction_args(pending_handle)
+    assert runtime.register_patch_interaction(*values) is True
+
+    assert runtime.resolve_patch_interaction(*values, selected) is False
+    assert runtime.claim_patch_interaction(*values) is None
+
+
+def test_task6_patch_interaction_accepts_exact_4096_byte_selected_value():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    pending_handle = object()
+    values = patch_interaction_args(pending_handle)
+    selected = "界" * 1365 + "a"
+    assert len(selected.encode("utf-8")) == 4096
+    assert runtime.register_patch_interaction(*values) is True
+    assert runtime.resolve_patch_interaction(*values, selected) is True
+    assert runtime.claim_patch_interaction(*values) == selected
+
+
+def test_task6_patch_interaction_requires_object_identity_not_equality():
+    class EqualityHandle:
+        def __eq__(self, other):
+            return True
+
+    posted = []
+    runtime = active_task4_runtime(posted)
+    original = EqualityHandle()
+    different = EqualityHandle()
+    original_values = patch_interaction_args(original)
+    different_values = patch_interaction_args(different)
+
+    assert runtime.register_patch_interaction(*original_values) is True
+    assert runtime.register_patch_interaction(*different_values) is False
+    assert runtime.register_patch_interaction(
+        *patch_interaction_args(original, interaction_id="different-key")
+    ) is False
+    assert runtime.resolve_patch_interaction(*different_values, "selected") is False
+    assert runtime.claim_patch_interaction(*different_values) is None
+    assert runtime.resolve_patch_interaction(*original_values, "selected") is True
+    assert runtime.claim_patch_interaction(*original_values) == "selected"
+
+
+def test_task6_patch_interaction_capacity_never_evicts_live_entries():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    runtime._MAX_PATCH_INTERACTIONS = 2
+    handles = [object(), object(), object()]
+    values = [
+        patch_interaction_args(handle, interaction_id=f"interaction-{index}")
+        for index, handle in enumerate(handles)
+    ]
+
+    assert runtime.register_patch_interaction(*values[0]) is True
+    assert runtime.register_patch_interaction(*values[1]) is True
+    assert runtime.register_patch_interaction(*values[0]) is True
+    assert runtime.register_patch_interaction(*values[2]) is False
+    assert len(runtime._patch_interactions) == 2
+    assert runtime.resolve_patch_interaction(*values[0], "first") is True
+    assert runtime.claim_patch_interaction(*values[0]) == "first"
+    assert len(runtime._patch_interactions) == 1
+
+
+def test_task6_patch_interaction_expiry_prunes_and_frees_capacity():
+    now = [100.0]
+    posted = []
+    runtime = active_task4_runtime(posted, now=lambda: now[0])
+    runtime._MAX_PATCH_INTERACTIONS = 1
+    first = patch_interaction_args(object(), interaction_id="first")
+    second = patch_interaction_args(object(), interaction_id="second")
+    assert runtime.register_patch_interaction(*first) is True
+    assert runtime.register_patch_interaction(*second) is False
+
+    now[0] += 300.0
+    assert runtime.claim_patch_interaction(*first) is None
+    assert runtime.register_patch_interaction(*second) is True
+    assert len(runtime._patch_interactions) == 1
+
+
+@pytest.mark.parametrize("cleanup_kind", ("reset", "finalize", "close", "terminal"))
+def test_task6_patch_interaction_cleanup_removes_selected_value_and_handle(
+    cleanup_kind,
+):
+    posted = []
+    runtime = active_task4_runtime(posted)
+    pending_handle = object()
+    values = patch_interaction_args(pending_handle)
+    assert runtime.register_patch_interaction(*values) is True
+    assert runtime.resolve_patch_interaction(*values, "SELECTED-CANARY") is True
+
+    if cleanup_kind == "reset":
+        runtime.handle_on_session_reset(old_session_id="session-1")
+    elif cleanup_kind == "finalize":
+        runtime.handle_on_session_finalize(session_id="session-1")
+    elif cleanup_kind == "close":
+        runtime.close()
+    else:
+        runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+        runtime.handle_on_session_end(
+            turn_id="turn-1", completed=True, failed=False, interrupted=False
+        )
+
+    assert runtime._patch_interactions == {}
+    assert runtime.claim_patch_interaction(*values) is None
+    assert "SELECTED-CANARY" not in repr(runtime)
+
+
+def test_task6_patch_interaction_turn_capacity_eviction_cleans_entry():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    runtime._MAX_ENTRIES = 1
+    first = patch_interaction_args(object())
+    assert runtime.register_patch_interaction(*first) is True
+    assert runtime.bind_ingress_from_values(
+        "second", "fallback_default", "session-2", "gateway-session-2",
+        "generation-2", "oc_2", "om_2", "om_2", "",
+    ) is True
+    runtime.handle_pre_llm_call(
+        session_id="session-2", turn_id="turn-2", platform="feishu"
+    )
+
+    assert runtime.turn_state("turn-1") is None
+    assert runtime._patch_interactions == {}
+    assert runtime.claim_patch_interaction(*first) is None
+
+
+def test_task6_patch_interaction_terminal_owner_blocks_claim_before_cleanup():
+    entered = Event()
+    release = Event()
+    posted = []
+
+    def post(payload, timeout_seconds):
+        posted.append(payload)
+        if payload["event"] == "message.completed":
+            entered.set()
+            assert release.wait(timeout=1.0)
+        return {"ok": True, "applied": True}
+
+    runtime = plugin_runtime.PluginRuntime(post=post, now=lambda: 100.0)
+    assert runtime.bind_ingress_from_values(
+        "default", "fallback_default", "session-1", "gateway-session-1",
+        "generation-1", "oc_1", "om_1", "om_1", "",
+    ) is True
+    runtime.handle_pre_llm_call(
+        session_id="session-1", turn_id="turn-1", platform="feishu"
+    )
+    values = patch_interaction_args(object())
+    assert runtime.register_patch_interaction(*values) is True
+    assert runtime.resolve_patch_interaction(*values, "selected") is True
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    terminal = Thread(
+        target=lambda: runtime.handle_on_session_end(
+            turn_id="turn-1", completed=True, failed=False, interrupted=False
+        )
+    )
+    terminal.start()
+    assert entered.wait(timeout=0.5)
+    try:
+        assert runtime.claim_patch_interaction(*values) is None
+        assert runtime.resolve_patch_interaction(*values, "selected") is False
+    finally:
+        release.set()
+        terminal.join(timeout=1.0)
+    assert not terminal.is_alive()
+    assert runtime._patch_interactions == {}
+
+
+def test_task6_patch_interaction_key_is_digest_and_claim_drops_raw_value():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    pending_handle = object()
+    values = patch_interaction_args(pending_handle)
+    assert runtime.register_patch_interaction(*values) is True
+    key = next(iter(runtime._patch_interactions))
+    state = runtime._patch_interactions[key]
+    assert type(key) is str and len(key) == 64
+    assert "gateway-session-1" not in key
+    assert not hasattr(state, "session_identity")
+    assert not hasattr(state, "interaction_id")
+    assert not hasattr(state, "fingerprint")
+    assert runtime.resolve_patch_interaction(*values, "SELECTED-CANARY") is True
+    assert runtime.claim_patch_interaction(*values) == "SELECTED-CANARY"
+    assert runtime._patch_interactions == {}
+    assert "SELECTED-CANARY" not in repr(runtime)
+
+
+def test_task6_patch_interaction_concurrent_resolve_and_claim_are_linearizable():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    values = patch_interaction_args(object())
+    assert runtime.register_patch_interaction(*values) is True
+    start = Barrier(2)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        resolve_future = executor.submit(
+            lambda: (start.wait(), runtime.resolve_patch_interaction(*values, "selected"))[1]
+        )
+        claim_future = executor.submit(
+            lambda: (start.wait(), runtime.claim_patch_interaction(*values))[1]
+        )
+        resolved = resolve_future.result()
+        first_claim = claim_future.result()
+
+    assert resolved is True
+    second_claim = runtime.claim_patch_interaction(*values)
+    assert [first_claim, second_claim].count("selected") == 1
+    assert [first_claim, second_claim].count(None) == 1
