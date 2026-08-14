@@ -585,6 +585,9 @@ class RuntimeControlEmitter:
         active_work_snapshot_provider: Callable[[], tuple[int, bool]] | None = None,
         admission_draining_provider: Callable[[], bool] | None = None,
         drain_home_verified_provider: Callable[[], bool] | None = None,
+        runtime_snapshot_provider: (
+            Callable[[], tuple[int, bool, bool, bool]] | None
+        ) = None,
     ):
         self.runtime_url = runtime_events_url(event_url)
         self.hook_generation = _bounded_text(hook_generation, "hook generation")
@@ -610,6 +613,7 @@ class RuntimeControlEmitter:
         self._drain_home_verified_provider = (
             drain_home_verified_provider or (lambda: False)
         )
+        self._runtime_snapshot_provider = runtime_snapshot_provider
         self._sequence = 0
         self._lock = threading.Lock()
 
@@ -621,11 +625,19 @@ class RuntimeControlEmitter:
                 self._sequence += 1
                 sequence = self._sequence
             created_at = float(self._now())
-            active_sessions, active_work_count_complete = (
-                self._active_work_snapshot_provider()
-            )
-            admission_draining = self._admission_draining_provider()
-            drain_home_verified = self._drain_home_verified_provider()
+            if self._runtime_snapshot_provider is not None:
+                (
+                    active_sessions,
+                    active_work_count_complete,
+                    admission_draining,
+                    drain_home_verified,
+                ) = self._runtime_snapshot_provider()
+            else:
+                active_sessions, active_work_count_complete = (
+                    self._active_work_snapshot_provider()
+                )
+                admission_draining = self._admission_draining_provider()
+                drain_home_verified = self._drain_home_verified_provider()
             event = RuntimeControlEvent.from_dict(
                 {
                     "schema_version": "2",
@@ -918,6 +930,8 @@ _CONTROL_PROVIDERS: dict[
         Callable[[], bool] | None,
     ],
 ] = {}
+_CONTROL_PROVIDER_EPOCH = 0
+_CONTROL_SNAPSHOT_ATTEMPTS = 3
 _CONTROL_STOPPING = False
 _LEGACY_CONTROL_LEASE: "RuntimeControlLease | None" = None
 
@@ -951,7 +965,7 @@ def acquire_runtime_control(
 ) -> RuntimeControlLease | None:
     """Acquire the one shared worker only when its exact config matches."""
     global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD, _CONTROL_CONFIG
-    global _CONTROL_STOPPING
+    global _CONTROL_PROVIDER_EPOCH, _CONTROL_STOPPING
     try:
         if interval_seconds <= 0:
             return None
@@ -979,6 +993,7 @@ def acquire_runtime_control(
                         admission_draining_provider,
                         drain_home_verified_provider,
                     )
+                    _CONTROL_PROVIDER_EPOCH += 1
                     return RuntimeControlLease(owner)
             emitter = RuntimeControlEmitter(
                 event_url=event_url,
@@ -987,6 +1002,7 @@ def acquire_runtime_control(
                 active_work_snapshot_provider=_combined_active_work_snapshot,
                 admission_draining_provider=_combined_admission_draining,
                 drain_home_verified_provider=_combined_drain_home_verified,
+                runtime_snapshot_provider=_combined_runtime_snapshot,
             )
             stop_event = threading.Event()
             thread = threading.Thread(
@@ -1005,16 +1021,12 @@ def acquire_runtime_control(
                 admission_draining_provider,
                 drain_home_verified_provider,
             )
+            _CONTROL_PROVIDER_EPOCH += 1
             _CONTROL_STOPPING = False
             try:
                 thread.start()
             except Exception:
-                _CONTROL_OWNERS.discard(owner)
-                _CONTROL_PROVIDERS.pop(owner, None)
-                _CONTROL_EMITTER = None
-                _CONTROL_STOP = None
-                _CONTROL_THREAD = None
-                _CONTROL_CONFIG = None
+                _clear_runtime_control_locked()
                 stop_event.set()
                 return None
         return RuntimeControlLease(owner)
@@ -1024,12 +1036,13 @@ def acquire_runtime_control(
 
 def _release_runtime_control(owner: object) -> None:
     global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD, _CONTROL_CONFIG
-    global _CONTROL_STOPPING
+    global _CONTROL_PROVIDER_EPOCH, _CONTROL_STOPPING
     with _CONTROL_LOCK:
         if owner not in _CONTROL_OWNERS:
             return None
         _CONTROL_OWNERS.remove(owner)
         _CONTROL_PROVIDERS.pop(owner, None)
+        _CONTROL_PROVIDER_EPOCH += 1
         if _CONTROL_OWNERS:
             return None
         stop_event = _CONTROL_STOP
@@ -1047,7 +1060,7 @@ def _release_runtime_control(owner: object) -> None:
 
 def _clear_runtime_control_locked() -> None:
     global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD, _CONTROL_CONFIG
-    global _CONTROL_STOPPING
+    global _CONTROL_PROVIDER_EPOCH, _CONTROL_STOPPING
     _CONTROL_EMITTER = None
     _CONTROL_STOP = None
     _CONTROL_THREAD = None
@@ -1055,14 +1068,24 @@ def _clear_runtime_control_locked() -> None:
     _CONTROL_STOPPING = False
     _CONTROL_OWNERS.clear()
     _CONTROL_PROVIDERS.clear()
+    _CONTROL_PROVIDER_EPOCH += 1
 
 
-def _combined_active_work_snapshot() -> tuple[int, bool]:
-    with _CONTROL_LOCK:
-        providers = tuple(_CONTROL_PROVIDERS.values())
+def _evaluate_runtime_snapshot(
+    providers: tuple[
+        tuple[
+            Callable[[], tuple[int, bool]] | None,
+            Callable[[], bool] | None,
+            Callable[[], bool] | None,
+        ],
+        ...,
+    ],
+) -> tuple[int, bool, bool, bool]:
     total = 0
     complete = bool(providers)
     gateway_aggregate_present = False
+    admission_draining = not providers
+    drain_home_verified = bool(providers)
     for active_provider, admission_provider, home_provider in providers:
         if (
             active_provider is not None
@@ -1072,53 +1095,69 @@ def _combined_active_work_snapshot() -> tuple[int, bool]:
             gateway_aggregate_present = True
         if active_provider is None:
             complete = False
-            continue
-        try:
-            active, owner_complete = active_provider()
-            if (
-                type(active) is not int
-                or active < 0
-                or type(owner_complete) is not bool
-            ):
-                raise ValueError("invalid active work snapshot")
-            total = min(1_000_000, total + active)
-            complete = complete and owner_complete
-        except Exception:
-            complete = False
-    return total, complete and gateway_aggregate_present
+        else:
+            try:
+                active, owner_complete = active_provider()
+                if (
+                    type(active) is not int
+                    or active < 0
+                    or type(owner_complete) is not bool
+                ):
+                    raise ValueError("invalid active work snapshot")
+                total = min(1_000_000, total + active)
+                complete = complete and owner_complete
+            except Exception:
+                complete = False
+        if admission_provider is None:
+            admission_draining = True
+        else:
+            try:
+                value = admission_provider()
+                if type(value) is not bool or value:
+                    admission_draining = True
+            except Exception:
+                admission_draining = True
+        if home_provider is None:
+            drain_home_verified = False
+        else:
+            try:
+                if home_provider() is not True:
+                    drain_home_verified = False
+            except Exception:
+                drain_home_verified = False
+    return (
+        total,
+        complete and gateway_aggregate_present,
+        admission_draining,
+        drain_home_verified,
+    )
+
+
+def _combined_runtime_snapshot() -> tuple[int, bool, bool, bool]:
+    for _attempt in range(_CONTROL_SNAPSHOT_ATTEMPTS):
+        with _CONTROL_LOCK:
+            epoch = _CONTROL_PROVIDER_EPOCH
+            providers = tuple(_CONTROL_PROVIDERS.values())
+        snapshot = _evaluate_runtime_snapshot(providers)
+        with _CONTROL_LOCK:
+            if epoch == _CONTROL_PROVIDER_EPOCH:
+                return snapshot
+    return 0, False, True, False
+
+
+def _combined_active_work_snapshot() -> tuple[int, bool]:
+    active, complete, _draining, _home_verified = _combined_runtime_snapshot()
+    return active, complete
 
 
 def _combined_admission_draining() -> bool:
-    with _CONTROL_LOCK:
-        providers = tuple(_CONTROL_PROVIDERS.values())
-    if not providers:
-        return True
-    for _active, admission_provider, _home in providers:
-        if admission_provider is None:
-            return True
-        try:
-            value = admission_provider()
-            if type(value) is not bool or value:
-                return True
-        except Exception:
-            return True
-    return False
+    _active, _complete, draining, _home_verified = _combined_runtime_snapshot()
+    return draining
 
 
 def _combined_drain_home_verified() -> bool:
-    with _CONTROL_LOCK:
-        providers = tuple(_CONTROL_PROVIDERS.values())
-    if not providers:
-        return False
-    for _active, _admission, home_provider in providers:
-        if home_provider is None:
-            return False
-        try:
-            if home_provider() is not True:
-                return False
-        except Exception:
-            return False
-    return True
+    _active, _complete, _draining, home_verified = _combined_runtime_snapshot()
+    return home_verified
 
 
 def start_runtime_control(
@@ -1153,7 +1192,7 @@ def start_runtime_control(
 
 def reset_runtime_control_for_tests() -> None:
     global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD, _CONTROL_CONFIG
-    global _LEGACY_CONTROL_LEASE, _CONTROL_STOPPING
+    global _LEGACY_CONTROL_LEASE, _CONTROL_PROVIDER_EPOCH, _CONTROL_STOPPING
     with _CONTROL_LOCK:
         stop_event = _CONTROL_STOP
         thread = _CONTROL_THREAD
@@ -1163,6 +1202,7 @@ def reset_runtime_control_for_tests() -> None:
         _CONTROL_CONFIG = None
         _CONTROL_OWNERS.clear()
         _CONTROL_PROVIDERS.clear()
+        _CONTROL_PROVIDER_EPOCH += 1
         _CONTROL_STOPPING = False
         _LEGACY_CONTROL_LEASE = None
     if stop_event is not None:

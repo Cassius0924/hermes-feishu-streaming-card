@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from time import monotonic
 
 import pytest
@@ -1315,3 +1315,196 @@ def test_last_owner_join_timeout_keeps_truthful_poisoned_worker_until_exit(
     assert len(threads) == 2
     threads[1].alive = False
     replacement.close()
+
+
+def test_combined_snapshot_retries_after_real_acquire_changes_owner_epoch(
+    monkeypatch,
+):
+    captured = {}
+    provider_entered = Event()
+    provider_release = Event()
+    acquire_finished = Event()
+    first_calls = []
+    results = []
+    second_leases = []
+
+    class FakeEmitter:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, stop_event, interval_seconds):
+            stop_event.wait()
+
+    def first_active():
+        first_calls.append(True)
+        if len(first_calls) == 1:
+            provider_entered.set()
+            provider_release.wait(timeout=1.0)
+        return 0, True
+
+    monkeypatch.setattr(runtime_control, "RuntimeControlEmitter", FakeEmitter)
+    first = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+        active_work_snapshot_provider=first_active,
+        admission_draining_provider=lambda: False,
+        drain_home_verified_provider=lambda: True,
+    )
+    assert first is not None
+
+    sample_thread = Thread(
+        target=lambda: results.append(captured["active_work_snapshot_provider"]())
+    )
+    sample_thread.start()
+    assert provider_entered.wait(timeout=0.5)
+
+    def acquire_second():
+        second_leases.append(
+            acquire_runtime_control(
+                event_url="http://127.0.0.1:18765/events",
+                package_version="4.3.0",
+                active_work_snapshot_provider=lambda: (3, True),
+            )
+        )
+        acquire_finished.set()
+
+    acquire_thread = Thread(target=acquire_second)
+    acquire_thread.start()
+    acquired_without_provider_lock = acquire_finished.wait(timeout=0.5)
+    provider_release.set()
+    acquire_thread.join(timeout=0.5)
+    sample_thread.join(timeout=0.5)
+
+    assert acquired_without_provider_lock is True
+    assert second_leases and second_leases[0] is not None
+    assert results == [(3, True)]
+    assert len(first_calls) >= 2
+
+    second_leases[0].close()
+    first.close()
+
+
+def test_shared_emitter_uses_one_epoch_validated_bundle_per_event(monkeypatch):
+    provider_entered = Event()
+    provider_release = Event()
+    first_calls = []
+    emitted = []
+    parked_threads = []
+
+    class ParkedThread:
+        def __init__(self, **_kwargs):
+            self.alive = True
+            parked_threads.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout):
+            self.alive = False
+
+    def first_active():
+        first_calls.append(True)
+        if len(first_calls) == 1:
+            provider_entered.set()
+            provider_release.wait(timeout=1.0)
+        return 0, True
+
+    monkeypatch.setattr(runtime_control.threading, "Thread", ParkedThread)
+    first = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+        active_work_snapshot_provider=first_active,
+        admission_draining_provider=lambda: False,
+        drain_home_verified_provider=lambda: True,
+    )
+    assert first is not None
+    emitter = runtime_control._CONTROL_EMITTER
+    assert isinstance(emitter, RuntimeControlEmitter)
+    bundle_calls = []
+    original_bundle = getattr(emitter, "_runtime_snapshot_provider", None)
+
+    def bundled_snapshot():
+        bundle_calls.append(True)
+        assert original_bundle is not None
+        return original_bundle()
+
+    emitter._runtime_snapshot_provider = bundled_snapshot
+    emitter._secret_reader = lambda: b"r" * 32
+
+    def poster(_url, body, _headers, _timeout):
+        emitted.append(json.loads(body.decode("utf-8")))
+        return True
+
+    emitter._poster = poster
+    emit_results = []
+    emit_thread = Thread(
+        target=lambda: emit_results.append(emitter.emit_once("runtime.heartbeat"))
+    )
+    emit_thread.start()
+    assert provider_entered.wait(timeout=0.5)
+
+    second = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+        active_work_snapshot_provider=lambda: (4, True),
+    )
+    assert second is not None
+    provider_release.set()
+    emit_thread.join(timeout=0.5)
+
+    assert emit_results == [True]
+    assert bundle_calls == [True]
+    assert len(first_calls) >= 2
+    assert len(emitted) == 1
+    assert emitted[0]["active_sessions"] == 4
+    assert emitted[0]["active_work_count_complete"] is True
+    assert emitted[0]["admission_draining"] is True
+    assert emitted[0]["drain_home_verified"] is False
+
+    second.close()
+    first.close()
+    assert parked_threads
+
+
+def test_bundle_returns_conservative_snapshot_after_bounded_epoch_churn(
+    monkeypatch,
+):
+    captured = {}
+    churn_leases = []
+
+    class FakeEmitter:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, stop_event, interval_seconds):
+            stop_event.wait()
+
+    def churning_active():
+        lease = acquire_runtime_control(
+            event_url="http://127.0.0.1:18765/events",
+            package_version="4.3.0",
+            active_work_snapshot_provider=lambda: (0, True),
+        )
+        assert lease is not None
+        churn_leases.append(lease)
+        return 0, True
+
+    monkeypatch.setattr(runtime_control, "RuntimeControlEmitter", FakeEmitter)
+    first = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+        active_work_snapshot_provider=churning_active,
+        admission_draining_provider=lambda: False,
+        drain_home_verified_provider=lambda: True,
+    )
+    assert first is not None
+
+    assert captured["runtime_snapshot_provider"]() == (0, False, True, False)
+    assert len(churn_leases) == runtime_control._CONTROL_SNAPSHOT_ATTEMPTS
+
+    for lease in reversed(churn_leases):
+        lease.close()
+    first.close()

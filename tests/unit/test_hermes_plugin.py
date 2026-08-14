@@ -528,6 +528,41 @@ def test_one_context_gate_transitions_inert_active_disabled_without_appending(
     assert lease.close_calls == 1
 
 
+def test_active_context_gate_callback_fails_open_when_exact_runtime_method_raises(
+    monkeypatch,
+):
+    class Lease:
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    lease = Lease()
+    monkeypatch.setattr(
+        plugin_runtime, "read_transport_root_secret", lambda: b"r" * 32
+    )
+    monkeypatch.setattr(
+        plugin_runtime, "acquire_runtime_control", lambda **_kwargs: lease
+    )
+    monkeypatch.setattr(plugin_runtime.atexit, "register", lambda _callback: None)
+    context = CountingPluginContext()
+    assert hermes_plugin.register(context) is None
+    runtime = plugin_runtime.active_plugin_runtime()
+    assert runtime is not None
+    calls = []
+
+    def fail_exact_method(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("private callback failure detail")
+
+    monkeypatch.setattr(runtime, "handle_pre_llm_call", fail_exact_method)
+
+    assert context.registered["pre_llm_call"](turn_id="turn-active") is None
+    assert calls == [{"turn_id": "turn-active"}]
+    assert plugin_runtime.active_plugin_runtime() is runtime
+    assert lease.close_calls == 0
+
+
 def test_context_gate_retries_only_the_missing_hook_after_transient_rejection(
     monkeypatch,
 ):
