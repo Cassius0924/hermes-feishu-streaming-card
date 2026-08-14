@@ -322,3 +322,101 @@ def test_sidecar_request_proof_is_domain_separated_and_expires():
             "/messages/message-1/summary",
             body,
         )
+
+
+def test_runtime_interaction_proof_binds_exact_path_body_domain_and_replay():
+    secret = b"i" * 32
+    body = b'{"choice":"approve"}'
+    signer = event_auth_module.sign_runtime_interaction_request
+    verifier_type = event_auth_module.RuntimeInteractionProofVerifier
+    error_type = event_auth_module.RuntimeInteractionAuthenticationError
+    headers = signer(
+        secret,
+        "/runtime/interactions/resolve",
+        body,
+        timestamp=100,
+        nonce="runtime-interaction-nonce-0001",
+    )
+    verifier = verifier_type(secret, now=lambda: 100.0, max_nonces=2)
+
+    verifier.verify(headers, "/runtime/interactions/resolve", body)
+    with pytest.raises(error_type, match="replayed"):
+        verifier.verify(headers, "/runtime/interactions/resolve", body)
+
+    for wrong_path, wrong_body in (
+        ("/runtime/interactions/resolve?x=1", body),
+        ("/runtime/interactions/resolve/", body),
+        ("/runtime/interactions/resolve", body + b" "),
+    ):
+        with pytest.raises(error_type):
+            verifier_type(secret, now=lambda: 100.0).verify(
+                headers, wrong_path, wrong_body
+            )
+
+    event_headers = sign_event_request(
+        secret,
+        body,
+        timestamp=100,
+        nonce="runtime-interaction-nonce-0001",
+    )
+    with pytest.raises(error_type):
+        verifier_type(secret, now=lambda: 100.0).verify(
+            event_headers, "/runtime/interactions/resolve", body
+        )
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "nonce"),
+    (
+        (True, "runtime-interaction-nonce-0002"),
+        (100.0, "runtime-interaction-nonce-0002"),
+        (100, "short"),
+        (100, "x" * 129),
+        (100, "é" * 16),
+    ),
+)
+def test_runtime_interaction_signer_rejects_inexact_metadata(timestamp, nonce):
+    with pytest.raises(ValueError):
+        event_auth_module.sign_runtime_interaction_request(
+            b"i" * 32,
+            "/runtime/interactions/resolve",
+            b"{}",
+            timestamp=timestamp,
+            nonce=nonce,
+        )
+
+
+def test_runtime_interaction_proof_expires_at_thirty_seconds():
+    secret = b"i" * 32
+    body = b"{}"
+    headers = event_auth_module.sign_runtime_interaction_request(
+        secret,
+        "/runtime/interactions/resolve",
+        body,
+        timestamp=100,
+        nonce="runtime-interaction-nonce-0003",
+    )
+    event_auth_module.RuntimeInteractionProofVerifier(
+        secret, now=lambda: 130.0
+    ).verify(headers, "/runtime/interactions/resolve", body)
+    with pytest.raises(event_auth_module.RuntimeInteractionAuthenticationError):
+        event_auth_module.RuntimeInteractionProofVerifier(
+            secret, now=lambda: 130.001
+        ).verify(headers, "/runtime/interactions/resolve", body)
+
+
+def test_runtime_interaction_verifier_rejects_noncanonical_header_strings():
+    secret = b"i" * 32
+    body = b"{}"
+    headers = event_auth_module.sign_runtime_interaction_request(
+        secret,
+        "/runtime/interactions/resolve",
+        body,
+        timestamp=100,
+        nonce="runtime-interaction-nonce-0004",
+    )
+    headers["X-HFC-Runtime-Interaction-Timestamp"] = "0100"
+    with pytest.raises(event_auth_module.RuntimeInteractionAuthenticationError):
+        event_auth_module.RuntimeInteractionProofVerifier(
+            secret, now=lambda: 100.0
+        ).verify(headers, "/runtime/interactions/resolve", body)

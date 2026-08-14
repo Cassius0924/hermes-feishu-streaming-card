@@ -6,12 +6,14 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
+import hmac
 from math import isfinite
 import atexit
 import json
 import os
 import queue
 import re
+import secrets
 import threading
 from threading import Lock, RLock
 from time import monotonic, time
@@ -23,6 +25,7 @@ from .event_auth import sign_event_request
 from .operations_transport import read_transport_root_secret
 from .profile_sources import TRUSTED_PROFILE_SOURCES
 from .runtime_control import RuntimeControlLease, acquire_runtime_control
+from .runtime_interaction_transport import RuntimeInteractionListener
 
 
 OFFICIAL_HOOKS = (
@@ -613,6 +616,12 @@ class _PatchInteraction:
     pending_handle: object
     selected_value: str | None
     expires_at: float
+    interaction_key: str | None = None
+    token_digest: str | None = None
+    descriptor_expires_at: float | None = None
+    resolver: Callable[[str], bool] | None = None
+    resolving_value: str | None = None
+    resolution_complete: threading.Event | None = None
 
 
 @dataclass(frozen=True, repr=False)
@@ -651,6 +660,8 @@ class PluginRuntime:
     _PATCH_INTERACTION_TTL_SECONDS = 300.0
     _MAX_PATCH_DELTA_BYTES = 64 * 1024
     _MAX_PATCH_SELECTED_BYTES = 4096
+    _RUNTIME_INTERACTION_PROTOCOL = "hfc-runtime-interaction-v1"
+    _RUNTIME_INTERACTION_DESCRIPTOR_TTL_SECONDS = 30.0
 
     def __init__(
         self,
@@ -691,6 +702,15 @@ class PluginRuntime:
         self._patch_interactions: OrderedDict[
             str, _PatchInteraction | _ConsumedPatchInteraction
         ] = OrderedDict()
+        self._interaction_cleanup_turns: set[str] = set()
+        self._runtime_id = secrets.token_hex(32)
+        self._runtime_interaction_token_root = secrets.token_bytes(32)
+        self._runtime_interaction_listener: RuntimeInteractionListener | None = None
+        self._runtime_interaction_listener_lock = Lock()
+        self._closed = False
+        self._close_lock = Lock()
+        self._close_started = False
+        self._close_complete = threading.Event()
 
     def bind_ingress_from_values(
         self,
@@ -853,7 +873,13 @@ class PluginRuntime:
                     interaction_id,
                     fingerprint,
                 )
-                if key is None or pending_handle is None:
+                if (
+                    self._closed
+                    or key is None
+                    or pending_handle is None
+                    or self._patch_turn_digest(turn_id)
+                    in self._interaction_cleanup_turns
+                ):
                     return False
                 existing = self._patch_interactions.get(key)
                 if existing is not None:
@@ -892,6 +918,8 @@ class PluginRuntime:
         try:
             with self._lock:
                 self._expire_locked(self._now())
+                if self._closed:
+                    return False
                 key = self._patch_interaction_key_locked(
                     kind,
                     session_identity,
@@ -909,6 +937,8 @@ class PluginRuntime:
                 if (
                     type(state) is not _PatchInteraction
                     or state.pending_handle is not pending_handle
+                    or state.turn_digest in self._interaction_cleanup_turns
+                    or state.resolving_value is not None
                 ):
                     return False
                 if state.selected_value is None:
@@ -931,6 +961,8 @@ class PluginRuntime:
             with self._lock:
                 now = self._now()
                 self._expire_locked(now)
+                if self._closed:
+                    return None
                 key = self._patch_interaction_key_locked(
                     kind,
                     session_identity,
@@ -945,6 +977,7 @@ class PluginRuntime:
                     type(state) is not _PatchInteraction
                     or state.pending_handle is not pending_handle
                     or state.selected_value is None
+                    or state.resolving_value is not None
                 ):
                     return None
                 selected_value = state.selected_value
@@ -956,6 +989,251 @@ class PluginRuntime:
                 return selected_value
         except Exception:
             return None
+
+    def start_runtime_interaction_listener(self, secret: object) -> bool:
+        if type(secret) is not bytes or len(secret) != 32:
+            return False
+        candidate: RuntimeInteractionListener | None = None
+        try:
+            with self._runtime_interaction_listener_lock:
+                with self._lock:
+                    if self._closed:
+                        return False
+                    current = self._runtime_interaction_listener
+                if current is not None:
+                    return current.snapshot()["accepting"] is True
+                candidate = RuntimeInteractionListener(
+                    secret, self.resolve_runtime_interaction_payload
+                )
+                candidate.start()
+                with self._lock:
+                    if self._closed or self._runtime_interaction_listener is not None:
+                        accepted = False
+                    else:
+                        self._runtime_interaction_listener = candidate
+                        accepted = True
+                if not accepted:
+                    candidate.close()
+                    return False
+                return True
+        except Exception:
+            if candidate is not None:
+                try:
+                    candidate.close()
+                except Exception:
+                    pass
+            return False
+
+    def arm_patch_interaction_descriptor(
+        self,
+        kind: object,
+        session_identity: object,
+        turn_id: object,
+        interaction_id: object,
+        fingerprint: object,
+        pending_handle: object,
+        resolver: object,
+    ) -> dict[str, object] | None:
+        if not callable(resolver):
+            return None
+        try:
+            with self._lock:
+                now = self._now()
+                self._expire_locked(now)
+                if self._closed:
+                    return None
+                listener = self._runtime_interaction_listener
+                key = self._patch_interaction_key_locked(
+                    kind,
+                    session_identity,
+                    turn_id,
+                    interaction_id,
+                    fingerprint,
+                )
+                state = None if key is None else self._patch_interactions.get(key)
+                if (
+                    listener is None
+                    or type(state) is not _PatchInteraction
+                    or state.pending_handle is not pending_handle
+                    or state.turn_digest in self._interaction_cleanup_turns
+                    or state.selected_value is not None
+                    or state.resolving_value is not None
+                ):
+                    return None
+                resolve_url = listener.resolve_url
+                if not resolve_url or not listener.accepts():
+                    return None
+                if state.resolver is not None and state.resolver is not resolver:
+                    return None
+                interaction_key = self._runtime_interaction_key(key)
+                token = self._runtime_interaction_token(interaction_key)
+                token_digest = self._runtime_interaction_token_digest(token)
+                if state.interaction_key is None:
+                    state.interaction_key = interaction_key
+                    state.token_digest = token_digest
+                    state.descriptor_expires_at = min(
+                        state.expires_at,
+                        now + self._RUNTIME_INTERACTION_DESCRIPTOR_TTL_SECONDS,
+                    )
+                    state.resolver = resolver
+                elif (
+                    state.interaction_key != interaction_key
+                    or state.token_digest != token_digest
+                    or state.descriptor_expires_at is None
+                    or state.resolver is not resolver
+                ):
+                    return None
+                if now >= state.descriptor_expires_at:
+                    return None
+                return {
+                    "protocol": self._RUNTIME_INTERACTION_PROTOCOL,
+                    "runtime_id": self._runtime_id,
+                    "resolve_url": resolve_url,
+                    "interaction_key": interaction_key,
+                    "token": token,
+                    "expires_at": state.descriptor_expires_at,
+                }
+        except Exception:
+            return None
+
+    def resolve_runtime_interaction_payload(self, payload: object) -> bool:
+        if type(payload) is not dict or set(payload) != {
+            "protocol", "runtime_id", "interaction_key", "token", "choice",
+            "expires_at",
+        }:
+            return False
+        if not all(type(key) is str for key in payload):
+            return False
+        protocol = payload["protocol"]
+        runtime_id = payload["runtime_id"]
+        interaction_key = payload["interaction_key"]
+        token = payload["token"]
+        choice = payload["choice"]
+        expires_at = payload["expires_at"]
+        if (
+            type(protocol) is not str
+            or protocol != self._RUNTIME_INTERACTION_PROTOCOL
+            or type(runtime_id) is not str
+            or runtime_id != self._runtime_id
+            or type(interaction_key) is not str
+            or self._HANDOFF_ID_RE.fullmatch(interaction_key) is None
+            or type(token) is not str
+            or self._HANDOFF_ID_RE.fullmatch(token) is None
+            or not self._valid_patch_selected_value(choice)
+            or type(expires_at) not in (int, float)
+        ):
+            return False
+        try:
+            if not isfinite(expires_at):
+                return False
+        except (OverflowError, TypeError, ValueError):
+            return False
+
+        state: _PatchInteraction | None = None
+        state_key: str | None = None
+        resolver: Callable[[str], bool] | None = None
+        completion: threading.Event | None = None
+        with self._lock:
+            now = self._now()
+            self._expire_locked(now)
+            if self._closed or now >= expires_at:
+                return False
+            for candidate_key, candidate in self._patch_interactions.items():
+                if (
+                    type(candidate) is _PatchInteraction
+                    and candidate.interaction_key == interaction_key
+                ):
+                    state = candidate
+                    state_key = candidate_key
+                    break
+            if (
+                state is None
+                or state.turn_digest in self._interaction_cleanup_turns
+                or state.descriptor_expires_at != expires_at
+                or state.expires_at <= now
+                or state.token_digest is None
+                or not hmac.compare_digest(
+                    state.token_digest,
+                    self._runtime_interaction_token_digest(token),
+                )
+                or state.resolver is None
+            ):
+                return False
+            if state.selected_value is not None:
+                return state.selected_value == choice
+            if state.resolving_value is not None:
+                return False
+            state.resolving_value = choice
+            completion = threading.Event()
+            state.resolution_complete = completion
+            resolver = state.resolver
+
+        try:
+            accepted = resolver(choice) is True
+        except Exception:
+            accepted = False
+
+        with self._lock:
+            current = self._patch_interactions.get(state_key)
+            if (
+                not accepted
+                or current is not state
+                or state.resolving_value != choice
+                or state.descriptor_expires_at != expires_at
+            ):
+                if current is state and state.resolving_value == choice:
+                    state.resolving_value = None
+                    state.resolution_complete = None
+                resolved = False
+            else:
+                state.selected_value = choice
+                state.resolving_value = None
+                state.resolution_complete = None
+                resolved = True
+        if completion is not None:
+            completion.set()
+        return resolved
+
+    def runtime_interaction_listener_snapshot(self) -> dict[str, object]:
+        with self._lock:
+            listener = self._runtime_interaction_listener
+        if listener is None:
+            return {"accepting": False, "poisoned": False, "worker_name": ""}
+        return listener.snapshot()
+
+    def pause_runtime_interaction_listener_for_replacement(self) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            listener = self._runtime_interaction_listener
+        return listener is not None and listener.pause_for_replacement()
+
+    def resume_runtime_interaction_listener_after_failed_replacement(self) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            listener = self._runtime_interaction_listener
+        return listener is not None and listener.resume_after_failed_replacement()
+
+    def _runtime_interaction_key(self, patch_key: str) -> str:
+        digest = sha256(b"hfc-runtime-interaction-key-v1\0")
+        digest.update(self._runtime_id.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(patch_key.encode("ascii"))
+        return digest.hexdigest()
+
+    def _runtime_interaction_token(self, interaction_key: str) -> str:
+        return hmac.new(
+            self._runtime_interaction_token_root,
+            b"hfc-runtime-interaction-token-v1\0" + interaction_key.encode("ascii"),
+            "sha256",
+        ).hexdigest()
+
+    @staticmethod
+    def _runtime_interaction_token_digest(token: str) -> str:
+        return sha256(
+            b"hfc-runtime-interaction-token-digest-v1\0" + token.encode("ascii")
+        ).hexdigest()
 
     def handle_pre_llm_call(self, **kwargs: object) -> None:
         session_id = kwargs.get("session_id")
@@ -1055,6 +1333,8 @@ class PluginRuntime:
             with self._lock:
                 self._expire_locked(self._now())
             return None
+        if not self._prepare_turn_cleanup(turn_id):
+            return None
         completed = kwargs.get("completed")
         failed = kwargs.get("failed")
         interrupted = kwargs.get("interrupted")
@@ -1069,6 +1349,9 @@ class PluginRuntime:
             self._expire_locked(now)
             turn = self._turns.get(turn_id)
             if turn is None or turn.state is TurnState.TERMINAL or turn_id in self._terminal_owners:
+                self._interaction_cleanup_turns.discard(
+                    self._patch_turn_digest(turn_id)
+                )
                 return None
             entry = self._answers.get(turn_id)
             if entry is not None:
@@ -1390,6 +1673,26 @@ class PluginRuntime:
             return min(len(self._turns), self._MAX_ENTRIES), True
 
     def close(self) -> None:
+        with self._close_lock:
+            if self._close_started:
+                wait_for_close = True
+            else:
+                self._close_started = True
+                wait_for_close = False
+        if wait_for_close:
+            self._close_complete.wait(timeout=2.0)
+            return None
+        with self._lock:
+            self._closed = True
+            listener = self._runtime_interaction_listener
+        if listener is not None:
+            try:
+                listener.close()
+            except Exception:
+                pass
+            if listener.snapshot()["poisoned"] is True:
+                self._close_complete.set()
+                return None
         with self._lock:
             coordinators = tuple(self._coordinators.values())
             started = tuple(self._started_transports.values())
@@ -1406,10 +1709,12 @@ class PluginRuntime:
             self._terminal_owners.clear()
             self._started_transports.clear()
             self._patch_interactions.clear()
+            self._interaction_cleanup_turns.clear()
             self._registry.clear()
         self._wait_started_transports(list(started))
         for coordinator in coordinators:
             coordinator.close()
+        self._close_complete.set()
         return None
 
     def _deliver_observer(self, event: ObserverEvent) -> None:
@@ -1763,6 +2068,20 @@ class PluginRuntime:
             return
         with self._lock:
             self._expire_locked(self._now())
+            turn_ids = [
+                turn_id
+                for turn_id, turn in self._turns.items()
+                if turn.ingress.session_id == session_id
+            ]
+            turn_digests = {self._patch_turn_digest(value) for value in turn_ids}
+            self._interaction_cleanup_turns.update(turn_digests)
+            resolution_events = self._resolution_events_for_turns_locked(
+                turn_digests
+            )
+        if not self._wait_interaction_resolutions(resolution_events):
+            return
+        with self._lock:
+            self._expire_locked(self._now())
             self._registry.remove_session(session_id)
             turn_ids = [
                 turn_id
@@ -1810,6 +2129,7 @@ class PluginRuntime:
         for key, state in tuple(self._patch_interactions.items()):
             if state.turn_digest == turn_digest:
                 del self._patch_interactions[key]
+        self._interaction_cleanup_turns.discard(turn_digest)
         if not keep_disposition:
             self._terminal_records.pop(turn_id, None)
             self._dispositions.pop(turn_id, None)
@@ -1831,8 +2151,45 @@ class PluginRuntime:
             if expires_at <= now:
                 del self._subagents[key]
         for key, state in tuple(self._patch_interactions.items()):
-            if state.expires_at <= now:
+            if (
+                state.expires_at <= now
+                and not (
+                    type(state) is _PatchInteraction
+                    and state.resolution_complete is not None
+                )
+            ):
                 del self._patch_interactions[key]
+
+    def _prepare_turn_cleanup(self, turn_id: str) -> bool:
+        turn_digest = self._patch_turn_digest(turn_id)
+        with self._lock:
+            self._interaction_cleanup_turns.add(turn_digest)
+            events = self._resolution_events_for_turns_locked({turn_digest})
+        return self._wait_interaction_resolutions(events)
+
+    def _resolution_events_for_turns_locked(
+        self, turn_digests: set[str]
+    ) -> list[threading.Event]:
+        return [
+            state.resolution_complete
+            for state in self._patch_interactions.values()
+            if (
+                type(state) is _PatchInteraction
+                and state.turn_digest in turn_digests
+                and state.resolution_complete is not None
+            )
+        ]
+
+    @staticmethod
+    def _wait_interaction_resolutions(
+        events: list[threading.Event], timeout_seconds: float = 1.25
+    ) -> bool:
+        deadline = monotonic() + timeout_seconds
+        for event in events:
+            remaining = deadline - monotonic()
+            if remaining <= 0 or not event.wait(timeout=remaining):
+                return False
+        return True
 
     @classmethod
     def _trim_locked(cls, mapping: OrderedDict) -> None:
@@ -1854,7 +2211,17 @@ class PluginRuntime:
                 (
                     turn_id
                     for turn_id in self._turns
-                    if turn_id not in self._terminal_owners
+                    if (
+                        turn_id not in self._terminal_owners
+                        and self._patch_turn_digest(turn_id)
+                        not in self._interaction_cleanup_turns
+                        and not any(
+                            type(state) is _PatchInteraction
+                            and state.turn_digest == self._patch_turn_digest(turn_id)
+                            and state.resolution_complete is not None
+                            for state in self._patch_interactions.values()
+                        )
+                    )
                 ),
                 None,
             )
@@ -2057,26 +2424,30 @@ class _ProductionBootstrap:
     config: ProductionRuntimeConfig
     _closed: bool = False
 
-    def close(self) -> None:
+    def close(self) -> bool:
         global _ACTIVE_RUNTIME
         if self._closed:
-            return None
+            return True
+        runtime_close_failed = False
+        try:
+            self.runtime.close()
+        except Exception:
+            runtime_close_failed = True
+        if (
+            not runtime_close_failed
+            and self.runtime.runtime_interaction_listener_snapshot()["poisoned"] is True
+        ):
+            return False
         self._closed = True
         with _ACTIVE_RUNTIME_LOCK:
             if _ACTIVE_RUNTIME is self.runtime:
                 _ACTIVE_RUNTIME = None
             self.gate.clear_runtime(self.runtime)
         try:
-            try:
-                self.runtime.close()
-            except Exception:
-                pass
-        finally:
-            try:
-                self.lease.close()
-            except Exception:
-                pass
-        return None
+            self.lease.close()
+        except Exception:
+            pass
+        return True
 
 
 _BOOTSTRAP_LOCK = RLock()
@@ -2088,16 +2459,20 @@ _CONTEXT_GATES: list[_ContextGate] = []
 def bootstrap_plugin_runtime(ctx: Any) -> None:
     """Install one production runtime before activating official callbacks."""
     global _ACTIVE_RUNTIME, _PRODUCTION_BOOTSTRAP, _ATEXIT_REGISTERED
+    paused_current: _ProductionBootstrap | None = None
+    candidate_runtime: PluginRuntime | None = None
+    candidate_lease: RuntimeControlLease | None = None
     try:
         with _BOOTSTRAP_LOCK:
             current = _PRODUCTION_BOOTSTRAP
             config = _load_production_runtime_config()
             if not config.enabled:
                 gate = _ensure_context_gate(ctx)
+                if current is not None:
+                    if not current.close():
+                        return None
                 gate.set_runtime(None)
                 _PRODUCTION_BOOTSTRAP = None
-                if current is not None:
-                    current.close()
                 return None
             secret = read_transport_root_secret()
             if type(secret) is not bytes or len(secret) != 32:
@@ -2118,6 +2493,10 @@ def bootstrap_plugin_runtime(ctx: Any) -> None:
                 and gate is current.gate
             ):
                 return None
+            if current is not None:
+                if not current.runtime.pause_runtime_interaction_listener_for_replacement():
+                    return None
+                paused_current = current
             transport = SignedEventTransport(
                 event_url=config.event_url,
                 timeout_seconds=config.timeout_seconds,
@@ -2127,14 +2506,24 @@ def bootstrap_plugin_runtime(ctx: Any) -> None:
                 post=transport,
                 observer_timeout_seconds=config.timeout_seconds,
             )
+            candidate_runtime = runtime
+            if not runtime.start_runtime_interaction_listener(secret):
+                runtime.close()
+                candidate_runtime = None
+                _ensure_context_gate(ctx)
+                _resume_paused_bootstrap(paused_current)
+                return None
             lease = acquire_runtime_control(
                 event_url=config.event_url,
                 package_version=__version__,
                 active_work_snapshot_provider=_runtime_activity_provider(runtime),
             )
+            candidate_lease = lease
             if lease is None:
                 runtime.close()
+                candidate_runtime = None
                 _ensure_context_gate(ctx)
+                _resume_paused_bootstrap(paused_current)
                 return None
             try:
                 if not _ATEXIT_REGISTERED:
@@ -2146,6 +2535,9 @@ def bootstrap_plugin_runtime(ctx: Any) -> None:
             except Exception:
                 _ensure_context_gate(ctx)
                 _close_runtime_and_lease(runtime, lease)
+                candidate_runtime = None
+                candidate_lease = None
+                _resume_paused_bootstrap(paused_current)
                 return None
             bootstrap = _ProductionBootstrap(ctx, gate, runtime, lease, config)
             with _ACTIVE_RUNTIME_LOCK:
@@ -2154,15 +2546,39 @@ def bootstrap_plugin_runtime(ctx: Any) -> None:
                 if current is not None and current.gate is not gate:
                     current.gate.clear_runtime(current.runtime)
             _PRODUCTION_BOOTSTRAP = bootstrap
+            candidate_runtime = None
+            candidate_lease = None
             if current is not None:
                 current.close()
+            paused_current = None
         return None
     except Exception:
+        if candidate_runtime is not None:
+            if candidate_lease is not None:
+                _close_runtime_and_lease(candidate_runtime, candidate_lease)
+            else:
+                try:
+                    candidate_runtime.close()
+                except Exception:
+                    pass
+        _resume_paused_bootstrap(paused_current)
         try:
             _ensure_context_gate(ctx)
         except Exception:
             pass
         return None
+
+
+def _resume_paused_bootstrap(
+    bootstrap: _ProductionBootstrap | None,
+) -> None:
+    if bootstrap is None:
+        return None
+    try:
+        bootstrap.runtime.resume_runtime_interaction_listener_after_failed_replacement()
+    except Exception:
+        pass
+    return None
 
 
 def _register_callbacks_checked(ctx: Any, runtime: PluginRuntime) -> bool:
@@ -2268,9 +2684,9 @@ def _close_process_plugin_runtime() -> None:
     global _PRODUCTION_BOOTSTRAP
     with _BOOTSTRAP_LOCK:
         bootstrap = _PRODUCTION_BOOTSTRAP
-        _PRODUCTION_BOOTSTRAP = None
         if bootstrap is not None:
-            bootstrap.close()
+            if bootstrap.close():
+                _PRODUCTION_BOOTSTRAP = None
     return None
 
 
