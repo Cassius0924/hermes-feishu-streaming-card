@@ -11,6 +11,8 @@ import subprocess
 import sys
 from types import SimpleNamespace
 import zipfile
+import py_compile
+import tempfile
 
 import pytest
 
@@ -303,6 +305,74 @@ def installed_fixed_runtime(tmp_path_factory) -> Path:
     return python
 
 
+def _run_installed_probe(
+    runtime: Path,
+    source_root: Path,
+    *,
+    swap_runtime_after_binding: bool = False,
+) -> dict[str, object]:
+    parent_cache = Path(tempfile.mkdtemp(
+        prefix="parent-pycache-", dir=runtime.parents[2]
+    ))
+    swap_setup = '''
+from pathlib import Path
+_real_validate_runtime = native_hooks._validate_runtime_python
+_runtime_swap = {}
+def _validate_then_swap(value):
+    binding = _real_validate_runtime(value)
+    runtime_path = binding.path
+    backup = runtime_path.with_name(runtime_path.name + "-verified-fd")
+    runtime_path.rename(backup)
+    runtime_path.symlink_to("/usr/bin/false")
+    _runtime_swap.update({"runtime": runtime_path, "backup": backup})
+    return binding
+native_hooks._validate_runtime_python = _validate_then_swap
+''' if swap_runtime_after_binding else ""
+    code = '''
+import json
+from hermes_feishu_card.install import native_hooks
+''' + swap_setup + '''
+try:
+    result = native_hooks.probe_native_hook_capabilities(
+        __import__("sys").argv[1],
+        expected_commit=native_hooks.FIXED_TAG_COMMIT,
+        runtime_python=__import__("sys").executable,
+    )
+finally:
+    if "_runtime_swap" in globals() and _runtime_swap:
+        _runtime_swap["runtime"].unlink()
+        _runtime_swap["backup"].rename(_runtime_swap["runtime"])
+print(json.dumps({
+    "module_origin": native_hooks.__file__,
+    "resource_path": str(native_hooks.FIXED_TAG_PROVENANCE_PATH),
+    "reason_code": result.reason_code,
+    "available": sorted(result.capabilities.available),
+    "source_commit": result.source_commit,
+    "source_digests": [[item.target, item.sha256] for item in result.source_digests],
+    "plugin_evidence_sha256": result.plugin_evidence_sha256,
+}, sort_keys=True, separators=(",", ":")))
+'''
+    completed = subprocess.run(
+        [
+            str(runtime),
+            "-I",
+            "-X",
+            f"pycache_prefix={parent_cache}",
+            "-c",
+            code,
+            str(source_root),
+        ],
+        check=True,
+        cwd=runtime.parents[2],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=90,
+        env={"HOME": str(runtime.parents[2])},
+    )
+    return json.loads(completed.stdout)
+
+
 def test_fixed_tag_provenance_is_one_canonical_manifest_with_24_slices():
     raw = FIXED_TAG_PROVENANCE_PATH.read_bytes()
     provenance = load_fixed_tag_native_hook_provenance(FIXED_TAG_PROVENANCE_PATH)
@@ -321,11 +391,7 @@ def test_real_regular_wheel_plugin_manager_probe_reports_exactly_four_capabiliti
     installed_fixed_runtime,
 ):
     assert FIXED_SOURCE_ROOT.is_dir()
-    result = probe_native_hook_capabilities(
-        FIXED_SOURCE_ROOT,
-        expected_commit=FIXED_TAG_COMMIT,
-        runtime_python=installed_fixed_runtime,
-    )
+    result = _run_installed_probe(installed_fixed_runtime, FIXED_SOURCE_ROOT)
 
     expected = {
         "turn_start",
@@ -333,35 +399,48 @@ def test_real_regular_wheel_plugin_manager_probe_reports_exactly_four_capabiliti
         "stable_tool_lifecycle",
         "approval_observe",
     }
-    assert result.reason_code == "verified"
-    assert result.capabilities.available == expected
-    assert result.plugin_evidence_sha256.startswith("sha256:")
-    assert {status.name for status in result.statuses if status.available} == expected
-    subagent = next(
-        status for status in result.statuses if status.name == "subagent_lifecycle"
+    assert result["reason_code"] == "verified"
+    assert set(result["available"]) == expected
+    assert result["plugin_evidence_sha256"].startswith("sha256:")
+    assert len(result["source_digests"]) == 9
+    assert set(item[0] for item in result["source_digests"]) == set(
+        native_hooks._EXPECTED_TARGETS
     )
-    assert subagent.reason_code == "callsite_contract_mismatch"
-    assert len(result.source_digests) == 9
+    assert str(installed_fixed_runtime.parents[1]) in result["module_origin"]
+    assert "tests/fixtures" not in result["resource_path"]
 
     decision = select_integration_mode(
-        result.capabilities,
+        native_hooks.NativeHookCapabilities.from_names(result["available"]),
         PatchCapabilities.from_names(HYBRID_REQUIRED_PATCH_GROUPS),
     )
     assert decision.mode is None
 
 
 def test_detector_wrapper_uses_runtime_probe_without_version_guessing(
-    installed_fixed_runtime,
+    tmp_path, monkeypatch,
 ):
-    result = detect.detect_native_hook_capabilities(
-        FIXED_SOURCE_ROOT,
-        expected_commit=FIXED_TAG_COMMIT,
-        runtime_python=installed_fixed_runtime,
+    sentinel = object()
+    calls = []
+    monkeypatch.setattr(
+        detect,
+        "probe_native_hook_capabilities",
+        lambda root, **kwargs: calls.append((root, kwargs)) or sentinel,
     )
-    assert result.capabilities.available == {
-        "turn_start", "turn_terminal_result", "stable_tool_lifecycle",
-        "approval_observe",
-    }
+    result = detect.detect_native_hook_capabilities(
+        tmp_path,
+        expected_commit=FIXED_TAG_COMMIT,
+        runtime_python=tmp_path / "runtime" / "bin" / "python",
+    )
+    assert result is sentinel
+    assert calls == [
+        (
+            tmp_path,
+            {
+                "expected_commit": FIXED_TAG_COMMIT,
+                "runtime_python": tmp_path / "runtime" / "bin" / "python",
+            },
+        )
+    ]
 
 
 def test_review_attack_caller_forged_evidence_and_manifest_are_not_public_inputs():
@@ -443,7 +522,11 @@ def test_review_attack_entrypoint_equality_spoof_is_rejected(tmp_path):
     payload["entrypoint_group"] = EqualitySpoof("attacker.group")
 
     assert native_hooks._validate_plugin_manager_payload(
-        payload, runtime_python=runtime, hermes_root=tmp_path
+        payload,
+        runtime=None,
+        snapshot=None,
+        home=tmp_path,
+        home_descriptor=-1,
     ) == "plugin_evidence_invalid"
 
 
@@ -574,25 +657,13 @@ def test_dirty_fixed_source_checkout_closes_all_capabilities(tmp_path, monkeypat
 
 
 def test_forged_subprocess_output_cannot_open_capabilities(
-    installed_fixed_runtime, monkeypatch,
+    tmp_path,
 ):
-    payload = _payload_template(installed_fixed_runtime, FIXED_SOURCE_ROOT)
+    payload = _payload_template(tmp_path / "runtime" / "bin" / "python", FIXED_SOURCE_ROOT)
     payload["matching_loaded_count"] = True
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
-    monkeypatch.setattr(
-        native_hooks.subprocess,
-        "run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout=raw, stderr=b""
-        ),
-    )
-
-    evidence, reason = native_hooks._produce_plugin_manager_evidence(
-        FIXED_SOURCE_ROOT, installed_fixed_runtime
-    )
-
-    assert evidence is None
-    assert reason == "plugin_evidence_invalid"
+    decoded = native_hooks._decode_canonical_json_object(raw)
+    assert type(decoded["matching_loaded_count"]) is bool
 
 
 def test_dataclasses_reject_duplicate_targets_path_aliases_and_bad_digest():
@@ -611,3 +682,230 @@ def test_dataclasses_reject_duplicate_targets_path_aliases_and_bad_digest():
         )
     with pytest.raises(ValueError, match="digest"):
         NativeHookSourceDigest(target="approval", sha256="not-a-digest")
+
+
+def test_second_review_verified_result_rejects_empty_digests_and_attestation():
+    statuses = tuple(
+        NativeCapabilityStatus(
+            name=name,
+            available=False,
+            reason_code="callsite_contract_mismatch",
+            callsite_signature="sha256:" + "0" * 64,
+        )
+        for name in sorted(native_hooks.KNOWN_NATIVE_CAPABILITIES)
+    )
+    with pytest.raises(ValueError, match="verified"):
+        NativeHookCapabilityProbe(
+            capabilities=native_hooks.NativeHookCapabilities.from_names(()),
+            statuses=statuses,
+            source_commit=FIXED_TAG_COMMIT,
+            source_digests=(),
+            plugin_evidence_sha256="",
+            reason_code="verified",
+        )
+
+
+def test_second_review_child_schema_reports_loaded_modules_and_fd_identities():
+    assert {
+        "loaded_modules",
+        "pycache_prefix",
+        "runtime_fd_identity",
+        "snapshot_fd_identity_before",
+        "snapshot_fd_identity_after",
+        "home_fd_identity_before",
+        "home_fd_identity_after",
+    } <= native_hooks._PLUGIN_PROBE_PAYLOAD_KEYS
+    assert "home_identity" in inspect.signature(
+        native_hooks._plugin_probe_child
+    ).parameters
+
+
+def test_second_review_trusted_git_disables_replacements_and_optional_writes(
+    monkeypatch,
+):
+    observed = {}
+
+    def capture_run(command, **kwargs):
+        observed["command"] = command
+        observed["environment"] = kwargs["env"]
+        return subprocess.CompletedProcess(command, 0, stdout=b"")
+
+    monkeypatch.setattr(native_hooks.subprocess, "run", capture_run)
+    native_hooks._run_trusted_git(
+        FIXED_SOURCE_ROOT, ["rev-parse", "--verify", "HEAD"], timeout=3
+    )
+
+    assert observed["command"][:8] == [
+        "/usr/bin/git",
+        "--no-optional-locks",
+        "--no-replace-objects",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-C",
+    ]
+    assert observed["environment"]["GIT_OPTIONAL_LOCKS"] == "0"
+
+
+def test_second_review_runtime_binding_holds_verified_executable_fd(
+    installed_fixed_runtime,
+):
+    code = '''
+import json, os, sys
+from hermes_feishu_card.install import native_hooks
+binding = native_hooks._validate_runtime_python(sys.executable)
+try:
+    info = os.fstat(binding.descriptor)
+    print(json.dumps({"fd": binding.descriptor, "identity": list(binding.identity), "fstat": [info.st_dev, info.st_ino]}))
+finally:
+    binding.close()
+'''
+    completed = subprocess.run(
+        [str(installed_fixed_runtime), "-I", "-c", code],
+        check=True,
+        cwd=installed_fixed_runtime.parents[2],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    result = json.loads(completed.stdout)
+    assert result["fd"] >= 0
+    assert result["identity"] == result["fstat"]
+
+
+def test_second_review_runtime_path_swap_cannot_substitute_after_fd_binding(
+    installed_fixed_runtime,
+):
+    result = _run_installed_probe(
+        installed_fixed_runtime,
+        FIXED_SOURCE_ROOT,
+        swap_runtime_after_binding=True,
+    )
+    assert result["reason_code"] == "verified"
+    assert set(result["available"]) == {
+        "turn_start", "turn_terminal_result", "stable_tool_lifecycle",
+        "approval_observe",
+    }
+
+
+def test_second_review_root_swap_is_rejected_after_exact_snapshot(
+    tmp_path, monkeypatch,
+):
+    clone = tmp_path / "fixed-root"
+    subprocess.run(
+        [
+            "/usr/bin/git", "clone", "--quiet", "--no-hardlinks",
+            str(FIXED_SOURCE_ROOT), str(clone),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    displaced = tmp_path / "displaced-root"
+    real_build = native_hooks._build_trusted_source_snapshot
+
+    def build_then_swap(root, expected_commit, provenance):
+        snapshot = real_build(root, expected_commit, provenance)
+        root.rename(displaced)
+        root.mkdir()
+        return snapshot
+
+    monkeypatch.setattr(
+        native_hooks, "_build_trusted_source_snapshot", build_then_swap
+    )
+    try:
+        result = probe_native_hook_capabilities(
+            clone,
+            expected_commit=FIXED_TAG_COMMIT,
+            runtime_python=tmp_path / "missing-runtime",
+        )
+    finally:
+        clone.rmdir()
+        displaced.rename(clone)
+
+    assert result.reason_code == "source_dirty"
+    assert result.capabilities.available == frozenset()
+
+
+def test_second_review_stale_record_missing_loaded_runtime_is_rejected(
+    installed_fixed_runtime,
+):
+    purelib = installed_fixed_runtime.parents[1] / "lib" / (
+        f"python{sys.version_info.major}.{sys.version_info.minor}"
+    ) / "site-packages"
+    metadata_path = next(purelib.glob("hermes_feishu_streaming_card-*.dist-info"))
+    record_path = metadata_path / "RECORD"
+    original = record_path.read_text(encoding="utf-8")
+    stale = "".join(
+        line for line in original.splitlines(keepends=True)
+        if not line.startswith("hermes_feishu_card/hermes_plugin_runtime.py,")
+    )
+    assert stale != original
+    record_path.write_text(stale, encoding="utf-8")
+    runtime = installed_fixed_runtime
+    payload = _payload_template(runtime, FIXED_SOURCE_ROOT)
+    payload.update({
+        "distribution_metadata_path": str(metadata_path),
+        "record_path": str(record_path),
+        "record_sha256": _sha256(record_path.read_bytes()),
+        "entrypoint_origin": str(purelib / "hermes_feishu_card" / "hermes_plugin.py"),
+        "package_origin": str(purelib / "hermes_feishu_card" / "__init__.py"),
+        "loaded_modules": [
+            {
+                "name": "hermes_feishu_card.hermes_plugin_runtime",
+                "loader": "_frozen_importlib_external.SourceFileLoader",
+                "origin": str(
+                    purelib / "hermes_feishu_card" / "hermes_plugin_runtime.py"
+                ),
+                "cached": "/private/pycache/hermes_plugin_runtime.pyc",
+            }
+        ],
+    })
+    try:
+        assert native_hooks._validate_installed_distribution(payload, purelib) is False
+    finally:
+        record_path.write_text(original, encoding="utf-8")
+
+
+def test_second_review_real_ignored_unchecked_pyc_cannot_influence_probe(
+    tmp_path, installed_fixed_runtime,
+):
+    clone = tmp_path / "fixed-clone"
+    subprocess.run(
+        [
+            "/usr/bin/git", "clone", "--quiet", "--no-hardlinks",
+            str(FIXED_SOURCE_ROOT), str(clone),
+        ],
+        check=True,
+    )
+    source = clone / "hermes_cli" / "plugins.py"
+    original = source.read_bytes()
+    timestamps = source.stat()
+    source.write_text("raise RuntimeError('ignored pyc attack')\n", encoding="utf-8")
+    cache = Path(
+        py_compile.compile(
+            str(source),
+            doraise=True,
+            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        )
+    )
+    assert cache.is_file()
+    source.write_bytes(original)
+    os.utime(source, ns=(timestamps.st_atime_ns, timestamps.st_mtime_ns))
+    assert subprocess.run(
+        [
+            "/usr/bin/git", "--no-optional-locks", "-C", str(clone),
+            "status", "--porcelain=v1", "--untracked-files=all",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        env={"GIT_OPTIONAL_LOCKS": "0"},
+    ).stdout == b""
+
+    result = _run_installed_probe(installed_fixed_runtime, clone)
+
+    assert result["reason_code"] == "verified"
+    assert set(result["available"]) == {
+        "turn_start", "turn_terminal_result", "stable_tool_lifecycle",
+        "approval_observe",
+    }

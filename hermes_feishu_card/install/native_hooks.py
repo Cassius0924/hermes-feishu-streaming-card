@@ -6,28 +6,37 @@ import csv
 from dataclasses import dataclass
 from email.parser import BytesParser
 import hashlib
+import importlib
+import importlib.metadata
+import importlib.resources
 import io
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import signal
 import stat
 import subprocess
+import sys
+import sysconfig
+import tarfile
 import tempfile
+import time
 from typing import Iterable
 
 from ..integration import KNOWN_NATIVE_CAPABILITIES, NativeHookCapabilities
 
 
 FIXED_TAG_COMMIT = "3c27eb6234bf91b8ceee9e9071591b31e9b148cb"
-FIXED_TAG_PROVENANCE_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "tests"
-    / "fixtures"
-    / "hermes_v2026_8_3_native_capabilities"
-    / "provenance.json"
+_PROVENANCE_RESOURCE_PACKAGE = (
+    "hermes_feishu_card.install._native_hook_provenance"
 )
+FIXED_TAG_PROVENANCE_PATH = Path(os.fspath(
+    importlib.resources.files(_PROVENANCE_RESOURCE_PACKAGE).joinpath(
+        "provenance.json"
+    )
+))
 FIXED_TAG_PROVENANCE_SHA256 = (
     "sha256:90a873bb3742155ba3cd3c006394f3487a3a509b4223d142df93da34f2c63f09"
 )
@@ -76,6 +85,9 @@ _MAX_MANIFEST_BYTES = 128 * 1024
 _MAX_SLICE_BYTES = 128 * 1024
 _MAX_SUBPROCESS_BYTES = 64 * 1024
 _PLUGIN_PROBE_TIMEOUT_SECONDS = 15.0
+_TRUSTED_GIT = Path("/usr/bin/git")
+_MAX_ARCHIVE_MEMBER_BYTES = 32 * 1024 * 1024
+_MAX_ARCHIVE_TOTAL_BYTES = 512 * 1024 * 1024
 _REASON_CODES = frozenset({
     "verified",
     "expected_commit_invalid",
@@ -186,6 +198,42 @@ class _PluginManagerEvidence:
         _validate_digest(self.attestation_sha256)
 
 
+@dataclass
+class _RuntimeBinding:
+    path: Path
+    descriptor: int
+    identity: tuple[int, int]
+    prefix: Path
+    base_prefix: Path
+    purelib: Path
+    platlib: Path
+    _closed: bool = False
+
+    def close(self) -> None:
+        if self._closed:
+            return None
+        self._closed = True
+        os.close(self.descriptor)
+        return None
+
+
+@dataclass
+class _SourceSnapshot:
+    root: Path
+    descriptor: int
+    identity: tuple[int, int]
+    container: Path
+    _closed: bool = False
+
+    def close(self) -> None:
+        if self._closed:
+            return None
+        self._closed = True
+        os.close(self.descriptor)
+        shutil.rmtree(self.container, ignore_errors=True)
+        return None
+
+
 @dataclass(frozen=True)
 class NativeCapabilityStatus:
     name: str
@@ -255,6 +303,13 @@ class NativeHookCapabilityProbe:
             _validate_digest(self.plugin_evidence_sha256)
         if type(self.reason_code) is not str or self.reason_code not in _REASON_CODES:
             raise ValueError("invalid probe reason")
+        if self.reason_code == "verified" and (
+            self.source_commit != FIXED_TAG_COMMIT
+            or set(targets) != _EXPECTED_TARGETS
+            or len(targets) != len(_EXPECTED_TARGETS)
+            or not self.plugin_evidence_sha256
+        ):
+            raise ValueError("verified probe evidence must be exact and complete")
 
 
 @dataclass(frozen=True)
@@ -408,29 +463,41 @@ def probe_native_hook_capabilities(
         root_descriptor = _open_absolute_directory(root)
     except (OSError, TypeError, ValueError):
         return _closed_probe("hermes_root_invalid")
-    actual_commit, source_clean = _git_source_state(root)
-    if actual_commit != expected_commit:
-        os.close(root_descriptor)
-        return _closed_probe(
-            "source_commit_mismatch", observed_commit=actual_commit
-        )
-    if not source_clean:
-        os.close(root_descriptor)
-        return _closed_probe("source_dirty", observed_commit=actual_commit)
-    if not verify_provenance_slices(
-        provenance, fixture_root=FIXED_TAG_PROVENANCE_PATH.parent
-    ):
-        os.close(root_descriptor)
-        return _closed_probe("provenance_invalid", observed_commit=actual_commit)
-
+    snapshot: _SourceSnapshot | None = None
     source_text: dict[str, str] = {}
     source_reason: dict[str, str] = {}
     source_digests: list[NativeHookSourceDigest] = []
     try:
+        actual_commit, source_clean = _git_source_state(root)
+        if actual_commit != expected_commit:
+            return _closed_probe(
+                "source_commit_mismatch", observed_commit=actual_commit
+            )
+        if not source_clean:
+            return _closed_probe("source_dirty", observed_commit=actual_commit)
+        if (
+            not _bound_directory_unchanged(root, root_descriptor)
+            or not verify_provenance_slices(
+                provenance, fixture_root=FIXED_TAG_PROVENANCE_PATH.parent
+            )
+        ):
+            return _closed_probe(
+                "provenance_invalid", observed_commit=actual_commit
+            )
+        try:
+            snapshot = _build_trusted_source_snapshot(
+                root, expected_commit, provenance
+            )
+        except (OSError, subprocess.SubprocessError, tarfile.TarError, ValueError):
+            return _closed_probe(
+                "source_commit_mismatch", observed_commit=actual_commit
+            )
+        if not _bound_directory_unchanged(root, root_descriptor):
+            return _closed_probe("source_dirty", observed_commit=actual_commit)
         for source in provenance.sources:
             try:
                 data = _read_bound_relative_file(
-                    root_descriptor, source.relative_path, _MAX_SOURCE_BYTES
+                    snapshot.descriptor, source.relative_path, _MAX_SOURCE_BYTES
                 )
             except FileNotFoundError:
                 source_reason[source.target] = "source_missing"
@@ -455,23 +522,33 @@ def probe_native_hook_capabilities(
                 source_reason[source.target] = "source_ast_invalid"
                 continue
             source_text[source.target] = text
-        if not _bound_directory_unchanged(root, root_descriptor):
+        if source_reason or len(source_digests) != len(_EXPECTED_TARGETS):
+            return _closed_probe(
+                next(iter(source_reason.values()), "source_digest_mismatch"),
+                observed_commit=actual_commit,
+            )
+        if not _bound_directory_unchanged(snapshot.root, snapshot.descriptor):
             return _closed_probe("source_dirty", observed_commit=actual_commit)
-    finally:
-        os.close(root_descriptor)
-
-    plugin_evidence, plugin_reason = _produce_plugin_manager_evidence(
-        root, runtime_python
-    )
-    if plugin_evidence is None:
-        return _closed_probe(plugin_reason, observed_commit=actual_commit)
-    final_commit, final_clean = _git_source_state(root)
-    if final_commit != expected_commit:
-        return _closed_probe(
-            "source_commit_mismatch", observed_commit=final_commit
+        plugin_evidence, plugin_reason = _produce_plugin_manager_evidence(
+            snapshot, runtime_python
         )
-    if not final_clean:
-        return _closed_probe("source_dirty", observed_commit=final_commit)
+        if plugin_evidence is None:
+            return _closed_probe(plugin_reason, observed_commit=actual_commit)
+        final_commit, final_clean = _git_source_state(root)
+        if final_commit != expected_commit:
+            return _closed_probe(
+                "source_commit_mismatch", observed_commit=final_commit
+            )
+        if (
+            not final_clean
+            or not _bound_directory_unchanged(root, root_descriptor)
+            or not _bound_directory_unchanged(snapshot.root, snapshot.descriptor)
+        ):
+            return _closed_probe("source_dirty", observed_commit=final_commit)
+    finally:
+        if snapshot is not None:
+            snapshot.close()
+        os.close(root_descriptor)
 
     contracts = {
         "authenticated_ingress": _probe_authenticated_ingress,
@@ -1242,28 +1319,197 @@ _PLUGIN_PROBE_PAYLOAD_KEYS = frozenset({
     "matching_enabled_count",
     "matching_loaded_count",
     "registered_hooks",
+    "loaded_modules",
+    "pycache_prefix",
+    "runtime_fd_identity",
+    "snapshot_fd_identity_before",
+    "snapshot_fd_identity_after",
+    "home_fd_identity_before",
+    "home_fd_identity_after",
     "attestation_sha256",
 })
 
-_PLUGIN_PROBE_CHILD = r'''
-import hashlib
-import importlib
-import importlib.metadata
-import json
-import os
-import sys
-import sysconfig
+def _produce_plugin_manager_evidence(
+    snapshot: _SourceSnapshot,
+    runtime_python: str | Path,
+) -> tuple[_PluginManagerEvidence | None, str]:
+    try:
+        runtime = _validate_runtime_python(runtime_python)
+    except (OSError, TypeError, ValueError):
+        return None, "plugin_runtime_unverified"
+    home_name = tempfile.mkdtemp(prefix="hfc-native-hook-probe-")
+    home = Path(os.path.realpath(home_name))
+    home_descriptor = -1
+    try:
+        home_descriptor = _open_absolute_directory(home)
+        home_info = os.fstat(home_descriptor)
+        home_identity = (home_info.st_dev, home_info.st_ino)
+        os.mkdir("bundled-plugins", 0o700, dir_fd=home_descriptor)
+        os.mkdir("pycache", 0o700, dir_fd=home_descriptor)
+        config = b"plugins:\n  enabled:\n    - hermes-feishu-card\n  disabled: []\n"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        config_descriptor = os.open(
+            "config.yaml", flags, 0o600, dir_fd=home_descriptor
+        )
+        try:
+            _write_all(config_descriptor, config)
+        finally:
+            os.close(config_descriptor)
+        environment = {
+            "HOME": str(home),
+            "HERMES_HOME": str(home),
+            "HERMES_BUNDLED_PLUGINS": str(home / "bundled-plugins"),
+            "HERMES_ENABLE_PROJECT_PLUGINS": "0",
+            "HERMES_SAFE_MODE": "0",
+            "HERMES_FEISHU_CARD_ENABLED": "0",
+        }
+        try:
+            child_output, child_ok = _run_forked_plugin_probe(
+                snapshot=snapshot,
+                runtime=runtime,
+                home=home,
+                home_descriptor=home_descriptor,
+                home_identity=home_identity,
+                environment=environment,
+            )
+        except OSError:
+            return None, "plugin_runtime_unverified"
+        if not child_ok:
+            return None, "plugin_runtime_unverified"
+        try:
+            payload = _decode_canonical_json_object(child_output)
+        except (UnicodeDecodeError, ValueError):
+            return None, "plugin_evidence_invalid"
+        reason = _validate_plugin_manager_payload(
+            payload,
+            runtime=runtime,
+            snapshot=snapshot,
+            home=home,
+            home_descriptor=home_descriptor,
+        )
+        if reason != "verified":
+            return None, reason
+        return _PluginManagerEvidence(payload["attestation_sha256"]), "verified"
+    finally:
+        if home_descriptor >= 0:
+            os.close(home_descriptor)
+        runtime.close()
+        shutil.rmtree(home, ignore_errors=True)
 
-saved_stdout = os.dup(1)
-devnull = os.open(os.devnull, os.O_WRONLY)
-os.dup2(devnull, 1)
-os.dup2(devnull, 2)
-os.close(devnull)
 
-try:
-    hermes_root = sys.argv[1]
-    sys.path.insert(0, hermes_root)
-    sys.dont_write_bytecode = True
+def _run_forked_plugin_probe(
+    *,
+    snapshot: _SourceSnapshot,
+    runtime: _RuntimeBinding,
+    home: Path,
+    home_descriptor: int,
+    home_identity: tuple[int, int],
+    environment: dict[str, str],
+) -> tuple[bytes, bool]:
+    read_descriptor, write_descriptor = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(read_descriptor)
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+            os.close(devnull)
+            _plugin_probe_child(
+                snapshot=snapshot,
+                runtime=runtime,
+                home=home,
+                home_descriptor=home_descriptor,
+                home_identity=home_identity,
+                environment=environment,
+                output_descriptor=write_descriptor,
+            )
+            os._exit(0)
+        except BaseException:
+            os._exit(70)
+    os.close(write_descriptor)
+    deadline = time.monotonic() + _PLUGIN_PROBE_TIMEOUT_SECONDS
+    status = None
+    try:
+        while time.monotonic() < deadline:
+            waited, child_status = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                status = child_status
+                break
+            time.sleep(0.01)
+        if status is None:
+            os.kill(pid, signal.SIGKILL)
+            _, status = os.waitpid(pid, 0)
+        output = _read_pipe_bounded(read_descriptor, _MAX_SUBPROCESS_BYTES)
+    finally:
+        os.close(read_descriptor)
+    return output, bool(
+        status is not None
+        and os.WIFEXITED(status)
+        and os.WEXITSTATUS(status) == 0
+    )
+
+
+def _read_pipe_bounded(descriptor: int, limit: int) -> bytes:
+    chunks = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, min(65536, limit + 1 - total))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise ValueError("child output exceeds bound")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _plugin_probe_child(
+    *,
+    snapshot: _SourceSnapshot,
+    runtime: _RuntimeBinding,
+    home: Path,
+    home_descriptor: int,
+    home_identity: tuple[int, int],
+    environment: dict[str, str],
+    output_descriptor: int,
+) -> None:
+    sys.pycache_prefix = str(home / "pycache")
+    snapshot_before = _fd_identity(snapshot.descriptor)
+    home_before = _fd_identity(home_descriptor)
+    runtime_identity = _fd_identity(runtime.descriptor)
+    if (
+        snapshot_before != snapshot.identity
+        or home_before != home_identity
+        or runtime_identity != runtime.identity
+        or not _bound_directory_unchanged(snapshot.root, snapshot.descriptor)
+        or not _bound_directory_unchanged(home, home_descriptor)
+    ):
+        raise RuntimeError("fd identity mismatch")
+    os.environ.clear()
+    os.environ.update(environment)
+    os.fchdir(home_descriptor)
+    for name in tuple(sys.modules):
+        if (
+            name == "hermes_feishu_card"
+            or name.startswith("hermes_feishu_card.")
+            or name == "hermes_cli"
+            or name.startswith("hermes_cli.")
+            or name in {"hermes_constants", "utils", "model_tools"}
+            or name == "tools"
+            or name.startswith("tools.")
+        ):
+            sys.modules.pop(name, None)
+    sys.path = [
+        str(snapshot.root),
+        *[
+            item for item in sys.path
+            if type(item) is str and item and item != str(snapshot.root)
+        ],
+    ]
+    importlib.invalidate_caches()
     plugins = importlib.import_module("hermes_cli.plugins")
     manager = plugins.PluginManager()
     entrypoints = list(
@@ -1301,8 +1547,19 @@ try:
     record_path = dist_path / "RECORD"
     record_bytes = record_path.read_bytes()
     package = importlib.import_module("hermes_feishu_card")
+    loaded_modules = _loaded_module_evidence()
+    snapshot_after = _fd_identity(snapshot.descriptor)
+    home_after = _fd_identity(home_descriptor)
+    if (
+        snapshot_after != snapshot_before
+        or home_after != home_before
+        or _fd_identity(runtime.descriptor) != runtime_identity
+        or not _bound_directory_unchanged(snapshot.root, snapshot.descriptor)
+        or not _bound_directory_unchanged(home, home_descriptor)
+    ):
+        raise RuntimeError("fd identity changed")
     payload = {
-        "schema": 1,
+        "schema": 2,
         "python_version": [
             sys.version_info.major,
             sys.version_info.minor,
@@ -1318,7 +1575,7 @@ try:
         "distribution_version": dist.version,
         "distribution_metadata_path": str(dist_path),
         "record_path": str(record_path),
-        "record_sha256": "sha256:" + hashlib.sha256(record_bytes).hexdigest(),
+        "record_sha256": _sha256(record_bytes),
         "entrypoint_group": ep.group if ep is not None else "",
         "entrypoint_key": ep.name if ep is not None else "",
         "entrypoint_value": ep.value if ep is not None else "",
@@ -1335,99 +1592,51 @@ try:
             and getattr(loaded, "error", None) is None
         ),
         "registered_hooks": manager_hooks,
+        "loaded_modules": loaded_modules,
+        "pycache_prefix": sys.pycache_prefix,
+        "runtime_fd_identity": list(runtime_identity),
+        "snapshot_fd_identity_before": list(snapshot_before),
+        "snapshot_fd_identity_after": list(snapshot_after),
+        "home_fd_identity_before": list(home_before),
+        "home_fd_identity_after": list(home_after),
     }
     canonical = json.dumps(
         payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    payload["attestation_sha256"] = (
-        "sha256:" + hashlib.sha256(canonical).hexdigest()
-    )
+    ).encode("ascii")
+    payload["attestation_sha256"] = _sha256(canonical)
     output = json.dumps(
         payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8") + b"\n"
-    os.write(saved_stdout, output)
-    os.close(saved_stdout)
-except BaseException:
-    try:
-        os.close(saved_stdout)
-    except OSError:
-        pass
-    os._exit(70)
-'''
+    ).encode("ascii") + b"\n"
+    _write_all(output_descriptor, output)
+    os.close(output_descriptor)
 
 
-def _produce_plugin_manager_evidence(
-    hermes_root: Path,
-    runtime_python: str | Path,
-) -> tuple[_PluginManagerEvidence | None, str]:
-    try:
-        runtime = _validate_runtime_python(runtime_python)
-    except (OSError, TypeError, ValueError):
-        return None, "plugin_runtime_unverified"
-    home_name = tempfile.mkdtemp(prefix="hfc-native-hook-probe-")
-    home = Path(os.path.realpath(home_name))
-    try:
-        home_descriptor = _open_absolute_directory(home)
-        try:
-            os.mkdir("bundled-plugins", 0o700, dir_fd=home_descriptor)
-            config = b"plugins:\n  enabled:\n    - hermes-feishu-card\n  disabled: []\n"
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            config_descriptor = os.open(
-                "config.yaml", flags, 0o600, dir_fd=home_descriptor
-            )
-            try:
-                _write_all(config_descriptor, config)
-            finally:
-                os.close(config_descriptor)
-        finally:
-            os.close(home_descriptor)
-        environment = {
-            "HOME": str(home),
-            "HERMES_HOME": str(home),
-            "HERMES_BUNDLED_PLUGINS": str(home / "bundled-plugins"),
-            "HERMES_ENABLE_PROJECT_PLUGINS": "0",
-            "HERMES_SAFE_MODE": "0",
-            "HERMES_FEISHU_CARD_ENABLED": "0",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONNOUSERSITE": "1",
-        }
-        try:
-            completed = subprocess.run(
-                [str(runtime), "-I", "-c", _PLUGIN_PROBE_CHILD, str(hermes_root)],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=_PLUGIN_PROBE_TIMEOUT_SECONDS,
-                env=environment,
-                cwd=home,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None, "plugin_runtime_unverified"
-        if completed.returncode != 0:
-            return None, "plugin_runtime_unverified"
-        if (
-            type(completed.stdout) is not bytes
-            or type(completed.stderr) is not bytes
-            or completed.stderr
-            or len(completed.stdout) > _MAX_SUBPROCESS_BYTES
+def _loaded_module_evidence() -> list[dict[str, str]]:
+    evidence = []
+    for name, module in sorted(sys.modules.items()):
+        if not (
+            name == "hermes_feishu_card"
+            or name.startswith("hermes_feishu_card.")
+            or name == "hermes_cli"
+            or name.startswith("hermes_cli.")
         ):
-            return None, "plugin_evidence_invalid"
-        try:
-            payload = _decode_canonical_json_object(completed.stdout)
-        except (UnicodeDecodeError, ValueError):
-            return None, "plugin_evidence_invalid"
-        reason = _validate_plugin_manager_payload(
-            payload,
-            runtime_python=runtime,
-            hermes_root=hermes_root,
-        )
-        if reason != "verified":
-            return None, reason
-        return _PluginManagerEvidence(payload["attestation_sha256"]), "verified"
-    finally:
-        shutil.rmtree(home, ignore_errors=True)
+            continue
+        spec = getattr(module, "__spec__", None)
+        loader = getattr(spec, "loader", None)
+        origin = getattr(spec, "origin", None)
+        cached = getattr(spec, "cached", None)
+        evidence.append({
+            "name": name,
+            "loader": f"{type(loader).__module__}.{type(loader).__qualname__}",
+            "origin": origin if type(origin) is str else "",
+            "cached": cached if type(cached) is str else "",
+        })
+    return evidence
+
+
+def _fd_identity(descriptor: int) -> tuple[int, int]:
+    info = os.fstat(descriptor)
+    return info.st_dev, info.st_ino
 
 
 def _decode_canonical_json_object(raw: bytes) -> dict[str, object]:
@@ -1476,8 +1685,10 @@ def _ordinary_json_value(value: object, *, depth: int = 0) -> bool:
 def _validate_plugin_manager_payload(
     payload: object,
     *,
-    runtime_python: Path,
-    hermes_root: Path,
+    runtime: _RuntimeBinding,
+    snapshot: _SourceSnapshot,
+    home: Path,
+    home_descriptor: int,
 ) -> str:
     if (
         type(payload) is not dict
@@ -1494,10 +1705,16 @@ def _validate_plugin_manager_payload(
         "matching_enabled_count",
         "matching_loaded_count",
         "registered_hooks",
+        "loaded_modules",
+        "runtime_fd_identity",
+        "snapshot_fd_identity_before",
+        "snapshot_fd_identity_after",
+        "home_fd_identity_before",
+        "home_fd_identity_after",
     }
     if any(type(payload[name]) is not str for name in string_fields):
         return "plugin_evidence_invalid"
-    if type(payload["schema"]) is not int or payload["schema"] != 1:
+    if type(payload["schema"]) is not int or payload["schema"] != 2:
         return "plugin_evidence_invalid"
     version = payload["python_version"]
     if (
@@ -1525,6 +1742,32 @@ def _validate_plugin_manager_payload(
         or hooks != sorted(set(hooks))
     ):
         return "plugin_evidence_invalid"
+    identities = {
+        "runtime_fd_identity": runtime.identity,
+        "snapshot_fd_identity_before": snapshot.identity,
+        "snapshot_fd_identity_after": snapshot.identity,
+        "home_fd_identity_before": _fd_identity(home_descriptor),
+        "home_fd_identity_after": _fd_identity(home_descriptor),
+    }
+    for name, expected_identity in identities.items():
+        value = payload[name]
+        if (
+            type(value) is not list
+            or len(value) != 2
+            or not all(type(item) is int and item >= 0 for item in value)
+            or tuple(value) != expected_identity
+        ):
+            return "plugin_runtime_unverified"
+    pycache_prefix = home / "pycache"
+    if payload["pycache_prefix"] != str(pycache_prefix):
+        return "plugin_evidence_invalid"
+    if not _validate_loaded_module_evidence(
+        payload["loaded_modules"],
+        snapshot=snapshot,
+        purelib=runtime.purelib,
+        pycache_prefix=pycache_prefix,
+    ):
+        return "plugin_evidence_invalid"
     attestation = payload["attestation_sha256"]
     if _DIGEST_RE.fullmatch(attestation) is None:
         return "plugin_evidence_invalid"
@@ -1535,19 +1778,12 @@ def _validate_plugin_manager_payload(
     ).encode("ascii")
     if attestation != _sha256(canonical):
         return "plugin_attestation_unverified"
-    expected_prefix = runtime_python.parent.parent
-    expected_purelib = (
-        expected_prefix
-        / "lib"
-        / f"python{version[0]}.{version[1]}"
-        / "site-packages"
-    )
     if (
-        payload["executable"] != str(runtime_python)
-        or payload["prefix"] != str(expected_prefix)
-        or payload["purelib"] != str(expected_purelib)
-        or payload["platlib"] != str(expected_purelib)
-        or payload["base_prefix"] == payload["prefix"]
+        payload["executable"] != str(runtime.path)
+        or payload["prefix"] != str(runtime.prefix)
+        or payload["base_prefix"] != str(runtime.base_prefix)
+        or payload["purelib"] != str(runtime.purelib)
+        or payload["platlib"] != str(runtime.platlib)
     ):
         return "plugin_runtime_unverified"
     try:
@@ -1557,17 +1793,9 @@ def _validate_plugin_manager_payload(
             "entrypoint_origin", "package_origin",
         ):
             _coerce_absolute_path(payload[name])
-        base_prefix = _coerce_absolute_path(payload["base_prefix"])
-        base_executable = (
-            base_prefix / "bin" / f"python{version[0]}.{version[1]}"
-        )
-        if not os.path.samefile(
-            base_executable, Path(os.path.realpath(runtime_python))
-        ):
-            return "plugin_runtime_unverified"
-    except (OSError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return "plugin_runtime_unverified"
-    if payload["manager_origin"] != str(hermes_root / "hermes_cli" / "plugins.py"):
+    if payload["manager_origin"] != str(snapshot.root / "hermes_cli" / "plugins.py"):
         return "plugin_source_commit_mismatch"
     if payload["matching_entrypoint_count"] != 1:
         return "entrypoint_ambiguous"
@@ -1589,9 +1817,61 @@ def _validate_plugin_manager_payload(
         or hooks != sorted(HFC_REGISTERED_HOOKS)
     ):
         return "registration_incomplete"
-    if not _validate_installed_distribution(payload, expected_purelib):
+    if not _validate_installed_distribution(payload, runtime.purelib):
         return "entrypoint_identity_mismatch"
     return "verified"
+
+
+def _validate_loaded_module_evidence(
+    value: object,
+    *,
+    snapshot: _SourceSnapshot,
+    purelib: Path,
+    pycache_prefix: Path,
+) -> bool:
+    if type(value) is not list or not 3 <= len(value) <= 128:
+        return False
+    names = []
+    required = {
+        "hermes_feishu_card",
+        "hermes_feishu_card.hermes_plugin",
+        "hermes_feishu_card.hermes_plugin_runtime",
+        "hermes_cli",
+        "hermes_cli.plugins",
+    }
+    for item in value:
+        if (
+            type(item) is not dict
+            or set(item) != {"name", "loader", "origin", "cached"}
+            or not all(type(key) is str for key in item)
+            or not all(type(item[key]) is str for key in item)
+        ):
+            return False
+        name = item["name"]
+        names.append(name)
+        if item["loader"] != "_frozen_importlib_external.SourceFileLoader":
+            return False
+        try:
+            origin = _coerce_absolute_path(item["origin"])
+            cached = _coerce_absolute_path(item["cached"])
+            cached.relative_to(pycache_prefix)
+        except (TypeError, ValueError):
+            return False
+        if origin.suffix != ".py" or cached.suffix != ".pyc":
+            return False
+        if name == "hermes_feishu_card" or name.startswith("hermes_feishu_card."):
+            try:
+                origin.relative_to(purelib / "hermes_feishu_card")
+            except ValueError:
+                return False
+        elif name == "hermes_cli" or name.startswith("hermes_cli."):
+            try:
+                origin.relative_to(snapshot.root / "hermes_cli")
+            except ValueError:
+                return False
+        else:
+            return False
+    return names == sorted(set(names)) and required <= set(names)
 
 
 def _validate_installed_distribution(
@@ -1674,6 +1954,26 @@ def _validate_installed_distribution(
             metadata_relative: metadata_path / "METADATA",
             entry_points_relative: entry_points_path,
         }
+        loaded_modules = payload.get("loaded_modules")
+        if type(loaded_modules) is not list:
+            return False
+        for item in loaded_modules:
+            if (
+                type(item) is not dict
+                or type(item.get("name")) is not str
+                or type(item.get("origin")) is not str
+                or not (
+                    item["name"] == "hermes_feishu_card"
+                    or item["name"].startswith("hermes_feishu_card.")
+                )
+            ):
+                continue
+            origin = _coerce_absolute_path(item["origin"])
+            try:
+                relative = origin.relative_to(purelib).as_posix()
+            except ValueError:
+                return False
+            critical[relative] = origin
         if not set(critical) <= set(records) or record_relative not in records:
             return False
         if records[record_relative] != ("", ""):
@@ -1725,8 +2025,14 @@ def _write_all(descriptor: int, data: bytes) -> None:
         view = view[written:]
 
 
-def _validate_runtime_python(value: str | Path) -> Path:
+def _validate_runtime_python(value: str | Path) -> _RuntimeBinding:
     runtime = _coerce_absolute_path(value)
+    if (
+        type(sys.executable) is not str
+        or runtime != _coerce_absolute_path(sys.executable)
+        or Path(sys.prefix) != runtime.parent.parent
+    ):
+        raise ValueError("probe parent is not the bound runtime")
     parent_descriptor = _open_absolute_directory(runtime.parent)
     try:
         info = os.stat(runtime.name, dir_fd=parent_descriptor, follow_symlinks=False)
@@ -1736,46 +2042,292 @@ def _validate_runtime_python(value: str | Path) -> Path:
         os.close(parent_descriptor)
     resolved = Path(os.path.realpath(runtime))
     descriptor = _open_absolute_regular_file(resolved)
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o111 == 0:
-            raise ValueError("invalid runtime executable")
-    finally:
+    info = os.fstat(descriptor)
+    purelib = _coerce_absolute_path(sysconfig.get_path("purelib"))
+    platlib = _coerce_absolute_path(sysconfig.get_path("platlib"))
+    base_prefix = _coerce_absolute_path(sys.base_prefix)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_mode & 0o111 == 0
+        or purelib != Path(sys.prefix) / "lib" / (
+            f"python{sys.version_info.major}.{sys.version_info.minor}"
+        ) / "site-packages"
+        or platlib != purelib
+    ):
         os.close(descriptor)
-    return runtime
+        raise ValueError("invalid runtime executable")
+    return _RuntimeBinding(
+        path=runtime,
+        descriptor=descriptor,
+        identity=(info.st_dev, info.st_ino),
+        prefix=Path(sys.prefix),
+        base_prefix=base_prefix,
+        purelib=purelib,
+        platlib=platlib,
+    )
 
 
 def _git_head(root: Path) -> str:
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD"],
-            cwd=root,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=2,
+        result = _run_trusted_git(
+            root, ["rev-parse", "--verify", "HEAD"], timeout=3
         )
     except (OSError, subprocess.SubprocessError):
         return ""
-    value = result.stdout.strip()
+    if type(result.stdout) is not bytes:
+        return ""
+    try:
+        value = result.stdout.decode("ascii").strip()
+    except UnicodeDecodeError:
+        return ""
     return value if _COMMIT_RE.fullmatch(value) else ""
 
 
 def _git_source_state(root: Path) -> tuple[str, bool]:
     commit = _git_head(root)
     try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-            cwd=root,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=3,
+        result = _run_trusted_git(
+            root,
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+            timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
         return commit, False
     return commit, type(result.stdout) is bytes and result.stdout == b""
+
+
+def _run_trusted_git(
+    root: Path,
+    arguments: list[str],
+    *,
+    timeout: float,
+    stdout: object = subprocess.PIPE,
+) -> subprocess.CompletedProcess:
+    if (
+        type(arguments) is not list
+        or not arguments
+        or not all(type(item) is str and item for item in arguments)
+    ):
+        raise ValueError("invalid git arguments")
+    git_descriptor = _open_absolute_regular_file(_TRUSTED_GIT)
+    try:
+        info = os.fstat(git_descriptor)
+        if info.st_mode & 0o111 == 0:
+            raise ValueError("trusted git is not executable")
+    finally:
+        os.close(git_descriptor)
+    environment = {
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "HOME": os.devnull,
+        "PATH": "/usr/bin:/bin",
+    }
+    return subprocess.run(
+        [
+            str(_TRUSTED_GIT),
+            "--no-optional-locks",
+            "--no-replace-objects",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-C",
+            str(root),
+            *arguments,
+        ],
+        check=True,
+        stdout=stdout,
+        stderr=subprocess.DEVNULL,
+        timeout=timeout,
+        env=environment,
+    )
+
+
+def _build_trusted_source_snapshot(
+    root: Path,
+    expected_commit: str,
+    provenance: FixedTagNativeHookProvenance,
+) -> _SourceSnapshot:
+    tree_result = _run_trusted_git(
+        root,
+        ["ls-tree", "-r", "-z", expected_commit],
+        timeout=10,
+    )
+    expected_tree = _parse_git_tree(tree_result.stdout)
+    container = Path(os.path.realpath(tempfile.mkdtemp(
+        prefix="hfc-fixed-source-snapshot-"
+    )))
+    snapshot_root = container / "source"
+    snapshot_root.mkdir(mode=0o700)
+    archive_path = container / "source.tar"
+    archive_descriptor = _open_new_regular_file(
+        archive_path, 0o600, readable=True
+    )
+    try:
+        _run_trusted_git(
+            root,
+            ["archive", "--format=tar", expected_commit],
+            timeout=30,
+            stdout=archive_descriptor,
+        )
+        os.lseek(archive_descriptor, 0, os.SEEK_SET)
+        extracted = _extract_and_verify_git_archive(
+            archive_descriptor, snapshot_root, expected_tree
+        )
+        if extracted != set(expected_tree):
+            raise ValueError("git snapshot paths mismatch")
+    except BaseException:
+        os.close(archive_descriptor)
+        shutil.rmtree(container, ignore_errors=True)
+        raise
+    os.close(archive_descriptor)
+    archive_path.unlink()
+    _make_tree_read_only(snapshot_root)
+    descriptor = _open_absolute_directory(snapshot_root)
+    info = os.fstat(descriptor)
+    snapshot = _SourceSnapshot(
+        root=snapshot_root,
+        descriptor=descriptor,
+        identity=(info.st_dev, info.st_ino),
+        container=container,
+    )
+    try:
+        _verify_snapshot_provenance(snapshot, provenance)
+        return snapshot
+    except BaseException:
+        snapshot.close()
+        raise
+
+
+def _parse_git_tree(raw: object) -> dict[str, tuple[str, str]]:
+    if type(raw) is not bytes or not raw or len(raw) > 16 * 1024 * 1024:
+        raise ValueError("invalid git tree")
+    result = {}
+    for record in raw.rstrip(b"\0").split(b"\0"):
+        try:
+            metadata, path_raw = record.split(b"\t", 1)
+            mode_raw, kind_raw, oid_raw = metadata.split(b" ", 2)
+            path = path_raw.decode("utf-8")
+            mode = mode_raw.decode("ascii")
+            kind = kind_raw.decode("ascii")
+            oid = oid_raw.decode("ascii")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError("invalid git tree") from exc
+        _validate_relative_path(path)
+        if (
+            kind != "blob"
+            or mode not in {"100644", "100755"}
+            or _COMMIT_RE.fullmatch(oid) is None
+            or path in result
+        ):
+            raise ValueError("unsupported git tree entry")
+        result[path] = (mode, oid)
+    return result
+
+
+def _extract_and_verify_git_archive(
+    archive_descriptor: int,
+    snapshot_root: Path,
+    expected_tree: dict[str, tuple[str, str]],
+) -> set[str]:
+    extracted = set()
+    total = 0
+    with os.fdopen(os.dup(archive_descriptor), "rb") as archive_file:
+        with tarfile.open(fileobj=archive_file, mode="r:") as archive:
+            for member in archive:
+                path = member.name.rstrip("/")
+                _validate_relative_path(path)
+                if member.isdir():
+                    _ensure_private_directory(snapshot_root, path)
+                    continue
+                if (
+                    not member.isfile()
+                    or path not in expected_tree
+                    or path in extracted
+                    or member.size < 0
+                    or member.size > _MAX_ARCHIVE_MEMBER_BYTES
+                ):
+                    raise ValueError("invalid git archive member")
+                total += member.size
+                if total > _MAX_ARCHIVE_TOTAL_BYTES:
+                    raise ValueError("git archive exceeds bound")
+                source = archive.extractfile(member)
+                if source is None:
+                    raise ValueError("missing git archive data")
+                destination = snapshot_root / PurePosixPath(path)
+                destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                data = source.read(_MAX_ARCHIVE_MEMBER_BYTES + 1)
+                if len(data) != member.size:
+                    raise ValueError("git archive member size mismatch")
+                expected_mode, expected_oid = expected_tree[path]
+                oid = hashlib.sha1(
+                    f"blob {len(data)}\0".encode("ascii") + data
+                ).hexdigest()
+                if oid != expected_oid:
+                    raise ValueError("git archive blob mismatch")
+                descriptor = _open_new_regular_file(
+                    destination, 0o500 if expected_mode == "100755" else 0o400
+                )
+                try:
+                    _write_all(descriptor, data)
+                finally:
+                    os.close(descriptor)
+                extracted.add(path)
+    return extracted
+
+
+def _open_new_regular_file(
+    path: Path, mode: int, *, readable: bool = False
+) -> int:
+    parent = _open_absolute_directory(path.parent)
+    try:
+        flags = (os.O_RDWR if readable else os.O_WRONLY) | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        return os.open(path.name, flags, mode, dir_fd=parent)
+    finally:
+        os.close(parent)
+
+
+def _ensure_private_directory(root: Path, relative_path: str) -> None:
+    current = root
+    for part in PurePosixPath(relative_path).parts:
+        current = current / part
+        try:
+            current.mkdir(mode=0o700)
+        except FileExistsError:
+            info = current.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise ValueError("invalid snapshot directory")
+
+
+def _make_tree_read_only(root: Path) -> None:
+    for current, directories, files in os.walk(root, topdown=False):
+        for name in files:
+            path = Path(current) / name
+            mode = path.stat(follow_symlinks=False).st_mode
+            path.chmod(0o500 if mode & 0o111 else 0o400, follow_symlinks=False)
+        for name in directories:
+            (Path(current) / name).chmod(0o500, follow_symlinks=False)
+    root.chmod(0o500, follow_symlinks=False)
+
+
+def _verify_snapshot_provenance(
+    snapshot: _SourceSnapshot,
+    provenance: FixedTagNativeHookProvenance,
+) -> None:
+    for source in provenance.sources:
+        data = _read_bound_relative_file(
+            snapshot.descriptor, source.relative_path, _MAX_SOURCE_BYTES
+        )
+        if (
+            _sha256(data) != source.sha256
+            or not _anchors_match_source(data, source.anchors)
+        ):
+            raise ValueError("snapshot provenance mismatch")
+    if not _bound_directory_unchanged(snapshot.root, snapshot.descriptor):
+        raise ValueError("snapshot identity changed")
 
 
 def _coerce_absolute_path(value: object) -> Path:

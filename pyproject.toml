@@ -48,3 +48,9 @@ pythonpath = ["."]
 
 [tool.setuptools.packages.find]
 include = ["hermes_feishu_card*"]
+
+[tool.setuptools.package-data]
+"hermes_feishu_card.install._native_hook_provenance" = [
+  "provenance.json",
+  "slices/*.py",
+]

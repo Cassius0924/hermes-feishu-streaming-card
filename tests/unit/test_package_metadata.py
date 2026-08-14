@@ -48,3 +48,17 @@ def test_declares_exact_hermes_plugin_entry_point():
     assert pyproject["project"]["entry-points"]["hermes_agent.plugins"] == {
         "hermes-feishu-card": "hermes_feishu_card.hermes_plugin"
     }
+
+
+def test_native_hook_provenance_is_packaged_with_regular_wheels():
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    package_data = pyproject["tool"]["setuptools"]["package-data"]
+
+    assert package_data[
+        "hermes_feishu_card.install._native_hook_provenance"
+    ] == ["provenance.json", "slices/*.py"]
+    resource_root = (
+        ROOT / "hermes_feishu_card" / "install" / "_native_hook_provenance"
+    )
+    assert (resource_root / "provenance.json").is_file()
+    assert len(tuple((resource_root / "slices").glob("*.py"))) == 24
