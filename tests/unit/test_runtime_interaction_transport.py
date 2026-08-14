@@ -566,3 +566,144 @@ def test_descriptor_expiring_while_body_read_is_blocked_never_calls_resolver():
     assert b" 409 " in response
     assert called.is_set() is False
     runtime.close()
+
+
+def test_partial_request_line_threads_are_capacity_bounded_and_close_is_truthful():
+    runtime = active_runtime()
+    assert runtime.start_runtime_interaction_listener(b"i" * 32)
+    listener = runtime._runtime_interaction_listener
+    listener._JOIN_SECONDS = 0.05
+    listener._MAX_ACTIVE_REQUESTS = 2
+    port = int(listener.resolve_url.split(":")[2].split("/")[0])
+    before = {
+        thread.ident
+        for thread in __import__("threading").enumerate()
+        if "process_request_thread" in thread.name
+    }
+    sockets = []
+    for _index in range(5):
+        sock = socket.create_connection(("127.0.0.1", port), timeout=1.0)
+        sock.sendall(b"POST /runtime/interactions")
+        sockets.append(sock)
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        spawned = [
+            thread
+            for thread in __import__("threading").enumerate()
+            if "process_request_thread" in thread.name
+            and thread.ident not in before
+            and thread.is_alive()
+        ]
+        if len(spawned) >= 2:
+            break
+        time.sleep(0.01)
+    assert len(spawned) <= 2
+
+    started = time.monotonic()
+    runtime.close()
+    assert time.monotonic() - started < 0.3
+    snapshot = runtime.runtime_interaction_listener_snapshot()
+    still_alive = [thread for thread in spawned if thread.is_alive()]
+    assert snapshot["poisoned"] is bool(still_alive)
+    assert snapshot["accepting"] is False
+
+    for sock in sockets:
+        sock.close()
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and any(
+        thread.is_alive() for thread in spawned
+    ):
+        time.sleep(0.01)
+    assert not any(thread.is_alive() for thread in spawned)
+
+
+@pytest.mark.parametrize("cleanup", ("reset", "finalize"))
+def test_timed_out_session_cleanup_is_deferred_without_reopening_admission(
+    cleanup, monkeypatch
+):
+    runtime = active_runtime()
+    runtime._MAX_ENTRIES = 1
+    args = interaction_args(object())
+    entered = Event()
+    release = Event()
+
+    def blocking(_choice):
+        entered.set()
+        assert release.wait(timeout=1.0)
+        return True
+
+    assert runtime.register_patch_interaction(*args)
+    assert runtime.start_runtime_interaction_listener(b"i" * 32)
+    descriptor = runtime.arm_patch_interaction_descriptor(*args, blocking)
+    result = []
+    callback = Thread(target=lambda: result.append(post(
+        descriptor["resolve_url"], b"i" * 32, callback_body(descriptor)
+    )))
+    callback.start()
+    assert entered.wait(timeout=0.5)
+    monkeypatch.setattr(runtime, "_wait_interaction_resolutions", lambda _events: False)
+    if cleanup == "reset":
+        runtime.handle_on_session_reset(old_session_id="session-1")
+    else:
+        runtime.handle_on_session_finalize(session_id="session-1")
+    assert runtime.resolve_runtime_interaction_payload(callback_body(descriptor)) is False
+
+    release.set()
+    callback.join(timeout=1.0)
+    assert result == [(200, {"ok": True, "status": "resolved"})]
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and runtime.turn_state("turn-1") is not None:
+        time.sleep(0.01)
+    assert runtime.turn_state("turn-1") is None
+    assert runtime._interaction_cleanup_turns == set()
+
+    assert runtime.bind_ingress_from_values(
+        "second", "fallback_default", "session-2", "gateway-session-2",
+        "generation-2", "oc_2", "om_2", "om_2", "",
+    )
+    runtime.handle_pre_llm_call(
+        session_id="session-2", turn_id="turn-2", platform="feishu"
+    )
+    assert runtime.turn_state("turn-2") is plugin_runtime.TurnState.CARD_ACTIVE
+    runtime.close()
+
+
+def test_timed_out_terminal_cleanup_clears_without_replaying_terminal(
+    monkeypatch,
+):
+    runtime = active_runtime()
+    args = interaction_args(object())
+    entered = Event()
+    release = Event()
+
+    def blocking(_choice):
+        entered.set()
+        assert release.wait(timeout=1.0)
+        return True
+
+    assert runtime.register_patch_interaction(*args)
+    assert runtime.start_runtime_interaction_listener(b"i" * 32)
+    descriptor = runtime.arm_patch_interaction_descriptor(*args, blocking)
+    result = []
+    callback = Thread(target=lambda: result.append(post(
+        descriptor["resolve_url"], b"i" * 32, callback_body(descriptor)
+    )))
+    callback.start()
+    assert entered.wait(timeout=0.5)
+    runtime.handle_post_llm_call(turn_id="turn-1", assistant_response="answer")
+    monkeypatch.setattr(runtime, "_wait_interaction_resolutions", lambda _events: False)
+    runtime.handle_on_session_end(
+        turn_id="turn-1", completed=True, failed=False, interrupted=False
+    )
+    assert "turn-1" not in runtime._terminal_records
+
+    release.set()
+    callback.join(timeout=1.0)
+    assert result == [(200, {"ok": True, "status": "resolved"})]
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and runtime.turn_state("turn-1") is not None:
+        time.sleep(0.01)
+    assert runtime.turn_state("turn-1") is None
+    assert runtime.take_terminal_record("turn-1") is None
+    assert runtime._interaction_cleanup_turns == set()
+    runtime.close()

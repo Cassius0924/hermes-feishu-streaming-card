@@ -31,11 +31,43 @@ class _RuntimeInteractionServer(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
 
+    def process_request(self, request, client_address) -> None:
+        listener = self.listener  # type: ignore[attr-defined]
+        try:
+            request.settimeout(listener._REQUEST_SOCKET_TIMEOUT_SECONDS)
+        except Exception:
+            self.shutdown_request(request)
+            return None
+        if not listener._begin_handler():
+            self.shutdown_request(request)
+            return None
+        thread = threading.Thread(
+            target=self.process_request_thread,
+            args=(request, client_address),
+            name="hfc-runtime-interaction-process_request_thread",
+            daemon=True,
+        )
+        listener._register_request_thread(thread)
+        try:
+            thread.start()
+        except Exception:
+            listener._abort_handler_start(thread)
+            self.shutdown_request(request)
+        return None
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.listener._end_handler()  # type: ignore[attr-defined]
+
 
 class RuntimeInteractionListener:
     """A literal-loopback, authenticated callback endpoint owned by one runtime."""
 
     _JOIN_SECONDS = 1.0
+    _REQUEST_SOCKET_TIMEOUT_SECONDS = 0.5
+    _MAX_ACTIVE_REQUESTS = 32
 
     def __init__(
         self,
@@ -54,6 +86,7 @@ class RuntimeInteractionListener:
         self._close_complete = threading.Event()
         self._handlers_drained = threading.Condition(self._lock)
         self._active_handlers = 0
+        self._request_threads: set[threading.Thread] = set()
         self._accepting = False
         self._closing = False
         self._poisoned = False
@@ -149,10 +182,29 @@ class RuntimeInteractionListener:
 
     def _begin_handler(self) -> bool:
         with self._lock:
-            if not self._accepting or self._closing or self._poisoned:
+            self._request_threads = {
+                thread for thread in self._request_threads if thread.is_alive()
+            }
+            if (
+                not self._accepting
+                or self._closing
+                or self._poisoned
+                or self._active_handlers >= self._MAX_ACTIVE_REQUESTS
+            ):
                 return False
             self._active_handlers += 1
             return True
+
+    def _register_request_thread(self, thread: threading.Thread) -> None:
+        with self._lock:
+            self._request_threads.add(thread)
+
+    def _abort_handler_start(self, thread: threading.Thread) -> None:
+        with self._lock:
+            self._request_threads.discard(thread)
+            self._active_handlers -= 1
+            if self._active_handlers == 0:
+                self._handlers_drained.notify_all()
 
     def _end_handler(self) -> None:
         with self._lock:
@@ -197,8 +249,24 @@ class RuntimeInteractionListener:
                     self._handlers_drained.wait(
                         timeout=max(0.0, deadline - time.monotonic())
                     )
+                request_threads = tuple(self._request_threads)
+            for request_thread in request_threads:
+                if request_thread is threading.current_thread():
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                request_thread.join(timeout=remaining)
+            with self._lock:
+                self._request_threads = {
+                    value for value in self._request_threads if value.is_alive()
+                }
                 alive = bool(thread is not None and thread.is_alive())
-                poisoned = alive or self._active_handlers != 0
+                poisoned = (
+                    alive
+                    or self._active_handlers != 0
+                    or bool(self._request_threads)
+                )
                 self._poisoned = poisoned
                 if not poisoned:
                     self._server = None
@@ -216,13 +284,7 @@ class _RuntimeInteractionHandler(BaseHTTPRequestHandler):
         return self.server.listener  # type: ignore[attr-defined]
 
     def do_POST(self) -> None:
-        if not self._listener._begin_handler():
-            self._respond(503, _REJECTED)
-            return
-        try:
-            self._do_exact_post()
-        finally:
-            self._listener._end_handler()
+        self._do_exact_post()
 
     def _do_exact_post(self) -> None:
         if self.path != RUNTIME_INTERACTION_PATH:
@@ -281,13 +343,7 @@ class _RuntimeInteractionHandler(BaseHTTPRequestHandler):
         self._respond(status, response)
 
     def do_GET(self) -> None:
-        if not self._listener._begin_handler():
-            self._respond(503, _REJECTED)
-            return
-        try:
-            self._respond(405, _REJECTED)
-        finally:
-            self._listener._end_handler()
+        self._respond(405, _REJECTED)
 
     def do_HEAD(self) -> None:
         self.do_GET()

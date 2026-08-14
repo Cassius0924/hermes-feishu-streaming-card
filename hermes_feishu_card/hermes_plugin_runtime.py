@@ -703,6 +703,7 @@ class PluginRuntime:
             str, _PatchInteraction | _ConsumedPatchInteraction
         ] = OrderedDict()
         self._interaction_cleanup_turns: set[str] = set()
+        self._deferred_interaction_cleanup_turns: set[str] = set()
         self._runtime_id = secrets.token_hex(32)
         self._runtime_interaction_token_root = secrets.token_bytes(32)
         self._runtime_interaction_listener: RuntimeInteractionListener | None = None
@@ -1192,6 +1193,8 @@ class PluginRuntime:
                 resolved = True
         if completion is not None:
             completion.set()
+        if state is not None:
+            self._complete_deferred_interaction_cleanup(state.turn_digest)
         return resolved
 
     def runtime_interaction_listener_snapshot(self) -> dict[str, object]:
@@ -1710,6 +1713,7 @@ class PluginRuntime:
             self._started_transports.clear()
             self._patch_interactions.clear()
             self._interaction_cleanup_turns.clear()
+            self._deferred_interaction_cleanup_turns.clear()
             self._registry.clear()
         self._wait_started_transports(list(started))
         for coordinator in coordinators:
@@ -2079,6 +2083,11 @@ class PluginRuntime:
                 turn_digests
             )
         if not self._wait_interaction_resolutions(resolution_events):
+            with self._lock:
+                self._registry.remove_session(session_id)
+                self._deferred_interaction_cleanup_turns.update(turn_digests)
+            for turn_digest in turn_digests:
+                self._complete_deferred_interaction_cleanup(turn_digest)
             return
         with self._lock:
             self._expire_locked(self._now())
@@ -2130,6 +2139,7 @@ class PluginRuntime:
             if state.turn_digest == turn_digest:
                 del self._patch_interactions[key]
         self._interaction_cleanup_turns.discard(turn_digest)
+        self._deferred_interaction_cleanup_turns.discard(turn_digest)
         if not keep_disposition:
             self._terminal_records.pop(turn_id, None)
             self._dispositions.pop(turn_id, None)
@@ -2165,7 +2175,45 @@ class PluginRuntime:
         with self._lock:
             self._interaction_cleanup_turns.add(turn_digest)
             events = self._resolution_events_for_turns_locked({turn_digest})
-        return self._wait_interaction_resolutions(events)
+        if self._wait_interaction_resolutions(events):
+            return True
+        with self._lock:
+            self._deferred_interaction_cleanup_turns.add(turn_digest)
+        self._complete_deferred_interaction_cleanup(turn_digest)
+        return False
+
+    def _complete_deferred_interaction_cleanup(self, turn_digest: str) -> None:
+        coordinator: TurnEventCoordinator | None = None
+        started: list[_StartedTransport] = []
+        with self._lock:
+            if turn_digest not in self._deferred_interaction_cleanup_turns:
+                return None
+            if self._resolution_events_for_turns_locked({turn_digest}):
+                return None
+            turn_id = next(
+                (
+                    value
+                    for value in self._turns
+                    if self._patch_turn_digest(value) == turn_digest
+                ),
+                None,
+            )
+            self._deferred_interaction_cleanup_turns.discard(turn_digest)
+            if turn_id is None:
+                self._interaction_cleanup_turns.discard(turn_digest)
+                return None
+            turn = self._turns.get(turn_id)
+            if turn is not None:
+                self._registry.remove_session(turn.ingress.session_id)
+            coordinator = self._cleanup_turn_locked(
+                turn_id, keep_disposition=False, started_waits=started
+            )
+            if turn is not None:
+                turn.finish()
+        self._wait_started_transports(started)
+        if coordinator is not None:
+            coordinator.close()
+        return None
 
     def _resolution_events_for_turns_locked(
         self, turn_digests: set[str]
@@ -2428,15 +2476,11 @@ class _ProductionBootstrap:
         global _ACTIVE_RUNTIME
         if self._closed:
             return True
-        runtime_close_failed = False
         try:
             self.runtime.close()
         except Exception:
-            runtime_close_failed = True
-        if (
-            not runtime_close_failed
-            and self.runtime.runtime_interaction_listener_snapshot()["poisoned"] is True
-        ):
+            return False
+        if self.runtime.runtime_interaction_listener_snapshot()["poisoned"] is True:
             return False
         self._closed = True
         with _ACTIVE_RUNTIME_LOCK:
@@ -2540,17 +2584,19 @@ def bootstrap_plugin_runtime(ctx: Any) -> None:
                 _resume_paused_bootstrap(paused_current)
                 return None
             bootstrap = _ProductionBootstrap(ctx, gate, runtime, lease, config)
+            if current is not None and not current.close():
+                _close_runtime_and_lease(runtime, lease)
+                candidate_runtime = None
+                candidate_lease = None
+                _resume_paused_bootstrap(paused_current)
+                return None
+            paused_current = None
             with _ACTIVE_RUNTIME_LOCK:
                 _ACTIVE_RUNTIME = runtime
                 gate.set_runtime(runtime)
-                if current is not None and current.gate is not gate:
-                    current.gate.clear_runtime(current.runtime)
             _PRODUCTION_BOOTSTRAP = bootstrap
             candidate_runtime = None
             candidate_lease = None
-            if current is not None:
-                current.close()
-            paused_current = None
         return None
     except Exception:
         if candidate_runtime is not None:

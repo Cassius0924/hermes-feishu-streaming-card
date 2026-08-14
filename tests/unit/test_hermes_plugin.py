@@ -664,7 +664,7 @@ def test_active_plugin_runtime_getter_uses_active_runtime_lock(monkeypatch):
     assert completed.is_set()
 
 
-def test_committed_replacement_is_not_rolled_back_by_old_teardown_exceptions(
+def test_replacement_teardown_exception_rolls_back_candidate_and_restores_old(
     monkeypatch,
 ):
     monkeypatch.setenv(
@@ -696,6 +696,7 @@ def test_committed_replacement_is_not_rolled_back_by_old_teardown_exceptions(
     hermes_plugin.register(first)
     old_runtime = plugin_runtime.active_plugin_runtime()
     old_close_calls = []
+    real_old_close = old_runtime.close
 
     def fail_old_close():
         old_close_calls.append(True)
@@ -704,20 +705,66 @@ def test_committed_replacement_is_not_rolled_back_by_old_teardown_exceptions(
     monkeypatch.setattr(old_runtime, "close", fail_old_close)
 
     assert hermes_plugin.register(second) is None
-    new_runtime = plugin_runtime.active_plugin_runtime()
-    assert new_runtime is not None and new_runtime is not old_runtime
-    assert plugin_runtime._PRODUCTION_BOOTSTRAP.runtime is new_runtime
+    active_runtime = plugin_runtime.active_plugin_runtime()
+    assert active_runtime is old_runtime
+    assert plugin_runtime._PRODUCTION_BOOTSTRAP.runtime is old_runtime
     assert old_close_calls == [True]
-    assert old_lease.close_calls == 1
-    assert new_lease.close_calls == 0
+    assert old_lease.close_calls == 0
+    assert new_lease.close_calls == 1
+    assert old_runtime.runtime_interaction_listener_snapshot()["accepting"] is True
     called = []
     monkeypatch.setattr(
-        new_runtime,
+        old_runtime,
         "handle_pre_llm_call",
         lambda **kwargs: called.append(kwargs),
     )
-    assert second.registered["pre_llm_call"](turn_id="turn-new") is None
-    assert called == [{"turn_id": "turn-new"}]
+    assert first.registered["pre_llm_call"](turn_id="turn-old") is None
+    assert called == [{"turn_id": "turn-old"}]
+    monkeypatch.setattr(old_runtime, "close", real_old_close)
+
+
+def test_replacement_false_close_rolls_back_ready_candidate_and_resumes_old(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_EVENT_URL", "http://127.0.0.1:18765/events"
+    )
+    monkeypatch.setattr(
+        plugin_runtime, "read_transport_root_secret", lambda: b"r" * 32
+    )
+    monkeypatch.setattr(plugin_runtime.atexit, "register", lambda _callback: None)
+
+    class Lease:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    leases = [Lease(), Lease()]
+    pending = iter(leases)
+    monkeypatch.setattr(
+        plugin_runtime, "acquire_runtime_control", lambda **_kwargs: next(pending)
+    )
+    first = CountingPluginContext()
+    second = CountingPluginContext()
+    hermes_plugin.register(first)
+    old_bootstrap = plugin_runtime._PRODUCTION_BOOTSTRAP
+    old_runtime = plugin_runtime.active_plugin_runtime()
+    real_close = old_bootstrap.close
+    close_calls = []
+    monkeypatch.setattr(
+        old_bootstrap, "close", lambda: close_calls.append(True) or False
+    )
+
+    assert hermes_plugin.register(second) is None
+    assert close_calls == [True]
+    assert plugin_runtime.active_plugin_runtime() is old_runtime
+    assert plugin_runtime._PRODUCTION_BOOTSTRAP is old_bootstrap
+    assert leases[0].close_calls == 0
+    assert leases[1].close_calls == 1
+    assert old_runtime.runtime_interaction_listener_snapshot()["accepting"] is True
+    monkeypatch.setattr(old_bootstrap, "close", real_close)
 
 
 def test_session_callbacks_do_not_close_process_runtime_or_heartbeat(monkeypatch):
