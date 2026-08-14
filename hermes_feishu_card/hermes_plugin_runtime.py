@@ -711,6 +711,7 @@ class PluginRuntime:
         self._closed = False
         self._close_lock = Lock()
         self._close_started = False
+        self._close_failed = False
         self._close_complete = threading.Event()
 
     def bind_ingress_from_values(
@@ -977,6 +978,7 @@ class PluginRuntime:
                 if (
                     type(state) is not _PatchInteraction
                     or state.pending_handle is not pending_handle
+                    or state.turn_digest in self._interaction_cleanup_turns
                     or state.selected_value is None
                     or state.resolving_value is not None
                 ):
@@ -1683,7 +1685,13 @@ class PluginRuntime:
                 self._close_started = True
                 wait_for_close = False
         if wait_for_close:
-            self._close_complete.wait(timeout=2.0)
+            completed = self._close_complete.wait(timeout=2.0)
+            with self._close_lock:
+                close_failed = self._close_failed
+            if not completed or close_failed:
+                raise RuntimeError(
+                    "runtime interaction listener close failed"
+                ) from None
             return None
         with self._lock:
             self._closed = True
@@ -1692,7 +1700,16 @@ class PluginRuntime:
             try:
                 listener.close()
             except Exception:
-                pass
+                try:
+                    listener.mark_close_failed()
+                except Exception:
+                    pass
+                with self._close_lock:
+                    self._close_failed = True
+                self._close_complete.set()
+                raise RuntimeError(
+                    "runtime interaction listener close failed"
+                ) from None
             if listener.snapshot()["poisoned"] is True:
                 self._close_complete.set()
                 return None

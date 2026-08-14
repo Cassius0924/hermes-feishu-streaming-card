@@ -767,6 +767,65 @@ def test_replacement_false_close_rolls_back_ready_candidate_and_resumes_old(
     monkeypatch.setattr(old_bootstrap, "close", real_close)
 
 
+def test_listener_close_exception_preserves_old_bootstrap_and_blocks_future_changes(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "HERMES_FEISHU_CARD_EVENT_URL", "http://127.0.0.1:18765/events"
+    )
+    monkeypatch.setattr(
+        plugin_runtime, "read_transport_root_secret", lambda: b"r" * 32
+    )
+    monkeypatch.setattr(plugin_runtime.atexit, "register", lambda _callback: None)
+
+    class Lease:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    leases = [Lease(), Lease()]
+    pending = iter(leases)
+    monkeypatch.setattr(
+        plugin_runtime, "acquire_runtime_control", lambda **_kwargs: next(pending)
+    )
+    first = CountingPluginContext()
+    second = CountingPluginContext()
+    hermes_plugin.register(first)
+    old_bootstrap = plugin_runtime._PRODUCTION_BOOTSTRAP
+    old_runtime = plugin_runtime.active_plugin_runtime()
+    listener = old_runtime._runtime_interaction_listener
+    real_listener_close = listener.close
+    monkeypatch.setattr(
+        listener,
+        "close",
+        lambda: (_ for _ in ()).throw(RuntimeError("PRIVATE-CLOSE-CANARY")),
+    )
+
+    assert hermes_plugin.register(second) is None
+    assert plugin_runtime.active_plugin_runtime() is old_runtime
+    assert plugin_runtime._PRODUCTION_BOOTSTRAP is old_bootstrap
+    assert old_bootstrap.gate._runtime is old_runtime
+    assert leases[0].close_calls == 0
+    assert leases[1].close_calls == 1
+    assert old_runtime.runtime_interaction_listener_snapshot() == {
+        "accepting": False,
+        "poisoned": True,
+        "worker_name": listener.snapshot()["worker_name"],
+    }
+
+    monkeypatch.setenv("HERMES_FEISHU_CARD_ENABLED", "0")
+    assert hermes_plugin.register(first) is None
+    assert plugin_runtime._PRODUCTION_BOOTSTRAP is old_bootstrap
+    assert plugin_runtime.active_plugin_runtime() is old_runtime
+    assert leases[0].close_calls == 0
+
+    monkeypatch.setattr(listener, "close", real_listener_close)
+    listener.close()
+    monkeypatch.setattr(old_runtime, "close", lambda: None)
+
+
 def test_session_callbacks_do_not_close_process_runtime_or_heartbeat(monkeypatch):
     monkeypatch.setenv(
         "HERMES_FEISHU_CARD_EVENT_URL", "http://127.0.0.1:18765/events"

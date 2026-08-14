@@ -159,6 +159,13 @@ class RuntimeInteractionListener:
             self._accepting = True
             return True
 
+    def mark_close_failed(self) -> None:
+        """Reject new admission while retaining the authoritative live owner."""
+        with self._lock:
+            self._accepting = False
+            self._poisoned = True
+        return None
+
     def verify_and_resolve(
         self,
         headers: Mapping[str, str],

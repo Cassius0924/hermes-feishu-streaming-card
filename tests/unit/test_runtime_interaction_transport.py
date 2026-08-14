@@ -707,3 +707,126 @@ def test_timed_out_terminal_cleanup_clears_without_replaying_terminal(
     assert runtime.take_terminal_record("turn-1") is None
     assert runtime._interaction_cleanup_turns == set()
     runtime.close()
+
+
+def test_listener_close_exception_is_sanitized_and_preserves_authoritative_state(
+    monkeypatch,
+):
+    runtime = active_runtime()
+    args = interaction_args(object())
+    assert runtime.register_patch_interaction(*args)
+    assert runtime.start_runtime_interaction_listener(b"i" * 32)
+    listener = runtime._runtime_interaction_listener
+    real_close = listener.close
+    monkeypatch.setattr(
+        listener,
+        "close",
+        lambda: (_ for _ in ()).throw(RuntimeError("PRIVATE-CLOSE-CANARY")),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        runtime.close()
+    assert str(caught.value) == "runtime interaction listener close failed"
+    snapshot = runtime.runtime_interaction_listener_snapshot()
+    assert snapshot["accepting"] is False
+    assert snapshot["poisoned"] is True
+    assert runtime.turn_state("turn-1") is plugin_runtime.TurnState.CARD_ACTIVE
+    assert runtime._patch_interactions
+    with pytest.raises(RuntimeError) as repeated:
+        runtime.close()
+    assert str(repeated.value) == "runtime interaction listener close failed"
+    assert "PRIVATE-CLOSE-CANARY" not in str(repeated.value)
+
+    monkeypatch.setattr(listener, "close", real_close)
+    listener.close()
+
+
+def test_concurrent_runtime_close_waiters_all_observe_listener_close_failure(
+    monkeypatch,
+):
+    runtime = active_runtime()
+    assert runtime.start_runtime_interaction_listener(b"i" * 32)
+    listener = runtime._runtime_interaction_listener
+    real_close = listener.close
+    entered = Event()
+    release = Event()
+
+    def fail_close():
+        entered.set()
+        assert release.wait(timeout=1.0)
+        raise RuntimeError("PRIVATE-CLOSE-CANARY")
+
+    monkeypatch.setattr(listener, "close", fail_close)
+    start = Barrier(6)
+
+    def close_runtime(_index):
+        start.wait()
+        try:
+            runtime.close()
+        except RuntimeError as exc:
+            return str(exc)
+        return "clean"
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [executor.submit(close_runtime, index) for index in range(6)]
+        assert entered.wait(timeout=0.5)
+        release.set()
+        results = [future.result(timeout=1.0) for future in futures]
+    assert results == ["runtime interaction listener close failed"] * 6
+    assert runtime.runtime_interaction_listener_snapshot()["poisoned"] is True
+    assert runtime.turn_state("turn-1") is plugin_runtime.TurnState.CARD_ACTIVE
+
+    monkeypatch.setattr(listener, "close", real_close)
+    listener.close()
+
+
+def test_late_claim_is_rejected_while_deferred_cleanup_owns_turn(monkeypatch):
+    runtime = active_runtime()
+    args = interaction_args(object())
+    resolver_entered = Event()
+    resolver_release = Event()
+    cleanup_entered = Event()
+    cleanup_release = Event()
+
+    def blocking_resolver(_choice):
+        resolver_entered.set()
+        assert resolver_release.wait(timeout=1.0)
+        return True
+
+    assert runtime.register_patch_interaction(*args)
+    assert runtime.start_runtime_interaction_listener(b"i" * 32)
+    descriptor = runtime.arm_patch_interaction_descriptor(*args, blocking_resolver)
+    real_cleanup = runtime._complete_deferred_interaction_cleanup
+    cleanup_calls = []
+
+    def blocked_cleanup(turn_digest):
+        cleanup_calls.append(turn_digest)
+        if len(cleanup_calls) >= 2:
+            cleanup_entered.set()
+            assert cleanup_release.wait(timeout=1.0)
+        return real_cleanup(turn_digest)
+
+    monkeypatch.setattr(runtime, "_complete_deferred_interaction_cleanup", blocked_cleanup)
+    result = []
+    callback = Thread(target=lambda: result.append(post(
+        descriptor["resolve_url"], b"i" * 32, callback_body(descriptor)
+    )))
+    callback.start()
+    assert resolver_entered.wait(timeout=0.5)
+    monkeypatch.setattr(runtime, "_wait_interaction_resolutions", lambda _events: False)
+    runtime.handle_on_session_finalize(session_id="session-1")
+    resolver_release.set()
+    assert cleanup_entered.wait(timeout=0.5)
+
+    try:
+        assert runtime.claim_patch_interaction(*args) is None
+        state = next(iter(runtime._patch_interactions.values()))
+        assert getattr(state, "selected_value", None) == "approve"
+        assert not hasattr(state, "state")
+    finally:
+        cleanup_release.set()
+        callback.join(timeout=1.0)
+    assert result == [(200, {"ok": True, "status": "resolved"})]
+    assert runtime._patch_interactions == {}
+    assert runtime.register_patch_interaction(*args) is False
+    runtime.close()
