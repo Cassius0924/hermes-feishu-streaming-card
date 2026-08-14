@@ -2123,6 +2123,9 @@ def test_task6_patch_interaction_register_resolve_and_claim_once(kind):
     assert runtime.resolve_patch_interaction(*values, " selected value ") is True
     assert runtime.resolve_patch_interaction(*values, "conflict") is False
     assert runtime.claim_patch_interaction(*values) == " selected value "
+    assert runtime.register_patch_interaction(*values) is False
+    assert runtime.resolve_patch_interaction(*values, " selected value ") is False
+    assert runtime.resolve_patch_interaction(*values, "conflict") is False
     assert runtime.claim_patch_interaction(*values) is None
     assert posted == []
     assert runtime._coordinators["turn-1"]._queue.qsize() == 0
@@ -2222,9 +2225,10 @@ def test_task6_patch_interaction_requires_object_identity_not_equality():
     assert runtime.claim_patch_interaction(*original_values) == "selected"
 
 
-def test_task6_patch_interaction_capacity_never_evicts_live_entries():
+def test_task6_patch_interaction_capacity_never_evicts_live_or_consumed_entries():
+    now = [100.0]
     posted = []
-    runtime = active_task4_runtime(posted)
+    runtime = active_task4_runtime(posted, now=lambda: now[0])
     runtime._MAX_PATCH_INTERACTIONS = 2
     handles = [object(), object(), object()]
     values = [
@@ -2239,6 +2243,15 @@ def test_task6_patch_interaction_capacity_never_evicts_live_entries():
     assert len(runtime._patch_interactions) == 2
     assert runtime.resolve_patch_interaction(*values[0], "first") is True
     assert runtime.claim_patch_interaction(*values[0]) == "first"
+    assert len(runtime._patch_interactions) == 2
+    assert runtime.register_patch_interaction(*values[2]) is False
+    assert runtime.resolve_patch_interaction(*values[1], "second") is True
+    assert runtime.claim_patch_interaction(*values[1]) == "second"
+    assert len(runtime._patch_interactions) == 2
+    assert runtime.register_patch_interaction(*values[2]) is False
+
+    now[0] += 300.0
+    assert runtime.register_patch_interaction(*values[2]) is True
     assert len(runtime._patch_interactions) == 1
 
 
@@ -2258,6 +2271,21 @@ def test_task6_patch_interaction_expiry_prunes_and_frees_capacity():
     assert len(runtime._patch_interactions) == 1
 
 
+def test_task6_consumed_patch_interaction_expires_before_exact_key_can_register():
+    now = [100.0]
+    posted = []
+    runtime = active_task4_runtime(posted, now=lambda: now[0])
+    values = patch_interaction_args(object())
+    assert runtime.register_patch_interaction(*values) is True
+    assert runtime.resolve_patch_interaction(*values, "once") is True
+    assert runtime.claim_patch_interaction(*values) == "once"
+
+    now[0] = 399.999
+    assert runtime.register_patch_interaction(*values) is False
+    now[0] = 400.0
+    assert runtime.register_patch_interaction(*values) is True
+
+
 @pytest.mark.parametrize("cleanup_kind", ("reset", "finalize", "close", "terminal"))
 def test_task6_patch_interaction_cleanup_removes_selected_value_and_handle(
     cleanup_kind,
@@ -2268,6 +2296,8 @@ def test_task6_patch_interaction_cleanup_removes_selected_value_and_handle(
     values = patch_interaction_args(pending_handle)
     assert runtime.register_patch_interaction(*values) is True
     assert runtime.resolve_patch_interaction(*values, "SELECTED-CANARY") is True
+    assert runtime.claim_patch_interaction(*values) == "SELECTED-CANARY"
+    assert len(runtime._patch_interactions) == 1
 
     if cleanup_kind == "reset":
         runtime.handle_on_session_reset(old_session_id="session-1")
@@ -2292,6 +2322,9 @@ def test_task6_patch_interaction_turn_capacity_eviction_cleans_entry():
     runtime._MAX_ENTRIES = 1
     first = patch_interaction_args(object())
     assert runtime.register_patch_interaction(*first) is True
+    assert runtime.resolve_patch_interaction(*first, "selected") is True
+    assert runtime.claim_patch_interaction(*first) == "selected"
+    assert len(runtime._patch_interactions) == 1
     assert runtime.bind_ingress_from_values(
         "second", "fallback_default", "session-2", "gateway-session-2",
         "generation-2", "oc_2", "om_2", "om_2", "",
@@ -2361,8 +2394,62 @@ def test_task6_patch_interaction_key_is_digest_and_claim_drops_raw_value():
     assert not hasattr(state, "fingerprint")
     assert runtime.resolve_patch_interaction(*values, "SELECTED-CANARY") is True
     assert runtime.claim_patch_interaction(*values) == "SELECTED-CANARY"
-    assert runtime._patch_interactions == {}
+    tombstone = runtime._patch_interactions[key]
+    assert tombstone.state == "consumed"
+    assert type(tombstone.turn_digest) is str and len(tombstone.turn_digest) == 64
+    assert not hasattr(tombstone, "pending_handle")
+    assert not hasattr(tombstone, "selected_value")
+    assert not hasattr(tombstone, "turn_id")
+    assert tombstone.expires_at == 400.0
+    assert len(runtime._patch_interactions) == 1
     assert "SELECTED-CANARY" not in repr(runtime)
+
+
+def test_task6_claimed_patch_interaction_blocks_reregister_conflict_and_retry():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    values = patch_interaction_args(object())
+
+    assert [
+        runtime.register_patch_interaction(*values),
+        runtime.resolve_patch_interaction(*values, "once"),
+        runtime.claim_patch_interaction(*values),
+        runtime.register_patch_interaction(*values),
+        runtime.resolve_patch_interaction(*values, "once"),
+        runtime.resolve_patch_interaction(*values, "deny"),
+        runtime.claim_patch_interaction(*values),
+    ] == [True, True, "once", False, False, False, None]
+
+
+def test_task6_claimed_patch_interaction_rejects_concurrent_replay_attempts():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    values = patch_interaction_args(object())
+    assert runtime.register_patch_interaction(*values) is True
+    assert runtime.resolve_patch_interaction(*values, "once") is True
+    assert runtime.claim_patch_interaction(*values) == "once"
+    start = Barrier(12)
+
+    def replay(index):
+        start.wait()
+        if index % 3 == 0:
+            return runtime.register_patch_interaction(*values)
+        if index % 3 == 1:
+            selected = "once" if index % 2 else "deny"
+            return runtime.resolve_patch_interaction(*values, selected)
+        return runtime.claim_patch_interaction(*values)
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        results = list(executor.map(replay, range(12)))
+
+    assert results == [
+        False, False, None,
+        False, False, None,
+        False, False, None,
+        False, False, None,
+    ]
+    assert len(runtime._patch_interactions) == 1
+    assert next(iter(runtime._patch_interactions.values())).state == "consumed"
 
 
 def test_task6_patch_interaction_concurrent_resolve_and_claim_are_linearizable():
@@ -2386,3 +2473,5 @@ def test_task6_patch_interaction_concurrent_resolve_and_claim_are_linearizable()
     second_claim = runtime.claim_patch_interaction(*values)
     assert [first_claim, second_claim].count("selected") == 1
     assert [first_claim, second_claim].count(None) == 1
+    assert len(runtime._patch_interactions) == 1
+    assert next(iter(runtime._patch_interactions.values())).state == "consumed"

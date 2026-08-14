@@ -608,9 +608,16 @@ class _TerminalRecord:
 
 @dataclass(repr=False)
 class _PatchInteraction:
-    turn_id: str
+    turn_digest: str
     pending_handle: object
     selected_value: str | None
+    expires_at: float
+
+
+@dataclass(frozen=True, repr=False)
+class _ConsumedPatchInteraction:
+    turn_digest: str
+    state: str
     expires_at: float
 
 
@@ -680,7 +687,9 @@ class PluginRuntime:
         self._subagents: OrderedDict[tuple[str, str], tuple[str, float]] = OrderedDict()
         self._terminal_owners: OrderedDict[str, object] = OrderedDict()
         self._started_transports: OrderedDict[str, _StartedTransport] = OrderedDict()
-        self._patch_interactions: OrderedDict[str, _PatchInteraction] = OrderedDict()
+        self._patch_interactions: OrderedDict[
+            str, _PatchInteraction | _ConsumedPatchInteraction
+        ] = OrderedDict()
 
     def bind_ingress_from_values(
         self,
@@ -794,16 +803,20 @@ class PluginRuntime:
                     return False
                 existing = self._patch_interactions.get(key)
                 if existing is not None:
-                    return existing.pending_handle is pending_handle
+                    return (
+                        type(existing) is _PatchInteraction
+                        and existing.pending_handle is pending_handle
+                    )
                 if any(
-                    state.pending_handle is pending_handle
+                    type(state) is _PatchInteraction
+                    and state.pending_handle is pending_handle
                     for state in self._patch_interactions.values()
                 ):
                     return False
                 if len(self._patch_interactions) >= self._MAX_PATCH_INTERACTIONS:
                     return False
                 self._patch_interactions[key] = _PatchInteraction(
-                    turn_id=turn_id,
+                    turn_digest=self._patch_turn_digest(turn_id),
                     pending_handle=pending_handle,
                     selected_value=None,
                     expires_at=now + self._PATCH_INTERACTION_TTL_SECONDS,
@@ -839,7 +852,10 @@ class PluginRuntime:
                 ):
                     return False
                 state = self._patch_interactions.get(key)
-                if state is None or state.pending_handle is not pending_handle:
+                if (
+                    type(state) is not _PatchInteraction
+                    or state.pending_handle is not pending_handle
+                ):
                     return False
                 if state.selected_value is None:
                     state.selected_value = selected_value
@@ -859,7 +875,8 @@ class PluginRuntime:
     ) -> str | None:
         try:
             with self._lock:
-                self._expire_locked(self._now())
+                now = self._now()
+                self._expire_locked(now)
                 key = self._patch_interaction_key_locked(
                     kind,
                     session_identity,
@@ -871,13 +888,17 @@ class PluginRuntime:
                     return None
                 state = self._patch_interactions.get(key)
                 if (
-                    state is None
+                    type(state) is not _PatchInteraction
                     or state.pending_handle is not pending_handle
                     or state.selected_value is None
                 ):
                     return None
                 selected_value = state.selected_value
-                del self._patch_interactions[key]
+                self._patch_interactions[key] = _ConsumedPatchInteraction(
+                    turn_digest=state.turn_digest,
+                    state="consumed",
+                    expires_at=now + self._PATCH_INTERACTION_TTL_SECONDS,
+                )
                 return selected_value
         except Exception:
             return None
@@ -1492,6 +1513,14 @@ class PluginRuntime:
             digest.update(encoded)
         return digest.hexdigest()
 
+    @staticmethod
+    def _patch_turn_digest(turn_id: str) -> str:
+        encoded = turn_id.encode("utf-8")
+        digest = sha256(b"hfc-patch-interaction-turn-v1\0")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        return digest.hexdigest()
+
     @classmethod
     def _valid_patch_selected_value(cls, value: object) -> bool:
         if (
@@ -1723,8 +1752,9 @@ class PluginRuntime:
         for key in tuple(self._subagents):
             if key[0] == turn_id:
                 del self._subagents[key]
+        turn_digest = self._patch_turn_digest(turn_id)
         for key, state in tuple(self._patch_interactions.items()):
-            if state.turn_id == turn_id:
+            if state.turn_digest == turn_digest:
                 del self._patch_interactions[key]
         if not keep_disposition:
             self._terminal_records.pop(turn_id, None)
