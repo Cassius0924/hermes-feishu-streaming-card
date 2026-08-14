@@ -310,6 +310,7 @@ def _run_installed_probe(
     source_root: Path,
     *,
     swap_runtime_after_binding: bool = False,
+    rebind_descriptor_paths_during_fork: bool = False,
 ) -> dict[str, object]:
     parent_cache = Path(tempfile.mkdtemp(
         prefix="parent-pycache-", dir=runtime.parents[2]
@@ -328,10 +329,38 @@ def _validate_then_swap(value):
     return binding
 native_hooks._validate_runtime_python = _validate_then_swap
 ''' if swap_runtime_after_binding else ""
+    descriptor_setup = '''
+import shutil
+_real_run_forked_probe = native_hooks._run_forked_plugin_probe
+def _run_with_rebound_descriptor_paths(**kwargs):
+    snapshot = kwargs["snapshot"]
+    home = kwargs["home"]
+    snapshot_original = snapshot.container
+    snapshot_held = snapshot_original.with_name(snapshot_original.name + "-held")
+    home_held = home.with_name(home.name + "-held")
+    snapshot_original.rename(snapshot_held)
+    snapshot_original.mkdir(mode=0o700)
+    home.rename(home_held)
+    home.mkdir(mode=0o700)
+    try:
+        return _real_run_forked_probe(**kwargs)
+    finally:
+        shutil.rmtree(snapshot_original)
+        snapshot_held.rename(snapshot_original)
+        shutil.rmtree(home)
+        home_held.rename(home)
+native_hooks._run_forked_plugin_probe = _run_with_rebound_descriptor_paths
+''' if rebind_descriptor_paths_during_fork else ""
     code = '''
 import json
 from hermes_feishu_card.install import native_hooks
-''' + swap_setup + '''
+_captured_probe_payload = {}
+_real_validate_payload = native_hooks._validate_plugin_manager_payload
+def _capture_probe_payload(payload, **kwargs):
+    _captured_probe_payload.update(payload)
+    return _real_validate_payload(payload, **kwargs)
+native_hooks._validate_plugin_manager_payload = _capture_probe_payload
+''' + swap_setup + descriptor_setup + '''
 try:
     result = native_hooks.probe_native_hook_capabilities(
         __import__("sys").argv[1],
@@ -350,6 +379,13 @@ print(json.dumps({
     "source_commit": result.source_commit,
     "source_digests": [[item.target, item.sha256] for item in result.source_digests],
     "plugin_evidence_sha256": result.plugin_evidence_sha256,
+    "descriptor_root_mode": _captured_probe_payload.get("descriptor_root_mode", ""),
+    "source_import_root": _captured_probe_payload.get("source_import_root", ""),
+    "manager_origin": _captured_probe_payload.get("manager_origin", ""),
+    "home_root": _captured_probe_payload.get("home_root", ""),
+    "pycache_prefix": _captured_probe_payload.get("pycache_prefix", ""),
+    "child_sys_path": _captured_probe_payload.get("child_sys_path", []),
+    "loaded_modules": _captured_probe_payload.get("loaded_modules", []),
 }, sort_keys=True, separators=(",", ":")))
 '''
     completed = subprocess.run(
@@ -786,6 +822,44 @@ def test_second_review_runtime_path_swap_cannot_substitute_after_fd_binding(
         "turn_start", "turn_terminal_result", "stable_tool_lifecycle",
         "approval_observe",
     }
+
+
+def test_third_review_child_consumes_rebound_roots_only_through_held_descriptors(
+    installed_fixed_runtime,
+):
+    result = _run_installed_probe(
+        installed_fixed_runtime,
+        FIXED_SOURCE_ROOT,
+        rebind_descriptor_paths_during_fork=True,
+    )
+
+    assert result["reason_code"] == "verified"
+    assert set(result["available"]) == {
+        "turn_start", "turn_terminal_result", "stable_tool_lifecycle",
+        "approval_observe",
+    }
+    assert result["descriptor_root_mode"] == "openat+fchdir"
+    assert result["source_import_root"] == "fd-source://snapshot"
+    assert result["manager_origin"] == (
+        "fd-source://snapshot/hermes_cli/plugins.py"
+    )
+    assert result["home_root"] == "."
+    assert result["pycache_prefix"] == "pycache"
+    assert all(
+        "hfc-fixed-source-snapshot-" not in entry
+        for entry in result["child_sys_path"]
+    )
+    hermes_modules = [
+        item for item in result["loaded_modules"]
+        if item["name"] == "hermes_cli"
+        or item["name"].startswith("hermes_cli.")
+    ]
+    assert hermes_modules
+    assert all(
+        item["origin"].startswith("fd-source://snapshot/")
+        and item["cached"] == ""
+        for item in hermes_modules
+    )
 
 
 def test_second_review_root_swap_is_rejected_after_exact_snapshot(

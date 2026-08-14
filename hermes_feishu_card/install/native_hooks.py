@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from email.parser import BytesParser
 import hashlib
 import importlib
+import importlib.abc
+import importlib.machinery
 import importlib.metadata
 import importlib.resources
 import io
@@ -88,6 +90,11 @@ _PLUGIN_PROBE_TIMEOUT_SECONDS = 15.0
 _TRUSTED_GIT = Path("/usr/bin/git")
 _MAX_ARCHIVE_MEMBER_BYTES = 32 * 1024 * 1024
 _MAX_ARCHIVE_TOTAL_BYTES = 512 * 1024 * 1024
+_DESCRIPTOR_ROOT_MODE = "openat+fchdir"
+_DESCRIPTOR_SOURCE_ROOT = "fd-source://snapshot"
+_DESCRIPTOR_LOADER_NAME = (
+    "hermes_feishu_card.install.native_hooks._DescriptorSourceLoader"
+)
 _REASON_CODES = frozenset({
     "verified",
     "expected_commit_invalid",
@@ -231,6 +238,78 @@ class _SourceSnapshot:
         self._closed = True
         os.close(self.descriptor)
         shutil.rmtree(self.container, ignore_errors=True)
+        return None
+
+
+class _DescriptorSourceLoader(importlib.abc.Loader):
+    def __init__(
+        self,
+        *,
+        fullname: str,
+        relative_path: str,
+        source: bytes,
+        is_package: bool,
+    ) -> None:
+        self.fullname = fullname
+        self.relative_path = relative_path
+        self.source = source
+        self.is_package = is_package
+
+    @property
+    def origin(self) -> str:
+        return f"{_DESCRIPTOR_SOURCE_ROOT}/{self.relative_path}"
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module) -> None:
+        module.__file__ = self.origin
+        module.__cached__ = None
+        if self.is_package:
+            module.__path__ = [self.origin.rsplit("/__init__.py", 1)[0]]
+        code = compile(self.source, self.origin, "exec", dont_inherit=True)
+        exec(code, module.__dict__)
+
+
+class _DescriptorSourceFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, root_descriptor: int) -> None:
+        self.root_descriptor = root_descriptor
+
+    def find_spec(self, fullname, path=None, target=None):
+        if type(fullname) is not str or not fullname:
+            return None
+        base = fullname.replace(".", "/")
+        for relative_path, is_package in (
+            (f"{base}/__init__.py", True),
+            (f"{base}.py", False),
+        ):
+            try:
+                source = _read_bound_relative_file(
+                    self.root_descriptor, relative_path, _MAX_SOURCE_BYTES
+                )
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as exc:
+                raise ImportError(
+                    f"descriptor source unavailable: {fullname}"
+                ) from exc
+            loader = _DescriptorSourceLoader(
+                fullname=fullname,
+                relative_path=relative_path,
+                source=source,
+                is_package=is_package,
+            )
+            spec = importlib.machinery.ModuleSpec(
+                fullname,
+                loader,
+                origin=loader.origin,
+                is_package=is_package,
+            )
+            if is_package:
+                spec.submodule_search_locations = [
+                    loader.origin.rsplit("/__init__.py", 1)[0]
+                ]
+            return spec
         return None
 
 
@@ -1326,6 +1405,17 @@ _PLUGIN_PROBE_PAYLOAD_KEYS = frozenset({
     "snapshot_fd_identity_after",
     "home_fd_identity_before",
     "home_fd_identity_after",
+    "snapshot_alias_identity_before",
+    "snapshot_alias_identity_after",
+    "home_alias_identity_before",
+    "home_alias_identity_after",
+    "child_cwd_identity_before",
+    "child_cwd_identity_after",
+    "descriptor_root_mode",
+    "source_import_root",
+    "home_root",
+    "bundled_plugins_root",
+    "child_sys_path",
     "attestation_sha256",
 })
 
@@ -1358,9 +1448,9 @@ def _produce_plugin_manager_evidence(
         finally:
             os.close(config_descriptor)
         environment = {
-            "HOME": str(home),
-            "HERMES_HOME": str(home),
-            "HERMES_BUNDLED_PLUGINS": str(home / "bundled-plugins"),
+            "HOME": ".",
+            "HERMES_HOME": ".",
+            "HERMES_BUNDLED_PLUGINS": "bundled-plugins",
             "HERMES_ENABLE_PROJECT_PLUGINS": "0",
             "HERMES_SAFE_MODE": "0",
             "HERMES_FEISHU_CARD_ENABLED": "0",
@@ -1408,6 +1498,11 @@ def _run_forked_plugin_probe(
     home_identity: tuple[int, int],
     environment: dict[str, str],
 ) -> tuple[bytes, bool]:
+    if (
+        _descriptor_alias_identity(snapshot.descriptor) != snapshot.identity
+        or _descriptor_alias_identity(home_descriptor) != home_identity
+    ):
+        raise OSError("descriptor root unavailable")
     read_descriptor, write_descriptor = os.pipe()
     pid = os.fork()
     if pid == 0:
@@ -1420,7 +1515,6 @@ def _run_forked_plugin_probe(
             _plugin_probe_child(
                 snapshot=snapshot,
                 runtime=runtime,
-                home=home,
                 home_descriptor=home_descriptor,
                 home_identity=home_identity,
                 environment=environment,
@@ -1470,27 +1564,37 @@ def _plugin_probe_child(
     *,
     snapshot: _SourceSnapshot,
     runtime: _RuntimeBinding,
-    home: Path,
     home_descriptor: int,
     home_identity: tuple[int, int],
     environment: dict[str, str],
     output_descriptor: int,
 ) -> None:
-    sys.pycache_prefix = str(home / "pycache")
     snapshot_before = _fd_identity(snapshot.descriptor)
     home_before = _fd_identity(home_descriptor)
     runtime_identity = _fd_identity(runtime.descriptor)
+    snapshot_alias_before = _descriptor_alias_identity(snapshot.descriptor)
+    home_alias_before = _descriptor_alias_identity(home_descriptor)
     if (
         snapshot_before != snapshot.identity
         or home_before != home_identity
         or runtime_identity != runtime.identity
-        or not _bound_directory_unchanged(snapshot.root, snapshot.descriptor)
-        or not _bound_directory_unchanged(home, home_descriptor)
+        or snapshot_alias_before != snapshot.identity
+        or home_alias_before != home_identity
     ):
         raise RuntimeError("fd identity mismatch")
+    os.fchdir(home_descriptor)
+    child_cwd_before = _cwd_identity()
+    pycache_descriptor = _open_bound_relative_directory(
+        home_descriptor, "pycache"
+    )
+    try:
+        if os.listdir(pycache_descriptor):
+            raise RuntimeError("private pycache is not empty")
+    finally:
+        os.close(pycache_descriptor)
+    sys.pycache_prefix = "pycache"
     os.environ.clear()
     os.environ.update(environment)
-    os.fchdir(home_descriptor)
     for name in tuple(sys.modules):
         if (
             name == "hermes_feishu_card"
@@ -1503,12 +1607,13 @@ def _plugin_probe_child(
         ):
             sys.modules.pop(name, None)
     sys.path = [
-        str(snapshot.root),
-        *[
-            item for item in sys.path
-            if type(item) is str and item and item != str(snapshot.root)
-        ],
+        item for item in sys.path
+        if type(item) is str
+        and item
+        and "hfc-fixed-source-snapshot-" not in item
     ]
+    descriptor_finder = _DescriptorSourceFinder(snapshot.descriptor)
+    sys.meta_path.insert(0, descriptor_finder)
     importlib.invalidate_caches()
     plugins = importlib.import_module("hermes_cli.plugins")
     manager = plugins.PluginManager()
@@ -1550,12 +1655,17 @@ def _plugin_probe_child(
     loaded_modules = _loaded_module_evidence()
     snapshot_after = _fd_identity(snapshot.descriptor)
     home_after = _fd_identity(home_descriptor)
+    snapshot_alias_after = _descriptor_alias_identity(snapshot.descriptor)
+    home_alias_after = _descriptor_alias_identity(home_descriptor)
+    child_cwd_after = _cwd_identity()
     if (
         snapshot_after != snapshot_before
         or home_after != home_before
         or _fd_identity(runtime.descriptor) != runtime_identity
-        or not _bound_directory_unchanged(snapshot.root, snapshot.descriptor)
-        or not _bound_directory_unchanged(home, home_descriptor)
+        or snapshot_alias_after != snapshot_before
+        or home_alias_after != home_before
+        or child_cwd_before != home_before
+        or child_cwd_after != home_before
     ):
         raise RuntimeError("fd identity changed")
     payload = {
@@ -1599,6 +1709,17 @@ def _plugin_probe_child(
         "snapshot_fd_identity_after": list(snapshot_after),
         "home_fd_identity_before": list(home_before),
         "home_fd_identity_after": list(home_after),
+        "snapshot_alias_identity_before": list(snapshot_alias_before),
+        "snapshot_alias_identity_after": list(snapshot_alias_after),
+        "home_alias_identity_before": list(home_alias_before),
+        "home_alias_identity_after": list(home_alias_after),
+        "child_cwd_identity_before": list(child_cwd_before),
+        "child_cwd_identity_after": list(child_cwd_after),
+        "descriptor_root_mode": _DESCRIPTOR_ROOT_MODE,
+        "source_import_root": _DESCRIPTOR_SOURCE_ROOT,
+        "home_root": os.environ["HERMES_HOME"],
+        "bundled_plugins_root": os.environ["HERMES_BUNDLED_PLUGINS"],
+        "child_sys_path": list(sys.path),
     }
     canonical = json.dumps(
         payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
@@ -1614,15 +1735,16 @@ def _plugin_probe_child(
 def _loaded_module_evidence() -> list[dict[str, str]]:
     evidence = []
     for name, module in sorted(sys.modules.items()):
+        spec = getattr(module, "__spec__", None)
+        loader = getattr(spec, "loader", None)
         if not (
             name == "hermes_feishu_card"
             or name.startswith("hermes_feishu_card.")
             or name == "hermes_cli"
             or name.startswith("hermes_cli.")
+            or type(loader) is _DescriptorSourceLoader
         ):
             continue
-        spec = getattr(module, "__spec__", None)
-        loader = getattr(spec, "loader", None)
         origin = getattr(spec, "origin", None)
         cached = getattr(spec, "cached", None)
         evidence.append({
@@ -1637,6 +1759,19 @@ def _loaded_module_evidence() -> list[dict[str, str]]:
 def _fd_identity(descriptor: int) -> tuple[int, int]:
     info = os.fstat(descriptor)
     return info.st_dev, info.st_ino
+
+
+def _descriptor_alias_identity(descriptor: int) -> tuple[int, int]:
+    info = os.stat(".", dir_fd=descriptor, follow_symlinks=False)
+    return info.st_dev, info.st_ino
+
+
+def _cwd_identity() -> tuple[int, int]:
+    descriptor = os.open(".", _directory_flags())
+    try:
+        return _fd_identity(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _decode_canonical_json_object(raw: bytes) -> dict[str, object]:
@@ -1711,6 +1846,13 @@ def _validate_plugin_manager_payload(
         "snapshot_fd_identity_after",
         "home_fd_identity_before",
         "home_fd_identity_after",
+        "snapshot_alias_identity_before",
+        "snapshot_alias_identity_after",
+        "home_alias_identity_before",
+        "home_alias_identity_after",
+        "child_cwd_identity_before",
+        "child_cwd_identity_after",
+        "child_sys_path",
     }
     if any(type(payload[name]) is not str for name in string_fields):
         return "plugin_evidence_invalid"
@@ -1748,6 +1890,12 @@ def _validate_plugin_manager_payload(
         "snapshot_fd_identity_after": snapshot.identity,
         "home_fd_identity_before": _fd_identity(home_descriptor),
         "home_fd_identity_after": _fd_identity(home_descriptor),
+        "snapshot_alias_identity_before": snapshot.identity,
+        "snapshot_alias_identity_after": snapshot.identity,
+        "home_alias_identity_before": _fd_identity(home_descriptor),
+        "home_alias_identity_after": _fd_identity(home_descriptor),
+        "child_cwd_identity_before": _fd_identity(home_descriptor),
+        "child_cwd_identity_after": _fd_identity(home_descriptor),
     }
     for name, expected_identity in identities.items():
         value = payload[name]
@@ -1758,14 +1906,32 @@ def _validate_plugin_manager_payload(
             or tuple(value) != expected_identity
         ):
             return "plugin_runtime_unverified"
-    pycache_prefix = home / "pycache"
-    if payload["pycache_prefix"] != str(pycache_prefix):
+    if (
+        payload["descriptor_root_mode"] != _DESCRIPTOR_ROOT_MODE
+        or payload["source_import_root"] != _DESCRIPTOR_SOURCE_ROOT
+        or payload["home_root"] != "."
+        or payload["bundled_plugins_root"] != "bundled-plugins"
+        or payload["pycache_prefix"] != "pycache"
+    ):
+        return "plugin_evidence_invalid"
+    child_sys_path = payload["child_sys_path"]
+    if (
+        type(child_sys_path) is not list
+        or not child_sys_path
+        or len(child_sys_path) > 32
+        or not all(type(item) is str and item for item in child_sys_path)
+        or any(
+            item == str(snapshot.root)
+            or item.startswith(str(snapshot.container))
+            or "hfc-fixed-source-snapshot-" in item
+            for item in child_sys_path
+        )
+    ):
         return "plugin_evidence_invalid"
     if not _validate_loaded_module_evidence(
         payload["loaded_modules"],
         snapshot=snapshot,
         purelib=runtime.purelib,
-        pycache_prefix=pycache_prefix,
     ):
         return "plugin_evidence_invalid"
     attestation = payload["attestation_sha256"]
@@ -1789,13 +1955,15 @@ def _validate_plugin_manager_payload(
     try:
         for name in (
             "executable", "prefix", "base_prefix", "purelib", "platlib",
-            "manager_origin", "distribution_metadata_path", "record_path",
+            "distribution_metadata_path", "record_path",
             "entrypoint_origin", "package_origin",
         ):
             _coerce_absolute_path(payload[name])
     except (TypeError, ValueError):
         return "plugin_runtime_unverified"
-    if payload["manager_origin"] != str(snapshot.root / "hermes_cli" / "plugins.py"):
+    if payload["manager_origin"] != (
+        f"{_DESCRIPTOR_SOURCE_ROOT}/hermes_cli/plugins.py"
+    ):
         return "plugin_source_commit_mismatch"
     if payload["matching_entrypoint_count"] != 1:
         return "entrypoint_ambiguous"
@@ -1827,7 +1995,6 @@ def _validate_loaded_module_evidence(
     *,
     snapshot: _SourceSnapshot,
     purelib: Path,
-    pycache_prefix: Path,
 ) -> bool:
     if type(value) is not list or not 3 <= len(value) <= 128:
         return False
@@ -1849,27 +2016,46 @@ def _validate_loaded_module_evidence(
             return False
         name = item["name"]
         names.append(name)
-        if item["loader"] != "_frozen_importlib_external.SourceFileLoader":
+        if item["loader"] == _DESCRIPTOR_LOADER_NAME:
+            prefix = f"{_DESCRIPTOR_SOURCE_ROOT}/"
+            if not item["origin"].startswith(prefix) or item["cached"] != "":
+                return False
+            relative_path = item["origin"][len(prefix):]
+            try:
+                _validate_relative_path(relative_path)
+                _read_bound_relative_file(
+                    snapshot.descriptor, relative_path, _MAX_SOURCE_BYTES
+                )
+            except (OSError, TypeError, ValueError):
+                return False
+            if relative_path not in {
+                f"{name.replace('.', '/')}.py",
+                f"{name.replace('.', '/')}/__init__.py",
+            }:
+                return False
+            continue
+        if (
+            item["loader"] != "_frozen_importlib_external.SourceFileLoader"
+            or not (
+                name == "hermes_feishu_card"
+                or name.startswith("hermes_feishu_card.")
+            )
+        ):
             return False
         try:
             origin = _coerce_absolute_path(item["origin"])
-            cached = _coerce_absolute_path(item["cached"])
-            cached.relative_to(pycache_prefix)
+            _validate_relative_path(item["cached"])
         except (TypeError, ValueError):
             return False
-        if origin.suffix != ".py" or cached.suffix != ".pyc":
+        if (
+            origin.suffix != ".py"
+            or not item["cached"].startswith("pycache/")
+            or not item["cached"].endswith(".pyc")
+        ):
             return False
-        if name == "hermes_feishu_card" or name.startswith("hermes_feishu_card."):
-            try:
-                origin.relative_to(purelib / "hermes_feishu_card")
-            except ValueError:
-                return False
-        elif name == "hermes_cli" or name.startswith("hermes_cli."):
-            try:
-                origin.relative_to(snapshot.root / "hermes_cli")
-            except ValueError:
-                return False
-        else:
+        try:
+            origin.relative_to(purelib / "hermes_feishu_card")
+        except ValueError:
             return False
     return names == sorted(set(names)) and required <= set(names)
 
@@ -2404,6 +2590,30 @@ def _open_absolute_regular_file(path: Path) -> int:
         os.close(descriptor)
         raise ValueError("path leaf is not regular")
     return descriptor
+
+
+def _open_bound_relative_directory(
+    root_descriptor: int, relative_path: str
+) -> int:
+    _validate_relative_path(relative_path)
+    if type(root_descriptor) is not int:
+        raise ValueError("invalid descriptor root")
+    current = os.dup(root_descriptor)
+    try:
+        for part in PurePosixPath(relative_path).parts:
+            next_descriptor = os.open(
+                part, _directory_flags(), dir_fd=current
+            )
+            info = os.fstat(next_descriptor)
+            if not stat.S_ISDIR(info.st_mode):
+                os.close(next_descriptor)
+                raise ValueError("relative path is not a directory")
+            os.close(current)
+            current = next_descriptor
+        return current
+    except BaseException:
+        os.close(current)
+        raise
 
 
 def _read_bound_relative_file(
