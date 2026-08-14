@@ -21,6 +21,7 @@ from urllib import parse, request
 from . import __version__
 from .event_auth import sign_event_request
 from .operations_transport import read_transport_root_secret
+from .profile_sources import TRUSTED_PROFILE_SOURCES
 from .runtime_control import RuntimeControlLease, acquire_runtime_control
 
 
@@ -466,7 +467,7 @@ class IngressBindingRegistry:
     """A bounded, one-shot registry for Feishu ingress bindings."""
 
     _MAX_BINDINGS = 1024
-    _PROFILE_SOURCES = frozenset({"env", "locals", "hermes_home", "fallback_default"})
+    _PROFILE_SOURCES = TRUSTED_PROFILE_SOURCES
 
     def __init__(
         self,
@@ -774,6 +775,59 @@ class PluginRuntime:
                     producer="patch",
                     event_id_for_sequence=lambda sequence: (
                         f"patch:{turn_id}:{event_name}:{sequence}"
+                    ),
+                )
+        except Exception:
+            return False
+
+    def submit_patch_status_notice(
+        self,
+        turn_id: object,
+        *,
+        notice_kind: object,
+        notice_id: object,
+    ) -> bool:
+        try:
+            if (
+                not self._exact_nonblank(turn_id)
+                or type(notice_kind) is not str
+                or type(notice_id) is not str
+                or (notice_kind, notice_id)
+                != ("context-compaction", "context-compaction:active")
+            ):
+                return False
+            with self._lock:
+                self._expire_locked(self._now())
+                coordinator = self._card_active_coordinator_locked(turn_id)
+                turn = self._turns.get(turn_id)
+                if coordinator is None or turn is None:
+                    return False
+                payload = self._base_payload(
+                    turn, sequence=0, created_at=self._now()
+                )
+                payload.update(
+                    event="system.notice",
+                    event_id="",
+                    producer="patch",
+                    phase="started",
+                    data={
+                        "notice_kind": "context-compaction",
+                        "notice_id": "context-compaction:active",
+                        "notice_scope": "session",
+                        "phase": "started",
+                        "title": "正在压缩上下文",
+                        "level": "info",
+                        "content": "正在总结较早的对话，完成后会继续当前任务。",
+                        "create_session": True,
+                        "display_status": "in_progress",
+                    },
+                )
+                return coordinator.submit_observer(
+                    payload,
+                    producer="patch",
+                    event_id_for_sequence=lambda sequence: (
+                        "patch:"
+                        f"{turn_id}:system.notice:context-compaction:active:{sequence}"
                     ),
                 )
         except Exception:

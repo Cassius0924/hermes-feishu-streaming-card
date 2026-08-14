@@ -49,6 +49,13 @@ from .native_handoff import (
     derive_native_handoff_uuid_seed,
     is_exact_native_text_scope,
 )
+from .profile_sources import (
+    TRUSTED_PROFILE_SOURCES,
+    legacy_profile_identity,
+    legacy_safe_profile_id,
+    profile_from_hermes_home_path,
+    validate_trusted_profile_identity,
+)
 from .status import normalize_display_status
 from .runtime_control import reset_runtime_control_for_tests, start_runtime_control
 
@@ -72,7 +79,6 @@ COMMAND_FEEDBACK_CONTEXT_TTL_SECONDS = 600.0
 POLICY_QUERY_TIMEOUT_SECONDS = 0.25
 POLICY_CACHE_TTL_SECONDS = 1.0
 POLICY_CACHE_LIMIT = 1024
-PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _CONTEXT_COMPACTION_STATUS_RE = re.compile(
     r"\bCompacting\s+context\b",
     re.IGNORECASE,
@@ -142,9 +148,13 @@ SUPPORTED_RUNTIME_EVENTS = {
 
 _CANONICAL_TURN_ATTR = "_hfc_turn_id"
 _THIN_INTERACTION_KINDS = frozenset({"approval", "clarify", "slash"})
-_THIN_PROFILE_SOURCES = frozenset(
-    {"env", "locals", "hermes_home", "fallback_default"}
+_THIN_CONTEXT_COMPACTION_MESSAGES = frozenset(
+    {
+        "Compacting context",
+        "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
+    }
 )
+_THIN_STATUS_MESSAGE_MAX_BYTES = 1024
 _LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -595,7 +605,16 @@ def bind_ingress_from_hermes_locals(local_vars: object) -> bool:
         values = tuple(local_vars.get(name) for name in names)
         if not all(_exact_nonblank_string(value) for value in values):
             return False
-        if values[1] not in _THIN_PROFILE_SOURCES:
+        if values[1] not in TRUSTED_PROFILE_SOURCES:
+            return False
+        profile_identity = validate_trusted_profile_identity(
+            values[0],
+            values[1],
+            hermes_home_membership_verified=local_vars.get(
+                "hermes_home_membership_verified", False
+            ),
+        )
+        if profile_identity != values[:2]:
             return False
         thread_id = local_vars.get("thread_id", "")
         if type(thread_id) is not str:
@@ -630,6 +649,39 @@ def emit_delta_from_hermes_locals_threadsafe(
         if not callable(method):
             return False
         return method(turn_id, event_name, text, mode) is True
+    except Exception:
+        return False
+
+
+def submit_status_notice_from_hermes_locals(
+    local_vars: object,
+    *,
+    event_type: object,
+    message: object,
+) -> bool:
+    """Classify one fixed Hermes status and submit only sanitized tags."""
+    try:
+        if (
+            type(event_type) is not str
+            or event_type != "context"
+            or type(message) is not str
+            or len(message) > _THIN_STATUS_MESSAGE_MAX_BYTES
+            or len(message.encode("utf-8")) > _THIN_STATUS_MESSAGE_MAX_BYTES
+            or message not in _THIN_CONTEXT_COMPACTION_MESSAGES
+        ):
+            return False
+        turn_id = _thin_bridge_turn(local_vars)
+        if turn_id is None:
+            return False
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "submit_patch_status_notice", None)
+        if not callable(method):
+            return False
+        return method(
+            turn_id,
+            notice_kind="context-compaction",
+            notice_id="context-compaction:active",
+        ) is True
     except Exception:
         return False
 
@@ -9128,18 +9180,18 @@ def _is_lower_hex(value: str, length: int) -> bool:
 def _profile_identity(local_vars: dict[str, Any], source_obj: Any, message_obj: Any) -> tuple[str, str]:
     env_profile = os.environ.get("HERMES_FEISHU_CARD_PROFILE_ID", "").strip()
     if env_profile:
-        return _safe_profile_identity(env_profile, "env")
+        return legacy_profile_identity(env_profile, "env")
     direct = (
         _first_string(local_vars, ("profile_id", "hermes_profile", "profile"))
         or _first_attr_string(source_obj, ("profile_id", "hermes_profile", "profile"))
         or _first_attr_string(message_obj, ("profile_id", "hermes_profile", "profile"))
     )
     if direct:
-        return _safe_profile_identity(direct, "locals")
+        return legacy_profile_identity(direct, "locals")
     hermes_home = os.environ.get("HERMES_HOME", "").strip()
-    profile = _profile_from_path(hermes_home)
+    profile = profile_from_hermes_home_path(hermes_home)
     if profile:
-        return _safe_profile_identity(profile, "hermes_home")
+        return legacy_profile_identity(profile, "hermes_home")
     return "default", "fallback_default"
 
 
@@ -9196,32 +9248,15 @@ def _json_safe_tool_value(value: Any) -> Any:
 
 
 def _safe_profile_identity(value: str, source: str) -> tuple[str, str]:
-    profile_id = _safe_profile_id(value)
-    if profile_id == "default" and value.strip() != "default":
-        return profile_id, f"sanitized_{source}"
-    return profile_id, source
+    return legacy_profile_identity(value, source)
 
 
 def _safe_profile_id(value: str) -> str:
-    candidate = value.strip()
-    if PROFILE_ID_PATTERN.fullmatch(candidate):
-        return candidate
-    return "default"
+    return legacy_safe_profile_id(value)
 
 
 def _profile_from_path(path: str) -> str | None:
-    if not path:
-        return None
-    normalized = str(Path(path).expanduser()).replace("\\", "/")
-    parts = tuple(part for part in normalized.split("/") if part)
-    for index in range(len(parts) - 2):
-        if parts[index] in {".hermes", "hermes"} and parts[index + 1] == "profiles":
-            if index + 3 != len(parts):
-                return None
-            candidate = parts[index + 2].strip()
-            if candidate:
-                return candidate
-    return None
+    return profile_from_hermes_home_path(path)
 
 
 def _thread_id_for_runtime_event(

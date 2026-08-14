@@ -5,6 +5,7 @@ from threading import Barrier, Event, Thread, current_thread
 import pytest
 
 import hermes_feishu_card.hermes_plugin_runtime as plugin_runtime
+from hermes_feishu_card import profile_sources
 
 from hermes_feishu_card.hermes_plugin_runtime import (
     IngressBinding,
@@ -393,6 +394,13 @@ def test_bind_rejects_unverified_profile_sources_without_consuming_valid_binding
     turn = registry.claim_unique_session("session-1", "turn-1")
     assert turn is not None
     assert turn.ingress.profile_source == "fallback_default"
+
+
+def test_ingress_registry_consumes_the_authoritative_trusted_profile_sources():
+    assert (
+        IngressBindingRegistry._PROFILE_SOURCES
+        is profile_sources.TRUSTED_PROFILE_SOURCES
+    )
 
 
 def test_invalid_profile_source_bind_still_prunes_expired_bindings():
@@ -2106,6 +2114,181 @@ def test_task6_patch_delta_queue_saturation_barrier_and_exception_fail_closed(
     other.close()
     runtime.close()
     assert other_posted == []
+
+
+def test_patch_status_notice_uses_shared_sequence_and_exact_sanitized_payload(
+    monkeypatch,
+):
+    posted = []
+    runtime = active_task4_runtime(posted)
+    coordinator = runtime._coordinators["turn-1"]
+    monkeypatch.setattr(
+        coordinator,
+        "next_sequence",
+        lambda *_args, **_kwargs: pytest.fail(
+            "status notice must not allocate a second sequence"
+        ),
+    )
+
+    assert runtime.submit_patch_status_notice(
+        "turn-1",
+        notice_kind="context-compaction",
+        notice_id="context-compaction:active",
+    ) is True
+    runtime.drain_observers(1.0)
+
+    assert posted == [
+        {
+            "schema_version": "1",
+            "event": "system.notice",
+            "conversation_id": "thread-1",
+            "message_id": "om_1",
+            "chat_id": "oc_1",
+            "thread_id": "thread-1",
+            "platform": "feishu",
+            "turn_id": "turn-1",
+            "sequence": 1,
+            "created_at": 100.0,
+            "event_id": (
+                "patch:turn-1:system.notice:context-compaction:active:1"
+            ),
+            "producer": "patch",
+            "phase": "started",
+            "data": {
+                "notice_kind": "context-compaction",
+                "notice_id": "context-compaction:active",
+                "notice_scope": "session",
+                "phase": "started",
+                "title": "正在压缩上下文",
+                "level": "info",
+                "content": "正在总结较早的对话，完成后会继续当前任务。",
+                "create_session": True,
+                "display_status": "in_progress",
+            },
+        }
+    ]
+    assert "session-1" not in repr(posted[0]["data"])
+    assert "gateway-session-1" not in repr(posted[0]["data"])
+    assert "oc_1" not in repr(posted[0]["data"])
+
+
+@pytest.mark.parametrize(
+    ("turn_id", "notice_kind", "notice_id"),
+    (
+        ("", "context-compaction", "context-compaction:active"),
+        (StringSubclass("turn-1"), "context-compaction", "context-compaction:active"),
+        ("turn-1", StringSubclass("context-compaction"), "context-compaction:active"),
+        ("turn-1", "other", "context-compaction:active"),
+        ("turn-1", "context-compaction", StringSubclass("context-compaction:active")),
+        ("turn-1", "context-compaction", "other"),
+    ),
+)
+def test_patch_status_notice_rejects_inexact_or_unknown_fixed_tags(
+    turn_id, notice_kind, notice_id
+):
+    posted = []
+    runtime = active_task4_runtime(posted)
+
+    assert runtime.submit_patch_status_notice(
+        turn_id, notice_kind=notice_kind, notice_id=notice_id
+    ) is False
+    runtime.close()
+    assert posted == []
+
+
+def test_patch_status_notice_requires_exact_card_active_turn_and_live_coordinator():
+    posted = []
+    runtime = task4_runtime(posted)
+    tags = {
+        "notice_kind": "context-compaction",
+        "notice_id": "context-compaction:active",
+    }
+    assert runtime.submit_patch_status_notice("turn-missing", **tags) is False
+
+    runtime.handle_pre_llm_call(
+        session_id="session-1", turn_id="turn-1", platform="feishu"
+    )
+    turn = runtime._turns["turn-1"]
+    with turn._lock:
+        turn._state = TurnState.PENDING_START
+    assert runtime.submit_patch_status_notice("turn-1", **tags) is False
+    with turn._lock:
+        turn._state = TurnState.NATIVE_BYPASS
+    assert runtime.submit_patch_status_notice("turn-1", **tags) is False
+    with turn._lock:
+        turn._state = TurnState.CARD_ACTIVE
+    runtime._terminal_owners["turn-1"] = object()
+    assert runtime.submit_patch_status_notice("turn-1", **tags) is False
+    runtime._terminal_owners.pop("turn-1")
+    original = runtime._coordinators["turn-1"]
+    wrong = TurnEventCoordinator("turn-other", start_worker=False)
+    runtime._coordinators["turn-1"] = wrong
+    try:
+        assert runtime.submit_patch_status_notice("turn-1", **tags) is False
+    finally:
+        runtime._coordinators["turn-1"] = original
+        wrong.close()
+    runtime.handle_on_session_reset(old_session_id="session-1")
+    assert runtime.submit_patch_status_notice("turn-1", **tags) is False
+    runtime.close()
+
+
+def test_patch_status_notice_queue_saturation_barrier_and_exception_fail_closed(
+    monkeypatch,
+):
+    tags = {
+        "notice_kind": "context-compaction",
+        "notice_id": "context-compaction:active",
+    }
+    posted = []
+    runtime = active_task4_runtime(posted, max_pending=1)
+    original = runtime._coordinators["turn-1"]
+    coordinator = TurnEventCoordinator("turn-1", max_pending=1, start_worker=False)
+    runtime._coordinators["turn-1"] = coordinator
+    original.close()
+    assert runtime.submit_patch_status_notice("turn-1", **tags) is True
+    assert runtime.submit_patch_status_notice("turn-1", **tags) is False
+    coordinator.close_terminal_barrier()
+    assert runtime.submit_patch_status_notice("turn-1", **tags) is False
+
+    other_posted = []
+    other = active_task4_runtime(other_posted)
+    monkeypatch.setattr(
+        other._coordinators["turn-1"],
+        "submit_observer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("canary")),
+    )
+    assert other.submit_patch_status_notice("turn-1", **tags) is False
+    other.close()
+    runtime.close()
+    assert other_posted == []
+
+
+def test_patch_status_notice_and_cleanup_race_is_linearizable():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    barrier = Barrier(2)
+    tags = {
+        "notice_kind": "context-compaction",
+        "notice_id": "context-compaction:active",
+    }
+
+    def submit():
+        barrier.wait()
+        return runtime.submit_patch_status_notice("turn-1", **tags)
+
+    def cleanup():
+        barrier.wait()
+        runtime.handle_on_session_reset(old_session_id="session-1")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        submitted = executor.submit(submit)
+        cleaned = executor.submit(cleanup)
+        assert type(submitted.result(timeout=1.0)) is bool
+        assert cleaned.result(timeout=1.0) is None
+    assert runtime.turn_state("turn-1") is None
+    assert runtime.submit_patch_status_notice("turn-1", **tags) is False
+    runtime.close()
 
 
 @pytest.mark.parametrize("kind", ("approval", "clarify", "slash"))

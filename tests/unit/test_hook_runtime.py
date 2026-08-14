@@ -49,6 +49,10 @@ class _ThinBridgeRuntime:
         self.calls.append(("delta", values))
         return True
 
+    def submit_patch_status_notice(self, turn_id, *, notice_kind, notice_id):
+        self.calls.append(("status", (turn_id, notice_kind, notice_id)))
+        return True
+
     def register_patch_interaction(self, *values):
         self.calls.append(("register", values))
         return True
@@ -447,6 +451,65 @@ def test_thin_ingress_before_turn_publish_accepts_authenticated_exact_values(mon
     assert runtime.calls[0][0] == "ingress"
 
 
+@pytest.mark.parametrize(
+    ("profile_id", "profile_source", "extra"),
+    (
+        ("work", "env", {}),
+        ("work", "locals", {}),
+        (
+            "work",
+            "hermes_home",
+            {"hermes_home_membership_verified": True},
+        ),
+        ("default", "fallback_default", {}),
+    ),
+)
+def test_thin_ingress_accepts_only_exact_trusted_profile_evidence(
+    monkeypatch, profile_id, profile_source, extra
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+
+    assert hook_runtime.bind_ingress_from_hermes_locals(
+        _thin_ingress_locals(
+            turn_id=None,
+            profile_id=profile_id,
+            profile_source=profile_source,
+            **extra,
+        )
+    ) is True
+    assert runtime.calls[0][1][:2] == (profile_id, profile_source)
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "profile_source", "extra"),
+    (
+        ("work", "hermes_home", {}),
+        ("work", "hermes_home", {"hermes_home_membership_verified": 1}),
+        ("work", "sanitized_env", {}),
+        ("work", "sanitized_locals", {}),
+        ("work", "sanitized_hermes_home", {}),
+        ("work", "fallback_default", {}),
+        ("bad/profile", "env", {}),
+    ),
+)
+def test_thin_ingress_rejects_unverified_sanitized_or_mismatched_profile_evidence(
+    monkeypatch, profile_id, profile_source, extra
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+
+    assert hook_runtime.bind_ingress_from_hermes_locals(
+        _thin_ingress_locals(
+            turn_id=None,
+            profile_id=profile_id,
+            profile_source=profile_source,
+            **extra,
+        )
+    ) is False
+    assert runtime.calls == []
+
+
 def test_thin_delta_delegates_exact_active_turn_without_legacy_emit_or_queue(monkeypatch):
     runtime = _ThinBridgeRuntime()
     monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
@@ -468,6 +531,130 @@ def test_thin_delta_delegates_exact_active_turn_without_legacy_emit_or_queue(mon
     finally:
         hook_runtime.clear_canonical_turn_id(token)
     assert runtime.calls == [("delta", ("turn-1", "answer.delta", "delta", "delta"))]
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Compacting context",
+        "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
+    ),
+)
+def test_thin_status_classifies_exact_compaction_and_delegates_only_fixed_tags(
+    monkeypatch, message
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    for forbidden_name in (
+        "_policy_identity",
+        "_next_sequence",
+        "emit_from_hermes_locals",
+        "emit_from_hermes_locals_threadsafe",
+        "emit_from_hermes_locals_async",
+        "build_event",
+        "handle_status_from_hermes_locals",
+        "_hfc_send_system_notice_card",
+        "_hfc_classify_system_notice",
+        "handle_platform_notice_from_hermes",
+    ):
+        monkeypatch.setattr(
+            hook_runtime,
+            forbidden_name,
+            lambda *_args, _name=forbidden_name, **_kwargs: pytest.fail(
+                f"forbidden Legacy/native owner: {_name}"
+            ),
+            raising=False,
+        )
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.submit_status_notice_from_hermes_locals(
+            _thin_bridge_locals(), event_type="context", message=message
+        ) is True
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+
+    assert runtime.calls == [
+        (
+            "status",
+            (
+                "turn-1",
+                "context-compaction",
+                "context-compaction:active",
+            ),
+        )
+    ]
+    assert message not in repr(runtime.calls)
+
+
+@pytest.mark.parametrize(
+    ("local_vars", "event_type", "message"),
+    (
+        (_thin_bridge_locals(_hfc_authorized=False), "context", "Compacting context"),
+        (_thin_bridge_locals(_hfc_authorized=1), "context", "Compacting context"),
+        (_thin_bridge_locals(platform="telegram"), "context", "Compacting context"),
+        (_thin_bridge_locals(platform=StringSubclass("feishu")), "context", "Compacting context"),
+        (_thin_bridge_locals(turn_id="turn-other"), "context", "Compacting context"),
+        (_thin_bridge_locals(), StringSubclass("context"), "Compacting context"),
+        (_thin_bridge_locals(), "tool", "Compacting context"),
+        (_thin_bridge_locals(), "provider", "Compacting context"),
+        (_thin_bridge_locals(), "context", StringSubclass("Compacting context")),
+        (_thin_bridge_locals(), "context", ""),
+        (_thin_bridge_locals(), "context", "COMPACTING CONTEXT"),
+        (_thin_bridge_locals(), "context", "Compacting   context"),
+        (_thin_bridge_locals(), "context", "Compacting context completed"),
+        (_thin_bridge_locals(), "context", "Compacting context failed"),
+        (_thin_bridge_locals(), "context", "tool: Compacting context"),
+        (_thin_bridge_locals(), "context", "provider status: Compacting context"),
+        (_thin_bridge_locals(), "context", "x" * 1025),
+        (
+            type("DictSubclass", (dict,), {})(_thin_bridge_locals()),
+            "context",
+            "Compacting context",
+        ),
+    ),
+)
+def test_thin_status_rejects_mismatch_nonordinary_unknown_and_terminal_text(
+    monkeypatch, local_vars, event_type, message
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.submit_status_notice_from_hermes_locals(
+            local_vars, event_type=event_type, message=message
+        ) is False
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+    assert runtime.calls == []
+
+
+def test_thin_status_requires_literal_true_and_fails_open_on_runtime_exception(
+    monkeypatch,
+):
+    class EqualitySpoof:
+        def __eq__(self, other):
+            return other is True
+
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        runtime.submit_patch_status_notice = lambda *_args, **_kwargs: EqualitySpoof()
+        assert hook_runtime.submit_status_notice_from_hermes_locals(
+            _thin_bridge_locals(),
+            event_type="context",
+            message="Compacting context",
+        ) is False
+        runtime.submit_patch_status_notice = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("canary")
+        )
+        assert hook_runtime.submit_status_notice_from_hermes_locals(
+            _thin_bridge_locals(),
+            event_type="context",
+            message="Compacting context",
+        ) is False
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
 
 
 @pytest.mark.parametrize(
