@@ -1129,3 +1129,189 @@ def test_legacy_start_owner_survives_temporary_shared_lease_rollback(monkeypatch
 
     runtime_control.reset_runtime_control_for_tests()
     assert stopped.wait(timeout=0.5)
+
+
+def test_shared_worker_combines_every_owner_provider_conservatively(monkeypatch):
+    captured = {}
+
+    class FakeEmitter:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, stop_event, interval_seconds):
+            stop_event.wait()
+
+    monkeypatch.setattr(runtime_control, "RuntimeControlEmitter", FakeEmitter)
+    first = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+        active_work_snapshot_provider=lambda: (0, True),
+        admission_draining_provider=lambda: False,
+        drain_home_verified_provider=lambda: True,
+    )
+    second = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+        active_work_snapshot_provider=lambda: (2, False),
+        admission_draining_provider=lambda: True,
+        drain_home_verified_provider=lambda: False,
+    )
+    assert first is not None and second is not None
+
+    assert captured["active_work_snapshot_provider"]() == (2, False)
+    assert captured["admission_draining_provider"]() is True
+    assert captured["drain_home_verified_provider"]() is False
+
+    second.close()
+    assert captured["active_work_snapshot_provider"]() == (0, True)
+    assert captured["admission_draining_provider"]() is False
+    assert captured["drain_home_verified_provider"]() is True
+    first.close()
+
+
+def test_shared_worker_unknown_owner_never_reports_complete_zero(monkeypatch):
+    captured = {}
+
+    class FakeEmitter:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, stop_event, interval_seconds):
+            stop_event.wait()
+
+    monkeypatch.setattr(runtime_control, "RuntimeControlEmitter", FakeEmitter)
+    known = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+        active_work_snapshot_provider=lambda: (0, True),
+        admission_draining_provider=lambda: False,
+        drain_home_verified_provider=lambda: True,
+    )
+    unknown = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+    )
+    assert known is not None and unknown is not None
+    assert captured["active_work_snapshot_provider"]() == (0, False)
+    assert captured["admission_draining_provider"]() is True
+    assert captured["drain_home_verified_provider"]() is False
+    unknown.close()
+    known.close()
+
+
+def test_plugin_local_owner_is_incomplete_until_gateway_aggregate_owner_exists(
+    monkeypatch,
+):
+    captured = {}
+
+    class FakeEmitter:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, stop_event, interval_seconds):
+            stop_event.wait()
+
+    monkeypatch.setattr(runtime_control, "RuntimeControlEmitter", FakeEmitter)
+    plugin = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+        active_work_snapshot_provider=lambda: (0, True),
+    )
+    assert plugin is not None
+    assert captured["active_work_snapshot_provider"]() == (0, False)
+
+    gateway = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+        active_work_snapshot_provider=lambda: (0, True),
+        admission_draining_provider=lambda: False,
+        drain_home_verified_provider=lambda: True,
+    )
+    assert gateway is not None
+    assert captured["active_work_snapshot_provider"]() == (0, True)
+
+    gateway.close()
+    assert captured["active_work_snapshot_provider"]() == (0, False)
+    plugin.close()
+
+
+def test_shared_worker_provider_exception_is_conservative(monkeypatch):
+    captured = {}
+
+    def broken():
+        raise RuntimeError("provider failed")
+
+    class FakeEmitter:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, stop_event, interval_seconds):
+            stop_event.wait()
+
+    monkeypatch.setattr(runtime_control, "RuntimeControlEmitter", FakeEmitter)
+    lease = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+        active_work_snapshot_provider=broken,
+        admission_draining_provider=broken,
+        drain_home_verified_provider=broken,
+    )
+    assert lease is not None
+    assert captured["active_work_snapshot_provider"]() == (0, False)
+    assert captured["admission_draining_provider"]() is True
+    assert captured["drain_home_verified_provider"]() is False
+    lease.close()
+
+
+def test_last_owner_join_timeout_keeps_truthful_poisoned_worker_until_exit(
+    monkeypatch,
+):
+    threads = []
+
+    class FakeEmitter:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self, stop_event, interval_seconds):
+            return None
+
+    class SlowStoppingThread:
+        def __init__(self, **_kwargs):
+            self.alive = True
+            threads.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout):
+            return None
+
+    monkeypatch.setattr(runtime_control, "RuntimeControlEmitter", FakeEmitter)
+    monkeypatch.setattr(runtime_control.threading, "Thread", SlowStoppingThread)
+    lease = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+    )
+    assert lease is not None
+    lease.close()
+
+    assert runtime_control._CONTROL_THREAD is threads[0]
+    assert runtime_control._CONTROL_STOPPING is True
+    assert acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+    ) is None
+    assert len(threads) == 1
+
+    threads[0].alive = False
+    replacement = acquire_runtime_control(
+        event_url="http://127.0.0.1:18765/events",
+        package_version="4.3.0",
+    )
+    assert replacement is not None
+    assert len(threads) == 2
+    threads[1].alive = False
+    replacement.close()

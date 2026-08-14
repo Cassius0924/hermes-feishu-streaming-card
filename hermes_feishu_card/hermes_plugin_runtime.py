@@ -6,7 +6,6 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
-from ipaddress import ip_address
 from math import isfinite
 import atexit
 import json
@@ -34,8 +33,22 @@ OFFICIAL_HOOKS = (
 
 DEFAULT_EVENT_URL = "http://127.0.0.1:8765/events"
 DEFAULT_EVENT_TIMEOUT_SECONDS = 0.8
+MAX_EVENT_REQUEST_BYTES = 256 * 1024
 MAX_EVENT_RESPONSE_BYTES = 64 * 1024
-_NO_PROXY_EVENT_OPENER = request.build_opener(request.ProxyHandler({}))
+MAX_EVENT_JSON_DEPTH = 16
+MAX_EVENT_JSON_NODES = 4096
+MAX_EVENT_JSON_TEXT_BYTES = 256 * 1024
+
+
+class _RejectRedirects(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_PROXY_EVENT_OPENER = request.build_opener(
+    request.ProxyHandler({}),
+    _RejectRedirects(),
+)
 
 
 @dataclass(frozen=True)
@@ -71,7 +84,7 @@ class SignedEventTransport:
         self, payload: dict[str, object], timeout_seconds: float
     ) -> dict[str, object] | None:
         try:
-            if type(payload) is not dict:
+            if not _is_bounded_ordinary_json_object(payload):
                 return None
             body = json.dumps(
                 payload,
@@ -80,6 +93,8 @@ class SignedEventTransport:
                 separators=(",", ":"),
                 allow_nan=False,
             ).encode("utf-8")
+            if len(body) > MAX_EVENT_REQUEST_BYTES:
+                return None
             secret = self._secret_reader()
             if type(secret) is not bytes or len(secret) != 32:
                 return None
@@ -111,41 +126,100 @@ class SignedEventTransport:
             if not isinstance(raw, bytes) or len(raw) > MAX_EVENT_RESPONSE_BYTES:
                 return None
             value = json.loads(raw.decode("utf-8"))
-            if type(value) is not dict or not all(type(key) is str for key in value):
+            if not _is_bounded_ordinary_json_object(value):
                 return None
             return value
         except Exception:
             return None
 
 
+def _is_bounded_ordinary_json_object(value: object) -> bool:
+    if type(value) is not dict:
+        return False
+    nodes = 0
+    active_containers: set[int] = set()
+    stack: list[tuple[object, int, bool]] = [(value, 1, False)]
+    while stack:
+        current, depth, exiting = stack.pop()
+        if exiting:
+            active_containers.discard(id(current))
+            continue
+        nodes += 1
+        if nodes > MAX_EVENT_JSON_NODES:
+            return False
+        current_type = type(current)
+        if current_type is dict:
+            if depth > MAX_EVENT_JSON_DEPTH or id(current) in active_containers:
+                return False
+            active_containers.add(id(current))
+            stack.append((current, depth, True))
+            if nodes + len(current) > MAX_EVENT_JSON_NODES:
+                return False
+            items = tuple(current.items())
+            nodes += len(items)
+            for key, item in reversed(items):
+                if (
+                    type(key) is not str
+                    or len(key) > MAX_EVENT_JSON_TEXT_BYTES
+                    or len(key.encode("utf-8")) > MAX_EVENT_JSON_TEXT_BYTES
+                ):
+                    return False
+                stack.append((item, depth + 1, False))
+            continue
+        if current_type is list:
+            if depth > MAX_EVENT_JSON_DEPTH or id(current) in active_containers:
+                return False
+            if nodes + len(current) > MAX_EVENT_JSON_NODES:
+                return False
+            active_containers.add(id(current))
+            stack.append((current, depth, True))
+            for item in reversed(current):
+                stack.append((item, depth + 1, False))
+            continue
+        if current_type is str:
+            if (
+                len(current) > MAX_EVENT_JSON_TEXT_BYTES
+                or len(current.encode("utf-8")) > MAX_EVENT_JSON_TEXT_BYTES
+            ):
+                return False
+            continue
+        if current is None or current_type is bool or current_type is int:
+            continue
+        if current_type is float and isfinite(current):
+            continue
+        return False
+    return True
+
+
 def _canonical_loopback_event_url(value: object) -> str:
-    if type(value) is not str:
+    if (
+        type(value) is not str
+        or value != value.strip()
+        or "?" in value
+        or "#" in value
+    ):
         raise ValueError("event URL is invalid")
     try:
-        parsed = parse.urlsplit(value.strip())
+        parsed = parse.urlsplit(value)
         port = parsed.port
     except ValueError as exc:
         raise ValueError("event URL is invalid") from exc
     if (
-        parsed.scheme.lower() != "http"
-        or not parsed.hostname
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1"}
         or parsed.username is not None
         or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
+        or port is None
+        or not 1 <= port <= 65535
         or parsed.path != "/events"
     ):
         raise ValueError("event URL is invalid")
-    hostname = parsed.hostname.strip().lower()
-    if hostname != "localhost":
-        try:
-            if not ip_address(hostname).is_loopback:
-                raise ValueError("event URL is invalid")
-        except ValueError as exc:
-            raise ValueError("event URL is invalid") from exc
+    hostname = parsed.hostname
     normalized_host = f"[{hostname}]" if ":" in hostname else hostname
-    netloc = f"{normalized_host}:{port}" if port is not None else normalized_host
-    return parse.urlunsplit(("http", netloc, "/events", "", ""))
+    canonical = f"http://{normalized_host}:{port}/events"
+    if value != canonical:
+        raise ValueError("event URL is invalid")
+    return canonical
 
 
 def _load_production_runtime_config() -> ProductionRuntimeConfig:
@@ -153,7 +227,7 @@ def _load_production_runtime_config() -> ProductionRuntimeConfig:
     enabled = enabled_text not in {"0", "false", "no", "off"}
     event_url = os.environ.get(
         "HERMES_FEISHU_CARD_EVENT_URL", DEFAULT_EVENT_URL
-    ).strip()
+    )
     timeout_text = os.environ.get("HERMES_FEISHU_CARD_TIMEOUT_MS")
     timeout_seconds = DEFAULT_EVENT_TIMEOUT_SECONDS
     if timeout_text is not None:
@@ -1497,6 +1571,12 @@ def _swap_active_runtime(runtime: PluginRuntime | None) -> PluginRuntime | None:
     return old_runtime
 
 
+def active_plugin_runtime() -> PluginRuntime | None:
+    """Return only the process runtime protected by its authoritative lock."""
+    with _ACTIVE_RUNTIME_LOCK:
+        return _ACTIVE_RUNTIME
+
+
 def reset_plugin_runtime_state() -> None:
     configure_plugin_runtime(None)
     _ingress_registry.clear()
@@ -1595,47 +1675,106 @@ def register_callbacks(ctx: Any) -> None:
 
 
 @dataclass
+class _ContextGate:
+    context: object
+    registration_complete: bool = False
+    registered_hooks: set[str] = field(default_factory=set)
+    _runtime: PluginRuntime | None = None
+    _lock: RLock = field(default_factory=RLock)
+
+    def invoke(self, handler_name: str, kwargs: dict[str, Any]) -> None:
+        try:
+            with _ACTIVE_RUNTIME_LOCK:
+                with self._lock:
+                    expected_runtime = self._runtime
+                if expected_runtime is None or _ACTIVE_RUNTIME is not expected_runtime:
+                    return None
+            getattr(expected_runtime, handler_name)(**kwargs)
+        except Exception:
+            return None
+        return None
+
+    def set_runtime(self, runtime: PluginRuntime | None) -> None:
+        with self._lock:
+            self._runtime = runtime
+        return None
+
+    def clear_runtime(self, expected_runtime: PluginRuntime) -> None:
+        with self._lock:
+            if self._runtime is expected_runtime:
+                self._runtime = None
+        return None
+
+
+@dataclass
 class _ProductionBootstrap:
     context: object
+    gate: _ContextGate
     runtime: PluginRuntime
     lease: RuntimeControlLease
+    config: ProductionRuntimeConfig
     _closed: bool = False
 
     def close(self) -> None:
+        global _ACTIVE_RUNTIME
         if self._closed:
             return None
         self._closed = True
         with _ACTIVE_RUNTIME_LOCK:
-            active = _ACTIVE_RUNTIME
-        if active is self.runtime:
-            configure_plugin_runtime(None)
-        else:
-            self.runtime.close()
-        self.lease.close()
+            if _ACTIVE_RUNTIME is self.runtime:
+                _ACTIVE_RUNTIME = None
+            self.gate.clear_runtime(self.runtime)
+        try:
+            try:
+                self.runtime.close()
+            except Exception:
+                pass
+        finally:
+            try:
+                self.lease.close()
+            except Exception:
+                pass
         return None
 
 
 _BOOTSTRAP_LOCK = RLock()
 _PRODUCTION_BOOTSTRAP: _ProductionBootstrap | None = None
 _ATEXIT_REGISTERED = False
-_INERT_CONTEXTS: list[object] = []
+_CONTEXT_GATES: list[_ContextGate] = []
 
 
 def bootstrap_plugin_runtime(ctx: Any) -> None:
-    """Install one production runtime before exposing official callbacks."""
-    global _PRODUCTION_BOOTSTRAP, _ATEXIT_REGISTERED
+    """Install one production runtime before activating official callbacks."""
+    global _ACTIVE_RUNTIME, _PRODUCTION_BOOTSTRAP, _ATEXIT_REGISTERED
     try:
         with _BOOTSTRAP_LOCK:
             current = _PRODUCTION_BOOTSTRAP
-            if current is not None and current.context is ctx:
-                return None
             config = _load_production_runtime_config()
             if not config.enabled:
-                _register_inert_callbacks_once(ctx)
+                gate = _ensure_context_gate(ctx)
+                gate.set_runtime(None)
+                _PRODUCTION_BOOTSTRAP = None
+                if current is not None:
+                    current.close()
                 return None
             secret = read_transport_root_secret()
             if type(secret) is not bytes or len(secret) != 32:
-                _register_inert_callbacks_once(ctx)
+                gate = _find_context_gate(ctx)
+                if (
+                    current is not None
+                    and current.context is ctx
+                    and gate is current.gate
+                ):
+                    return None
+                _ensure_context_gate(ctx).set_runtime(None)
+                return None
+            gate = _find_context_gate(ctx)
+            if (
+                current is not None
+                and current.context is ctx
+                and current.config == config
+                and gate is current.gate
+            ):
                 return None
             transport = SignedEventTransport(
                 event_url=config.event_url,
@@ -1649,45 +1788,43 @@ def bootstrap_plugin_runtime(ctx: Any) -> None:
             lease = acquire_runtime_control(
                 event_url=config.event_url,
                 package_version=__version__,
-                active_work_snapshot_provider=_runtime_activity_snapshot,
+                active_work_snapshot_provider=_runtime_activity_provider(runtime),
             )
             if lease is None:
                 runtime.close()
-                _register_inert_callbacks_once(ctx)
+                _ensure_context_gate(ctx)
                 return None
             try:
                 if not _ATEXIT_REGISTERED:
                     atexit.register(_close_process_plugin_runtime)
                     _ATEXIT_REGISTERED = True
-                _swap_active_runtime(runtime)
-                if not _register_callbacks_checked(ctx, runtime):
+                gate = _ensure_context_gate(ctx)
+                if not gate.registration_complete:
                     raise RuntimeError("official callback registration incomplete")
             except Exception:
-                _swap_active_runtime(current.runtime if current is not None else None)
-                runtime.close()
-                lease.close()
+                _ensure_context_gate(ctx)
+                _close_runtime_and_lease(runtime, lease)
                 return None
-            bootstrap = _ProductionBootstrap(ctx, runtime, lease)
+            bootstrap = _ProductionBootstrap(ctx, gate, runtime, lease, config)
+            with _ACTIVE_RUNTIME_LOCK:
+                _ACTIVE_RUNTIME = runtime
+                gate.set_runtime(runtime)
+                if current is not None and current.gate is not gate:
+                    current.gate.clear_runtime(current.runtime)
             _PRODUCTION_BOOTSTRAP = bootstrap
             if current is not None:
                 current.close()
         return None
     except Exception:
         try:
-            _register_inert_callbacks_once(ctx)
+            _ensure_context_gate(ctx)
         except Exception:
             pass
         return None
 
 
 def _register_callbacks_checked(ctx: Any, runtime: PluginRuntime) -> bool:
-    complete = True
-    for name, handler_name in HOOK_HANDLERS.items():
-        try:
-            ctx.register_hook(name, _runtime_callback(handler_name, runtime))
-        except Exception:
-            complete = False
-    return complete
+    return _ensure_context_gate(ctx).registration_complete
 
 
 def _runtime_callback(
@@ -1698,7 +1835,7 @@ def _runtime_callback(
             with _ACTIVE_RUNTIME_LOCK:
                 if _ACTIVE_RUNTIME is not expected_runtime:
                     return None
-            globals()[handler_name](**kwargs)
+            getattr(expected_runtime, handler_name)(**kwargs)
         except Exception:
             return None
         return None
@@ -1706,18 +1843,37 @@ def _runtime_callback(
     return invoke
 
 
-def _register_inert_callbacks_once(ctx: Any) -> None:
-    if any(known is ctx for known in _INERT_CONTEXTS):
-        return None
-    for name in HOOK_HANDLERS:
+def _find_context_gate(ctx: Any) -> _ContextGate | None:
+    for gate in _CONTEXT_GATES:
+        if gate.context is ctx:
+            return gate
+    return None
+
+
+def _ensure_context_gate(ctx: Any) -> _ContextGate:
+    gate = _find_context_gate(ctx)
+    if gate is None:
+        gate = _ContextGate(ctx)
+        _CONTEXT_GATES.append(gate)
+    for name, handler_name in HOOK_HANDLERS.items():
+        if name in gate.registered_hooks:
+            continue
         try:
-            ctx.register_hook(name, _inert_callback())
+            ctx.register_hook(name, _gate_callback(gate, handler_name))
+            gate.registered_hooks.add(name)
         except Exception:
             continue
-    _INERT_CONTEXTS.append(ctx)
-    if len(_INERT_CONTEXTS) > 64:
-        del _INERT_CONTEXTS[0]
-    return None
+    gate.registration_complete = len(gate.registered_hooks) == len(HOOK_HANDLERS)
+    return gate
+
+
+def _gate_callback(
+    gate: _ContextGate, handler_name: str
+) -> Callable[..., None]:
+    def invoke(**kwargs: Any) -> None:
+        return gate.invoke(handler_name, kwargs)
+
+    return invoke
 
 
 def _inert_callback() -> Callable[..., None]:
@@ -1738,6 +1894,34 @@ def _runtime_activity_snapshot() -> tuple[int, bool]:
         return 0, False
 
 
+def _runtime_activity_provider(
+    runtime: PluginRuntime,
+) -> Callable[[], tuple[int, bool]]:
+    def snapshot() -> tuple[int, bool]:
+        try:
+            return runtime.runtime_activity_snapshot()
+        except Exception:
+            return 0, False
+
+    return snapshot
+
+
+def _close_runtime_and_lease(
+    runtime: PluginRuntime, lease: RuntimeControlLease
+) -> None:
+    try:
+        try:
+            runtime.close()
+        except Exception:
+            pass
+    finally:
+        try:
+            lease.close()
+        except Exception:
+            pass
+    return None
+
+
 def _close_process_plugin_runtime() -> None:
     global _PRODUCTION_BOOTSTRAP
     with _BOOTSTRAP_LOCK:
@@ -1753,5 +1937,5 @@ def reset_production_plugin_runtime_for_tests() -> None:
     _close_process_plugin_runtime()
     with _BOOTSTRAP_LOCK:
         _ATEXIT_REGISTERED = False
-        _INERT_CONTEXTS.clear()
+        _CONTEXT_GATES.clear()
     return None

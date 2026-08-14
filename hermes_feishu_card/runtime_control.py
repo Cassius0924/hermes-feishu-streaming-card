@@ -910,6 +910,15 @@ _CONTROL_STOP: threading.Event | None = None
 _CONTROL_THREAD: threading.Thread | None = None
 _CONTROL_CONFIG: tuple[object, ...] | None = None
 _CONTROL_OWNERS: set[object] = set()
+_CONTROL_PROVIDERS: dict[
+    object,
+    tuple[
+        Callable[[], tuple[int, bool]] | None,
+        Callable[[], bool] | None,
+        Callable[[], bool] | None,
+    ],
+] = {}
+_CONTROL_STOPPING = False
 _LEGACY_CONTROL_LEASE: "RuntimeControlLease | None" = None
 
 
@@ -942,6 +951,7 @@ def acquire_runtime_control(
 ) -> RuntimeControlLease | None:
     """Acquire the one shared worker only when its exact config matches."""
     global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD, _CONTROL_CONFIG
+    global _CONTROL_STOPPING
     try:
         if interval_seconds <= 0:
             return None
@@ -954,19 +964,29 @@ def acquire_runtime_control(
         owner = object()
         with _CONTROL_LOCK:
             if _CONTROL_CONFIG is not None:
-                if _CONTROL_CONFIG != config:
-                    return None
-                if _CONTROL_THREAD is None or not _CONTROL_THREAD.is_alive():
-                    return None
-                _CONTROL_OWNERS.add(owner)
-                return RuntimeControlLease(owner)
+                if _CONTROL_STOPPING:
+                    if _CONTROL_THREAD is not None and _CONTROL_THREAD.is_alive():
+                        return None
+                    _clear_runtime_control_locked()
+                if _CONTROL_CONFIG is not None:
+                    if _CONTROL_CONFIG != config:
+                        return None
+                    if _CONTROL_THREAD is None or not _CONTROL_THREAD.is_alive():
+                        return None
+                    _CONTROL_OWNERS.add(owner)
+                    _CONTROL_PROVIDERS[owner] = (
+                        active_work_snapshot_provider,
+                        admission_draining_provider,
+                        drain_home_verified_provider,
+                    )
+                    return RuntimeControlLease(owner)
             emitter = RuntimeControlEmitter(
                 event_url=event_url,
                 hook_generation=hook_generation,
                 package_version=package_version,
-                active_work_snapshot_provider=active_work_snapshot_provider,
-                admission_draining_provider=admission_draining_provider,
-                drain_home_verified_provider=drain_home_verified_provider,
+                active_work_snapshot_provider=_combined_active_work_snapshot,
+                admission_draining_provider=_combined_admission_draining,
+                drain_home_verified_provider=_combined_drain_home_verified,
             )
             stop_event = threading.Event()
             thread = threading.Thread(
@@ -980,10 +1000,17 @@ def acquire_runtime_control(
             _CONTROL_THREAD = thread
             _CONTROL_CONFIG = config
             _CONTROL_OWNERS.add(owner)
+            _CONTROL_PROVIDERS[owner] = (
+                active_work_snapshot_provider,
+                admission_draining_provider,
+                drain_home_verified_provider,
+            )
+            _CONTROL_STOPPING = False
             try:
                 thread.start()
             except Exception:
                 _CONTROL_OWNERS.discard(owner)
+                _CONTROL_PROVIDERS.pop(owner, None)
                 _CONTROL_EMITTER = None
                 _CONTROL_STOP = None
                 _CONTROL_THREAD = None
@@ -997,10 +1024,12 @@ def acquire_runtime_control(
 
 def _release_runtime_control(owner: object) -> None:
     global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD, _CONTROL_CONFIG
+    global _CONTROL_STOPPING
     with _CONTROL_LOCK:
         if owner not in _CONTROL_OWNERS:
             return None
         _CONTROL_OWNERS.remove(owner)
+        _CONTROL_PROVIDERS.pop(owner, None)
         if _CONTROL_OWNERS:
             return None
         stop_event = _CONTROL_STOP
@@ -1009,11 +1038,87 @@ def _release_runtime_control(owner: object) -> None:
             stop_event.set()
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=1.0)
-        _CONTROL_EMITTER = None
-        _CONTROL_STOP = None
-        _CONTROL_THREAD = None
-        _CONTROL_CONFIG = None
+        if thread is not None and thread.is_alive():
+            _CONTROL_STOPPING = True
+            return None
+        _clear_runtime_control_locked()
     return None
+
+
+def _clear_runtime_control_locked() -> None:
+    global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD, _CONTROL_CONFIG
+    global _CONTROL_STOPPING
+    _CONTROL_EMITTER = None
+    _CONTROL_STOP = None
+    _CONTROL_THREAD = None
+    _CONTROL_CONFIG = None
+    _CONTROL_STOPPING = False
+    _CONTROL_OWNERS.clear()
+    _CONTROL_PROVIDERS.clear()
+
+
+def _combined_active_work_snapshot() -> tuple[int, bool]:
+    with _CONTROL_LOCK:
+        providers = tuple(_CONTROL_PROVIDERS.values())
+    total = 0
+    complete = bool(providers)
+    gateway_aggregate_present = False
+    for active_provider, admission_provider, home_provider in providers:
+        if (
+            active_provider is not None
+            and admission_provider is not None
+            and home_provider is not None
+        ):
+            gateway_aggregate_present = True
+        if active_provider is None:
+            complete = False
+            continue
+        try:
+            active, owner_complete = active_provider()
+            if (
+                type(active) is not int
+                or active < 0
+                or type(owner_complete) is not bool
+            ):
+                raise ValueError("invalid active work snapshot")
+            total = min(1_000_000, total + active)
+            complete = complete and owner_complete
+        except Exception:
+            complete = False
+    return total, complete and gateway_aggregate_present
+
+
+def _combined_admission_draining() -> bool:
+    with _CONTROL_LOCK:
+        providers = tuple(_CONTROL_PROVIDERS.values())
+    if not providers:
+        return True
+    for _active, admission_provider, _home in providers:
+        if admission_provider is None:
+            return True
+        try:
+            value = admission_provider()
+            if type(value) is not bool or value:
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def _combined_drain_home_verified() -> bool:
+    with _CONTROL_LOCK:
+        providers = tuple(_CONTROL_PROVIDERS.values())
+    if not providers:
+        return False
+    for _active, _admission, home_provider in providers:
+        if home_provider is None:
+            return False
+        try:
+            if home_provider() is not True:
+                return False
+        except Exception:
+            return False
+    return True
 
 
 def start_runtime_control(
@@ -1048,7 +1153,7 @@ def start_runtime_control(
 
 def reset_runtime_control_for_tests() -> None:
     global _CONTROL_EMITTER, _CONTROL_STOP, _CONTROL_THREAD, _CONTROL_CONFIG
-    global _LEGACY_CONTROL_LEASE
+    global _LEGACY_CONTROL_LEASE, _CONTROL_STOPPING
     with _CONTROL_LOCK:
         stop_event = _CONTROL_STOP
         thread = _CONTROL_THREAD
@@ -1057,6 +1162,8 @@ def reset_runtime_control_for_tests() -> None:
         _CONTROL_THREAD = None
         _CONTROL_CONFIG = None
         _CONTROL_OWNERS.clear()
+        _CONTROL_PROVIDERS.clear()
+        _CONTROL_STOPPING = False
         _LEGACY_CONTROL_LEASE = None
     if stop_event is not None:
         stop_event.set()
