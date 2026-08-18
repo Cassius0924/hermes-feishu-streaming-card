@@ -77,6 +77,7 @@ from .render import (
     _is_initial_loading,
     render_card_result,
     render_terminal_limit_handoff_card,
+    _format_duration,
 )
 from .process import state_dir
 from .session import CardSession
@@ -4763,6 +4764,18 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                     handoff_identity,
                     handoff_record,
                 )
+            if (
+                updated
+                and is_terminal
+                and event.event == "message.completed"
+                and render_result.disposition == "card"
+            ):
+                await _maybe_send_completion_notify(
+                    request.app,
+                    session_key,
+                    latest_session,
+                    event,
+                )
             return updated
 
         if is_terminal:
@@ -4819,6 +4832,58 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             _session_key(event),
         )
     return web.json_response(response_payload), post_lock_task
+
+
+async def _maybe_send_completion_notify(
+    app: web.Application,
+    session_key: str,
+    session: CardSession,
+    event: SidecarEvent,
+) -> None:
+    """Send an @-mention completion notice after the card finished updating.
+
+    Feishu does not push notifications for card edits (verified 2026-08-18:
+    PATCHing a card to add an <at> mention does not notify the user), so a
+    completed long-running task needs a fresh text message that mentions the
+    initiating user. Controlled by ``card.completion_notify.enabled``
+    (default: enabled). Sends at most once per session.
+    """
+    try:
+        if session.completion_notify_sent:
+            return
+        if session.status != "completed":
+            return
+        sender_open_id = session.sender_open_id
+        if not sender_open_id:
+            return
+        card_config = app[SESSION_CARD_CONFIGS_KEY].get(session_key, {})
+        notify_config = card_config.get("completion_notify")
+        if isinstance(notify_config, dict) and notify_config.get("enabled") is False:
+            return
+        if notify_config is False:
+            return
+        bot_id = app[MESSAGE_BOT_IDS_KEY].get(session_key)
+        client = _client_for_bot(app, bot_id)
+        duration_text = (
+            _format_duration(session.duration) if (session.duration or 0) > 0 else ""
+        )
+        suffix = f"（用时 {duration_text}）" if duration_text else ""
+        text = f'<at user_id="{sender_open_id}"></at> ✅ 任务已完成{suffix}'
+        reply_to = session.reply_to_message_id or _reply_to_message_id_for_event(event)
+        await client.send_text_message(
+            event.chat_id,
+            text,
+            thread_id=_thread_id_for_event(event),
+            reply_to_message_id=reply_to or None,
+        )
+        session.completion_notify_sent = True
+        logger.info(
+            "completion notify sent to %s (session %s)",
+            sender_open_id,
+            session_key,
+        )
+    except Exception as exc:
+        logger.warning("completion notify send failed: %s", exc)
 
 
 def _post_terminal_cleanup(

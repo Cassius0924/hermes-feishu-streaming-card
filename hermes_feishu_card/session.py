@@ -110,6 +110,8 @@ class CardSession:
     active_interaction: InteractionState | None = None
     delivery_kind: str = "chat"
     reply_to_message_id: str = ""
+    sender_open_id: str = ""
+    completion_notify_sent: bool = False
     notice_title: str = ""
     notice_level: str = "info"
     terminal_disposition: str = ""
@@ -264,6 +266,9 @@ class CardSession:
             delivery_kind = event.data.get("delivery_kind")
             if isinstance(delivery_kind, str) and delivery_kind.strip():
                 self.delivery_kind = delivery_kind.strip()
+            sender_open_id = event.data.get("sender_open_id")
+            if isinstance(sender_open_id, str) and sender_open_id.strip():
+                self.sender_open_id = sender_open_id.strip()
             reply_to_message_id = event.data.get("reply_to_message_id")
             if isinstance(reply_to_message_id, str):
                 self.reply_to_message_id = reply_to_message_id
@@ -319,6 +324,9 @@ class CardSession:
             self.latest_tool_preview = ""
             if completed_answer.strip():
                 self.answer_text = completed_answer
+            sender_open_id = event.data.get("sender_open_id")
+            if isinstance(sender_open_id, str) and sender_open_id.strip():
+                self.sender_open_id = sender_open_id.strip()
             delivery_kind = event.data.get("delivery_kind")
             if isinstance(delivery_kind, str) and delivery_kind.strip():
                 self.delivery_kind = delivery_kind.strip()

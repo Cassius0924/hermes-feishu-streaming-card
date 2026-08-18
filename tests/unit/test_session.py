@@ -66,6 +66,41 @@ def test_started_message_uses_feishu_message_id_as_native_reply_anchor():
     assert session.reply_to_message_id == "om_user_message"
 
 
+def test_started_message_records_sender_open_id():
+    session = CardSession(
+        conversation_id="chat-1", message_id="om_user_message", chat_id="oc_abc"
+    )
+
+    assert session.apply(
+        event(
+            "message.started",
+            0,
+            {"sender_open_id": "ou_sender"},
+            message_id="om_user_message",
+        )
+    )
+
+    assert session.sender_open_id == "ou_sender"
+
+
+def test_completed_message_records_sender_open_id_when_started_missing():
+    session = CardSession(
+        conversation_id="chat-1", message_id="om_user_message", chat_id="oc_abc"
+    )
+
+    assert session.apply(
+        event(
+            "message.completed",
+            1,
+            {"answer": "done", "sender_open_id": "ou_sender"},
+            message_id="om_user_message",
+        )
+    )
+
+    assert session.sender_open_id == "ou_sender"
+    assert session.status == "completed"
+
+
 def test_rejects_duplicate_and_stale_sequence():
     session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
     assert session.apply(event("thinking.delta", 2, {"text": "新"}))

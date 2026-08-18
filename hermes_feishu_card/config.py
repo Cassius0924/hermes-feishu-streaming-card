@@ -43,6 +43,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "max_reasoning_chars": 1200,
         "max_tool_result_chars": 600,
         "table_overflow_mode": "compact",
+        "completion_notify": {"enabled": True},
         "footer_fields": [
             "duration",
             "model",

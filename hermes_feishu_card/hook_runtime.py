@@ -8584,6 +8584,11 @@ def _event_data(
             "tokens": _completion_tokens(local_vars, answer),
             "context": _completion_context(local_vars),
         })
+        sender_open_id = _command_operator(local_vars, source_obj, local_vars.get("event"))
+        if not sender_open_id:
+            sender_open_id = _hfc_resume_operator_open_id(local_vars.get("event"))
+        if sender_open_id:
+            data["sender_open_id"] = sender_open_id
         delivery_kind = _first_string(local_vars, ("delivery_kind",))
         if delivery_kind:
             data["delivery_kind"] = delivery_kind
@@ -8601,6 +8606,11 @@ def _event_data(
             value = _first_string(local_vars, (source_key,)) or _first_attr_string(message_obj, (source_key,))
             if value:
                 data[data_key] = value
+        sender_open_id = _command_operator(local_vars, source_obj, local_vars.get("event"))
+        if not sender_open_id:
+            sender_open_id = _hfc_resume_operator_open_id(local_vars.get("event"))
+        if sender_open_id:
+            data["sender_open_id"] = sender_open_id
         reply_aliases = (
             "reply_to_message_id",
             "quote_message_id",
