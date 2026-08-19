@@ -113,6 +113,12 @@ from hermes_feishu_card.process import (
     status_sidecar,
     stop_sidecar,
 )
+from hermes_feishu_card.persistent_service import (
+    disable_persistent_sidecar,
+    enable_persistent_sidecar,
+    persistent_sidecar_active,
+    persistent_sidecar_matches,
+)
 from hermes_feishu_card.render import render_card
 from hermes_feishu_card.server import python_executable_identity
 from hermes_feishu_card.session import CardSession
@@ -197,6 +203,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_stop(args)
     if args.command == "status":
         return _run_status(args)
+    if args.command == "enable":
+        return _run_enable(args)
+    if args.command == "disable":
+        return _run_disable(args)
     if args.command == "smoke-feishu-card":
         return _run_smoke_feishu_card(args)
     if args.command == "bots":
@@ -287,6 +297,24 @@ def _build_parser() -> argparse.ArgumentParser:
         if command in {"start", "status"}:
             process_parser.add_argument("--hermes-dir")
             process_parser.add_argument("--hermes-home")
+
+    enable = subparsers.add_parser(
+        "enable",
+        help="install and enable a persistent systemd user sidecar service",
+    )
+    enable.add_argument("--config", default="config.yaml.example")
+    enable.add_argument("--env-file")
+    enable.add_argument("--hermes-dir", required=True)
+    enable.add_argument(
+        "--yes",
+        action="store_true",
+        required=True,
+        help="confirm persistent user-service installation",
+    )
+    subparsers.add_parser(
+        "disable",
+        help="disable and remove the owned persistent systemd user service",
+    )
 
     smoke = subparsers.add_parser("smoke-feishu-card")
     smoke.add_argument("--config", default="config.yaml.example")
@@ -2411,6 +2439,94 @@ def _print_sidecar_start_failure(result: str) -> None:
     print(f"error: {result}", file=sys.stderr)
 
 
+def _run_enable(args: argparse.Namespace) -> int:
+    try:
+        config = (
+            load_config(args.config, env_file=args.env_file)
+            if args.env_file is not None
+            else load_config(args.config)
+        )
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    hook_check = _lifecycle_hook_check(args)
+    if hook_check is None or bool(hook_check["blocking"]):
+        if hook_check is not None:
+            hook_check["config"] = args.config
+            _print_lifecycle_hook_check(hook_check, file=sys.stderr)
+        else:
+            print("error: an explicit verified Hermes root is required", file=sys.stderr)
+        return 1
+    if hook_check.get("status") != "installed":
+        print(
+            "error: install the Hermes integration before enabling the persistent "
+            "sidecar service",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        hermes_root = Path(hook_check["root"]).expanduser().resolve(strict=True)
+        runtime_python, runtime_identity = _resolve_start_runtime_identity(
+            hermes_root
+        )
+        if persistent_sidecar_matches(
+            config_path=args.config,
+            config=config,
+            env_file=args.env_file,
+            hermes_dir=hermes_root,
+            python_executable=runtime_python,
+            expected_package_version=PACKAGE_VERSION,
+            expected_python_identity=runtime_identity,
+        ):
+            print("enable: already enabled")
+            return 0
+        stop_result = stop_sidecar(config)
+        if stop_result.startswith("failed:"):
+            print(
+                "error: existing sidecar could not be stopped safely before enable: "
+                f"{stop_result}",
+                file=sys.stderr,
+            )
+            return 1
+        result = enable_persistent_sidecar(
+            config_path=args.config,
+            config=config,
+            env_file=args.env_file,
+            hermes_dir=hermes_root,
+            python_executable=runtime_python,
+            expected_package_version=PACKAGE_VERSION,
+            expected_python_identity=runtime_identity,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if result.startswith("failed:"):
+        print(f"error: {result}", file=sys.stderr)
+        return 1
+    if result == "already enabled":
+        print("enable: already enabled")
+        return 0
+    print("enable ok")
+    return 0
+
+
+def _run_disable(args: argparse.Namespace) -> int:
+    del args
+    try:
+        result = disable_persistent_sidecar()
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if result.startswith("failed:"):
+        print(f"error: {result}", file=sys.stderr)
+        return 1
+    if result == "not enabled":
+        print("disable: not enabled")
+        return 0
+    print("disable ok")
+    return 0
+
+
 def _run_start(args: argparse.Namespace) -> int:
     try:
         config = (
@@ -2432,13 +2548,21 @@ def _run_start(args: argparse.Namespace) -> int:
     if args.env_file is not None:
         start_kwargs["env_file"] = args.env_file
     verified_hermes_root: Path | None = None
-    if args.hermes_dir is not None:
+    if hook_check is not None:
         try:
-            verified_hermes_root = (
-                Path(hook_check["root"]).expanduser().resolve(strict=True)
-                if hook_check is not None
-                else _verified_explicit_hermes_root(args.hermes_dir)
+            verified_hermes_root = Path(hook_check["root"]).expanduser().resolve(
+                strict=True
             )
+        except (OSError, RuntimeError, ValueError):
+            print(
+                "error: Explicit Hermes root could not be verified. Rerun the "
+                f"official installer: {OFFICIAL_INSTALLER_COMMAND}",
+                file=sys.stderr,
+            )
+            return 1
+    elif args.hermes_dir is not None:
+        try:
+            verified_hermes_root = _verified_explicit_hermes_root(args.hermes_dir)
         except (OSError, RuntimeError, ValueError):
             print(
                 "error: Explicit Hermes root could not be verified. Rerun the "
@@ -2462,6 +2586,18 @@ def _run_start(args: argparse.Namespace) -> int:
     )
     if verified_hermes_root is not None:
         start_kwargs["hermes_dir"] = verified_hermes_root
+
+    if verified_hermes_root is not None and persistent_sidecar_matches(
+        config_path=args.config,
+        config=config,
+        env_file=args.env_file,
+        hermes_dir=verified_hermes_root,
+        python_executable=runtime_python,
+        expected_package_version=PACKAGE_VERSION,
+        expected_python_identity=runtime_identity,
+    ):
+        print("start: already running")
+        return 0
 
     try:
         result = start_sidecar(args.config, config, **start_kwargs)
@@ -2487,6 +2623,14 @@ def _run_stop(args: argparse.Namespace) -> int:
         )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if persistent_sidecar_active():
+        print(
+            "error: persistent sidecar service is enabled; use "
+            "hermes-feishu-card disable",
+            file=sys.stderr,
+        )
         return 1
 
     try:
@@ -2697,6 +2841,12 @@ def _run_status(args: argparse.Namespace) -> int:
         return 1
     readiness_degraded = False
     native_handoff_manual_review = False
+    if (
+        status.get("running") is True
+        and status.get("manager") == "unknown"
+        and persistent_sidecar_active()
+    ):
+        status["manager"] = "systemd-user-persistent"
     if status["running"]:
         print("status: running")
         print(f"pid: {status['pid'] or 'unknown'}")
