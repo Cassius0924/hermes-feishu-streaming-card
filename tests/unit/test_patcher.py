@@ -1038,6 +1038,64 @@ def test_apply_patch_uses_stable_tool_call_ids_when_gateway_exposes_callbacks():
     assert patcher.remove_patch(patched) == content
 
 
+def _late_tool_complete_callback_fixture() -> str:
+    return (
+        "async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):\n"
+        "    return await self._run_agent(source, event_message_id=event.message_id)\n"
+        "\n"
+        "async def _run_agent(self, source, event_message_id=None):\n"
+        "    _loop_for_step = asyncio.get_running_loop()\n"
+        "    agent = self.agent\n"
+        "    def _run_still_current():\n"
+        "        return True\n"
+        "    def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):\n"
+        "        return None\n"
+        "    agent.tool_progress_callback = progress_callback\n"
+        "    agent.tool_start_callback = voice_ack_callback if voice_enabled else None\n"
+        "    native_complete_callback = None\n"
+        "    agent.tool_complete_callback = (\n"
+        "        native_complete_callback\n"
+        "        if native_cards_enabled\n"
+        "        else None\n"
+        "    )\n"
+        "    return agent\n"
+    )
+
+
+def test_stable_tool_patch_anchors_after_last_native_lifecycle_assignment():
+    content = _late_tool_complete_callback_fixture()
+
+    patched = patcher.apply_patch(content, strategy="gateway_run_013_plus")
+
+    late_assignment = "    agent.tool_complete_callback = (\n"
+    assert patched.index(patcher.STABLE_TOOL_PATCH_BEGIN) > patched.index(
+        late_assignment
+    )
+    assert patcher.apply_patch(patched, strategy="gateway_run_013_plus") == patched
+    assert patcher.remove_patch(patched) == content
+
+
+def test_stable_tool_patch_relocates_owned_block_stranded_before_late_assignment():
+    content = _late_tool_complete_callback_fixture()
+    owned_block = "".join(
+        patcher._render_stable_tool_lifecycle_hook_block("    ", "\n")
+    )
+    late_assignment = "    agent.tool_complete_callback = (\n"
+    stranded = content.replace(
+        late_assignment,
+        owned_block + late_assignment,
+        1,
+    )
+
+    repaired = patcher.apply_patch(stranded, strategy="gateway_run_013_plus")
+
+    assert repaired.index(patcher.STABLE_TOOL_PATCH_BEGIN) > repaired.index(
+        late_assignment
+    )
+    assert patcher.apply_patch(repaired, strategy="gateway_run_013_plus") == repaired
+    assert patcher.remove_patch(repaired) == content
+
+
 def _status_callback_fixture() -> str:
     return (
         "async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):\n"

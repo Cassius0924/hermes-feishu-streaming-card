@@ -901,18 +901,8 @@ def _apply_stable_tool_lifecycle_patch(content: str) -> str:
     if owned_block is not None:
         lines = content.splitlines(keepends=True)
         begin_index, end_index = owned_block
-        indent = _leading_whitespace(_strip_line_ending(lines[begin_index]))
-        newline = _line_ending(lines[begin_index]) or _detect_newline(content)
-        expected = (
-            _render_turn_context_hook_block(
-                _render_stable_tool_lifecycle_hook_block, indent, newline
-            )
-            if any("_hfc_turn_ctx = ctx" in line for line in lines[begin_index : end_index + 1])
-            else _render_stable_tool_lifecycle_hook_block(indent, newline)
-        )
-        if lines[begin_index : end_index + 1] == expected:
-            return content
-        return "".join(lines[:begin_index] + expected + lines[end_index + 1 :])
+        unpatched = "".join(lines[:begin_index] + lines[end_index + 1 :])
+        return _apply_stable_tool_lifecycle_patch(unpatched)
 
     tree = _parse_content(content)
     lines = content.splitlines(keepends=True)
@@ -1259,15 +1249,7 @@ def _find_stable_tool_lifecycle_location(tree, lines):
     }
     if not required_names.issubset(_function_scope_names(run_agent)):
         return None
-    for node in ast.walk(run_agent):
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        if not any(_is_agent_callback_target(target, "tool_start_callback") for target in targets):
-            continue
-        end_lineno = getattr(node, "end_lineno", None) or node.lineno
-        return end_lineno, _line_indent(lines, node.lineno - 1)
-    return None
+    return _last_stable_tool_lifecycle_assignment_location(run_agent, lines)
 
 
 def _find_turn_runner_stable_tool_lifecycle_location(tree, lines):
@@ -1279,18 +1261,30 @@ def _find_turn_runner_stable_tool_lifecycle_location(tree, lines):
         return None
     if "agent" not in _function_scope_names(run_sync):
         return None
-    for node in ast.walk(run_sync):
+    return _last_stable_tool_lifecycle_assignment_location(run_sync, lines)
+
+
+def _last_stable_tool_lifecycle_assignment_location(function_node, lines):
+    callback_names = {"tool_start_callback", "tool_complete_callback"}
+    candidates = []
+    for node in ast.walk(function_node):
         if not isinstance(node, (ast.Assign, ast.AnnAssign)):
             continue
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        if not any(
-            _is_agent_callback_target(target, "tool_start_callback")
+        if any(
+            _is_agent_callback_target(target, callback_name)
             for target in targets
+            for callback_name in callback_names
         ):
-            continue
-        end_lineno = getattr(node, "end_lineno", None) or node.lineno
-        return end_lineno, _line_indent(lines, node.lineno - 1)
-    return None
+            candidates.append(node)
+    if not candidates:
+        return None
+    latest = max(
+        candidates,
+        key=lambda node: getattr(node, "end_lineno", None) or node.lineno,
+    )
+    end_lineno = getattr(latest, "end_lineno", None) or latest.lineno
+    return end_lineno, _line_indent(lines, latest.lineno - 1)
 
 
 def _find_turn_runner_node(tree):
