@@ -284,6 +284,8 @@ def _build_regular_hfc_wheel(output_dir: Path) -> Path:
 
 @pytest.fixture(scope="module")
 def installed_fixed_runtime(tmp_path_factory) -> Path:
+    if sys.version_info < (3, 11):
+        pytest.skip("fixed Hermes v2026.8.3 requires Python >=3.11")
     root = tmp_path_factory.mktemp("fixed-runtime")
     wheel = _build_regular_hfc_wheel(root)
     runtime = root / "runtime"
@@ -638,7 +640,7 @@ def test_review_attack_symlink_hardlink_and_oversize_source_are_rejected(tmp_pat
     symlink = root / "symlink.py"
     symlink.symlink_to(original.name)
     hardlink = root / "hardlink.py"
-    hardlink.hardlink_to(original)
+    os.link(original, hardlink)
     oversized = root / "oversized.py"
     oversized.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
     descriptor = native_hooks._open_absolute_directory(root)
@@ -903,7 +905,7 @@ def test_second_review_root_swap_is_rejected_after_exact_snapshot(
             runtime_python=tmp_path / "missing-runtime",
         )
     finally:
-        clone.rmdir()
+        shutil.rmtree(clone)
         displaced.rename(clone)
 
     assert result.reason_code == "source_dirty"

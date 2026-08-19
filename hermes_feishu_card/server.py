@@ -314,10 +314,17 @@ class EventIdFence:
         self.wait_seconds = wait_seconds
         self.now = now
         self.entries: OrderedDict[str, EventIdFenceEntry] = OrderedDict()
-        self._lock = asyncio.Lock()
+        # Python 3.9 requires a current event loop when constructing a Lock.
+        # create_app() is intentionally safe to call from synchronous startup,
+        # so bind the fence lock lazily from the first async claim instead.
+        self._lock: asyncio.Lock | None = None
 
     async def claim(self, event_id: str, fingerprint: str) -> EventIdFenceClaim:
-        async with self._lock:
+        lock = self._lock
+        if lock is None:
+            lock = asyncio.Lock()
+            self._lock = lock
+        async with lock:
             self._evict_expired_completed_locked()
             entry = self.entries.get(event_id)
             if entry is not None:

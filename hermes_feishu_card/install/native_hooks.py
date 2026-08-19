@@ -2492,11 +2492,23 @@ def _make_tree_read_only(root: Path) -> None:
     for current, directories, files in os.walk(root, topdown=False):
         for name in files:
             path = Path(current) / name
-            mode = path.stat(follow_symlinks=False).st_mode
-            path.chmod(0o500 if mode & 0o111 else 0o400, follow_symlinks=False)
+            descriptor = _open_absolute_regular_file(path)
+            try:
+                mode = os.fstat(descriptor).st_mode
+                os.fchmod(descriptor, 0o500 if mode & 0o111 else 0o400)
+            finally:
+                os.close(descriptor)
         for name in directories:
-            (Path(current) / name).chmod(0o500, follow_symlinks=False)
-    root.chmod(0o500, follow_symlinks=False)
+            descriptor = _open_absolute_directory(Path(current) / name)
+            try:
+                os.fchmod(descriptor, 0o500)
+            finally:
+                os.close(descriptor)
+    descriptor = _open_absolute_directory(root)
+    try:
+        os.fchmod(descriptor, 0o500)
+    finally:
+        os.close(descriptor)
 
 
 def _verify_snapshot_provenance(

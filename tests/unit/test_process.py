@@ -2483,6 +2483,7 @@ def test_managed_pidfile_handshake_requires_exact_detached_pid_and_token(
         )
     )
     monkeypatch.setattr(process, "read_pid_record", lambda: next(responses))
+    monkeypatch.setattr(process, "_current_boot_id", lambda: "")
     monkeypatch.setattr(process.time, "monotonic", lambda: 0.0)
     monkeypatch.setattr(process.time, "sleep", lambda _seconds: None)
 
