@@ -36,6 +36,7 @@ def test_process_token_hash_is_stable_and_empty_safe():
 def test_pid_record_preserves_systemd_manager_identity(monkeypatch, tmp_path):
     record_path = tmp_path / "sidecar.pid"
     monkeypatch.setattr(process, "pid_path", lambda: record_path)
+    monkeypatch.setattr(process, "_current_boot_id", lambda: "")
 
     process.write_pid_record(
         4321,
@@ -55,6 +56,7 @@ def test_pid_record_preserves_systemd_manager_identity(monkeypatch, tmp_path):
 def test_pid_record_preserves_detached_manager_identity(monkeypatch, tmp_path):
     record_path = tmp_path / "sidecar.pid"
     monkeypatch.setattr(process, "pid_path", lambda: record_path)
+    monkeypatch.setattr(process, "_current_boot_id", lambda: "")
 
     process.write_pid_record(4321, "sidecar-token", manager="detached")
 
@@ -65,6 +67,22 @@ def test_pid_record_preserves_detached_manager_identity(monkeypatch, tmp_path):
     }
 
 
+def test_pid_record_preserves_linux_boot_identity(monkeypatch, tmp_path):
+    record_path = tmp_path / "sidecar.pid"
+    boot_id = "11111111-2222-4333-8444-555555555555"
+    monkeypatch.setattr(process, "pid_path", lambda: record_path)
+    monkeypatch.setattr(process, "_current_boot_id", lambda: boot_id)
+
+    process.write_pid_record(4321, "sidecar-token", manager="detached")
+
+    assert process.read_pid_record() == {
+        "pid": 4321,
+        "token": "sidecar-token",
+        "manager": "detached",
+        "boot_id": boot_id,
+    }
+
+
 def test_pid_record_accepts_only_expected_systemd_unit_identity(
     monkeypatch, tmp_path
 ):
@@ -72,6 +90,7 @@ def test_pid_record_accepts_only_expected_systemd_unit_identity(
     state_root = tmp_path / "state"
     monkeypatch.setattr(process, "pid_path", lambda: record_path)
     monkeypatch.setattr(process, "state_dir", lambda: state_root)
+    monkeypatch.setattr(process, "_current_boot_id", lambda: "")
     owner_uid = tmp_path.stat().st_uid
     monkeypatch.setattr(process.os, "getuid", lambda: owner_uid)
     unit = process._systemd_system_unit_name()
@@ -1338,6 +1357,114 @@ def test_start_sidecar_migrates_stale_dead_legacy_pidfile_before_cleanup(
     assert result == "failed: process exited with 1"
     assert stat.S_IMODE(record_path.stat().st_mode) == 0o600
     assert cleared == [True, True]
+
+
+def test_start_sidecar_recovers_stale_pidfile_from_prior_linux_boot(
+    monkeypatch, tmp_path
+):
+    record_path = tmp_path / process.PIDFILE_NAME
+    record_path.write_text(
+        '{"boot_id":"11111111-2222-4333-8444-555555555555",'
+        '"manager":"detached","pid":4321,"token":"old-token"}\n',
+        encoding="utf-8",
+    )
+    record_path.chmod(0o600)
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(process, "log_path", lambda: tmp_path / "sidecar.log")
+    monkeypatch.setattr(process, "fetch_health", lambda _config: None)
+    monkeypatch.setattr(process, "_systemd_user_available", lambda: False)
+    monkeypatch.setattr(
+        process,
+        "_current_boot_id",
+        lambda: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    )
+    monkeypatch.setattr(process, "pid_is_running", lambda _pid: True)
+    launched = []
+    monkeypatch.setattr(
+        process.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: launched.append(True)
+        or SimpleNamespace(pid=9999, poll=lambda: 1, returncode=1),
+    )
+    monkeypatch.setattr(process, "write_pid_record", lambda *_args, **_kwargs: None)
+
+    result = process.start_sidecar(
+        tmp_path / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+
+    assert result == "failed: process exited with 1"
+    assert launched == [True]
+    assert not record_path.exists()
+
+
+def test_start_sidecar_recovers_legacy_pid_reused_by_non_hfc_process(
+    monkeypatch, tmp_path
+):
+    record_path = tmp_path / process.PIDFILE_NAME
+    record_path.write_text(
+        '{"manager":"detached","pid":4321,"token":"old-token"}\n',
+        encoding="utf-8",
+    )
+    record_path.chmod(0o600)
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(process, "log_path", lambda: tmp_path / "sidecar.log")
+    monkeypatch.setattr(process, "fetch_health", lambda _config: None)
+    monkeypatch.setattr(process, "_systemd_user_available", lambda: False)
+    monkeypatch.setattr(process, "_current_boot_id", lambda: "")
+    monkeypatch.setattr(process, "pid_is_running", lambda _pid: True)
+    monkeypatch.setattr(process, "_pid_is_hfc_runner", lambda _pid: False)
+    launched = []
+    monkeypatch.setattr(
+        process.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: launched.append(True)
+        or SimpleNamespace(pid=9999, poll=lambda: 1, returncode=1),
+    )
+    monkeypatch.setattr(process, "write_pid_record", lambda *_args, **_kwargs: None)
+
+    result = process.start_sidecar(
+        tmp_path / "config.yaml",
+        {"server": {"host": "127.0.0.1", "port": 8765}},
+    )
+
+    assert result == "failed: process exited with 1"
+    assert launched == [True]
+    assert not record_path.exists()
+
+
+def test_stop_sidecar_clears_prior_boot_record_without_signalling_pid(
+    monkeypatch, tmp_path
+):
+    record = {
+        "boot_id": "11111111-2222-4333-8444-555555555555",
+        "manager": "detached",
+        "pid": 4321,
+        "token": "old-token",
+    }
+    monkeypatch.setattr(process, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(process, "read_pid_record", lambda: record)
+    monkeypatch.setattr(process, "fetch_health", lambda _config: None)
+    monkeypatch.setattr(process, "pid_is_running", lambda _pid: True)
+    monkeypatch.setattr(
+        process,
+        "_current_boot_id",
+        lambda: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    )
+    cleared = []
+    monkeypatch.setattr(process, "clear_pid", lambda: cleared.append(True))
+    monkeypatch.setattr(
+        process,
+        "_request_authenticated_shutdown",
+        lambda *_args, **_kwargs: pytest.fail("stale PID must not be signalled"),
+    )
+
+    result = process.stop_sidecar(
+        {"server": {"host": "127.0.0.1", "port": 8765}}
+    )
+
+    assert result == "not running"
+    assert cleared == [True]
 
 
 def test_start_sidecar_recovers_explicit_systemd_user_when_health_is_unavailable(
