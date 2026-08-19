@@ -72,6 +72,32 @@ def test_started_message_uses_feishu_message_id_as_native_reply_anchor():
     assert session.reply_to_message_id == "om_user_message"
 
 
+@pytest.mark.parametrize(
+    ("sender_open_id", "expected"),
+    (
+        ("ou_sender-01", "ou_sender-01"),
+        ('ou_bad"><at user_id="ou_other"', ""),
+        ("on_wrong_kind", ""),
+        (_StringSubclass("ou_subclass"), ""),
+    ),
+)
+def test_session_records_only_exact_feishu_sender_open_id(sender_open_id, expected):
+    session = CardSession(
+        conversation_id="chat-1", message_id="om_user_message", chat_id="oc_abc"
+    )
+
+    assert session.apply(
+        event(
+            "message.started",
+            0,
+            {"sender_open_id": sender_open_id},
+            message_id="om_user_message",
+        )
+    )
+
+    assert session.sender_open_id == expected
+
+
 def test_rejects_duplicate_and_stale_sequence():
     session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
     assert session.apply(event("thinking.delta", 2, {"text": "新"}))

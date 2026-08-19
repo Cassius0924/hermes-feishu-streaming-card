@@ -80,6 +80,7 @@ COMMAND_FEEDBACK_CONTEXT_TTL_SECONDS = 600.0
 POLICY_QUERY_TIMEOUT_SECONDS = 0.25
 POLICY_CACHE_TTL_SECONDS = 1.0
 POLICY_CACHE_LIMIT = 1024
+_FEISHU_OPEN_ID_RE = re.compile(r"ou_[A-Za-z0-9_-]{1,128}")
 _CONTEXT_COMPACTION_STATUS_RE = re.compile(
     r"\bCompacting\s+context\b",
     re.IGNORECASE,
@@ -2831,6 +2832,19 @@ def _command_operator(
         if value:
             return value
     return ""
+
+
+def _message_sender_open_id(
+    local_vars: dict[str, Any], source_obj: Any, gateway_event_obj: Any
+) -> str:
+    candidate = _command_operator(local_vars, source_obj, gateway_event_obj)
+    if not candidate:
+        candidate = _hfc_resume_operator_open_id(gateway_event_obj)
+    return (
+        candidate
+        if type(candidate) is str and _FEISHU_OPEN_ID_RE.fullmatch(candidate)
+        else ""
+    )
 
 
 def _parse_hfc_command(text: str) -> str | None:
@@ -9138,6 +9152,11 @@ def _event_data(
             "tokens": _completion_tokens(local_vars, answer),
             "context": _completion_context(local_vars),
         })
+        sender_open_id = _message_sender_open_id(
+            local_vars, source_obj, local_vars.get("event")
+        )
+        if sender_open_id:
+            data["sender_open_id"] = sender_open_id
         delivery_kind = _first_string(local_vars, ("delivery_kind",))
         if delivery_kind:
             data["delivery_kind"] = delivery_kind
@@ -9147,6 +9166,11 @@ def _event_data(
         data["error"] = error
         return data
     if event_name == "message.started":
+        sender_open_id = _message_sender_open_id(
+            local_vars, source_obj, local_vars.get("event")
+        )
+        if sender_open_id:
+            data["sender_open_id"] = sender_open_id
         for source_key, data_key in (
             ("chat_type", "chat_type"),
             ("tenant_key", "tenant_key"),

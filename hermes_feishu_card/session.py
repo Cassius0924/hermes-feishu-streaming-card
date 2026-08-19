@@ -29,10 +29,19 @@ _RUNTIME_ACTION_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _SEARCH_SITE_OPERATOR_RE = re.compile(r"(?:^|\s)site:\S+", re.IGNORECASE)
+_FEISHU_OPEN_ID_RE = re.compile(r"ou_[A-Za-z0-9_-]{1,128}")
 
 
 def _now() -> float:
     return time.time()
+
+
+def _exact_feishu_open_id(value: object) -> str:
+    return (
+        value
+        if type(value) is str and _FEISHU_OPEN_ID_RE.fullmatch(value)
+        else ""
+    )
 
 
 @dataclass
@@ -130,6 +139,8 @@ class CardSession:
     active_interaction: InteractionState | None = None
     delivery_kind: str = "chat"
     reply_to_message_id: str = ""
+    sender_open_id: str = ""
+    completion_notify_state: str = "idle"
     notice_title: str = ""
     notice_level: str = "info"
     terminal_disposition: str = ""
@@ -321,6 +332,9 @@ class CardSession:
             delivery_kind = event.data.get("delivery_kind")
             if isinstance(delivery_kind, str) and delivery_kind.strip():
                 self.delivery_kind = delivery_kind.strip()
+            sender_open_id = _exact_feishu_open_id(event.data.get("sender_open_id"))
+            if sender_open_id:
+                self.sender_open_id = sender_open_id
             reply_to_message_id = event.data.get("reply_to_message_id")
             if isinstance(reply_to_message_id, str):
                 self.reply_to_message_id = reply_to_message_id
@@ -380,6 +394,9 @@ class CardSession:
             self.latest_tool_preview = ""
             if completed_answer.strip():
                 self.answer_text = completed_answer
+            sender_open_id = _exact_feishu_open_id(event.data.get("sender_open_id"))
+            if sender_open_id:
+                self.sender_open_id = sender_open_id
             delivery_kind = event.data.get("delivery_kind")
             if isinstance(delivery_kind, str) and delivery_kind.strip():
                 self.delivery_kind = delivery_kind.strip()

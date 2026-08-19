@@ -45,6 +45,10 @@ card:
   # compact preserves rows from table 6 onward as readable field lists.
   # truncate keeps the legacy five-table behavior when explicitly selected.
   table_overflow_mode: compact
+  # Opt-in: after the final card update succeeds, send one new text reply that
+  # @mentions the initiating Feishu user. Card edits themselves do not notify.
+  completion_notify:
+    enabled: false
   # Optional role-based CardKit text sizes. Roles: body, reasoning, tool,
   # notice, footer. Values may be scalar or default/pc/mobile mappings.
   # card width/height are controlled by the Feishu/Lark client.

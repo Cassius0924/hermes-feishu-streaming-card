@@ -6494,6 +6494,30 @@ def test_interaction_request_uses_dedicated_five_second_delivery_timeout(
     assert hook_runtime._timeout_for_event(config, "answer.delta") == 0.8
 
 
+@pytest.mark.parametrize("event_name", ("message.started", "message.completed"))
+def test_message_lifecycle_event_carries_only_strict_feishu_sender_open_id(
+    event_name,
+):
+    local_vars = {
+        "platform": "feishu",
+        "chat_id": "oc_abc",
+        "conversation_id": "conversation-sender",
+        "message_id": f"om_{event_name.replace('.', '_')}",
+        "sender_open_id": "ou_sender-01",
+        "answer": "done",
+    }
+
+    payload = hook_runtime.build_event(event_name, local_vars)
+
+    assert payload["data"]["sender_open_id"] == "ou_sender-01"
+
+    invalid = dict(local_vars)
+    invalid["message_id"] += "_invalid"
+    invalid["sender_open_id"] = 'ou_bad"><at user_id="ou_other"'
+    invalid_payload = hook_runtime.build_event(event_name, invalid)
+    assert "sender_open_id" not in invalid_payload["data"]
+
+
 def test_post_interaction_event_does_not_retry_transport_failure(monkeypatch):
     calls = []
 

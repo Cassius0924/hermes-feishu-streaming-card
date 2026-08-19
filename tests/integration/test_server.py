@@ -159,7 +159,10 @@ class FakeFeishuClient:
     def __init__(self):
         self.sent = []
         self.updated = []
+        self.texts = []
+        self.operations = []
         self.fail_send = False
+        self.fail_text = False
         self.send_delay = 0.0
         self.update_failures_remaining = 0
         self.update_error_message = "update unavailable"
@@ -180,6 +183,20 @@ class FakeFeishuClient:
             self.update_failures_remaining -= 1
             raise RuntimeError(self.update_error_message)
         self.updated.append((message_id, card))
+        self.operations.append("update")
+
+    async def send_text_message(
+        self,
+        chat_id,
+        text,
+        thread_id=None,
+        reply_to_message_id=None,
+    ):
+        if self.fail_text:
+            raise RuntimeError("text send unavailable")
+        self.texts.append((chat_id, text, thread_id, reply_to_message_id))
+        self.operations.append("text")
+        return f"feishu-text-{len(self.texts)}"
 
 
 class PermanentFailureClient(FakeFeishuClient):
@@ -7650,6 +7667,148 @@ async def test_completed_without_deltas_updates_started_card(client):
     assert session_snapshot["status"] == "completed"
     assert session_snapshot["answer_chars"] > 0
     assert body["metrics"]["feishu_update_attempts"] == 1
+
+
+async def test_completion_notify_is_disabled_by_default(client):
+    test_client, feishu_client = client
+
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {
+                "sender_open_id": "ou_sender-01",
+                "reply_to_message_id": "om_user_message",
+            },
+        ),
+    )
+    completed = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.completed",
+            1,
+            {"answer": "done", "sender_open_id": "ou_sender-01"},
+        ),
+    )
+
+    assert completed.status == 200
+    assert feishu_client.texts == []
+
+
+async def test_completion_notify_updates_card_then_mentions_once_when_enabled(
+    tmp_path,
+):
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        card_config={"completion_notify": {"enabled": True}},
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {
+                    "sender_open_id": "ou_sender-01",
+                    "reply_to_message_id": "om_user_message",
+                },
+                thread_id="omt_thread",
+            ),
+        )
+        feishu_client.operations.clear()
+        completed_payload = event_payload(
+            "message.completed",
+            1,
+            {
+                "answer": "done",
+                "duration": 65.0,
+                "sender_open_id": "ou_sender-01",
+            },
+            thread_id="omt_thread",
+        )
+        first = await test_client.post("/events", json=completed_payload)
+        replay = await test_client.post("/events", json=completed_payload)
+
+        assert first.status == 200
+        assert replay.status == 200
+        assert feishu_client.operations[-2:] == ["update", "text"]
+        assert feishu_client.texts == [
+            (
+                "oc_abc",
+                '<at user_id="ou_sender-01"></at> ✅ 任务已完成（用时 1m5s）',
+                "omt_thread",
+                "om_user_message",
+            )
+        ]
+        session = app[SESSIONS_KEY]["hermes-message-1"]
+        assert session.completion_notify_state == "sent"
+    finally:
+        await test_client.close()
+
+
+async def test_completion_notify_rejects_spoofed_sender_and_failed_send_is_retryable(
+    tmp_path,
+):
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        card_config={"completion_notify": {"enabled": True}},
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"sender_open_id": 'ou_bad"><at user_id="ou_other"'},
+            ),
+        )
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                1,
+                {"answer": "done"},
+            ),
+        )
+        assert feishu_client.texts == []
+        assert app[SESSIONS_KEY]["hermes-message-1"].sender_open_id == ""
+
+        app[SESSIONS_KEY].clear()
+        app[FEISHU_MESSAGE_IDS_KEY].clear()
+        feishu_client.fail_text = True
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"sender_open_id": "ou_sender-02"},
+                message_id="hermes-message-2",
+            ),
+        )
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                1,
+                {"answer": "done", "sender_open_id": "ou_sender-02"},
+                message_id="hermes-message-2",
+            ),
+        )
+        assert feishu_client.texts == []
+        assert app[SESSIONS_KEY]["hermes-message-2"].completion_notify_state == "idle"
+    finally:
+        await test_client.close()
 
 
 async def test_card_config_controls_timeline_rendering():

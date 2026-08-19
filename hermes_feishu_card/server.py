@@ -76,6 +76,7 @@ from .operations_transport import (
 from .profile_sources import PROFILE_SOURCE_FALLBACK, PROFILE_SOURCES
 from .render import (
     CardRenderResult,
+    _format_duration,
     _is_initial_loading,
     render_card_result,
     render_terminal_limit_handoff_card,
@@ -5359,6 +5360,18 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                     handoff_identity,
                     handoff_record,
                 )
+            if (
+                updated
+                and is_terminal
+                and event.event == "message.completed"
+                and render_result.disposition == "card"
+            ):
+                await _maybe_send_completion_notify(
+                    request.app,
+                    session_key,
+                    latest_session,
+                    event,
+                )
             return updated
 
         if is_terminal:
@@ -5424,6 +5437,65 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             _session_key(event),
         )
     return web.json_response(response_payload), post_lock_task
+
+
+async def _maybe_send_completion_notify(
+    app: web.Application,
+    session_key: str,
+    session: CardSession,
+    event: SidecarEvent,
+) -> None:
+    card_config = app[SESSION_CARD_CONFIGS_KEY].get(session_key, {})
+    notify_config = (
+        card_config.get("completion_notify")
+        if type(card_config) is dict
+        else None
+    )
+    if (
+        type(notify_config) is not dict
+        or notify_config.get("enabled") is not True
+        or session.status != "completed"
+        or session.delivery_kind != "chat"
+        or session.completion_notify_state != "idle"
+        or re.fullmatch(r"ou_[A-Za-z0-9_-]{1,128}", session.sender_open_id)
+        is None
+    ):
+        return
+    client = _client_for_bot(app, app[MESSAGE_BOT_IDS_KEY].get(session_key))
+    send_text = getattr(client, "send_text_message", None)
+    if not callable(send_text):
+        return
+
+    session.completion_notify_state = "sending"
+    duration_text = _format_duration(session.duration) if session.duration > 0 else ""
+    suffix = f"（用时 {duration_text}）" if duration_text else ""
+    text = (
+        f'<at user_id="{session.sender_open_id}"></at> '
+        f"✅ 任务已完成{suffix}"
+    )
+    try:
+        await send_text(
+            session.chat_id,
+            text,
+            thread_id=_thread_id_for_event(event) or None,
+            reply_to_message_id=session.reply_to_message_id or None,
+        )
+    except asyncio.CancelledError:
+        session.completion_notify_state = "idle"
+        raise
+    except Exception as exc:
+        session.completion_notify_state = "idle"
+        logger.warning(
+            "completion notify send failed: %s",
+            exc.__class__.__name__,
+        )
+        return
+    session.completion_notify_state = "sent"
+    logger.info(
+        "completion notify sent (sender_hash=%s session_hash=%s)",
+        _diagnostic_id_hash(session.sender_open_id, domain="completion-sender"),
+        _diagnostic_id_hash(session_key, domain="completion-session"),
+    )
 
 
 def _post_terminal_cleanup(
