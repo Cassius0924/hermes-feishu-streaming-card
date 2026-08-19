@@ -8,10 +8,16 @@ import subprocess
 
 from . import patcher
 from .native_hooks import (
+    FIXED_TAG_COMMIT,
     NativeHookCapabilityProbe,
     probe_native_hook_capabilities,
 )
 from .patcher import apply_base_patch, remove_base_patch
+from ..integration import (
+    IntegrationDecision,
+    PatchCapabilities,
+    select_integration_mode,
+)
 
 
 MIN_SUPPORTED_VERSION = "v2026.4.23"
@@ -53,6 +59,35 @@ class HermesDetection:
     capabilities: dict[str, bool] = field(default_factory=dict)
     suggested_root: Path | None = None
     suggestion_reason: str = ""
+
+
+@dataclass(frozen=True)
+class FixedTagIntegrationDetection:
+    native_probe: NativeHookCapabilityProbe
+    decision: IntegrationDecision
+
+
+def detect_fixed_tag_integration(
+    root: str | Path,
+    *,
+    runtime_python: str | Path,
+) -> FixedTagIntegrationDetection:
+    native_probe = probe_native_hook_capabilities(
+        root,
+        expected_commit=FIXED_TAG_COMMIT,
+        runtime_python=runtime_python,
+    )
+    patch_capabilities = PatchCapabilities.from_names(
+        patcher.HYBRID_PATCH_REGISTRY.available_groups
+    )
+    decision = select_integration_mode(
+        native_probe.capabilities,
+        patch_capabilities,
+    )
+    return FixedTagIntegrationDetection(
+        native_probe=native_probe,
+        decision=decision,
+    )
 
 
 def detect_native_hook_capabilities(

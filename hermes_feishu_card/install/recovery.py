@@ -17,7 +17,6 @@ from uuid import uuid4
 
 from .detect import HermesDetection
 from .manifest import (
-    CURRENT_INSTALL_MANIFEST_VERSION,
     ManifestStructureError,
     ManifestVersionError,
     UNSUPPORTED_INSTALL_MANIFEST_VERSION_MESSAGE,
@@ -619,7 +618,7 @@ def _render_manifest(
         f"{detection.run_py.name}{BACKUP_SUFFIX}"
     )
     manifest = {
-        "manifest_version": CURRENT_INSTALL_MANIFEST_VERSION,
+        "manifest_version": 2,
         "run_py": _relative_path(detection.root, detection.run_py),
         "patched_sha256": _text_sha256(state.run_text),
         "backup": _relative_path(detection.root, backup_path),

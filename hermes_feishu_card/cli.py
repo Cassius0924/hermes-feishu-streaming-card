@@ -104,7 +104,9 @@ from hermes_feishu_card.session import CardSession
 
 BACKUP_SUFFIX = ".hermes_feishu_card.bak"
 MANIFEST_NAME = ".hermes_feishu_card_manifest"
-INSTALL_MANIFEST_VERSION = CURRENT_INSTALL_MANIFEST_VERSION
+# Legacy single-target installs retain the V2 writer until the verified
+# aggregate V3 transaction below owns all seven fixed-tag targets.
+INSTALL_MANIFEST_VERSION = 2
 _BASE_MANIFEST_FIELDS = BASE_INSTALL_MANIFEST_FIELDS
 _CRON_MANIFEST_FIELDS = CRON_INSTALL_MANIFEST_FIELDS
 DEFAULT_EVENT_URL = "http://127.0.0.1:8765/events"
@@ -211,6 +213,7 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor")
     doctor.add_argument("--config", required=True)
     doctor.add_argument("--hermes-dir")
+    doctor.add_argument("--hermes-home")
     doctor.add_argument("--skip-hermes", action="store_true")
     doctor.add_argument("--profile-id")
     doctor_output = doctor.add_mutually_exclusive_group()
@@ -222,6 +225,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="run the guided all-in-one installer for ordinary users",
     )
     setup.add_argument("--hermes-dir", required=True, help="Hermes Agent root directory")
+    setup.add_argument("--hermes-home")
     setup.add_argument(
         "--config",
         default=str(Path.home() / ".hermes_feishu_card" / "config.yaml"),
@@ -266,6 +270,7 @@ def _build_parser() -> argparse.ArgumentParser:
         process_parser.add_argument("--env-file")
         if command in {"start", "status"}:
             process_parser.add_argument("--hermes-dir")
+            process_parser.add_argument("--hermes-home")
 
     smoke = subparsers.add_parser("smoke-feishu-card")
     smoke.add_argument("--config", default="config.yaml.example")
@@ -354,6 +359,7 @@ def _build_parser() -> argparse.ArgumentParser:
     maintenance_subparsers = maintenance.add_subparsers(dest="maintenance_command")
     maintenance_provision = maintenance_subparsers.add_parser("provision")
     maintenance_provision.add_argument("--hermes-dir", required=True)
+    maintenance_provision.add_argument("--hermes-home")
     maintenance_provision.add_argument("--wheel", required=True)
     maintenance_provision.add_argument("--root")
     maintenance_status = maintenance_subparsers.add_parser("status")
@@ -362,6 +368,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=str(Path.home() / ".hermes" / "hermes-agent"),
     )
     maintenance_status.add_argument("--root")
+    maintenance_status.add_argument("--hermes-home")
     for command in ("run", "resume"):
         maintenance_run = maintenance_subparsers.add_parser(command)
         maintenance_run.add_argument("--job", required=True)
@@ -370,6 +377,7 @@ def _build_parser() -> argparse.ArgumentParser:
     for command in ("install", "repair", "restore", "uninstall"):
         command_parser = subparsers.add_parser(command)
         command_parser.add_argument("--hermes-dir", required=True)
+        command_parser.add_argument("--hermes-home")
         command_parser.add_argument("--yes", action="store_true", required=True)
         if command == "install":
             command_parser.add_argument("--no-repair", action="store_true")

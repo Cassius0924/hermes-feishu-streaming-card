@@ -13,7 +13,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from .detect import HermesDetection
-from .manifest import CURRENT_INSTALL_MANIFEST_VERSION, validate_install_manifest
+from .manifest import validate_install_manifest
 from .patcher import (
     apply_base_patch,
     apply_cron_patch,
@@ -551,7 +551,7 @@ def _install_manifest(
     cron_py = _active_cron_py(detection)
     base_py = _active_base_py(detection)
     manifest: dict[str, Any] = {
-        "manifest_version": CURRENT_INSTALL_MANIFEST_VERSION,
+        "manifest_version": INTEGRITY_MANIFEST_VERSION,
         "run_py": detection.run_py.relative_to(detection.root).as_posix(),
         "patched_sha256": _text_sha256(run_patched),
         "backup": run_backup.relative_to(detection.root).as_posix(),
