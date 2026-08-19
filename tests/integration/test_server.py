@@ -791,18 +791,22 @@ async def test_serial_and_concurrent_conflict_reject_before_session_mutation(cli
     conflict = dict(payload)
     conflict["data"] = {"reply_to_message_id": "om_conflict"}
 
-    owner, racing_conflict = await asyncio.gather(
+    first, second = await asyncio.gather(
         test_client.post("/events", json=payload),
         test_client.post("/events", json=conflict),
     )
-    assert sorted([owner.status, racing_conflict.status]) == [200, 409]
-    rejected = racing_conflict if racing_conflict.status == 409 else owner
+    assert sorted([first.status, second.status]) == [200, 409]
+    rejected = second if second.status == 409 else first
     assert await rejected.json() == {
         "ok": False,
         "error": "event_id payload conflict",
     }
-    serial = await test_client.post("/events", json=conflict)
+    losing_payload = conflict if first.status == 200 else payload
+    winning_payload = payload if first.status == 200 else conflict
+    serial = await test_client.post("/events", json=losing_payload)
     assert serial.status == 409
+    replay = await test_client.post("/events", json=winning_payload)
+    assert replay.status == 200
     assert len(feishu_client.sent) == 1
 
 

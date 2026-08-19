@@ -1,7 +1,10 @@
 from hermes_feishu_card import __version__
 from pathlib import Path
 import re
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised by Python 3.9/3.10 CI
+    import tomli as tomllib
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -41,6 +44,14 @@ def test_pyproject_has_open_source_package_metadata():
     assert '[project.urls]' in pyproject
     assert 'Repository = "https://github.com/baileyh8/hermes-feishu-streaming-card"' in pyproject
     assert 'Issues = "https://github.com/baileyh8/hermes-feishu-streaming-card/issues"' in pyproject
+
+
+def test_test_extra_declares_tomli_for_python_before_311():
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "tomli>=1.1.0; python_version < '3.11'" in pyproject["project"][
+        "optional-dependencies"
+    ]["test"]
 
 
 def test_declares_exact_hermes_plugin_entry_point():
