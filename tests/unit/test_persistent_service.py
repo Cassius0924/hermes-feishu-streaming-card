@@ -27,13 +27,14 @@ def _inputs(tmp_path: Path):
 
 def _patch_paths(monkeypatch, tmp_path: Path):
     state, config, env_file, hermes, python = _inputs(tmp_path)
+    owner_uid = tmp_path.stat().st_uid
     unit = tmp_path / "home" / ".config" / "systemd" / "user" / persistent_service.UNIT_NAME
     manifest = state / persistent_service.MANIFEST_NAME
     monkeypatch.setattr(persistent_service, "_state_dir", lambda: state)
     monkeypatch.setattr(persistent_service, "_unit_path", lambda: unit)
     monkeypatch.setattr(persistent_service.sys, "platform", "linux")
     monkeypatch.setattr(persistent_service.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(persistent_service.os, "getuid", lambda: 501)
+    monkeypatch.setattr(persistent_service.os, "getuid", lambda: owner_uid)
     monkeypatch.setattr(persistent_service, "_unowned_unit_active", lambda: False)
     return state, config, env_file, hermes, python, unit, manifest
 

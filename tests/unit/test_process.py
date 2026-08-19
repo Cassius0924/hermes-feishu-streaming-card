@@ -2483,7 +2483,7 @@ def test_managed_pidfile_handshake_requires_exact_detached_pid_and_token(
         )
     )
     monkeypatch.setattr(process, "read_pid_record", lambda: next(responses))
-    monkeypatch.setattr(process.time, "monotonic", iter((0, 0, 0, 0)).__next__)
+    monkeypatch.setattr(process.time, "monotonic", lambda: 0.0)
     monkeypatch.setattr(process.time, "sleep", lambda _seconds: None)
 
     assert process.wait_for_managed_pidfile(4444, "owned", timeout=5) is True

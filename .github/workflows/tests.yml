@@ -16,6 +16,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  HFC_FIXED_TAG_SOURCE_ROOT: /private/tmp/hermes-agent-v2026.8.3-v430-audit
+  HFC_FIXED_TAG_COMMIT: 3c27eb6234bf91b8ceee9e9071591b31e9b148cb
+
 jobs:
   pytest:
     runs-on: ubuntu-latest
@@ -32,6 +36,18 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+      - name: Checkout exact Hermes fixed-tag source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e "$HFC_FIXED_TAG_SOURCE_ROOT"
+          GIT_LFS_SKIP_SMUDGE=1 git clone --quiet --filter=blob:none --depth=1 \
+            --branch v2026.8.3 \
+            https://github.com/NousResearch/hermes-agent.git \
+            "$HFC_FIXED_TAG_SOURCE_ROOT"
+          test "$(git -C "$HFC_FIXED_TAG_SOURCE_ROOT" rev-parse HEAD)" = \
+            "$HFC_FIXED_TAG_COMMIT"
+          test -z "$(git -C "$HFC_FIXED_TAG_SOURCE_ROOT" status --porcelain)"
       - name: Install
         run: python -m pip install -e ".[test]"
       - name: Test
@@ -86,6 +102,18 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - name: Checkout exact Hermes fixed-tag source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e "$HFC_FIXED_TAG_SOURCE_ROOT"
+          GIT_LFS_SKIP_SMUDGE=1 git clone --quiet --filter=blob:none --depth=1 \
+            --branch v2026.8.3 \
+            https://github.com/NousResearch/hermes-agent.git \
+            "$HFC_FIXED_TAG_SOURCE_ROOT"
+          test "$(git -C "$HFC_FIXED_TAG_SOURCE_ROOT" rev-parse HEAD)" = \
+            "$HFC_FIXED_TAG_COMMIT"
+          test -z "$(git -C "$HFC_FIXED_TAG_SOURCE_ROOT" status --porcelain)"
       - name: Install
         run: python -m pip install -e ".[test]"
       - name: Test
