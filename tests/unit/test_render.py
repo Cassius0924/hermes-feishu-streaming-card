@@ -656,6 +656,7 @@ def test_render_completed_interaction_replaces_buttons_with_choice():
                 "interaction_id": "approval-1",
                 "kind": "approval",
                 "prompt": "允许执行命令吗？",
+                "description": "敏感命令详情不应保留在完成态 tooltip",
                 "options": [{"label": "允许一次", "value": "once"}],
             },
         )
@@ -681,9 +682,29 @@ def test_render_completed_interaction_replaces_buttons_with_choice():
 
     card = render_card(session)
 
-    assert not any(element.get("tag") == "button" for element in card["body"]["elements"])
+    assert not any(
+        element.get("tag") == "button" and element.get("behaviors")
+        for element in card["body"]["elements"]
+    )
     assert "已选择：允许一次" in str(card)
     assert "Bailey" in str(card)
+    hover = next(
+        element
+        for element in card["body"]["elements"]
+        if element.get("element_id") == "interaction_hover"
+    )
+    assert hover == {
+        "tag": "button",
+        "element_id": "interaction_hover",
+        "type": "text",
+        "size": "small",
+        "text": {"tag": "plain_text", "content": "已选择：允许一次 by Bailey"},
+        "hover_tips": {
+            "tag": "plain_text",
+            "content": "❓ 允许执行命令吗？\n📋 ① 允许一次",
+        },
+    }
+    assert "敏感命令详情" not in hover["hover_tips"]["content"]
 
 
 def test_render_completed_card_shows_attachment_summary():
