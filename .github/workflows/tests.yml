@@ -20,7 +20,37 @@ env:
   HFC_FIXED_TAG_COMMIT: 3c27eb6234bf91b8ceee9e9071591b31e9b148cb
 
 jobs:
+  fixed-hermes-fixture:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout exact Hermes fixed-tag source once
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixed_root="$RUNNER_TEMP/hermes-agent-v2026.8.3-v430-audit"
+          test ! -e "$fixed_root"
+          GIT_LFS_SKIP_SMUDGE=1 git clone --quiet --filter=blob:none --depth=1 \
+            --branch v2026.8.3 \
+            https://github.com/NousResearch/hermes-agent.git \
+            "$fixed_root"
+          test "$(git -C "$fixed_root" rev-parse HEAD)" = \
+            "$HFC_FIXED_TAG_COMMIT"
+          test -z "$(git -C "$fixed_root" status --porcelain)"
+          test -z "$(git -C "$fixed_root" rev-list --objects --missing=print HEAD | sed -n '/^?/p')"
+          tar -czf "$RUNNER_TEMP/hermes-v2026.8.3-fixed-tag.tar.gz" \
+            -C "$RUNNER_TEMP" hermes-agent-v2026.8.3-v430-audit
+      - name: Upload immutable Hermes fixed-tag fixture
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-v2026.8.3-fixed-tag
+          path: ${{ runner.temp }}/hermes-v2026.8.3-fixed-tag.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
   pytest:
+    needs: fixed-hermes-fixture
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -35,19 +65,23 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Checkout exact Hermes fixed-tag source
+      - name: Download immutable Hermes fixed-tag fixture
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hermes-v2026.8.3-fixed-tag
+          path: ${{ runner.temp }}
+      - name: Restore exact Hermes fixed-tag source
         shell: bash
         run: |
           set -euo pipefail
           fixed_root="$RUNNER_TEMP/hermes-agent-v2026.8.3-v430-audit"
           test ! -e "$fixed_root"
-          GIT_LFS_SKIP_SMUDGE=1 git clone --quiet --filter=blob:none --depth=1 \
-            --branch v2026.8.3 \
-            https://github.com/NousResearch/hermes-agent.git \
-            "$fixed_root"
+          tar -xzf "$RUNNER_TEMP/hermes-v2026.8.3-fixed-tag.tar.gz" \
+            -C "$RUNNER_TEMP"
           test "$(git -C "$fixed_root" rev-parse HEAD)" = \
             "$HFC_FIXED_TAG_COMMIT"
           test -z "$(git -C "$fixed_root" status --porcelain)"
+          test -z "$(git -C "$fixed_root" rev-list --objects --missing=print HEAD | sed -n '/^?/p')"
           printf 'HFC_FIXED_TAG_SOURCE_ROOT=%s\n' "$fixed_root" >> "$GITHUB_ENV"
       - name: Install
         run: python -m pip install -e ".[test]"
@@ -93,6 +127,7 @@ jobs:
           tests/integration/test_server.py
 
   pytest-macos:
+    needs: fixed-hermes-fixture
     runs-on: macos-latest
 
     steps:
@@ -103,19 +138,23 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Checkout exact Hermes fixed-tag source
+      - name: Download immutable Hermes fixed-tag fixture
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hermes-v2026.8.3-fixed-tag
+          path: ${{ runner.temp }}
+      - name: Restore exact Hermes fixed-tag source
         shell: bash
         run: |
           set -euo pipefail
           fixed_root="$RUNNER_TEMP/hermes-agent-v2026.8.3-v430-audit"
           test ! -e "$fixed_root"
-          GIT_LFS_SKIP_SMUDGE=1 git clone --quiet --filter=blob:none --depth=1 \
-            --branch v2026.8.3 \
-            https://github.com/NousResearch/hermes-agent.git \
-            "$fixed_root"
+          tar -xzf "$RUNNER_TEMP/hermes-v2026.8.3-fixed-tag.tar.gz" \
+            -C "$RUNNER_TEMP"
           test "$(git -C "$fixed_root" rev-parse HEAD)" = \
             "$HFC_FIXED_TAG_COMMIT"
           test -z "$(git -C "$fixed_root" status --porcelain)"
+          test -z "$(git -C "$fixed_root" rev-list --objects --missing=print HEAD | sed -n '/^?/p')"
           printf 'HFC_FIXED_TAG_SOURCE_ROOT=%s\n' "$fixed_root" >> "$GITHUB_ENV"
       - name: Install
         run: python -m pip install -e ".[test]"
