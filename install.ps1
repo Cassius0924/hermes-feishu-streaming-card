@@ -4,6 +4,7 @@ param(
   [string]$Version = $env:HFC_VERSION,
   [string]$ProfileId = $env:HERMES_FEISHU_CARD_PROFILE_ID,
   [string]$EventUrl = $env:HERMES_FEISHU_CARD_EVENT_URL,
+  [string]$HermesHome = $env:HERMES_HOME,
   [switch]$NoRepair
 )
 
@@ -11,6 +12,7 @@ $ErrorActionPreference = "Stop"
 
 $Repo = if ($env:HFC_REPO) { $env:HFC_REPO } else { "baileyh8/hermes-feishu-streaming-card" }
 $HermesDir = if ($env:HERMES_DIR) { $env:HERMES_DIR } else { Join-Path $HOME ".hermes/hermes-agent" }
+$HermesHome = if ($HermesHome) { $HermesHome } else { Split-Path -Parent $HermesDir }
 $PythonBin = if ($env:PYTHON) { $env:PYTHON } else { "python" }
 $PipUserFlag = if ($env:HFC_PIP_USER) { $env:HFC_PIP_USER } else { "--user" }
 
@@ -240,6 +242,7 @@ function Invoke-HfcSetup {
     $args = @(
         "-m", "hermes_feishu_card.cli", "setup",
         "--hermes-dir", $HermesDir,
+        "--hermes-home", $HermesHome,
         "--config", $ConfigPath,
         "--env-file", $EnvFile,
         "--profile-id", $ProfileId,

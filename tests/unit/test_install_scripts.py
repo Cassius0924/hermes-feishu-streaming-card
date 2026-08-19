@@ -839,7 +839,11 @@ def test_install_docker_sh_explicit_local_source_allows_credential_free_smoke(tm
     assert f"-m pip install --upgrade {ROOT}" in log
     assert "git+https://" not in log
     assert "hermes_feishu_card.cli doctor" in log
-    assert f"hermes_feishu_card.cli install --hermes-dir {hermes_dir} --yes" in log
+    assert (
+        "hermes_feishu_card.cli install "
+        f"--hermes-dir {hermes_dir} --hermes-home {hermes_dir.parent} --yes"
+        in log
+    )
     assert "hermes_feishu_card.cli setup" not in log
 
 
@@ -1161,9 +1165,14 @@ def test_install_docker_sh_uses_container_defaults_and_hermes_venv(tmp_path):
     log = (tmp_path / "python.log").read_text(encoding="utf-8")
     assert str(runtime_python) in result.stdout
     assert "-m pip install --upgrade git+https://github.com/baileyh8/hermes-feishu-streaming-card.git@v3.7.0" in log
-    doctor_cmd = f"hermes_feishu_card.cli doctor --config {data_dir / 'config.yaml'} --hermes-dir {hermes_dir} --profile-id default --explain"
+    doctor_cmd = (
+        "hermes_feishu_card.cli doctor "
+        f"--config {data_dir / 'config.yaml'} --hermes-dir {hermes_dir} "
+        f"--hermes-home {hermes_dir.parent} --profile-id default --explain"
+    )
     setup_cmd = (
         f"hermes_feishu_card.cli setup --hermes-dir {hermes_dir} "
+        f"--hermes-home {hermes_dir.parent} "
         f"--config {data_dir / 'config.yaml'} --env-file {env_file} "
         "--profile-id default --event-url http://127.0.0.1:8765/events "
         "--yes --skip-start"
@@ -1684,7 +1693,8 @@ def test_installers_resolve_profile_arguments_with_shared_precedence(
     assert f"@{version}" in log
     setup = (
         "-m hermes_feishu_card.cli setup "
-        f"--hermes-dir {hermes_dir} --config {config} --env-file {selected_env} "
+        f"--hermes-dir {hermes_dir} --hermes-home {hermes_dir.parent} "
+        f"--config {config} --env-file {selected_env} "
         f"--profile-id {profile} --event-url {event_url} --yes --skip-start"
     )
     if no_repair == "1":
@@ -1710,6 +1720,7 @@ def test_install_powershell_declares_and_forwards_profile_parameters():
   [string]$Version = $env:HFC_VERSION,
   [string]$ProfileId = $env:HERMES_FEISHU_CARD_PROFILE_ID,
   [string]$EventUrl = $env:HERMES_FEISHU_CARD_EVENT_URL,
+  [string]$HermesHome = $env:HERMES_HOME,
   [switch]$NoRepair
 )""" in script
     for argument in (
@@ -1717,6 +1728,7 @@ def test_install_powershell_declares_and_forwards_profile_parameters():
         '"--env-file", $EnvFile',
         '"--profile-id", $ProfileId',
         '"--event-url", $EventUrl',
+        '"--hermes-home", $HermesHome',
     ):
         assert argument in script
     assert '$args += "--no-repair"' in script

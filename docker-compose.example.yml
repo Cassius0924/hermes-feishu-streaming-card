@@ -1,6 +1,7 @@
 # Example only: this project does not publish an official Hermes Docker image.
 x-hfc-environment: &hfc-environment
   HERMES_DIR: /opt/hermes
+  HERMES_HOME: /opt
   HFC_CONFIG: /opt/data/config.yaml
   HFC_ENV_FILE: /opt/data/.env
   HFC_VERSION: "${HFC_VERSION:-v4.2.12}"

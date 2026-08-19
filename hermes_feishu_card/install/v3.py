@@ -474,6 +474,151 @@ def inspect_fixed_tag_hybrid_install(
     )
 
 
+def restore_fixed_tag_hybrid_install(
+    *,
+    binding: plugin_install.HermesRuntimeBinding,
+) -> FixedTagInstallResult:
+    if type(binding) is not plugin_install.HermesRuntimeBinding:
+        raise FixedTagInstallRefused("fixed-tag runtime binding is invalid")
+    root = binding.checkout_root
+    manifest_path = root / ".hermes_feishu_card_manifest"
+    manifest_snapshot = _require_snapshot(
+        manifest_path, "V3 install manifest is missing"
+    )
+    try:
+        manifest = json.loads(manifest_snapshot.contents.decode("utf-8"))
+        validate_install_manifest(manifest)
+    except (UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise FixedTagInstallRefused("V3 install manifest is invalid") from exc
+    if manifest.get("manifest_version") != 3:
+        raise FixedTagInstallRefused("V3 install manifest is invalid")
+    phase = manifest.get("phase")
+    integration = manifest["integration"]
+    plugin = integration["plugin"]
+    config = integration["plugin_config"]
+    if plugin["python_identity"] != binding.python_identity:
+        raise FixedTagInstallRefused("V3 install runtime binding changed")
+    current_config = _require_snapshot(binding.config_path, "Hermes config is missing")
+    expected_config_sha256 = (
+        config["pre_sha256"] if phase == "prepared" else config["post_sha256"]
+    )
+    if current_config.sha256 != expected_config_sha256:
+        raise FixedTagInstallRefused("Hermes config changed since install")
+
+    installed: dict[str, bytes] = {}
+    backups: dict[str, bytes] = {}
+    source_paths: dict[str, Path] = {}
+    source_snapshots: dict[Path, _FileSnapshot] = {}
+    evidence_snapshots: dict[Path, _FileSnapshot] = {
+        manifest_path: manifest_snapshot
+    }
+    for target in HYBRID_PATCH_TARGET_ORDER:
+        ownership = manifest["targets"][target]
+        source_path = root / ownership["path"]
+        backup_path = root / ownership["backup"]
+        source_snapshot = _require_snapshot(source_path, "installed target is missing")
+        backup_snapshot = _require_snapshot(backup_path, "installed backup is missing")
+        if source_snapshot.sha256 != ownership["patched_sha256"]:
+            raise FixedTagInstallRefused("installed target hash changed")
+        if backup_snapshot.sha256 != ownership["backup_sha256"]:
+            raise FixedTagInstallRefused("installed backup hash changed")
+        source_paths[target] = source_path
+        source_snapshots[source_path] = source_snapshot
+        evidence_snapshots[backup_path] = backup_snapshot
+        installed[target] = source_snapshot.contents
+        backups[target] = backup_snapshot.contents
+    if phase == "installed":
+        patch_groups = frozenset(integration["patch_groups"])
+        expected_matrix = HYBRID_PATCH_REGISTRY.target_fragments(patch_groups)
+        try:
+            detected = detect_patch_groups_by_target(
+                installed,
+                expected_groups=patch_groups,
+                expected_fragment_matrix=expected_matrix,
+            )
+            restored = remove_patch_snapshots(
+                installed,
+                expected_groups=patch_groups,
+                expected_fragment_matrix=expected_matrix,
+            )
+        except Exception as exc:
+            raise FixedTagInstallRefused("installed Hybrid patch is invalid") from exc
+        expected_targets = {
+            target: frozenset(groups)
+            for target, groups in integration["patch_targets"].items()
+        }
+        if detected != expected_targets or restored != backups:
+            raise FixedTagInstallRefused(
+                "installed Hybrid patch ownership is inconsistent"
+            )
+    elif installed != backups:
+        raise FixedTagInstallRefused("incomplete V3 source changed before recovery")
+
+    state_dir = binding.hermes_home / ".hermes_feishu_card" / "install"
+    backup_id = config["config_backup_id"]
+    preimage = plugin_install.PluginConfigPreimage(
+        state_dir=state_dir,
+        backup_path=state_dir / f"{backup_id}.yaml",
+        journal_path=state_dir / f"{backup_id}.json",
+        config_backup_id=backup_id,
+        pre_sha256=config["pre_sha256"],
+        backup_sha256=config["backup_sha256"],
+        enabled_before=config["enabled_before"],
+    )
+    config_ownership = plugin_install.PluginOwnership(
+        enabled_before=config["enabled_before"],
+        added_by_hfc=config["added_by_hfc"],
+        pre_sha256=config["pre_sha256"],
+        post_sha256=config["post_sha256"],
+        config_backup_id=backup_id,
+        backup_sha256=config["backup_sha256"],
+    )
+    source_after: dict[Path, _FileSnapshot] | None = None
+    if phase == "installed":
+        try:
+            source_after = _commit_file_set(
+                {
+                    source_paths[target]: backups[target]
+                    for target in HYBRID_PATCH_TARGET_ORDER
+                },
+                expected=source_snapshots,
+            )
+        except Exception as exc:
+            raise FixedTagInstallRefused("V3 source restore failed") from exc
+    if phase != "prepared":
+        try:
+            plugin_install.restore_plugin_config(
+                binding, preimage, config_ownership
+            )
+        except Exception as exc:
+            if source_after is not None:
+                try:
+                    _commit_file_set(
+                        {
+                            source_paths[target]: installed[target]
+                            for target in HYBRID_PATCH_TARGET_ORDER
+                        },
+                        expected=source_after,
+                    )
+                except Exception as rollback_exc:
+                    raise FixedTagInstallRefused(
+                        "V3 config restore failed and source rollback requires manual review"
+                    ) from rollback_exc
+            raise FixedTagInstallRefused("V3 config restore failed") from exc
+    try:
+        _remove_file_set(evidence_snapshots)
+        plugin_install.cleanup_plugin_config_preimage(preimage)
+    except Exception as exc:
+        raise FixedTagInstallRefused(
+            "V3 evidence cleanup failed after verified restore"
+        ) from exc
+    return FixedTagInstallResult(
+        status="restored",
+        manifest_path=manifest_path,
+        gateway_restart_required=phase != "prepared",
+    )
+
+
 def _render_phase_manifest(
     plan: FixedTagHybridPlan,
     *,
@@ -610,6 +755,32 @@ def _replace_bytes(path: Path, contents: bytes, mode: int) -> None:
             temporary_path.unlink()
         except FileNotFoundError:
             pass
+
+
+def _remove_file_set(expected: Mapping[Path, _FileSnapshot]) -> None:
+    if type(expected) is not dict or not expected:
+        raise FixedTagInstallRefused("evidence cleanup input is invalid")
+    staged: dict[Path, Path] = {}
+    try:
+        for path, snapshot in expected.items():
+            if _snapshot(path) != snapshot:
+                raise FixedTagInstallRefused("install evidence changed before cleanup")
+            _require_safe_parent(path.parent)
+        for path in expected:
+            temporary = path.parent / (
+                f".{path.name}.hfc-remove-{os.getpid()}-{len(staged)}"
+            )
+            if temporary.exists() or temporary.is_symlink():
+                raise FixedTagInstallRefused("evidence cleanup staging path exists")
+            os.replace(path, temporary)
+            staged[path] = temporary
+        for temporary in staged.values():
+            temporary.unlink()
+    except Exception:
+        for path, temporary in reversed(tuple(staged.items())):
+            if temporary.exists() and not path.exists():
+                os.replace(temporary, path)
+        raise
 
 
 def _snapshot(path: Path) -> _FileSnapshot | None:

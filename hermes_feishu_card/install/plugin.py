@@ -368,6 +368,29 @@ def mark_plugin_config_prepared(preimage: PluginConfigPreimage) -> None:
     _atomic_replace_bytes(preimage.journal_path, value, 0o600)
 
 
+def cleanup_plugin_config_preimage(preimage: PluginConfigPreimage) -> None:
+    if type(preimage) is not PluginConfigPreimage:
+        raise PluginConfigRefused("plugin config ownership input is invalid")
+    backup = _read_private_backup(preimage)
+    if _sha256(backup) != preimage.pre_sha256:
+        raise PluginConfigRefused("plugin config backup hash mismatch")
+    snapshots = {}
+    for path in (preimage.backup_path, preimage.journal_path):
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise PluginConfigRefused("plugin config evidence is unavailable") from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise PluginConfigRefused("plugin config evidence is unsafe")
+        snapshots[path] = (metadata.st_dev, metadata.st_ino)
+    for path, identity in snapshots.items():
+        current = path.lstat()
+        if (current.st_dev, current.st_ino) != identity:
+            raise PluginConfigRefused("plugin config evidence changed")
+    for path in (preimage.journal_path, preimage.backup_path):
+        path.unlink()
+
+
 def _expected_enabled_config(before: Mapping[str, object]) -> tuple[dict[str, object], bool]:
     expected = json.loads(json.dumps(before))
     plugins = expected.get("plugins")

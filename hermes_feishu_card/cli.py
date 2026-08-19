@@ -60,6 +60,7 @@ from hermes_feishu_card.install.v3 import (
     execute_fixed_tag_hybrid_install,
     inspect_fixed_tag_hybrid_install,
     is_fixed_tag_checkout,
+    restore_fixed_tag_hybrid_install,
 )
 from hermes_feishu_card.install.integrity import (
     IntegrityRepairRefused,
@@ -3509,6 +3510,17 @@ def _run_fixed_tag_v3_install(
 ) -> int | None:
     if not is_fixed_tag_checkout(detection.root):
         return None
+    manifest_path = detection.root / MANIFEST_NAME
+    manifest_version = _manifest_version_candidate(manifest_path)
+    if manifest_version in {1, 2}:
+        try:
+            # Legacy ownership is restored before V3 binding requirements;
+            # the verified original snapshot is then re-probed and rendered.
+            _restore(detection.root)
+        except (OSError, UnicodeError, ValueError) as exc:
+            print(f"error: legacy migration restore failed: {exc}", file=sys.stderr)
+            return 1
+        print("manifest: restored verified Legacy source for V3 migration")
     try:
         binding = resolve_runtime_binding(
             checkout_root=detection.root,
@@ -3523,7 +3535,6 @@ def _run_fixed_tag_v3_install(
             raise FixedTagInstallRefused(
                 "plugin entry point verification failed: " + entrypoint.reason
             )
-        manifest_path = detection.root / MANIFEST_NAME
         if _is_v3_manifest_candidate(manifest_path):
             result = inspect_fixed_tag_hybrid_install(
                 binding=binding,
@@ -3560,16 +3571,28 @@ def _run_fixed_tag_v3_install(
 
 
 def _is_v3_manifest_candidate(path: Path) -> bool:
+    return _manifest_version_candidate(path) == 3
+
+
+def _manifest_version_candidate(path: Path) -> int | None:
     try:
         if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
-            return False
+            return None
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return False
-    return type(value) is dict and value.get("manifest_version") == 3
+        return None
+    if type(value) is not dict:
+        return None
+    if "manifest_version" not in value:
+        return 1
+    version = value.get("manifest_version")
+    return version if type(version) is int and not isinstance(version, bool) else None
 
 
 def _run_repair(args: argparse.Namespace) -> int:
+    fixed_tag_result = _run_fixed_tag_v3_repair(args)
+    if fixed_tag_result is not None:
+        return fixed_tag_result
     detection = detect_hermes(args.hermes_dir)
     if not detection.supported:
         print(_format_hermes_detection(detection), file=sys.stderr)
@@ -3594,7 +3617,48 @@ def _run_repair(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_fixed_tag_v3_repair(args: argparse.Namespace) -> int | None:
+    root = Path(args.hermes_dir).expanduser()
+    manifest_path = root / MANIFEST_NAME
+    if not _is_v3_manifest_candidate(manifest_path):
+        return None
+    try:
+        binding = resolve_runtime_binding(
+            checkout_root=root,
+            hermes_home=getattr(args, "hermes_home", None),
+            profile_id=getattr(args, "profile_id", None),
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("phase") == "installed":
+            entrypoint = probe_plugin_entrypoint(
+                binding, expected_version=PACKAGE_VERSION
+            )
+            inspect_fixed_tag_hybrid_install(
+                binding=binding,
+                entrypoint=entrypoint,
+                package_version=PACKAGE_VERSION,
+            )
+            print("repair: no changes")
+        else:
+            restore_fixed_tag_hybrid_install(binding=binding)
+            print("install state: recovered incomplete V3 transaction")
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        RuntimeBindingRefused,
+        FixedTagInstallRefused,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print("repair ok")
+    return 0
+
+
 def _run_restore(args: argparse.Namespace) -> int:
+    fixed_tag_result = _run_fixed_tag_v3_restore(args, command="restore")
+    if fixed_tag_result is not None:
+        return fixed_tag_result
     try:
         _restore(Path(args.hermes_dir))
     except (OSError, UnicodeError, ValueError) as exc:
@@ -3606,6 +3670,9 @@ def _run_restore(args: argparse.Namespace) -> int:
 
 
 def _run_uninstall(args: argparse.Namespace) -> int:
+    fixed_tag_result = _run_fixed_tag_v3_restore(args, command="uninstall")
+    if fixed_tag_result is not None:
+        return fixed_tag_result
     try:
         _restore(Path(args.hermes_dir))
     except (OSError, UnicodeError, ValueError) as exc:
@@ -3613,6 +3680,30 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         return 1
 
     print("uninstall ok")
+    return 0
+
+
+def _run_fixed_tag_v3_restore(
+    args: argparse.Namespace,
+    *,
+    command: str,
+) -> int | None:
+    root = Path(args.hermes_dir).expanduser()
+    if not _is_v3_manifest_candidate(root / MANIFEST_NAME):
+        return None
+    try:
+        binding = resolve_runtime_binding(
+            checkout_root=root,
+            hermes_home=getattr(args, "hermes_home", None),
+            profile_id=getattr(args, "profile_id", None),
+        )
+        result = restore_fixed_tag_hybrid_install(binding=binding)
+    except (OSError, UnicodeError, RuntimeBindingRefused, FixedTagInstallRefused) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"{command} ok")
+    if result.gateway_restart_required:
+        print("gateway.restart_required: hermes gateway start")
     return 0
 
 
