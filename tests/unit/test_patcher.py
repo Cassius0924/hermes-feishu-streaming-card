@@ -1,5 +1,6 @@
 import ast
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,12 @@ TURN_RUNNER_FIXTURE = (
 EXACT_BASE_V020_FIXTURE = (
     Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base_v020.py"
 )
-FIXED_TAG_SOURCE_ROOT = Path("/private/tmp/hermes-agent-v2026.8.3-v430-audit")
+FIXED_TAG_SOURCE_ROOT = Path(
+    os.environ.get(
+        "HFC_FIXED_TAG_SOURCE_ROOT",
+        "/private/tmp/hermes-agent-v2026.8.3-v430-audit",
+    )
+)
 FIXED_TAG_HYBRID_SHA256 = {
     "gateway/run.py": "0b749a90ff5740b5c8ce9d138f869aca19295f4c458e3b680e9be9fd7b0fb2ec",
     "agent/turn_context.py": "a0e136367b64007d7b49ea006ab0aa7dcc66b12134b512a463a03bd69fb8a90c",

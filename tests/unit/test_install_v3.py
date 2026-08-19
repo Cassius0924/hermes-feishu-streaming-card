@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,12 @@ from hermes_feishu_card.integration import (
 )
 
 
-FIXED_SOURCE_ROOT = Path("/private/tmp/hermes-agent-v2026.8.3-v430-audit")
+FIXED_SOURCE_ROOT = Path(
+    os.environ.get(
+        "HFC_FIXED_TAG_SOURCE_ROOT",
+        "/private/tmp/hermes-agent-v2026.8.3-v430-audit",
+    )
+)
 
 
 def _decision():

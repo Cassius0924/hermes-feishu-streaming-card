@@ -220,7 +220,12 @@ def _sha256(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-FIXED_SOURCE_ROOT = Path("/private/tmp/hermes-agent-v2026.8.3-v430-audit")
+FIXED_SOURCE_ROOT = Path(
+    os.environ.get(
+        "HFC_FIXED_TAG_SOURCE_ROOT",
+        "/private/tmp/hermes-agent-v2026.8.3-v430-audit",
+    )
+)
 
 
 def _wheel_digest(data: bytes) -> str:
