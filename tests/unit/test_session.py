@@ -1,6 +1,8 @@
 from hermes_feishu_card.events import SidecarEvent
 from hermes_feishu_card.session import CardSession, InteractionState
+from copy import deepcopy
 import pytest
+import time
 
 
 class _StringSubclass(str):
@@ -176,6 +178,54 @@ def test_pending_interaction_clears_explicit_status_to_session_source():
 
     assert session.display_status == ""
     assert session.display_status_source == "session"
+
+
+def test_runtime_admission_is_hidden_frozen_and_erased_on_completion():
+    descriptor = {
+        "protocol": "hfc-runtime-interaction-v1",
+        "runtime_id": "a" * 64,
+        "resolve_url": "http://127.0.0.1:43210/runtime/interactions/resolve",
+        "interaction_key": "b" * 64,
+        "token": "c" * 64,
+        "expires_at": time.time() + 20.0,
+    }
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "approval-1",
+                "kind": "approval",
+                "prompt": "请选择",
+                "options": [{"label": "允许", "value": "once"}],
+                "_hfc_runtime_admission": descriptor,
+            },
+            turn_id="turn-1",
+            event_id="patch:turn-1:interaction:approval-1:1",
+            producer="patch",
+            phase="started",
+        )
+    )
+    descriptor["token"] = "d" * 64
+    interaction = session.active_interaction
+    assert interaction is not None
+    assert interaction.runtime_admission["token"] == "c" * 64
+    assert "c" * 64 not in repr(interaction)
+    with pytest.raises(TypeError):
+        interaction.runtime_admission["token"] = "d" * 64
+    snapshot = deepcopy(session)
+    assert snapshot.active_interaction.runtime_admission["token"] == "c" * 64
+    assert snapshot.active_interaction.runtime_admission is not interaction.runtime_admission
+
+    assert session.apply(
+        event(
+            "interaction.completed",
+            2,
+            {"interaction_id": "approval-1", "choice": "once"},
+        )
+    )
+    assert interaction.runtime_admission is None
 
 
 def test_failed_event_clears_explicit_status_to_session_source():

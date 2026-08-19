@@ -2314,6 +2314,108 @@ def test_task6_patch_interaction_register_resolve_and_claim_once(kind):
     assert runtime._coordinators["turn-1"]._queue.qsize() == 0
 
 
+def _runtime_interaction_ui():
+    return {
+        "prompt": "允许执行命令吗？",
+        "description": "仅用于本次操作",
+        "allow_custom_input": False,
+        "multi_select": False,
+        "timeout_seconds": 20.0,
+        "options": [
+            {"label": "允许一次", "value": "once", "style": "primary"},
+            {"label": "拒绝", "value": "deny", "style": "danger"},
+        ],
+    }
+
+
+def test_runtime_interaction_admission_posts_once_and_owns_ui_only_on_exact_delivery():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    assert runtime.start_runtime_interaction_listener(b"r" * 32) is True
+    try:
+        handle = object()
+        values = patch_interaction_args(handle)
+        assert runtime.register_patch_interaction(*values) is True
+
+        runtime._post = lambda payload, timeout: posted.append(payload) or {
+            "ok": True,
+            "applied": True,
+            "delivery": {"outcome": "delivered"},
+            "runtime_admission": True,
+        }
+        resolver = lambda choice: choice in {"once", "deny"}
+        assert runtime.admit_patch_interaction(
+            *values, resolver, _runtime_interaction_ui()
+        ) is True
+
+        assert len(posted) == 1
+        payload = posted[0]
+        assert payload["event"] == "interaction.requested"
+        assert payload["producer"] == "patch"
+        assert payload["data"]["_hfc_runtime_admission"]["resolve_url"].startswith(
+            "http://127.0.0.1:"
+        )
+        state = next(iter(runtime._patch_interactions.values()))
+        assert state.hfc_owned is True
+        assert "token" not in state.admission_payload["data"][
+            "_hfc_runtime_admission"
+        ]
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "response",
+    (
+        {"ok": True, "applied": True},
+        {"ok": True, "applied": True, "delivery": {"outcome": "delivered"}},
+        {"ok": 1, "applied": True, "delivery": {"outcome": "delivered"}, "runtime_admission": True},
+        AcceptedDict(ok=True, applied=True, delivery={"outcome": "delivered"}, runtime_admission=True),
+        {"ok": True, "applied": True, "delivery": {"outcome": "delivered"}, "runtime_admission": True, "extra": False},
+    ),
+)
+def test_runtime_interaction_admission_rejects_lookalikes_without_consuming_native(response):
+    posted = []
+    runtime = active_task4_runtime(posted)
+    assert runtime.start_runtime_interaction_listener(b"r" * 32) is True
+    handle = object()
+    values = patch_interaction_args(handle)
+    assert runtime.register_patch_interaction(*values) is True
+    runtime._post = lambda payload, timeout: posted.append(payload) or response
+
+    assert runtime.admit_patch_interaction(
+        *values, lambda choice: True, _runtime_interaction_ui()
+    ) is False
+    state = next(iter(runtime._patch_interactions.values()))
+    assert state.hfc_owned is False
+    assert state.selected_value is None
+    assert runtime.claim_patch_interaction(*values) is None
+    runtime.close()
+
+
+def test_runtime_interaction_unknown_transport_retry_reuses_byte_equivalent_event():
+    posted = []
+    responses = [None, {
+        "ok": True,
+        "applied": True,
+        "delivery": {"outcome": "delivered"},
+        "runtime_admission": True,
+    }]
+    runtime = active_task4_runtime(posted)
+    assert runtime.start_runtime_interaction_listener(b"r" * 32) is True
+    handle = object()
+    values = patch_interaction_args(handle)
+    assert runtime.register_patch_interaction(*values) is True
+    runtime._post = lambda payload, timeout: posted.append(payload) or responses.pop(0)
+
+    assert runtime.admit_patch_interaction(
+        *values, lambda choice: True, _runtime_interaction_ui()
+    ) is True
+    assert len(posted) == 2
+    assert posted[0] == posted[1]
+    runtime.close()
+
+
 @pytest.mark.parametrize(
     ("field", "invalid"),
     (

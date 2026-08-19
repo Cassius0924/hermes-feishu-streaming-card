@@ -622,6 +622,8 @@ class _PatchInteraction:
     resolver: Callable[[str], bool] | None = None
     resolving_value: str | None = None
     resolution_complete: threading.Event | None = None
+    hfc_owned: bool = False
+    admission_payload: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, repr=False)
@@ -1098,6 +1100,206 @@ class PluginRuntime:
                 }
         except Exception:
             return None
+
+    def admit_patch_interaction(
+        self,
+        kind: object,
+        session_identity: object,
+        turn_id: object,
+        interaction_id: object,
+        fingerprint: object,
+        pending_handle: object,
+        resolver: object,
+        ui_data: object,
+    ) -> bool:
+        """Synchronously select HFC UI only after exact Sidecar delivery proof."""
+        if not callable(resolver) or not self._valid_interaction_ui_data(ui_data):
+            return False
+        descriptor = self.arm_patch_interaction_descriptor(
+            kind,
+            session_identity,
+            turn_id,
+            interaction_id,
+            fingerprint,
+            pending_handle,
+            resolver,
+        )
+        if descriptor is None:
+            return False
+        key: str | None = None
+        state: _PatchInteraction | None = None
+        try:
+            with self._lock:
+                now = self._now()
+                self._expire_locked(now)
+                key = self._patch_interaction_key_locked(
+                    kind,
+                    session_identity,
+                    turn_id,
+                    interaction_id,
+                    fingerprint,
+                )
+                candidate = None if key is None else self._patch_interactions.get(key)
+                coordinator = (
+                    self._card_active_coordinator_locked(turn_id)
+                    if type(turn_id) is str
+                    else None
+                )
+                turn = self._turns.get(turn_id) if type(turn_id) is str else None
+                if (
+                    self._closed
+                    or type(candidate) is not _PatchInteraction
+                    or candidate.pending_handle is not pending_handle
+                    or candidate.resolver is not resolver
+                    or candidate.turn_digest in self._interaction_cleanup_turns
+                    or candidate.selected_value is not None
+                    or candidate.resolving_value is not None
+                    or coordinator is None
+                    or turn is None
+                    or now >= descriptor["expires_at"]
+                ):
+                    return False
+                state = candidate
+                if state.hfc_owned:
+                    return True
+                if state.admission_payload is None:
+                    sequence = coordinator.next_sequence("patch")
+                    payload = self._base_payload(
+                        turn, sequence=sequence, created_at=now
+                    )
+                    safe_ui = deepcopy(ui_data)
+                    data = {
+                        "interaction_id": interaction_id,
+                        "kind": kind,
+                        **safe_ui,
+                        "_hfc_runtime_admission": deepcopy(descriptor),
+                    }
+                    payload.update(
+                        event="interaction.requested",
+                        event_id=(
+                            f"patch:{turn_id}:interaction:{key}:{sequence}"
+                        ),
+                        producer="patch",
+                        phase="started",
+                        data=data,
+                    )
+                    stored_payload = deepcopy(payload)
+                    stored_descriptor = stored_payload["data"][
+                        "_hfc_runtime_admission"
+                    ]
+                    stored_descriptor.pop("token", None)
+                    state.admission_payload = stored_payload
+                stored_payload = deepcopy(state.admission_payload)
+                if state.interaction_key is None:
+                    return False
+                payload = deepcopy(stored_payload)
+                payload["data"]["_hfc_runtime_admission"]["token"] = (
+                    self._runtime_interaction_token(state.interaction_key)
+                )
+            result: object = None
+            for attempt in range(2):
+                try:
+                    result = self._post(deepcopy(payload), self._terminal_timeout_seconds)
+                except Exception:
+                    result = None
+                if result is not None or attempt == 1:
+                    break
+            if not self._is_exact_runtime_interaction_admission_response(result):
+                return False
+            with self._lock:
+                checked_at = self._now()
+                self._expire_locked(checked_at)
+                current = None if key is None else self._patch_interactions.get(key)
+                if (
+                    current is not state
+                    or type(current) is not _PatchInteraction
+                    or current.pending_handle is not pending_handle
+                    or current.resolver is not resolver
+                    or current.turn_digest in self._interaction_cleanup_turns
+                    or current.selected_value is not None
+                    or current.resolving_value is not None
+                    or current.admission_payload != stored_payload
+                    or current.descriptor_expires_at is None
+                    or checked_at >= current.descriptor_expires_at
+                ):
+                    return False
+                current.hfc_owned = True
+                return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_exact_runtime_interaction_admission_response(value: object) -> bool:
+        if (
+            type(value) is not dict
+            or not all(type(key) is str for key in value)
+            or set(value) != {"ok", "applied", "delivery", "runtime_admission"}
+            or value["ok"] is not True
+            or value["applied"] is not True
+            or value["runtime_admission"] is not True
+        ):
+            return False
+        delivery = value["delivery"]
+        return (
+            type(delivery) is dict
+            and all(type(key) is str for key in delivery)
+            and set(delivery) == {"outcome"}
+            and type(delivery["outcome"]) is str
+            and delivery["outcome"] == "delivered"
+        )
+
+    @classmethod
+    def _valid_interaction_ui_data(cls, value: object) -> bool:
+        if (
+            type(value) is not dict
+            or not all(type(key) is str for key in value)
+            or set(value)
+            != {
+                "prompt",
+                "description",
+                "allow_custom_input",
+                "multi_select",
+                "timeout_seconds",
+                "options",
+            }
+            or type(value["prompt"]) is not str
+            or not value["prompt"].strip()
+            or len(value["prompt"].encode("utf-8")) > 4096
+            or type(value["description"]) is not str
+            or len(value["description"].encode("utf-8")) > 4096
+            or type(value["allow_custom_input"]) is not bool
+            or type(value["multi_select"]) is not bool
+            or type(value["timeout_seconds"]) not in (int, float)
+            or type(value["options"]) is not list
+            or not value["options"]
+            or len(value["options"]) > 32
+        ):
+            return False
+        try:
+            timeout = value["timeout_seconds"]
+            if not isfinite(timeout) or not 0 < timeout <= cls._PATCH_INTERACTION_TTL_SECONDS:
+                return False
+        except (OverflowError, TypeError, ValueError):
+            return False
+        allowed_styles = {"default", "primary", "danger"}
+        seen: set[str] = set()
+        for option in value["options"]:
+            if (
+                type(option) is not dict
+                or not all(type(key) is str for key in option)
+                or set(option) != {"label", "value", "style"}
+                or type(option["label"]) is not str
+                or not option["label"].strip()
+                or type(option["value"]) is not str
+                or not cls._valid_patch_selected_value(option["value"])
+                or type(option["style"]) is not str
+                or option["style"] not in allowed_styles
+                or option["value"] in seen
+                or len(option["label"].encode("utf-8")) > 256
+            ):
+                return False
+            seen.add(option["value"])
+        return True
 
     def resolve_runtime_interaction_payload(self, payload: object) -> bool:
         if type(payload) is not dict or set(payload) != {

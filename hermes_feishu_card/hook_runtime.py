@@ -778,6 +778,55 @@ def resolve_pending_interaction_from_hermes_locals(
     )
 
 
+def admit_pending_interaction_from_hermes_locals(
+    local_vars: object,
+    kind: object,
+    interaction_data: object,
+    pending_handle: object,
+    resolver: object,
+    ui_data: object,
+) -> bool:
+    """Attempt one synchronous HFC UI admission for an existing Hermes handle."""
+    try:
+        values = _thin_interaction_values(
+            local_vars, kind, interaction_data, pending_handle
+        )
+        if (
+            values is None
+            or not callable(resolver)
+            or type(ui_data) is not dict
+            or not all(type(key) is str for key in ui_data)
+            or set(ui_data)
+            != {
+                "prompt",
+                "description",
+                "allow_custom_input",
+                "multi_select",
+                "timeout_seconds",
+                "options",
+            }
+            or type(ui_data.get("prompt")) is not str
+            or type(ui_data.get("description")) is not str
+            or type(ui_data.get("allow_custom_input")) is not bool
+            or type(ui_data.get("multi_select")) is not bool
+            or type(ui_data.get("timeout_seconds")) not in (int, float)
+            or type(ui_data.get("options")) is not list
+            or not _is_ordinary_json_value(ui_data)
+        ):
+            return False
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "admit_patch_interaction", None)
+        if not callable(method):
+            return False
+        return method(
+            *values,
+            resolver,
+            copy.deepcopy(ui_data),
+        ) is True
+    except Exception:
+        return False
+
+
 def claim_pending_interaction_from_hermes_locals(
     local_vars: object,
     kind: object,

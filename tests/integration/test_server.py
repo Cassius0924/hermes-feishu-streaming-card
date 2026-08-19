@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import logging
@@ -71,6 +72,7 @@ from hermes_feishu_card.server import (
     create_app as _create_app,
 )
 from hermes_feishu_card.runner import NoopFeishuClient
+from hermes_feishu_card.runtime_interaction_transport import RuntimeInteractionListener
 
 
 _REAL_ASYNCIO_SLEEP = asyncio.sleep
@@ -502,6 +504,42 @@ def event_payload(
     if turn_id:
         payload["turn_id"] = turn_id
     return payload
+
+
+def runtime_interaction_payload(descriptor, *, event_id="patch:turn-runtime:interaction:1"):
+    payload = event_payload(
+        "interaction.requested",
+        1,
+        {
+            "interaction_id": "runtime-approval-1",
+            "kind": "approval",
+            "prompt": "允许继续吗？",
+            "description": "仅用于本次操作",
+            "allow_custom_input": False,
+            "multi_select": False,
+            "timeout_seconds": 20.0,
+            "options": [
+                {"label": "允许一次", "value": "once", "style": "primary"},
+                {"label": "拒绝", "value": "deny", "style": "danger"},
+            ],
+            "_hfc_runtime_admission": descriptor,
+        },
+        turn_id="turn-runtime",
+        created_at=time.time(),
+    )
+    payload.update(event_id=event_id, producer="patch", phase="started")
+    return payload
+
+
+def runtime_descriptor(listener):
+    return {
+        "protocol": "hfc-runtime-interaction-v1",
+        "runtime_id": "a" * 64,
+        "resolve_url": listener.resolve_url,
+        "interaction_key": "b" * 64,
+        "token": "c" * 64,
+        "expires_at": time.time() + 20.0,
+    }
 
 
 def exact_handoff_metadata(
@@ -8313,6 +8351,463 @@ async def test_interaction_request_renders_buttons_and_callback_resolves(client)
     }
     assert feishu_client.updated[-1][0] == "feishu-message-2"
     assert "已选择：允许一次" in str(feishu_client.updated[-1][1])
+
+
+async def test_runtime_interaction_admission_requires_actual_delivery_and_canonical_replay(client):
+    test_client, feishu_client = client
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        payload = runtime_interaction_payload(runtime_descriptor(listener))
+        admitted = await test_client.post("/events", json=payload)
+
+        assert admitted.status == 200
+        assert await admitted.json() == {
+            "ok": True,
+            "applied": True,
+            "delivery": {"outcome": "delivered"},
+            "runtime_admission": True,
+        }
+        assert len(feishu_client.sent) == 2
+        replay = await test_client.post("/events", json=payload)
+        assert await replay.json() == await admitted.json()
+        assert len(feishu_client.sent) == 2
+    finally:
+        listener.close()
+
+
+async def test_runtime_interaction_delivery_failure_rolls_back_fence_for_exact_retry(client):
+    test_client, feishu_client = client
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        payload = runtime_interaction_payload(runtime_descriptor(listener))
+        feishu_client.fail_send = True
+        failed = await test_client.post("/events", json=payload)
+        assert failed.status == 502
+        assert len(feishu_client.sent) == 1
+
+        feishu_client.fail_send = False
+        retried = await test_client.post("/events", json=payload)
+        assert retried.status == 200
+        assert (await retried.json())["runtime_admission"] is True
+        assert len(feishu_client.sent) == 2
+    finally:
+        listener.close()
+
+
+async def test_runtime_interaction_action_resolves_listener_before_terminal_mutation(client):
+    test_client, feishu_client = client
+    observed = []
+
+    def resolve(payload):
+        session = test_client.app[SESSIONS_KEY]["turn-runtime"]
+        observed.append((payload, session.active_interaction.status))
+        return True
+
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, resolve)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        requested = await test_client.post(
+            "/events", json=runtime_interaction_payload(runtime_descriptor(listener))
+        )
+        assert requested.status == 200
+        card = feishu_client.sent[-1][1]
+        action_value = next(
+            item["behaviors"][0]["value"]
+            for item in card["body"]["elements"]
+            if item.get("tag") == "button"
+        )
+
+        callback = await test_client.post(
+            "/card/actions",
+            json={
+                "event": {
+                    "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                    "context": {"open_chat_id": "oc_abc", "profile_id": "default"},
+                    "action": {"value": action_value},
+                }
+            },
+        )
+
+        assert callback.status == 200
+        callback_body = await callback.json()
+        assert observed and observed[0][1] == "pending"
+        callback_payload = observed[0][0]
+        assert set(callback_payload) == {
+            "protocol", "runtime_id", "interaction_key", "token", "choice", "expires_at"
+        }
+        assert callback_payload["choice"] == "once"
+        assert test_client.app[SESSIONS_KEY][
+            "turn-runtime"
+        ].active_interaction.status == "completed", callback_body
+    finally:
+        listener.close()
+
+
+async def test_runtime_interaction_callback_failure_keeps_pending_and_hides_descriptor(client):
+    test_client, feishu_client = client
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: False)
+    listener.start()
+    descriptor = runtime_descriptor(listener)
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        requested = await test_client.post(
+            "/events", json=runtime_interaction_payload(descriptor)
+        )
+        assert requested.status == 200
+        card = feishu_client.sent[-1][1]
+        action_value = next(
+            item["behaviors"][0]["value"]
+            for item in card["body"]["elements"]
+            if item.get("tag") == "button"
+        )
+        callback = await test_client.post(
+            "/card/actions",
+            json={
+                "event": {
+                    "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                    "context": {"open_chat_id": "oc_abc", "profile_id": "default"},
+                    "action": {"value": action_value},
+                }
+            },
+        )
+
+        assert callback.status == 503
+        result = await test_client.get("/interactions/runtime-approval-1")
+        assert (await result.json())["status"] == "pending"
+        health = await (await test_client.get("/health")).text()
+        result_text = await result.text()
+        rendered = json.dumps(card, ensure_ascii=False)
+        for canary in (descriptor["runtime_id"], descriptor["interaction_key"], descriptor["token"], descriptor["resolve_url"]):
+            assert canary not in health
+            assert canary not in result_text
+            assert canary not in rendered
+    finally:
+        listener.close()
+
+
+async def test_runtime_interaction_feishu_delivery_holds_no_message_lock(client):
+    test_client, feishu_client = client
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        original_send = feishu_client.send_card
+        observed = []
+
+        async def probe_send(*args, **kwargs):
+            lock = test_client.app[MESSAGE_LOCKS_KEY]["turn-runtime"]
+            observed.append(lock.locked())
+            return await original_send(*args, **kwargs)
+
+        feishu_client.send_card = probe_send
+        requested = await test_client.post(
+            "/events", json=runtime_interaction_payload(runtime_descriptor(listener))
+        )
+
+        assert requested.status == 200
+        assert observed == [False]
+    finally:
+        listener.close()
+
+
+async def test_runtime_interaction_owner_cancellation_keeps_delivery_and_canonical_replay(client):
+    test_client, feishu_client = client
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
+    listener.start()
+    delivery_started = asyncio.Event()
+    release_delivery = asyncio.Event()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        original_send = feishu_client.send_card
+
+        async def blocked_send(*args, **kwargs):
+            delivery_started.set()
+            await release_delivery.wait()
+            return await original_send(*args, **kwargs)
+
+        feishu_client.send_card = blocked_send
+        payload = runtime_interaction_payload(runtime_descriptor(listener))
+        owner = asyncio.create_task(test_client.post("/events", json=payload))
+        await asyncio.wait_for(delivery_started.wait(), timeout=1.0)
+        owner.cancel()
+        release_delivery.set()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+
+        deadline = time.monotonic() + 1.0
+        while len(feishu_client.sent) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert len(feishu_client.sent) == 2
+
+        replay = await test_client.post("/events", json=payload)
+        assert await replay.json() == {
+            "ok": True,
+            "applied": True,
+            "delivery": {"outcome": "delivered"},
+            "runtime_admission": True,
+        }
+        assert len(feishu_client.sent) == 2
+    finally:
+        release_delivery.set()
+        listener.close()
+
+
+async def test_runtime_interaction_expiry_during_blocked_callback_erases_admission(client):
+    test_client, feishu_client = client
+    entered = threading.Event()
+    release = threading.Event()
+
+    def resolve(payload):
+        entered.set()
+        release.wait(timeout=1.0)
+        return True
+
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, resolve)
+    listener.start()
+    descriptor = runtime_descriptor(listener)
+    descriptor["expires_at"] = time.time() + 0.15
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        assert (
+            await test_client.post(
+                "/events", json=runtime_interaction_payload(descriptor)
+            )
+        ).status == 200
+        card = feishu_client.sent[-1][1]
+        action_value = next(
+            item["behaviors"][0]["value"]
+            for item in card["body"]["elements"]
+            if item.get("tag") == "button"
+        )
+        action = asyncio.create_task(
+            test_client.post(
+                "/card/actions",
+                json={
+                    "event": {
+                        "operator": {"open_id": "ou_bailey"},
+                        "context": {"open_chat_id": "oc_abc", "profile_id": "default"},
+                        "action": {"value": action_value},
+                    }
+                },
+            )
+        )
+        deadline = time.monotonic() + 1.0
+        while not entered.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        await asyncio.sleep(0.2)
+        release.set()
+        response = await action
+        assert response.status in {409, 503}
+        interaction = test_client.app[SESSIONS_KEY][
+            "turn-runtime"
+        ].active_interaction
+        assert interaction.status == "failed"
+        assert interaction.runtime_admission is None
+    finally:
+        release.set()
+        listener.close()
+
+
+async def test_runtime_interaction_session_replacement_during_callback_clears_old_admission(client):
+    test_client, feishu_client = client
+    entered = threading.Event()
+    release = threading.Event()
+
+    def resolve(payload):
+        entered.set()
+        release.wait(timeout=1.0)
+        return True
+
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, resolve)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        assert (
+            await test_client.post(
+                "/events",
+                json=runtime_interaction_payload(runtime_descriptor(listener)),
+            )
+        ).status == 200
+        old_session = test_client.app[SESSIONS_KEY]["turn-runtime"]
+        card = feishu_client.sent[-1][1]
+        action_value = next(
+            item["behaviors"][0]["value"]
+            for item in card["body"]["elements"]
+            if item.get("tag") == "button"
+        )
+        action = asyncio.create_task(
+            test_client.post(
+                "/card/actions",
+                json={
+                    "event": {
+                        "operator": {"open_id": "ou_bailey"},
+                        "context": {"open_chat_id": "oc_abc", "profile_id": "default"},
+                        "action": {"value": action_value},
+                    }
+                },
+            )
+        )
+        deadline = time.monotonic() + 1.0
+        while not entered.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        replacement = copy.copy(old_session)
+        test_client.app[SESSIONS_KEY]["turn-runtime"] = replacement
+        release.set()
+        response = await action
+
+        assert response.status == 409
+        assert replacement.active_interaction.status == "pending"
+        assert old_session.active_interaction.runtime_admission is None
+    finally:
+        release.set()
+        listener.close()
+
+
+async def test_runtime_interaction_app_cleanup_erases_hidden_admission(client):
+    test_client, _feishu_client = client
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        assert (
+            await test_client.post(
+                "/events",
+                json=runtime_interaction_payload(runtime_descriptor(listener)),
+            )
+        ).status == 200
+        interaction = test_client.app[SESSIONS_KEY][
+            "turn-runtime"
+        ].active_interaction
+        assert interaction.runtime_admission is not None
+
+        await test_client.close()
+
+        assert interaction.runtime_admission is None
+        assert test_client.app[
+            sidecar_server.RUNTIME_INTERACTION_RESERVATIONS_KEY
+        ] == {}
+    finally:
+        listener.close()
+
+
+async def test_runtime_interaction_concurrent_same_and_conflicting_actions_complete_once_without_lock(client):
+    test_client, feishu_client = client
+    selected = []
+    observed_locks = []
+    selected_lock = threading.Lock()
+
+    def resolve(payload):
+        observed_locks.append(
+            test_client.app[MESSAGE_LOCKS_KEY]["turn-runtime"].locked()
+        )
+        with selected_lock:
+            if not selected:
+                selected.append(payload["choice"])
+                return True
+            return selected[0] == payload["choice"]
+
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, resolve)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        assert (
+            await test_client.post(
+                "/events",
+                json=runtime_interaction_payload(runtime_descriptor(listener)),
+            )
+        ).status == 200
+        card = feishu_client.sent[-1][1]
+        values = [
+            item["behaviors"][0]["value"]
+            for item in card["body"]["elements"]
+            if item.get("tag") == "button"
+        ]
+        once = next(value for value in values if value["choice"] == "once")
+        deny = next(value for value in values if value["choice"] == "deny")
+
+        async def act(value):
+            return await test_client.post(
+                "/card/actions",
+                json={
+                    "event": {
+                        "operator": {"open_id": "ou_bailey"},
+                        "context": {"open_chat_id": "oc_abc", "profile_id": "default"},
+                        "action": {"value": value},
+                    }
+                },
+            )
+
+        responses = await asyncio.gather(act(once), act(once), act(deny))
+        statuses = [response.status for response in responses]
+        interaction = test_client.app[SESSIONS_KEY][
+            "turn-runtime"
+        ].active_interaction
+
+        assert statuses.count(200) == 1
+        assert all(status in {200, 409, 503} for status in statuses)
+        assert interaction.status == "completed"
+        assert interaction.choice == selected[0]
+        assert interaction.runtime_admission is None
+        assert observed_locks and observed_locks == [False] * len(observed_locks)
+    finally:
+        listener.close()
 
 
 async def test_repeated_interactions_each_promote_a_fresh_latest_card(client):

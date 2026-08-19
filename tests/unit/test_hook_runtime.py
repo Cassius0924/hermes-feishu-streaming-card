@@ -65,6 +65,10 @@ class _ThinBridgeRuntime:
         self.calls.append(("claim", values))
         return "selected"
 
+    def admit_patch_interaction(self, *values):
+        self.calls.append(("admit", values))
+        return True
+
     def take_terminal_record(self, turn_id):
         self.calls.append(("terminal", (turn_id,)))
         if not self.terminal_records:
@@ -117,6 +121,20 @@ def _thin_interaction_data(**overrides):
     }
     values.update(overrides)
     return values
+
+
+def _thin_interaction_ui():
+    return {
+        "prompt": "允许继续吗？",
+        "description": "仅用于本次操作",
+        "allow_custom_input": False,
+        "multi_select": False,
+        "timeout_seconds": 20.0,
+        "options": [
+            {"label": "允许一次", "value": "once", "style": "primary"},
+            {"label": "拒绝", "value": "deny", "style": "danger"},
+        ],
+    }
 
 
 def test_thin_carrier_nested_scope_restores_outer_and_rejects_stale_token():
@@ -723,6 +741,69 @@ def test_thin_interaction_facades_delegate_exact_original_pending_handle(
     if operation == "resolve":
         expected = (*expected, "selected")
     assert runtime.calls == [(operation, expected)]
+
+
+def test_thin_interaction_admission_delegates_exact_handle_resolver_and_detached_ui(monkeypatch):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    pending_handle = object()
+    resolver = lambda choice: choice == "once"
+    ui_data = _thin_interaction_ui()
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.admit_pending_interaction_from_hermes_locals(
+            _thin_bridge_locals(),
+            "approval",
+            _thin_interaction_data(),
+            pending_handle,
+            resolver,
+            ui_data,
+        ) is True
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+
+    operation, values = runtime.calls[0]
+    assert operation == "admit"
+    assert values[:6] == (
+        "approval",
+        "gateway-session-1",
+        "turn-1",
+        "approval-1",
+        "a" * 64,
+        pending_handle,
+    )
+    assert values[6] is resolver
+    assert values[7] == ui_data
+    assert values[7] is not ui_data
+
+
+@pytest.mark.parametrize(
+    ("resolver", "ui_data"),
+    (
+        (None, _thin_interaction_ui()),
+        (lambda choice: True, type("DictSubclass", (dict,), {})(_thin_interaction_ui())),
+        (lambda choice: True, dict(_thin_interaction_ui(), extra=False)),
+        (lambda choice: True, dict(_thin_interaction_ui(), prompt=StringSubclass("x"))),
+    ),
+)
+def test_thin_interaction_admission_rejects_inexact_resolver_or_ui(
+    monkeypatch, resolver, ui_data
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.admit_pending_interaction_from_hermes_locals(
+            _thin_bridge_locals(),
+            "approval",
+            _thin_interaction_data(),
+            object(),
+            resolver,
+            ui_data,
+        ) is False
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+    assert runtime.calls == []
 
 
 @pytest.mark.parametrize(

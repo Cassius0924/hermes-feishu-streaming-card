@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from copy import deepcopy
 import json
 import math
 import re
 import secrets
 import time
 from typing import Any, Dict, Optional
+from types import MappingProxyType
 from urllib.parse import urlsplit
 
 from .card_timeline import CardTimeline, TERMINAL_TOOL_STATUSES
@@ -66,6 +68,23 @@ class InteractionState:
     choice_label: str = ""
     user_name: str = ""
     error: str = ""
+    runtime_admission: object | None = field(default=None, repr=False)
+    runtime_turn_id: str = field(default="", repr=False)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "InteractionState":
+        admission = self.runtime_admission
+        copied_admission = (
+            MappingProxyType(deepcopy(dict(admission), memo))
+            if admission is not None
+            else None
+        )
+        copied = replace(
+            self,
+            options=deepcopy(self.options, memo),
+            runtime_admission=copied_admission,
+        )
+        memo[id(self)] = copied
+        return copied
 
     @property
     def expires_at(self) -> float:
@@ -81,6 +100,7 @@ class InteractionState:
             return False
         self.status = "failed"
         self.error = "交互已过期"
+        self.runtime_admission = None
         return True
 
 
@@ -307,7 +327,9 @@ class CardSession:
             elif event.message_id.startswith("om_"):
                 self.reply_to_message_id = event.message_id
         elif event.event == "interaction.requested":
-            self.active_interaction = _interaction_from_event_data(event.data)
+            self.active_interaction = _interaction_from_event_data(
+                event.data, runtime_turn_id=event.turn_id
+            )
         elif event.event == "interaction.completed":
             self._complete_interaction(event.data)
         elif event.event == "interaction.failed":
@@ -348,6 +370,8 @@ class CardSession:
             if not is_runtime_phase:
                 self.timeline.record_notice(notice_id, title, level, content)
         elif event.event == "message.completed":
+            if self.active_interaction is not None:
+                self.active_interaction.runtime_admission = None
             completed_answer = normalize_stream_text(str(event.data.get("answer") or ""))
             if completed_answer.strip():
                 completed_answer = self._prepare_completed_answer(completed_answer)
@@ -380,6 +404,8 @@ class CardSession:
                     if isinstance(attachment, dict) and isinstance(attachment.get("name"), str)
                 ]
         elif event.event == "message.failed":
+            if self.active_interaction is not None:
+                self.active_interaction.runtime_admission = None
             self._archive_current_answer_to_reasoning()
             self.timeline.complete()
             self.status = "failed"
@@ -440,6 +466,7 @@ class CardSession:
             data.get("choice_label") or self.active_interaction.choice
         ).strip()
         self.active_interaction.user_name = str(data.get("user_name") or "").strip()
+        self.active_interaction.runtime_admission = None
 
     def _fail_interaction(self, data: dict[str, Any]) -> None:
         interaction_id = str(data.get("interaction_id") or "").strip()
@@ -451,9 +478,12 @@ class CardSession:
             return
         self.active_interaction.status = "failed"
         self.active_interaction.error = str(data.get("error") or "交互请求失败").strip()
+        self.active_interaction.runtime_admission = None
 
 
-def _interaction_from_event_data(data: dict[str, Any]) -> InteractionState:
+def _interaction_from_event_data(
+    data: dict[str, Any], *, runtime_turn_id: str = ""
+) -> InteractionState:
     interaction_id = str(data.get("interaction_id") or "").strip()
     if not interaction_id:
         interaction_id = secrets.token_hex(8)
@@ -464,6 +494,12 @@ def _interaction_from_event_data(data: dict[str, Any]) -> InteractionState:
         # capability became explicit. Hermes clarify has always exposed an
         # Other/free-text path; fixed-choice interactions have not.
         allow_custom_input = kind == "clarify"
+    runtime_admission = data.get("_hfc_runtime_admission")
+    frozen_runtime_admission = (
+        MappingProxyType(deepcopy(runtime_admission))
+        if type(runtime_admission) is dict
+        else None
+    )
     return InteractionState(
         interaction_id=interaction_id,
         kind=kind,
@@ -474,6 +510,12 @@ def _interaction_from_event_data(data: dict[str, Any]) -> InteractionState:
         multi_select=bool(data.get("multi_select", False)),
         allow_custom_input=allow_custom_input,
         timeout_seconds=_safe_timeout_seconds(data.get("timeout_seconds")),
+        runtime_admission=frozen_runtime_admission,
+        runtime_turn_id=(
+            runtime_turn_id
+            if frozen_runtime_admission is not None and type(runtime_turn_id) is str
+            else ""
+        ),
     )
 
 

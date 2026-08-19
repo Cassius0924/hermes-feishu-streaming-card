@@ -1,4 +1,5 @@
 import pytest
+import time
 
 from hermes_feishu_card.events import EventValidationError, SidecarEvent
 
@@ -21,6 +22,73 @@ def test_parses_valid_event():
     event = SidecarEvent.from_dict(valid_payload())
     assert event.event == "thinking.delta"
     assert event.sequence == 2
+
+
+def _runtime_admission():
+    return {
+        "protocol": "hfc-runtime-interaction-v1",
+        "runtime_id": "a" * 64,
+        "resolve_url": "http://127.0.0.1:43210/runtime/interactions/resolve",
+        "interaction_key": "b" * 64,
+        "token": "c" * 64,
+        "expires_at": time.time() + 20.0,
+    }
+
+
+def test_runtime_interaction_admission_requires_exact_closed_fresh_descriptor():
+    payload = valid_payload(event="interaction.requested", sequence=3)
+    payload.update(
+        turn_id="turn-1",
+        event_id="patch:turn-1:interaction:approval-1:3",
+        producer="patch",
+        phase="started",
+    )
+    descriptor = _runtime_admission()
+    payload["data"] = {
+        "interaction_id": "approval-1",
+        "kind": "approval",
+        "prompt": "请选择",
+        "options": [{"label": "允许", "value": "once"}],
+        "_hfc_runtime_admission": descriptor,
+    }
+
+    event = SidecarEvent.from_dict(payload)
+
+    assert event.data["_hfc_runtime_admission"] == descriptor
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda value: value.update(extra=False),
+        lambda value: value.update(protocol="future"),
+        lambda value: value.update(runtime_id="A" * 64),
+        lambda value: value.update(resolve_url="http://localhost:43210/runtime/interactions/resolve"),
+        lambda value: value.update(resolve_url="http://127.0.0.1:43210/runtime/interactions/resolve?x=1"),
+        lambda value: value.update(expires_at=time.time() - 1.0),
+        lambda value: value.update(expires_at=True),
+    ),
+)
+def test_runtime_interaction_admission_rejects_malformed_before_session_mutation(mutate):
+    payload = valid_payload(event="interaction.requested", sequence=3)
+    payload.update(
+        turn_id="turn-1",
+        event_id="patch:turn-1:interaction:approval-1:3",
+        producer="patch",
+        phase="started",
+    )
+    descriptor = _runtime_admission()
+    mutate(descriptor)
+    payload["data"] = {
+        "interaction_id": "approval-1",
+        "kind": "approval",
+        "prompt": "请选择",
+        "options": [{"label": "允许", "value": "once"}],
+        "_hfc_runtime_admission": descriptor,
+    }
+
+    with pytest.raises(EventValidationError, match="runtime admission"):
+        SidecarEvent.from_dict(payload)
 
 
 def test_parses_optional_turn_id_and_exposes_canonical_turn_id():
