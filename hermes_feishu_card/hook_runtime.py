@@ -74,6 +74,9 @@ _NOTICE_UNCERTAIN_WARNING = (
 OPERATIONS_ACTION_TIMEOUT_SECONDS = 10.0
 OPERATIONS_ACTION_FORWARD_ATTEMPTS = 2
 OPERATIONS_ACTION_RETRY_DELAY_SECONDS = 0.1
+INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS = 5.0
+INTERACTION_ACTION_FORWARD_ATTEMPTS = 3
+INTERACTION_ACTION_RETRY_DELAY_SECONDS = 0.1
 OPERATIONS_ACTION_WORKERS = 4
 OPERATIONS_ACTION_QUEUE_LIMIT = 64
 COMMAND_FEEDBACK_CONTEXT_TTL_SECONDS = 600.0
@@ -4178,6 +4181,19 @@ def _hfc_exception_summary(exc: BaseException) -> str:
     return f"{exc.__class__.__name__}{suffix}"
 
 
+def _hfc_is_transient_sidecar_error(exc: BaseException) -> bool:
+    if isinstance(exc, urlerror.HTTPError):
+        return False
+    if isinstance(exc, (ConnectionError, BrokenPipeError, TimeoutError)):
+        return True
+    if isinstance(exc, urlerror.URLError):
+        return isinstance(
+            getattr(exc, "reason", None),
+            (ConnectionError, BrokenPipeError, TimeoutError),
+        )
+    return False
+
+
 def _hfc_response_summary(response: Any) -> str:
     try:
         code = getattr(response, "code", None)
@@ -6933,11 +6949,48 @@ def _hfc_handle_interaction_select_action(
         config = load_runtime_config()
         base_url = _summary_base_url(config.event_url)
         url = f"{base_url}/card/actions"
-        result = _post_json_sync_response(url, sidecar_payload, 5.0)
     except Exception as exc:
         _hfc_warn(
-            "interaction.select forward failed: "
+            "interaction.select forward setup failed: "
             f"{_hfc_exception_summary(exc)}"
+        )
+        return _hfc_empty_feishu_callback_response(adapter)
+
+    started_at = time.monotonic()
+    result: Any = None
+    last_error: BaseException | None = None
+    for attempt in range(INTERACTION_ACTION_FORWARD_ATTEMPTS):
+        if attempt == 0:
+            timeout = INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS
+        else:
+            timeout = INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS - (
+                time.monotonic() - started_at
+            )
+        if timeout <= 0:
+            break
+        try:
+            result = _post_json_sync_response(url, sidecar_payload, timeout)
+        except Exception as exc:
+            last_error = exc
+            if (
+                not _hfc_is_transient_sidecar_error(exc)
+                or attempt + 1 >= INTERACTION_ACTION_FORWARD_ATTEMPTS
+            ):
+                break
+            remaining = INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS - (
+                time.monotonic() - started_at
+            )
+            if remaining <= 0:
+                break
+            time.sleep(min(INTERACTION_ACTION_RETRY_DELAY_SECONDS, remaining))
+            continue
+        last_error = None
+        break
+
+    if last_error is not None:
+        _hfc_warn(
+            "interaction.select forward failed: "
+            f"{_hfc_exception_summary(last_error)}"
         )
         return _hfc_empty_feishu_callback_response(adapter)
 

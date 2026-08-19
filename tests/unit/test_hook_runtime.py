@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 import json
 import inspect
+from http.client import RemoteDisconnected
 import math
 import re
 import sys
@@ -10815,6 +10816,131 @@ def test_interaction_select_forwards_to_sidecar_and_returns_card(monkeypatch):
     assert sent["operator"] == {"name": "Bailey", "open_id": "ou_user"}
     assert response.card.type == "raw"
     assert response.card.data["header"]["template"] == "green"
+
+
+def test_interaction_select_retries_fast_transient_disconnect_within_one_budget(
+    monkeypatch,
+):
+    class FakeCallBackCard:
+        def __init__(self):
+            self.type = None
+            self.data = None
+
+    class FakeP2Response:
+        def __init__(self):
+            self.card = None
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        def _on_card_action_trigger(self, data):
+            raise AssertionError("interaction.select must stay inside HFC")
+
+    DummyFeishuAdapter.__module__ = hook_runtime.__name__
+    monkeypatch.setattr(
+        hook_runtime, "P2CardActionTriggerResponse", FakeP2Response, raising=False
+    )
+    monkeypatch.setattr(hook_runtime, "CallBackCard", FakeCallBackCard, raising=False)
+    monkeypatch.setattr(
+        hook_runtime,
+        "load_runtime_config",
+        lambda: SimpleNamespace(event_url="http://127.0.0.1:8765/events"),
+    )
+    calls = []
+    sleeps = []
+
+    def fake_post(url, payload, timeout):
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise RemoteDisconnected("sidecar closed before response")
+        return {"ok": True, "card": {"header": {}, "elements": []}}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_sync_response", fake_post)
+    monkeypatch.setattr(hook_runtime.time, "sleep", sleeps.append)
+
+    response = hook_runtime._hfc_on_feishu_card_action_trigger(
+        DummyFeishuAdapter(),
+        SimpleNamespace(
+            event=SimpleNamespace(
+                action=SimpleNamespace(
+                    value={
+                        "hfc_action": "interaction.select",
+                        "interaction_id": "int-retry",
+                        "choice": "approve",
+                        "choice_label": "Approve",
+                        "token": "tok-retry",
+                    }
+                ),
+                context=SimpleNamespace(open_chat_id="oc_retry"),
+                operator=SimpleNamespace(open_id="ou_user"),
+            )
+        ),
+    )
+
+    assert len(calls) == 2
+    assert calls[0] == hook_runtime.INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS
+    assert 0 < calls[1] <= hook_runtime.INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS
+    assert sleeps == [hook_runtime.INTERACTION_ACTION_RETRY_DELAY_SECONDS]
+    assert response.card.type == "raw"
+
+
+def test_interaction_select_never_retries_http_or_propagates_application_error(
+    monkeypatch,
+):
+    class FakeP2Response:
+        def __init__(self):
+            self.card = None
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        def _on_card_action_trigger(self, data):
+            raise AssertionError("interaction.select must stay inside HFC")
+
+    DummyFeishuAdapter.__module__ = hook_runtime.__name__
+    monkeypatch.setattr(
+        hook_runtime, "P2CardActionTriggerResponse", FakeP2Response, raising=False
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "load_runtime_config",
+        lambda: SimpleNamespace(event_url="http://127.0.0.1:8765/events"),
+    )
+    action = SimpleNamespace(
+        event=SimpleNamespace(
+            action=SimpleNamespace(
+                value={
+                    "hfc_action": "interaction.select",
+                    "interaction_id": "int-error",
+                    "choice": "deny",
+                    "choice_label": "Deny",
+                    "token": "tok-error",
+                }
+            ),
+            context=SimpleNamespace(open_chat_id="oc_error"),
+            operator=SimpleNamespace(open_id="ou_user"),
+        )
+    )
+
+    for exc in (
+        error.HTTPError(
+            "http://127.0.0.1:8765/card/actions", 409, "conflict", {}, None
+        ),
+        ValueError("invalid sidecar response"),
+    ):
+        calls = []
+
+        def fail_once(url, payload, timeout, *, _exc=exc):
+            calls.append(timeout)
+            raise _exc
+
+        monkeypatch.setattr(hook_runtime, "_post_json_sync_response", fail_once)
+        response = hook_runtime._hfc_on_feishu_card_action_trigger(
+            DummyFeishuAdapter(), action
+        )
+
+        assert len(calls) == 1
+        assert response.card is None
 
 
 def test_interaction_select_ignores_incomplete_action(monkeypatch):
