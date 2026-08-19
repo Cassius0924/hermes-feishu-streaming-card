@@ -33,7 +33,11 @@ from hermes_feishu_card.diagnostics import (
 )
 from hermes_feishu_card.events import SidecarEvent
 from hermes_feishu_card.feishu_client import FeishuAPIError, FeishuClient, FeishuClientConfig
-from hermes_feishu_card.install.detect import HermesDetection, detect_hermes
+from hermes_feishu_card.install.detect import (
+    HermesDetection,
+    detect_fixed_tag_integration,
+    detect_hermes,
+)
 from hermes_feishu_card.install.envfile import (
     read_hfc_env,
     render_hfc_env,
@@ -45,6 +49,17 @@ from hermes_feishu_card.install.manifest import (
     CURRENT_INSTALL_MANIFEST_VERSION,
     file_sha256,
     validate_install_manifest,
+)
+from hermes_feishu_card.install.plugin import (
+    RuntimeBindingRefused,
+    probe_plugin_entrypoint,
+    resolve_runtime_binding,
+)
+from hermes_feishu_card.install.v3 import (
+    FixedTagInstallRefused,
+    execute_fixed_tag_hybrid_install,
+    inspect_fixed_tag_hybrid_install,
+    is_fixed_tag_checkout,
 )
 from hermes_feishu_card.install.integrity import (
     IntegrityRepairRefused,
@@ -466,6 +481,7 @@ def _run_setup(args: argparse.Namespace) -> int:
         repair_code = _run_repair(
             argparse.Namespace(
                 hermes_dir=args.hermes_dir,
+                hermes_home=getattr(args, "hermes_home", None),
                 yes=True,
                 accept_hermes_upgrade=args.accept_hermes_upgrade,
             )
@@ -476,6 +492,7 @@ def _run_setup(args: argparse.Namespace) -> int:
     install_code = _run_install(
         argparse.Namespace(
             hermes_dir=args.hermes_dir,
+            hermes_home=getattr(args, "hermes_home", None),
             yes=True,
             no_repair=args.no_repair,
             accept_hermes_upgrade=args.accept_hermes_upgrade,
@@ -3206,6 +3223,10 @@ def _run_install(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    fixed_tag_result = _run_fixed_tag_v3_install(args, detection)
+    if fixed_tag_result is not None:
+        return fixed_tag_result
+
     accept_hermes_upgrade = bool(
         getattr(args, "accept_hermes_upgrade", False)
     )
@@ -3480,6 +3501,72 @@ def _run_install(args: argparse.Namespace) -> int:
     if gateway_restart_required:
         print("gateway.restart_required: hermes gateway start")
     return 0
+
+
+def _run_fixed_tag_v3_install(
+    args: argparse.Namespace,
+    detection: HermesDetection,
+) -> int | None:
+    if not is_fixed_tag_checkout(detection.root):
+        return None
+    try:
+        binding = resolve_runtime_binding(
+            checkout_root=detection.root,
+            hermes_home=getattr(args, "hermes_home", None),
+            profile_id=getattr(args, "profile_id", None),
+        )
+        entrypoint = probe_plugin_entrypoint(
+            binding,
+            expected_version=PACKAGE_VERSION,
+        )
+        if entrypoint.status != "verified":
+            raise FixedTagInstallRefused(
+                "plugin entry point verification failed: " + entrypoint.reason
+            )
+        manifest_path = detection.root / MANIFEST_NAME
+        if _is_v3_manifest_candidate(manifest_path):
+            result = inspect_fixed_tag_hybrid_install(
+                binding=binding,
+                entrypoint=entrypoint,
+                package_version=PACKAGE_VERSION,
+            )
+            print("integration.mode: hybrid")
+            print("install ok")
+            return 0
+        integration = detect_fixed_tag_integration(
+            detection.root,
+            runtime_python=binding.runtime_python,
+        )
+        if not integration.decision.supported:
+            raise FixedTagInstallRefused(integration.decision.reason)
+        result = execute_fixed_tag_hybrid_install(
+            binding=binding,
+            entrypoint=entrypoint,
+            decision=integration.decision,
+            source_commit=integration.native_probe.source_commit,
+            plugin_evidence_sha256=(
+                integration.native_probe.plugin_evidence_sha256
+            ),
+            package_version=PACKAGE_VERSION,
+        )
+    except (OSError, UnicodeError, RuntimeBindingRefused, FixedTagInstallRefused) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print("integration.mode: hybrid")
+    print("install ok")
+    if result.gateway_restart_required:
+        print("gateway.restart_required: hermes gateway start")
+    return 0
+
+
+def _is_v3_manifest_candidate(path: Path) -> bool:
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+            return False
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return type(value) is dict and value.get("manifest_version") == 3
 
 
 def _run_repair(args: argparse.Namespace) -> int:

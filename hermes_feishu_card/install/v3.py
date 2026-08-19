@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
+import os
 from pathlib import Path
 import re
 import stat
+import tempfile
+import subprocess
 from types import MappingProxyType
 from typing import Mapping
 
@@ -19,6 +23,8 @@ from .native_hooks import (
     FIXED_TAG_PROVENANCE_PATH,
     load_fixed_tag_native_hook_provenance,
 )
+from . import plugin as plugin_install
+from .manifest import render_install_manifest_v3, validate_install_manifest
 from .patcher import (
     HYBRID_PATCH_REGISTRY,
     HYBRID_PATCH_TARGET_ORDER,
@@ -58,6 +64,40 @@ class FixedTagHybridPlan:
         if restored != dict(self.originals):
             raise FixedTagInstallRefused("Hybrid restore did not recover verified originals")
         return restored
+
+
+@dataclass(frozen=True, repr=False)
+class FixedTagInstallResult:
+    status: str
+    manifest_path: Path
+    gateway_restart_required: bool
+
+
+@dataclass(frozen=True, repr=False)
+class _FileSnapshot:
+    device: int
+    inode: int
+    sha256: str
+    mode: int
+    contents: bytes
+
+
+def is_fixed_tag_checkout(checkout_root: str | Path) -> bool:
+    root = Path(checkout_root).expanduser().absolute()
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=str(root),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+            env={"PATH": os.environ.get("PATH", "")},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0 and completed.stdout.strip() == FIXED_TAG_COMMIT
 
 
 def build_fixed_tag_hybrid_plan(
@@ -162,3 +202,444 @@ def build_fixed_tag_hybrid_plan(
         expected_fragment_matrix=MappingProxyType(dict(expected_matrix)),
         capability_fingerprint=decision.fingerprint,
     )
+
+
+def execute_fixed_tag_hybrid_install(
+    *,
+    binding: plugin_install.HermesRuntimeBinding,
+    entrypoint: plugin_install.PluginEntrypointProbe,
+    decision: IntegrationDecision,
+    source_commit: str,
+    plugin_evidence_sha256: str,
+    package_version: str,
+) -> FixedTagInstallResult:
+    if (
+        type(binding) is not plugin_install.HermesRuntimeBinding
+        or type(entrypoint) is not plugin_install.PluginEntrypointProbe
+        or entrypoint.status != "verified"
+        or entrypoint.reason != "verified"
+        or entrypoint.version != package_version
+        or type(package_version) is not str
+        or not package_version
+    ):
+        raise FixedTagInstallRefused("fixed-tag plugin entry point is not verified")
+    root = binding.checkout_root
+    plan = build_fixed_tag_hybrid_plan(
+        root,
+        decision=decision,
+        source_commit=source_commit,
+        plugin_evidence_sha256=plugin_evidence_sha256,
+    )
+    manifest_path = root / ".hermes_feishu_card_manifest"
+    backup_paths = {
+        target: root / (target + ".hermes_feishu_card.bak")
+        for target in HYBRID_PATCH_TARGET_ORDER
+    }
+    evidence_paths = (manifest_path, *backup_paths.values())
+    if any(_snapshot(path) is not None for path in evidence_paths):
+        raise FixedTagInstallRefused(
+            "fixed-tag install evidence already exists; migration or recovery is required"
+        )
+    source_paths = {target: root / target for target in HYBRID_PATCH_TARGET_ORDER}
+    source_snapshots = {
+        path: _require_snapshot(path, "fixed-tag source changed before install")
+        for path in source_paths.values()
+    }
+    for target, path in source_paths.items():
+        if source_snapshots[path].contents != plan.originals[target]:
+            raise FixedTagInstallRefused("fixed-tag source changed before install")
+
+    try:
+        preimage = plugin_install.prepare_plugin_config(binding)
+    except Exception as exc:
+        raise FixedTagInstallRefused("plugin config preimage failed") from exc
+    prepared_config = {
+        "enabled_before": preimage.enabled_before,
+        "added_by_hfc": False,
+        "pre_sha256": preimage.pre_sha256,
+        "post_sha256": preimage.pre_sha256,
+        "config_backup_id": preimage.config_backup_id,
+        "backup_sha256": preimage.backup_sha256,
+    }
+    prepared_manifest = _render_phase_manifest(
+        plan,
+        phase="prepared",
+        target_contents={
+            target: (plan.originals[target], plan.originals[target])
+            for target in HYBRID_PATCH_TARGET_ORDER
+        },
+        binding=binding,
+        package_version=package_version,
+        plugin_config=prepared_config,
+    )
+    evidence_changes = {
+        **{
+            backup_paths[target]: plan.originals[target]
+            for target in HYBRID_PATCH_TARGET_ORDER
+        },
+        manifest_path: prepared_manifest.encode("utf-8"),
+    }
+    try:
+        evidence_after = _commit_file_set(
+            evidence_changes,
+            expected={path: None for path in evidence_changes},
+        )
+    except Exception as exc:
+        raise FixedTagInstallRefused("prepared install evidence commit failed") from exc
+
+    try:
+        ownership = plugin_install.enable_plugin(binding, preimage)
+    except Exception as exc:
+        raise FixedTagInstallRefused("official plugin enable failed") from exc
+    plugin_enabled_manifest = _render_phase_manifest(
+        plan,
+        phase="plugin_enabled",
+        target_contents={
+            target: (plan.originals[target], plan.originals[target])
+            for target in HYBRID_PATCH_TARGET_ORDER
+        },
+        binding=binding,
+        package_version=package_version,
+        plugin_config=ownership.sanitized(),
+    )
+    try:
+        plugin_manifest_after = _commit_file_set(
+            {manifest_path: plugin_enabled_manifest.encode("utf-8")},
+            expected={manifest_path: evidence_after[manifest_path]},
+        )
+    except Exception as exc:
+        _restore_config_after_failure(binding, preimage, ownership)
+        raise FixedTagInstallRefused("plugin-enabled manifest commit failed") from exc
+
+    installed_manifest = _render_phase_manifest(
+        plan,
+        phase="installed",
+        target_contents={
+            target: (plan.rendered[target], plan.originals[target])
+            for target in HYBRID_PATCH_TARGET_ORDER
+        },
+        binding=binding,
+        package_version=package_version,
+        plugin_config=ownership.sanitized(),
+    )
+    final_changes = {
+        **{
+            source_paths[target]: plan.rendered[target]
+            for target in HYBRID_PATCH_TARGET_ORDER
+        },
+        manifest_path: installed_manifest.encode("utf-8"),
+    }
+    final_expected = {
+        **source_snapshots,
+        manifest_path: plugin_manifest_after[manifest_path],
+    }
+    try:
+        final_after = _commit_file_set(final_changes, expected=final_expected)
+    except Exception as exc:
+        _restore_config_after_failure(binding, preimage, ownership)
+        _restore_prepared_manifest(
+            manifest_path,
+            prepared_manifest,
+            expected=plugin_manifest_after[manifest_path],
+        )
+        raise FixedTagInstallRefused("fixed-tag source commit failed") from exc
+
+    try:
+        installed = {
+            target: _require_snapshot(
+                source_paths[target], "installed source verification failed"
+            ).contents
+            for target in HYBRID_PATCH_TARGET_ORDER
+        }
+        detected = detect_patch_groups_by_target(
+            installed,
+            expected_groups=plan.patch_groups,
+            expected_fragment_matrix=plan.expected_fragment_matrix,
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        validate_install_manifest(manifest)
+        config_sha256 = hashlib.sha256(binding.config_path.read_bytes()).hexdigest()
+        if (
+            detected != dict(plan.patch_targets)
+            or config_sha256 != ownership.post_sha256
+            or _require_snapshot(
+                manifest_path, "installed manifest verification failed"
+            )
+            != final_after[manifest_path]
+        ):
+            raise FixedTagInstallRefused("installed verification did not converge")
+        plugin_install.mark_plugin_config_installed(preimage, ownership)
+    except Exception as exc:
+        rollback_changes = {
+            **{
+                source_paths[target]: plan.originals[target]
+                for target in HYBRID_PATCH_TARGET_ORDER
+            },
+            manifest_path: prepared_manifest.encode("utf-8"),
+        }
+        try:
+            _commit_file_set(rollback_changes, expected=final_after)
+            _restore_config_after_failure(binding, preimage, ownership)
+        except Exception as rollback_exc:
+            raise FixedTagInstallRefused(
+                "installed verification failed and rollback requires manual review"
+            ) from rollback_exc
+        raise FixedTagInstallRefused("installed verification did not converge") from exc
+    return FixedTagInstallResult(
+        status="installed",
+        manifest_path=manifest_path,
+        gateway_restart_required=True,
+    )
+
+
+def inspect_fixed_tag_hybrid_install(
+    *,
+    binding: plugin_install.HermesRuntimeBinding,
+    entrypoint: plugin_install.PluginEntrypointProbe,
+    package_version: str,
+) -> FixedTagInstallResult:
+    if (
+        type(binding) is not plugin_install.HermesRuntimeBinding
+        or type(entrypoint) is not plugin_install.PluginEntrypointProbe
+        or entrypoint.status != "verified"
+        or entrypoint.reason != "verified"
+        or entrypoint.version != package_version
+    ):
+        raise FixedTagInstallRefused("fixed-tag plugin entry point is not verified")
+    root = binding.checkout_root
+    manifest_path = root / ".hermes_feishu_card_manifest"
+    snapshot = _require_snapshot(manifest_path, "V3 install manifest is missing")
+    if len(snapshot.contents) > 1024 * 1024:
+        raise FixedTagInstallRefused("V3 install manifest is too large")
+    try:
+        manifest = json.loads(snapshot.contents.decode("utf-8"))
+        validate_install_manifest(manifest)
+    except (UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise FixedTagInstallRefused("V3 install manifest is invalid") from exc
+    if manifest.get("manifest_version") != 3 or manifest.get("phase") != "installed":
+        raise FixedTagInstallRefused("V3 install requires recovery before reuse")
+    integration = manifest["integration"]
+    plugin = integration["plugin"]
+    if (
+        integration["mode"] != "hybrid"
+        or plugin["version"] != package_version
+        or plugin["python_identity"] != binding.python_identity
+    ):
+        raise FixedTagInstallRefused("V3 install binding or mode changed")
+    config_snapshot = _require_snapshot(
+        binding.config_path, "Hermes config is missing"
+    )
+    if config_snapshot.sha256 != integration["plugin_config"]["post_sha256"]:
+        raise FixedTagInstallRefused("Hermes plugin config changed since install")
+
+    installed: dict[str, bytes] = {}
+    backups: dict[str, bytes] = {}
+    for target in HYBRID_PATCH_TARGET_ORDER:
+        target_ownership = manifest["targets"][target]
+        current_path = root / target_ownership["path"]
+        backup_path = root / target_ownership["backup"]
+        current = _require_snapshot(current_path, "installed target is missing")
+        backup = _require_snapshot(backup_path, "installed backup is missing")
+        if current.sha256 != target_ownership["patched_sha256"]:
+            raise FixedTagInstallRefused("installed target hash changed")
+        if backup.sha256 != target_ownership["backup_sha256"]:
+            raise FixedTagInstallRefused("installed backup hash changed")
+        installed[target] = current.contents
+        backups[target] = backup.contents
+    patch_groups = frozenset(integration["patch_groups"])
+    expected_matrix = HYBRID_PATCH_REGISTRY.target_fragments(patch_groups)
+    try:
+        detected = detect_patch_groups_by_target(
+            installed,
+            expected_groups=patch_groups,
+            expected_fragment_matrix=expected_matrix,
+        )
+        restored = remove_patch_snapshots(
+            installed,
+            expected_groups=patch_groups,
+            expected_fragment_matrix=expected_matrix,
+        )
+    except Exception as exc:
+        raise FixedTagInstallRefused("installed Hybrid patch is invalid") from exc
+    expected_targets = {
+        target: frozenset(groups)
+        for target, groups in integration["patch_targets"].items()
+    }
+    if detected != expected_targets or restored != backups:
+        raise FixedTagInstallRefused("installed Hybrid patch ownership is inconsistent")
+    return FixedTagInstallResult(
+        status="installed",
+        manifest_path=manifest_path,
+        gateway_restart_required=False,
+    )
+
+
+def _render_phase_manifest(
+    plan: FixedTagHybridPlan,
+    *,
+    phase: str,
+    target_contents: dict[str, tuple[bytes, bytes]],
+    binding: plugin_install.HermesRuntimeBinding,
+    package_version: str,
+    plugin_config: Mapping[str, object],
+) -> str:
+    return render_install_manifest_v3(
+        phase=phase,
+        target_contents=target_contents,
+        mode="hybrid",
+        capability_fingerprint=plan.capability_fingerprint,
+        patch_groups=plan.patch_groups,
+        patch_targets=plan.patch_targets,
+        plugin_version=package_version,
+        python_identity=binding.python_identity,
+        plugin_config=plugin_config,
+    )
+
+
+def _restore_config_after_failure(
+    binding: plugin_install.HermesRuntimeBinding,
+    preimage: plugin_install.PluginConfigPreimage,
+    ownership: plugin_install.PluginOwnership,
+) -> None:
+    try:
+        plugin_install.restore_plugin_config(binding, preimage, ownership)
+        plugin_install.mark_plugin_config_prepared(preimage)
+    except Exception as exc:
+        raise FixedTagInstallRefused(
+            "plugin config rollback failed; manual review required"
+        ) from exc
+
+
+def _restore_prepared_manifest(
+    manifest_path: Path,
+    contents: str,
+    *,
+    expected: _FileSnapshot,
+) -> None:
+    try:
+        _commit_file_set(
+            {manifest_path: contents.encode("utf-8")},
+            expected={manifest_path: expected},
+        )
+    except Exception as exc:
+        raise FixedTagInstallRefused(
+            "manifest rollback failed; manual review required"
+        ) from exc
+
+
+def _commit_file_set(
+    changes: Mapping[Path, bytes],
+    *,
+    expected: Mapping[Path, _FileSnapshot | None],
+) -> dict[Path, _FileSnapshot]:
+    if (
+        type(changes) is not dict
+        or type(expected) is not dict
+        or set(changes) != set(expected)
+        or not changes
+        or any(
+            not isinstance(path, Path) or type(value) is not bytes
+            for path, value in changes.items()
+        )
+    ):
+        raise FixedTagInstallRefused("install transaction input is invalid")
+    for path in changes:
+        if _snapshot(path) != expected[path]:
+            raise FixedTagInstallRefused("install target changed before commit")
+        _require_safe_parent(path.parent)
+    staged: dict[Path, Path] = {}
+    try:
+        for path, contents in changes.items():
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{path.name}.hfc-", dir=path.parent
+            )
+            temporary_path = Path(temporary)
+            staged[path] = temporary_path
+            mode = expected[path].mode if expected[path] is not None else 0o600
+            os.fchmod(descriptor, mode)
+            with os.fdopen(descriptor, "wb") as file:
+                file.write(contents)
+                file.flush()
+                os.fsync(file.fileno())
+        written: list[Path] = []
+        after: dict[Path, _FileSnapshot] = {}
+        try:
+            for path in changes:
+                if _snapshot(path) != expected[path]:
+                    raise FixedTagInstallRefused("install target changed during commit")
+                os.replace(staged[path], path)
+                written.append(path)
+                snapshot = _require_snapshot(path, "install write verification failed")
+                if snapshot.sha256 != hashlib.sha256(changes[path]).hexdigest():
+                    raise FixedTagInstallRefused("install write verification failed")
+                after[path] = snapshot
+            return after
+        except Exception:
+            for path in reversed(written):
+                current = after.get(path) or _snapshot(path)
+                if current is None or _snapshot(path) != current:
+                    raise FixedTagInstallRefused(
+                        "install rollback lost ownership; manual review required"
+                    )
+                previous = expected[path]
+                if previous is None:
+                    path.unlink()
+                else:
+                    _replace_bytes(path, previous.contents, previous.mode)
+            raise
+    finally:
+        for temporary_path in staged.values():
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _replace_bytes(path: Path, contents: bytes, mode: int) -> None:
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.hfc-", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(contents)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _snapshot(path: Path) -> _FileSnapshot | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise FixedTagInstallRefused("install target is not a regular file")
+    contents = path.read_bytes()
+    return _FileSnapshot(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        sha256=hashlib.sha256(contents).hexdigest(),
+        mode=stat.S_IMODE(metadata.st_mode),
+        contents=contents,
+    )
+
+
+def _require_snapshot(path: Path, message: str) -> _FileSnapshot:
+    snapshot = _snapshot(path)
+    if snapshot is None:
+        raise FixedTagInstallRefused(message)
+    return snapshot
+
+
+def _require_safe_parent(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise FixedTagInstallRefused("install target parent is unavailable") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise FixedTagInstallRefused("install target parent is unsafe")

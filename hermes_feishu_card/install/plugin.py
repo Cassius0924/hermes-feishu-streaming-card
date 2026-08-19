@@ -63,12 +63,14 @@ class PluginConfigPreimage:
     config_backup_id: str
     pre_sha256: str
     backup_sha256: str
+    enabled_before: bool
 
     def sanitized(self) -> dict[str, object]:
         return {
             "config_backup_id": self.config_backup_id,
             "pre_sha256": self.pre_sha256,
             "backup_sha256": self.backup_sha256,
+            "enabled_before": self.enabled_before,
         }
 
 
@@ -233,6 +235,8 @@ def prepare_plugin_config(binding: HermesRuntimeBinding) -> PluginConfigPreimage
     if type(binding) is not HermesRuntimeBinding:
         raise PluginConfigRefused("runtime binding is invalid")
     config_bytes = _read_bound_config(binding)
+    config_mapping = _load_config_mapping(config_bytes)
+    _expected_config, enabled_before = _expected_enabled_config(config_mapping)
     pre_sha256 = _sha256(config_bytes)
     state_root = binding.hermes_home / ".hermes_feishu_card"
     state_dir = state_root / "install"
@@ -270,6 +274,7 @@ def prepare_plugin_config(binding: HermesRuntimeBinding) -> PluginConfigPreimage
         config_backup_id=config_backup_id,
         pre_sha256=pre_sha256,
         backup_sha256=backup_sha256,
+        enabled_before=enabled_before,
     )
 
 
@@ -333,6 +338,34 @@ def restore_plugin_config(
         raise PluginConfigRefused("Hermes config changed since plugin enable")
     backup = _read_private_backup(preimage)
     _restore_exact_config(binding, backup, expected_sha256=ownership.post_sha256)
+
+
+def mark_plugin_config_installed(
+    preimage: PluginConfigPreimage,
+    ownership: PluginOwnership,
+) -> None:
+    if (
+        type(preimage) is not PluginConfigPreimage
+        or type(ownership) is not PluginOwnership
+        or preimage.config_backup_id != ownership.config_backup_id
+    ):
+        raise PluginConfigRefused("plugin config ownership input is invalid")
+    _rewrite_private_journal(preimage, phase="installed", ownership=ownership)
+
+
+def mark_plugin_config_prepared(preimage: PluginConfigPreimage) -> None:
+    if type(preimage) is not PluginConfigPreimage:
+        raise PluginConfigRefused("plugin config ownership input is invalid")
+    value = json.dumps(
+        {
+            "protocol": "hfc-plugin-config-preimage-v1",
+            "phase": "prepared",
+            **preimage.sanitized(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    _atomic_replace_bytes(preimage.journal_path, value, 0o600)
 
 
 def _expected_enabled_config(before: Mapping[str, object]) -> tuple[dict[str, object], bool]:
