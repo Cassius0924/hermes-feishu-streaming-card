@@ -1090,7 +1090,7 @@ def _render_footer(
         )
         minutes = max(1, int(math.ceil(remaining_seconds / 60.0)))
         return f"等待选择 · ⏳ {minutes} 分钟后过期"
-    if session.status != "completed":
+    if session.status != "completed" and display_status != "completed":
         return _spinner_text("生成中")
     tokens = session.tokens if isinstance(session.tokens, dict) else {}
     input_tokens = _safe_int(tokens.get("input_tokens"))

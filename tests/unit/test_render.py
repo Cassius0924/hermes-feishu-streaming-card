@@ -1190,6 +1190,19 @@ def test_footer_still_static_for_failed():
     assert _render_footer(session) == "已停止"
 
 
+def test_footer_treats_explicit_completed_snapshot_as_terminal():
+    from hermes_feishu_card.render import _render_footer
+
+    session = CardSession(conversation_id="c", message_id="m", chat_id="c")
+    session.status = "running"
+    session.duration = 1.25
+
+    footer = _render_footer(session, display_status="completed")
+
+    assert "生成中" not in footer
+    assert footer.startswith("1s · ")
+
+
 def test_waiting_footer_uses_absolute_remaining_deadline(monkeypatch):
     from hermes_feishu_card import render as render_module
     from hermes_feishu_card.render import _render_footer

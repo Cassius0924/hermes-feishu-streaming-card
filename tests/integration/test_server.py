@@ -8863,6 +8863,74 @@ async def test_repeated_interactions_each_promote_a_fresh_latest_card(client):
     )
 
 
+async def test_completed_previous_interaction_choice_never_leaks_into_next_snapshot(
+    client,
+):
+    test_client, feishu_client = client
+    old_label = "保存为 skill（含重装流程与坑位清单）"
+
+    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "clarify-first",
+                "kind": "clarify",
+                "prompt": "第 1 轮请选择",
+                "allow_custom_input": True,
+                "options": [
+                    {"label": old_label, "value": "save", "style": "primary"},
+                    {"label": "不保存", "value": "skip", "style": "default"},
+                ],
+            },
+        ),
+    )
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.completed",
+            2,
+            {
+                "interaction_id": "clarify-first",
+                "choice": "save",
+                "choice_label": old_label,
+            },
+        ),
+    )
+
+    requested = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            3,
+            {
+                "interaction_id": "clarify-second",
+                "kind": "clarify",
+                "prompt": "第 2 轮请选择",
+                "allow_custom_input": True,
+                "options": [
+                    {"label": "A", "value": "a", "style": "primary"},
+                    {"label": "B", "value": "b", "style": "default"},
+                ],
+            },
+        ),
+    )
+
+    assert requested.status == 200
+    predecessor_snapshots = [
+        card
+        for message_id, card in feishu_client.updated
+        if message_id == "feishu-message-2"
+        and "已转入交互卡片" in str(card)
+    ]
+    assert len(predecessor_snapshots) == 1
+    snapshot_text = str(predecessor_snapshots[0])
+    assert old_label not in snapshot_text
+    assert "已选择：" not in snapshot_text
+
+
 async def test_interaction_predecessor_update_failure_still_promotes_replacement(
     client,
 ):

@@ -5492,12 +5492,7 @@ async def _finalize_interaction_predecessor(
         animation_task.cancel()
         await asyncio.gather(animation_task, return_exceptions=True)
 
-    predecessor_interaction = predecessor_snapshot.active_interaction
-    if (
-        predecessor_interaction is not None
-        and predecessor_interaction.status == "pending"
-    ):
-        predecessor_snapshot.active_interaction = None
+    predecessor_snapshot.active_interaction = None
     predecessor_snapshot.latest_tool_preview = ""
     predecessor_snapshot.runtime_phase_text = ""
     predecessor_snapshot.display_status = "completed"
