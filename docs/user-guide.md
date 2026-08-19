@@ -110,6 +110,18 @@ Issue #162 所述的多机器人群聊需要显式使用原生模式：把目标
 
 `service.manager: auto` 只选择可用的 `systemd-user`，否则使用 `detached`，从不隐式进入 `systemd-system` 或调用 sudo。`systemd-system` 仅 Linux 显式 opt-in 且只用 transient unit；Docker 保持普通容器进程与 `detached`。完整排障见 [V4.1 安全控制与排障](wiki/v4.1-safety-controls.md)。
 
+V4.3.0 另提供显式开机常驻，不改变 `start` 的 transient 默认值。Linux 用户先由自己或管理员确认 linger，再创建受 HFC ownership 保护的真实 user unit：
+
+```bash
+loginctl enable-linger "$USER"
+hermes-feishu-card enable \
+  --config ~/.hermes_feishu_card/config.yaml \
+  --hermes-dir ~/.hermes/hermes-agent \
+  --yes
+```
+
+`enable` 会先安全停止已有 verified transient/detached sidecar，再写入 mode `0600` 的 unit 与私有 SHA-256 manifest，执行 `systemctl --user enable --now` 并核对 `/health` 的 package/Python identity。未启用 linger、同名未知 unit、unit/manifest 漂移、停服失败或 Hermes integration 未安装都会拒绝。移除时使用 `hermes-feishu-card disable`；不要手工删除 unit 或 ownership manifest。
+
 ## V4.0.0 实时双轨卡片
 
 - 运行态 Header title 保留用户自定义标题（默认 `Hermes Agent`），subtitle 根据工具名和 Hermes `progress_callback.preview` 显示动作摘要；完整命令留在 timeline。
@@ -529,7 +541,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.2.12`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.3.0`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -537,7 +549,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.12
+export HFC_VERSION=v4.3.0
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -822,6 +834,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
+| [v4.3.0](release-notes-v4.3.0.md) | 2026-08-19 | Hermes v2026.8.3 Hybrid 能力探测与 V3 installer、单 owner runtime interaction、fixed-tag restore、systemd linger 常驻及 Issues #210–#223 本地候选修复 |
 | [v4.2.12](release-notes-v4.2.12.md) | 2026-08-11 | 审批卡能力收敛与服务端选项校验；零工具卡保持稳定 reasoning timeline |
 | [v4.2.11](release-notes-v4.2.11.md) | 2026-08-10 | Issue #202 旧交互卡冻结为“已转入交互卡片”历史快照，保留内容与工具记录，并维持 PATCH fail-open |
 | [v4.2.10](release-notes-v4.2.10.md) | 2026-08-10 | 非回环 sidecar HMAC、交互绝对过期/晚到回调拒绝，以及跨平台 CI、CodeQL、Dependabot 与 Action SHA 固定 |

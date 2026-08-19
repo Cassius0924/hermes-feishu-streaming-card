@@ -1,0 +1,477 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import shutil
+from types import SimpleNamespace
+
+import pytest
+import yaml
+
+from hermes_feishu_card.install import plugin, v3
+from hermes_feishu_card import cli
+from hermes_feishu_card.integration import (
+    HYBRID_REQUIRED_NATIVE_CAPABILITIES,
+    HYBRID_REQUIRED_PATCH_GROUPS,
+    NativeHookCapabilities,
+    PatchCapabilities,
+    select_integration_mode,
+)
+
+
+FIXED_SOURCE_ROOT = Path(
+    os.environ.get(
+        "HFC_FIXED_TAG_SOURCE_ROOT",
+        "/private/tmp/hermes-agent-v2026.8.3-v430-audit",
+    )
+)
+
+
+def _fixture(tmp_path: Path):
+    root = tmp_path / "home" / "hermes-agent"
+    for target in v3.HYBRID_PATCH_TARGET_ORDER:
+        path = root / target
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(FIXED_SOURCE_ROOT / target, path)
+    home = root.parent
+    (home / "config.yaml").write_text(
+        "private: SECRET-CANARY\nplugins: {}\n", encoding="utf-8"
+    )
+    runtime = root / ".venv" / "bin" / "python"
+    runtime.parent.mkdir(parents=True)
+    runtime.symlink_to("/usr/bin/python3")
+    purelib = root / ".venv" / "lib" / "python3.12" / "site-packages"
+    binding = plugin.HermesRuntimeBinding(
+        checkout_root=root,
+        runtime_python=runtime,
+        runtime_python_resolved=Path("/usr/bin/python3"),
+        python_identity="sha256:" + "d" * 64,
+        hermes_home=home,
+        config_path=home / "config.yaml",
+        purelib=purelib,
+        platlib=purelib,
+    )
+    entrypoint = plugin.PluginEntrypointProbe(
+        status="verified",
+        reason="verified",
+        version="4.3.0",
+        module_origin=purelib / "hermes_feishu_card" / "hermes_plugin.py",
+    )
+    decision = select_integration_mode(
+        NativeHookCapabilities.from_names(HYBRID_REQUIRED_NATIVE_CAPABILITIES),
+        PatchCapabilities.from_names(HYBRID_REQUIRED_PATCH_GROUPS),
+    )
+    return root, binding, entrypoint, decision
+
+
+def _official_enable(binding):
+    config = yaml.safe_load(binding.config_path.read_text(encoding="utf-8"))
+    plugins = config.setdefault("plugins", {})
+    plugins["enabled"] = ["hermes-feishu-card"]
+    plugins["disabled"] = []
+    plugins["entries"] = {
+        "hermes-feishu-card": {"allow_tool_override": False}
+    }
+    binding.config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    return 0
+
+
+def test_execute_fixed_tag_install_commits_seven_targets_config_and_v3_manifest(
+    tmp_path, monkeypatch
+):
+    root, binding, entrypoint, decision = _fixture(tmp_path)
+    originals = {
+        target: (root / target).read_bytes()
+        for target in v3.HYBRID_PATCH_TARGET_ORDER
+    }
+    monkeypatch.setattr(plugin, "_run_official_enable", _official_enable)
+
+    result = v3.execute_fixed_tag_hybrid_install(
+        binding=binding,
+        entrypoint=entrypoint,
+        decision=decision,
+        source_commit=v3.FIXED_TAG_COMMIT,
+        plugin_evidence_sha256="sha256:" + "a" * 64,
+        package_version="4.3.0",
+    )
+
+    assert result.status == "installed"
+    manifest = json.loads((root / ".hermes_feishu_card_manifest").read_text())
+    assert manifest["phase"] == "installed"
+    assert manifest["integration"]["mode"] == "hybrid"
+    assert set(manifest["targets"]) == set(v3.HYBRID_PATCH_TARGET_ORDER)
+    for target in v3.HYBRID_PATCH_TARGET_ORDER:
+        assert (root / target).read_bytes() != originals[target]
+        assert (root / (target + ".hermes_feishu_card.bak")).read_bytes() == originals[target]
+    config = yaml.safe_load(binding.config_path.read_text(encoding="utf-8"))
+    assert config["private"] == "SECRET-CANARY"
+    assert config["plugins"]["enabled"] == ["hermes-feishu-card"]
+    inspected = v3.inspect_fixed_tag_hybrid_install(
+        binding=binding,
+        entrypoint=entrypoint,
+        package_version="4.3.0",
+    )
+    assert inspected.status == "installed"
+    assert inspected.gateway_restart_required is False
+
+
+def test_inspect_fixed_tag_install_rejects_patched_source_drift(
+    tmp_path, monkeypatch
+):
+    root, binding, entrypoint, decision = _fixture(tmp_path)
+    monkeypatch.setattr(plugin, "_run_official_enable", _official_enable)
+    v3.execute_fixed_tag_hybrid_install(
+        binding=binding,
+        entrypoint=entrypoint,
+        decision=decision,
+        source_commit=v3.FIXED_TAG_COMMIT,
+        plugin_evidence_sha256="sha256:" + "a" * 64,
+        package_version="4.3.0",
+    )
+    with (root / "gateway" / "run.py").open("ab") as file:
+        file.write(b"\n# drift\n")
+
+    with pytest.raises(v3.FixedTagInstallRefused, match="hash|patch"):
+        v3.inspect_fixed_tag_hybrid_install(
+            binding=binding,
+            entrypoint=entrypoint,
+            package_version="4.3.0",
+        )
+
+
+def test_restore_fixed_tag_install_restores_sources_config_and_owned_evidence(
+    tmp_path, monkeypatch
+):
+    root, binding, entrypoint, decision = _fixture(tmp_path)
+    originals = {
+        target: (root / target).read_bytes()
+        for target in v3.HYBRID_PATCH_TARGET_ORDER
+    }
+    original_config = binding.config_path.read_bytes()
+    monkeypatch.setattr(plugin, "_run_official_enable", _official_enable)
+    v3.execute_fixed_tag_hybrid_install(
+        binding=binding,
+        entrypoint=entrypoint,
+        decision=decision,
+        source_commit=v3.FIXED_TAG_COMMIT,
+        plugin_evidence_sha256="sha256:" + "a" * 64,
+        package_version="4.3.0",
+    )
+
+    result = v3.restore_fixed_tag_hybrid_install(binding=binding)
+
+    assert result.status == "restored"
+    assert all((root / target).read_bytes() == originals[target] for target in originals)
+    assert binding.config_path.read_bytes() == original_config
+    assert not (root / ".hermes_feishu_card_manifest").exists()
+    assert all(
+        not (root / (target + ".hermes_feishu_card.bak")).exists()
+        for target in originals
+    )
+    assert not any(
+        path.name.startswith("hfc-config-preimage-")
+        for path in (binding.hermes_home / ".hermes_feishu_card" / "install").iterdir()
+    )
+
+
+def test_restore_fixed_tag_install_refuses_config_drift_without_source_mutation(
+    tmp_path, monkeypatch
+):
+    root, binding, entrypoint, decision = _fixture(tmp_path)
+    monkeypatch.setattr(plugin, "_run_official_enable", _official_enable)
+    v3.execute_fixed_tag_hybrid_install(
+        binding=binding,
+        entrypoint=entrypoint,
+        decision=decision,
+        source_commit=v3.FIXED_TAG_COMMIT,
+        plugin_evidence_sha256="sha256:" + "a" * 64,
+        package_version="4.3.0",
+    )
+    patched = {
+        target: (root / target).read_bytes()
+        for target in v3.HYBRID_PATCH_TARGET_ORDER
+    }
+    binding.config_path.write_text("user_change: true\n", encoding="utf-8")
+
+    with pytest.raises(v3.FixedTagInstallRefused, match="config changed"):
+        v3.restore_fixed_tag_hybrid_install(binding=binding)
+
+    assert all((root / target).read_bytes() == patched[target] for target in patched)
+    assert (root / ".hermes_feishu_card_manifest").exists()
+
+
+def test_execute_fixed_tag_install_enable_failure_keeps_prepared_evidence(
+    tmp_path, monkeypatch
+):
+    root, binding, entrypoint, decision = _fixture(tmp_path)
+    originals = {
+        target: (root / target).read_bytes()
+        for target in v3.HYBRID_PATCH_TARGET_ORDER
+    }
+    monkeypatch.setattr(plugin, "_run_official_enable", lambda _binding: 1)
+
+    with pytest.raises(v3.FixedTagInstallRefused, match="enable"):
+        v3.execute_fixed_tag_hybrid_install(
+            binding=binding,
+            entrypoint=entrypoint,
+            decision=decision,
+            source_commit=v3.FIXED_TAG_COMMIT,
+            plugin_evidence_sha256="sha256:" + "a" * 64,
+            package_version="4.3.0",
+        )
+
+    manifest = json.loads((root / ".hermes_feishu_card_manifest").read_text())
+    assert manifest["phase"] == "prepared"
+    assert all((root / target).read_bytes() == originals[target] for target in originals)
+    assert binding.config_path.read_text(encoding="utf-8").startswith(
+        "private: SECRET-CANARY"
+    )
+
+    recovered = v3.restore_fixed_tag_hybrid_install(binding=binding)
+    assert recovered.status == "restored"
+    assert recovered.gateway_restart_required is False
+    assert not (root / ".hermes_feishu_card_manifest").exists()
+    assert all(
+        not (root / (target + ".hermes_feishu_card.bak")).exists()
+        for target in originals
+    )
+
+
+def test_execute_fixed_tag_install_source_failure_restores_config_and_sources(
+    tmp_path, monkeypatch
+):
+    root, binding, entrypoint, decision = _fixture(tmp_path)
+    originals = {
+        target: (root / target).read_bytes()
+        for target in v3.HYBRID_PATCH_TARGET_ORDER
+    }
+    original_config = binding.config_path.read_bytes()
+    monkeypatch.setattr(plugin, "_run_official_enable", _official_enable)
+    real_commit = v3._commit_file_set
+    calls = []
+
+    def fail_final(changes, *, expected):
+        calls.append(tuple(changes))
+        if any(path.name == "run.py" for path in changes):
+            raise OSError("injected source commit failure")
+        return real_commit(changes, expected=expected)
+
+    monkeypatch.setattr(v3, "_commit_file_set", fail_final)
+    with pytest.raises(v3.FixedTagInstallRefused, match="source commit"):
+        v3.execute_fixed_tag_hybrid_install(
+            binding=binding,
+            entrypoint=entrypoint,
+            decision=decision,
+            source_commit=v3.FIXED_TAG_COMMIT,
+            plugin_evidence_sha256="sha256:" + "a" * 64,
+            package_version="4.3.0",
+        )
+
+    assert all((root / target).read_bytes() == originals[target] for target in originals)
+    assert binding.config_path.read_bytes() == original_config
+    manifest = json.loads((root / ".hermes_feishu_card_manifest").read_text())
+    assert manifest["phase"] == "prepared"
+
+
+def test_execute_fixed_tag_install_refuses_existing_evidence_before_config_write(
+    tmp_path, monkeypatch
+):
+    root, binding, entrypoint, decision = _fixture(tmp_path)
+    backup = root / "gateway" / "run.py.hermes_feishu_card.bak"
+    backup.write_bytes(b"foreign")
+    original_config = binding.config_path.read_bytes()
+    monkeypatch.setattr(
+        plugin,
+        "prepare_plugin_config",
+        lambda _binding: pytest.fail("config preimage must not be written"),
+    )
+
+    with pytest.raises(v3.FixedTagInstallRefused, match="evidence"):
+        v3.execute_fixed_tag_hybrid_install(
+            binding=binding,
+            entrypoint=entrypoint,
+            decision=decision,
+            source_commit=v3.FIXED_TAG_COMMIT,
+            plugin_evidence_sha256="sha256:" + "a" * 64,
+            package_version="4.3.0",
+        )
+
+    assert binding.config_path.read_bytes() == original_config
+
+
+def test_cli_fixed_tag_dispatch_uses_verified_v3_transaction(
+    tmp_path, monkeypatch, capsys
+):
+    root, binding, entrypoint, decision = _fixture(tmp_path)
+    detection = SimpleNamespace(root=root)
+    native_probe = SimpleNamespace(
+        source_commit=v3.FIXED_TAG_COMMIT,
+        plugin_evidence_sha256="sha256:" + "a" * 64,
+    )
+    monkeypatch.setattr(cli, "is_fixed_tag_checkout", lambda _root: True)
+    monkeypatch.setattr(cli, "resolve_runtime_binding", lambda **kwargs: binding)
+    monkeypatch.setattr(
+        cli, "probe_plugin_entrypoint", lambda *args, **kwargs: entrypoint
+    )
+    monkeypatch.setattr(
+        cli,
+        "detect_fixed_tag_integration",
+        lambda *args, **kwargs: SimpleNamespace(
+            decision=decision, native_probe=native_probe
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "execute_fixed_tag_hybrid_install",
+        lambda **kwargs: v3.FixedTagInstallResult(
+            status="installed",
+            manifest_path=root / ".hermes_feishu_card_manifest",
+            gateway_restart_required=True,
+        ),
+    )
+    monkeypatch.setattr(cli, "PACKAGE_VERSION", "4.3.0")
+
+    result = cli._run_fixed_tag_v3_install(
+        SimpleNamespace(hermes_home=str(binding.hermes_home)), detection
+    )
+
+    assert result == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "integration.mode: hybrid",
+        "install ok",
+        "gateway.restart_required: hermes gateway start",
+    ]
+
+
+def test_cli_fixed_tag_v2_migration_restores_legacy_before_runtime_binding(
+    tmp_path, monkeypatch
+):
+    root, binding, entrypoint, decision = _fixture(tmp_path)
+    (root / ".hermes_feishu_card_manifest").write_text(
+        '{"manifest_version":2}\n', encoding="utf-8"
+    )
+    order = []
+    monkeypatch.setattr(cli, "is_fixed_tag_checkout", lambda _root: True)
+
+    def restore(_root):
+        order.append("restore")
+        (root / ".hermes_feishu_card_manifest").unlink()
+
+    def resolve(**kwargs):
+        order.append("bind")
+        return binding
+
+    monkeypatch.setattr(cli, "_restore", restore)
+    monkeypatch.setattr(cli, "resolve_runtime_binding", resolve)
+    monkeypatch.setattr(
+        cli, "probe_plugin_entrypoint", lambda *args, **kwargs: entrypoint
+    )
+    monkeypatch.setattr(
+        cli,
+        "detect_fixed_tag_integration",
+        lambda *args, **kwargs: SimpleNamespace(
+            decision=decision,
+            native_probe=SimpleNamespace(
+                source_commit=v3.FIXED_TAG_COMMIT,
+                plugin_evidence_sha256="sha256:" + "a" * 64,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "execute_fixed_tag_hybrid_install",
+        lambda **kwargs: v3.FixedTagInstallResult(
+            status="installed",
+            manifest_path=root / ".hermes_feishu_card_manifest",
+            gateway_restart_required=False,
+        ),
+    )
+    monkeypatch.setattr(cli, "PACKAGE_VERSION", "4.3.0")
+
+    assert cli._run_fixed_tag_v3_install(
+        SimpleNamespace(hermes_home=str(binding.hermes_home)),
+        SimpleNamespace(root=root),
+    ) == 0
+    assert order == ["restore", "bind"]
+
+
+def test_cli_non_fixed_checkout_preserves_legacy_dispatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "is_fixed_tag_checkout", lambda _root: False)
+    assert cli._run_fixed_tag_v3_install(
+        SimpleNamespace(hermes_home=None), SimpleNamespace(root=tmp_path)
+    ) is None
+
+
+def test_cli_fixed_tag_installed_v3_is_idempotent_without_native_reprobe(
+    tmp_path, monkeypatch, capsys
+):
+    root, binding, entrypoint, _decision = _fixture(tmp_path)
+    (root / ".hermes_feishu_card_manifest").write_text(
+        '{"manifest_version":3}\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "is_fixed_tag_checkout", lambda _root: True)
+    monkeypatch.setattr(cli, "resolve_runtime_binding", lambda **kwargs: binding)
+    monkeypatch.setattr(
+        cli, "probe_plugin_entrypoint", lambda *args, **kwargs: entrypoint
+    )
+    monkeypatch.setattr(
+        cli,
+        "inspect_fixed_tag_hybrid_install",
+        lambda **kwargs: v3.FixedTagInstallResult(
+            status="installed",
+            manifest_path=root / ".hermes_feishu_card_manifest",
+            gateway_restart_required=False,
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "detect_fixed_tag_integration",
+        lambda *args, **kwargs: pytest.fail("installed V3 must not re-probe dirty source"),
+    )
+    monkeypatch.setattr(cli, "PACKAGE_VERSION", "4.3.0")
+
+    assert cli._run_fixed_tag_v3_install(
+        SimpleNamespace(hermes_home=str(binding.hermes_home)),
+        SimpleNamespace(root=root),
+    ) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "integration.mode: hybrid",
+        "install ok",
+    ]
+
+
+@pytest.mark.parametrize("command", ["restore", "uninstall"])
+def test_cli_v3_restore_dispatches_before_legacy_binding_free_path(
+    tmp_path, monkeypatch, capsys, command
+):
+    root, binding, _entrypoint, _decision = _fixture(tmp_path)
+    (root / ".hermes_feishu_card_manifest").write_text(
+        '{"manifest_version":3}\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "resolve_runtime_binding", lambda **kwargs: binding)
+    monkeypatch.setattr(
+        cli,
+        "restore_fixed_tag_hybrid_install",
+        lambda **kwargs: v3.FixedTagInstallResult(
+            status="restored",
+            manifest_path=root / ".hermes_feishu_card_manifest",
+            gateway_restart_required=True,
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_restore",
+        lambda _root: pytest.fail("V3 must not enter Legacy restore"),
+    )
+    args = SimpleNamespace(hermes_dir=str(root), hermes_home=str(binding.hermes_home))
+
+    result = (
+        cli._run_restore(args) if command == "restore" else cli._run_uninstall(args)
+    )
+
+    assert result == 0
+    assert capsys.readouterr().out.splitlines() == [
+        f"{command} ok",
+        "gateway.restart_required: hermes gateway start",
+    ]

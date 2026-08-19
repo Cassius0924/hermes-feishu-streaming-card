@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.2.12`。本轮让 approval 卡按 Hermes `smart_denied`、`allow_session`、`allow_permanent` 能力生成固定选项，并在 hook、event、session、renderer 与 sidecar 回调边界显式传播/校验 `allow_custom_input`；启用 reasoning timeline 时，零工具调用卡片在整个生命周期保持稳定折叠入口。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.3.0`。本轮为 Hermes `v2026.8.3` 增加 source-proven Hybrid Plugin/patch 集成、V3 installer ownership、single-owner runtime interaction 与 linger 校验的 persistent systemd user service，并吸收 Issues #210–#223 中可由本地代码修复的反馈。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -146,6 +146,17 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.3.0 发布门禁
+
+- 固定 Hermes `v2026.8.3` / commit `3c27eb6234bf91b8ceee9e9071591b31e9b148cb` 的 probe 必须同时通过源码哈希/call-site slices、runtime Python、entrypoint/distribution origin 与真实 PluginManager subprocess evidence；不能用版本字符串或 hook 名列表代替能力证明。
+- Hybrid 必须精确检测 17 个 patch group、7 个 target，并逐文件 compile；重复 install 的 manifest 哈希必须不变，restore 后 Hermes checkout 必须 Git clean，配置 SHA-256 与安装前一致，ownership evidence 必须清空。
+- interaction callback 必须直接唤醒 Hermes 原 pending handle/future，Sidecar listener POST 和 Feishu create/PATCH 均不持 session/message lock；event-id fence、terminal/native handoff、expiry、session replacement 与 caller cancellation 攻击测试必须通过。
+- persistent `enable` 必须要求 `Linger=yes`、安全迁移 verified transient owner、用 SHA-256 绑定 mode `0600` unit/manifest，并在停服失败时保留 ownership；`disable` 对 drift fail-closed。
+- 已完成聚焦证据：V3 installer/restore/script `340 passed, 5 skipped`；persistent process/CLI loopback `302 passed`；真实 fixed-tag install/idempotence/restore 全链路通过。
+- 完整 pytest：**`3227 passed, 6 skipped in 378.84s`**；sdist/wheel、全新 Python 3.12 venv 的隔离 `site-packages` provenance、唯一 Hermes plugin entrypoint、24 个 provenance slices、主 CLI 与 `enable/disable --help`：**本地通过**。最终提交后仍需再跑 `git diff --check` 与 docs/package 快速门禁。
+- Issue #216 属于平台零事件边界，不写成已修复；PR #203 仅改归档 `legacy/`，不纳入 active runtime。
+- exact merge SHA、远端 CI、annotated tag、public tag/install 与 Release assets：**发布流程中逐项记录**。
 
 ## V4.2.12 发布门禁
 

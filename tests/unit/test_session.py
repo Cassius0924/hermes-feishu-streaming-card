@@ -1,6 +1,12 @@
 from hermes_feishu_card.events import SidecarEvent
 from hermes_feishu_card.session import CardSession, InteractionState
+from copy import deepcopy
 import pytest
+import time
+
+
+class _StringSubclass(str):
+    pass
 
 
 def event(name, sequence, data, **overrides):
@@ -64,6 +70,32 @@ def test_started_message_uses_feishu_message_id_as_native_reply_anchor():
     )
 
     assert session.reply_to_message_id == "om_user_message"
+
+
+@pytest.mark.parametrize(
+    ("sender_open_id", "expected"),
+    (
+        ("ou_sender-01", "ou_sender-01"),
+        ('ou_bad"><at user_id="ou_other"', ""),
+        ("on_wrong_kind", ""),
+        (_StringSubclass("ou_subclass"), ""),
+    ),
+)
+def test_session_records_only_exact_feishu_sender_open_id(sender_open_id, expected):
+    session = CardSession(
+        conversation_id="chat-1", message_id="om_user_message", chat_id="oc_abc"
+    )
+
+    assert session.apply(
+        event(
+            "message.started",
+            0,
+            {"sender_open_id": sender_open_id},
+            message_id="om_user_message",
+        )
+    )
+
+    assert session.sender_open_id == expected
 
 
 def test_rejects_duplicate_and_stale_sequence():
@@ -174,6 +206,54 @@ def test_pending_interaction_clears_explicit_status_to_session_source():
     assert session.display_status_source == "session"
 
 
+def test_runtime_admission_is_hidden_frozen_and_erased_on_completion():
+    descriptor = {
+        "protocol": "hfc-runtime-interaction-v1",
+        "runtime_id": "a" * 64,
+        "resolve_url": "http://127.0.0.1:43210/runtime/interactions/resolve",
+        "interaction_key": "b" * 64,
+        "token": "c" * 64,
+        "expires_at": time.time() + 20.0,
+    }
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "approval-1",
+                "kind": "approval",
+                "prompt": "请选择",
+                "options": [{"label": "允许", "value": "once"}],
+                "_hfc_runtime_admission": descriptor,
+            },
+            turn_id="turn-1",
+            event_id="patch:turn-1:interaction:approval-1:1",
+            producer="patch",
+            phase="started",
+        )
+    )
+    descriptor["token"] = "d" * 64
+    interaction = session.active_interaction
+    assert interaction is not None
+    assert interaction.runtime_admission["token"] == "c" * 64
+    assert "c" * 64 not in repr(interaction)
+    with pytest.raises(TypeError):
+        interaction.runtime_admission["token"] = "d" * 64
+    snapshot = deepcopy(session)
+    assert snapshot.active_interaction.runtime_admission["token"] == "c" * 64
+    assert snapshot.active_interaction.runtime_admission is not interaction.runtime_admission
+
+    assert session.apply(
+        event(
+            "interaction.completed",
+            2,
+            {"interaction_id": "approval-1", "choice": "once"},
+        )
+    )
+    assert interaction.runtime_admission is None
+
+
 def test_failed_event_clears_explicit_status_to_session_source():
     session = CardSession(conversation_id="chat-1", message_id="msg-1", chat_id="oc_abc")
     assert session.apply(event("message.started", 0, {"display_status": "thinking"}))
@@ -192,6 +272,147 @@ def test_tool_count_tracks_invocations_instead_of_lifecycle_events():
     assert session.tool_count == 2
     assert len(session.tools) == 2
     assert session.tools["t1"].status == "completed"
+
+
+def test_subagent_start_stop_updates_one_distinct_timeline_item_without_tool_count():
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {
+                "child_id": "child-1",
+                "role": "research",
+                "status": "running",
+                "goal_preview": "分析 <风险>",
+                "goal": "raw alias must not appear",
+                "tool_history": [{"secret": "must not appear"}],
+            },
+        )
+    )
+    assert session.apply(
+        event(
+            "subagent.updated",
+            2,
+            {
+                "child_id": "child-1",
+                "role": "research",
+                "status": "completed",
+                "duration_ms": 12,
+                "summary_preview": "完成核验",
+                "summary": "raw summary must not appear",
+                "args": {"secret": "must not appear"},
+                "result": "must not appear",
+            },
+        )
+    )
+
+    entries = session.timeline.snapshot()
+    assert [(item.kind, item.status) for item in entries] == [
+        ("subagent", "completed")
+    ]
+    assert entries[0].subagent_id == "child-1"
+    assert "完成核验" in entries[0].detail
+    assert "12 ms" in entries[0].detail
+    assert "raw" not in entries[0].detail
+    assert "secret" not in entries[0].detail
+    assert session.tool_count == 0
+
+
+@pytest.mark.parametrize("child_id", [None, "", "   ", 123, _StringSubclass("child")])
+def test_subagent_requires_exact_nonblank_child_id(child_id):
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {"child_id": child_id, "status": "running"},
+        )
+    )
+    assert session.timeline.snapshot() == []
+    assert session.last_sequence == 1
+
+
+def test_terminal_subagent_cannot_be_reopened_by_late_running_update():
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {"child_id": "child-1", "status": "failed"},
+        )
+    )
+    assert session.apply(
+        event(
+            "subagent.updated",
+            2,
+            {"child_id": "child-1", "status": "running"},
+        )
+    )
+
+    entries = session.timeline.snapshot()
+    assert len(entries) == 1
+    assert entries[0].status == "failed"
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        "completed",
+        "success",
+        "succeeded",
+        "failed",
+        "error",
+        "cancelled",
+        "canceled",
+        "timeout",
+        "blocked",
+        "interrupted",
+    ],
+)
+def test_all_terminal_subagent_statuses_reject_late_running_update(terminal_status):
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {"child_id": "child-1", "status": terminal_status},
+        )
+    )
+    assert session.apply(
+        event(
+            "subagent.updated",
+            2,
+            {"child_id": "child-1", "status": "running"},
+        )
+    )
+
+    entries = session.timeline.snapshot()
+    assert len(entries) == 1
+    assert entries[0].status == terminal_status
+
+
+@pytest.mark.parametrize(
+    "duration_ms",
+    [True, "12", -1, float("nan"), float("inf"), float("-inf")],
+)
+def test_subagent_ignores_non_numeric_or_non_finite_duration(duration_ms):
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        event(
+            "subagent.updated",
+            1,
+            {
+                "child_id": "child-1",
+                "status": "completed",
+                "duration_ms": duration_ms,
+                "summary_preview": "完成",
+            },
+        )
+    )
+
+    assert session.timeline.snapshot()[0].detail == "完成"
 
 
 def test_compaction_notice_sets_runtime_phase_without_changing_answer():

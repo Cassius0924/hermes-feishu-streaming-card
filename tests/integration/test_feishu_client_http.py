@@ -1,4 +1,5 @@
 import asyncio
+import json
 import pytest
 import subprocess
 import sys
@@ -151,6 +152,60 @@ async def test_send_card_replies_in_thread_when_reply_anchor_present(feishu_api)
     assert "你好" in reply_request[2]["content"]
     assert reply_request[2]["uuid"] == "hfc_" + "a" * 40
     assert reply_request[3]["Authorization"] == "Bearer tenant-token-1"
+
+
+async def test_send_text_message_posts_text_with_mention(feishu_api):
+    test_client, requests, token_calls = feishu_api
+    client = FeishuClient(
+        FeishuClientConfig(
+            app_id="cli_test",
+            app_secret="secret",
+            base_url=str(test_client.make_url("/")),
+        )
+    )
+
+    message_id = await client.send_text_message(
+        "oc_abc",
+        '<at user_id="ou_sender"></at> ✅ 任务已完成',
+    )
+
+    assert message_id == "om_message_1"
+    assert token_calls() == 1
+    send_request = requests[1]
+    assert send_request[0] == "send"
+    assert send_request[1] == "chat_id"
+    assert send_request[2]["receive_id"] == "oc_abc"
+    assert send_request[2]["msg_type"] == "text"
+    assert json.loads(send_request[2]["content"])["text"] == (
+        '<at user_id="ou_sender"></at> ✅ 任务已完成'
+    )
+
+
+async def test_send_text_message_replies_in_thread_when_anchor_present(feishu_api):
+    test_client, requests, token_calls = feishu_api
+    client = FeishuClient(
+        FeishuClientConfig(
+            app_id="cli_test",
+            app_secret="secret",
+            base_url=str(test_client.make_url("/")),
+        )
+    )
+
+    message_id = await client.send_text_message(
+        "oc_abc",
+        '<at user_id="ou_sender"></at> ✅ 任务已完成',
+        thread_id="omt_thread",
+        reply_to_message_id="om_user_message",
+    )
+
+    assert message_id == "om_reply_1"
+    assert token_calls() == 1
+    reply_request = requests[1]
+    assert reply_request[0] == "reply"
+    assert reply_request[1] == "om_user_message"
+    assert reply_request[2]["msg_type"] == "text"
+    assert reply_request[2]["reply_in_thread"] is True
+    assert "任务已完成" in json.loads(reply_request[2]["content"])["text"]
 
 
 @pytest.mark.parametrize("delivery_uuid", ["", "   ", "x" * 51, 123])

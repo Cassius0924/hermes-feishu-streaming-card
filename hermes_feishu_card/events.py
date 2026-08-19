@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import re
+import time
 from typing import Any, Dict
+from urllib.parse import urlsplit
 
 from .status import normalize_display_status
 
@@ -17,7 +20,17 @@ SUPPORTED_EVENTS = {
     "interaction.requested",
     "interaction.completed",
     "interaction.failed",
+    "subagent.updated",
 }
+
+_EVENT_IDENTITY_MAX_CHARS = 256
+_EVENT_PRODUCERS = {"plugin", "patch", "legacy-patch"}
+_EVENT_PHASES = {"started", "terminal", "update"}
+_RUNTIME_ADMISSION_FIELD = "_hfc_runtime_admission"
+_RUNTIME_ADMISSION_PROTOCOL = "hfc-runtime-interaction-v1"
+_RUNTIME_ADMISSION_PATH = "/runtime/interactions/resolve"
+_LOWER_HEX_64_RE = re.compile(r"[0-9a-f]{64}")
+_RUNTIME_ADMISSION_MAX_FUTURE_SECONDS = 60.0
 
 
 class EventValidationError(ValueError):
@@ -37,6 +50,9 @@ class SidecarEvent:
     data: Dict[str, Any]
     thread_id: str = ""
     turn_id: str = ""
+    event_id: str = ""
+    producer: str = ""
+    phase: str = ""
 
     @property
     def canonical_turn_id(self) -> str:
@@ -101,6 +117,39 @@ class SidecarEvent:
         turn_id = payload.get("turn_id", "")
         if not isinstance(turn_id, str):
             raise EventValidationError("turn_id must be a string")
+        identity: dict[str, str] = {}
+        for key in ("event_id", "producer", "phase"):
+            value = payload.get(key, "")
+            if type(value) is not str:
+                raise EventValidationError(f"{key} must be an ordinary string")
+            canonical_value = value.strip()
+            if len(canonical_value) > _EVENT_IDENTITY_MAX_CHARS:
+                raise EventValidationError(f"{key} must be at most 256 characters")
+            identity[key] = canonical_value
+        if identity["producer"] and identity["producer"] not in _EVENT_PRODUCERS:
+            raise EventValidationError("unknown producer")
+        if identity["phase"] and identity["phase"] not in _EVENT_PHASES:
+            raise EventValidationError("unknown phase")
+        stripped_turn_id = turn_id.strip()
+        identity_present = any(identity.values())
+        if identity_present and not all(
+            (
+                identity["event_id"],
+                identity["producer"],
+                identity["phase"],
+                stripped_turn_id,
+            )
+        ):
+            raise EventValidationError("partial event identity")
+        if _RUNTIME_ADMISSION_FIELD in data:
+            _validate_runtime_admission(
+                data[_RUNTIME_ADMISSION_FIELD],
+                event=event,
+                turn_id=stripped_turn_id,
+                event_id=identity["event_id"],
+                producer=identity["producer"],
+                phase=identity["phase"],
+            )
         return cls(
             schema_version=payload["schema_version"],
             event=event,
@@ -112,5 +161,80 @@ class SidecarEvent:
             sequence=payload["sequence"],
             created_at=created_at,
             data=data,
-            turn_id=turn_id.strip(),
+            turn_id=stripped_turn_id,
+            event_id=identity["event_id"],
+            producer=identity["producer"],
+            phase=identity["phase"],
         )
+
+
+def _validate_runtime_admission(
+    value: object,
+    *,
+    event: str,
+    turn_id: str,
+    event_id: str,
+    producer: str,
+    phase: str,
+) -> None:
+    if (
+        event != "interaction.requested"
+        or not turn_id
+        or not event_id
+        or producer != "patch"
+        or phase != "started"
+        or type(value) is not dict
+        or not all(type(key) is str for key in value)
+        or set(value)
+        != {
+            "protocol",
+            "runtime_id",
+            "resolve_url",
+            "interaction_key",
+            "token",
+            "expires_at",
+        }
+    ):
+        raise EventValidationError("invalid runtime admission")
+    if value["protocol"] != _RUNTIME_ADMISSION_PROTOCOL or type(
+        value["protocol"]
+    ) is not str:
+        raise EventValidationError("invalid runtime admission")
+    for key in ("runtime_id", "interaction_key", "token"):
+        candidate = value[key]
+        if type(candidate) is not str or _LOWER_HEX_64_RE.fullmatch(candidate) is None:
+            raise EventValidationError("invalid runtime admission")
+    resolve_url = value["resolve_url"]
+    if type(resolve_url) is not str or resolve_url != resolve_url.strip():
+        raise EventValidationError("invalid runtime admission")
+    try:
+        parsed = urlsplit(resolve_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise EventValidationError("invalid runtime admission") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.netloc != f"127.0.0.1:{port}"
+        or parsed.path != _RUNTIME_ADMISSION_PATH
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+        or type(port) is not int
+        or not 1 <= port <= 65535
+    ):
+        raise EventValidationError("invalid runtime admission")
+    expires_at = value["expires_at"]
+    if type(expires_at) not in (int, float):
+        raise EventValidationError("invalid runtime admission")
+    now = time.time()
+    try:
+        valid_expiry = (
+            math.isfinite(expires_at)
+            and now < expires_at <= now + _RUNTIME_ADMISSION_MAX_FUTURE_SECONDS
+        )
+    except (OverflowError, TypeError, ValueError):
+        valid_expiry = False
+    if not valid_expiry:
+        raise EventValidationError("invalid runtime admission")

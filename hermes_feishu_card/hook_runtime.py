@@ -49,6 +49,13 @@ from .native_handoff import (
     derive_native_handoff_uuid_seed,
     is_exact_native_text_scope,
 )
+from .profile_sources import (
+    TRUSTED_PROFILE_SOURCES,
+    legacy_profile_identity,
+    legacy_safe_profile_id,
+    profile_from_hermes_home_path,
+    validate_trusted_profile_identity,
+)
 from .status import normalize_display_status
 from .runtime_control import reset_runtime_control_for_tests, start_runtime_control
 
@@ -56,6 +63,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_EVENT_URL = "http://127.0.0.1:8765/events"
 DEFAULT_TIMEOUT_SECONDS = 0.8
+INTERACTION_ADMISSION_TIMEOUT_SECONDS = 5.0
 TERMINAL_TIMEOUT_SECONDS = 10.0
 NATIVE_HANDOFF_PROTOCOL = "hfc-native-handoff-v2"
 NATIVE_HANDOFF_MAX_LIFETIME_SECONDS = 3600.0
@@ -66,13 +74,16 @@ _NOTICE_UNCERTAIN_WARNING = (
 OPERATIONS_ACTION_TIMEOUT_SECONDS = 10.0
 OPERATIONS_ACTION_FORWARD_ATTEMPTS = 2
 OPERATIONS_ACTION_RETRY_DELAY_SECONDS = 0.1
+INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS = 5.0
+INTERACTION_ACTION_FORWARD_ATTEMPTS = 3
+INTERACTION_ACTION_RETRY_DELAY_SECONDS = 0.1
 OPERATIONS_ACTION_WORKERS = 4
 OPERATIONS_ACTION_QUEUE_LIMIT = 64
 COMMAND_FEEDBACK_CONTEXT_TTL_SECONDS = 600.0
 POLICY_QUERY_TIMEOUT_SECONDS = 0.25
 POLICY_CACHE_TTL_SECONDS = 1.0
 POLICY_CACHE_LIMIT = 1024
-PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_FEISHU_OPEN_ID_RE = re.compile(r"ou_[A-Za-z0-9_-]{1,128}")
 _CONTEXT_COMPACTION_STATUS_RE = re.compile(
     r"\bCompacting\s+context\b",
     re.IGNORECASE,
@@ -141,6 +152,37 @@ SUPPORTED_RUNTIME_EVENTS = {
 }
 
 _CANONICAL_TURN_ATTR = "_hfc_turn_id"
+_THIN_INTERACTION_KINDS = frozenset({"approval", "clarify", "slash"})
+_THIN_CONTEXT_COMPACTION_MESSAGES = frozenset(
+    {
+        "Compacting context",
+        "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
+    }
+)
+_THIN_STATUS_MESSAGE_MAX_BYTES = 1024
+_LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, repr=False)
+class _CanonicalTurnFrame:
+    turn_id: str
+    token: object
+
+
+@dataclass(frozen=True, repr=False)
+class _CanonicalTurnEntry:
+    token: object
+    owner: object
+    turn_id: str
+
+
+@dataclass(frozen=True, repr=False)
+class HybridTerminalRecord:
+    """Detached one-shot terminal evidence; it carries no suppress decision."""
+
+    terminal_kind: str
+    payload: dict[str, Any]
+    response: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -261,6 +303,12 @@ _HFC_NATIVE_HANDOFF_CHUNK: ContextVar[dict[str, Any] | None] = ContextVar(
     "hfc_native_handoff_chunk",
     default=None,
 )
+_HFC_CANONICAL_TURN_CARRIER: ContextVar[tuple[_CanonicalTurnFrame, ...]] = (
+    ContextVar("hfc_canonical_turn_carrier", default=())
+)
+_CANONICAL_TURN_REGISTRY_LIMIT = 1024
+_CANONICAL_TURN_REGISTRY_LOCK = threading.RLock()
+_CANONICAL_TURN_REGISTRY: dict[object, _CanonicalTurnEntry] = {}
 _HFC_NATIVE_HANDOFF_ROUTE: ContextVar[str | None] = ContextVar(
     "hfc_native_handoff_route",
     default=None,
@@ -359,6 +407,9 @@ def reset_runtime_state() -> None:
     _HFC_NATIVE_HANDOFF_SEND_TRACKER.set(None)
     _HFC_NATIVE_HANDOFF_CHUNK.set(None)
     _HFC_NATIVE_HANDOFF_ROUTE.set(None)
+    with _CANONICAL_TURN_REGISTRY_LOCK:
+        _CANONICAL_TURN_REGISTRY.clear()
+        _HFC_CANONICAL_TURN_CARRIER.set(())
     for task in list(_NATIVE_HANDOFF_ACK_TASKS):
         task.cancel()
     _NATIVE_HANDOFF_ACK_TASKS.clear()
@@ -366,6 +417,558 @@ def reset_runtime_state() -> None:
     with _GATEWAY_RUNNER_LOCK:
         _GATEWAY_RUNNER_REF = None
     reset_runtime_control_for_tests()
+
+
+def _canonical_turn_owner() -> tuple[threading.Thread, asyncio.Task[Any] | None]:
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return threading.current_thread(), task
+
+
+def _same_canonical_turn_owner(left: object, right: object) -> bool:
+    return left is right or (
+        type(left) is tuple
+        and len(left) == 2
+        and type(right) is tuple
+        and len(right) == 2
+        and left[0] is right[0]
+        and left[1] is right[1]
+    )
+
+
+def _live_canonical_turn_frames_locked(
+    frames: object,
+    owner: object,
+) -> tuple[_CanonicalTurnFrame, ...] | None:
+    if type(frames) is not tuple:
+        return None
+    live_frames: list[_CanonicalTurnFrame] = []
+    for frame in frames:
+        if type(frame) is not _CanonicalTurnFrame:
+            return None
+        entry = _CANONICAL_TURN_REGISTRY.get(frame.token)
+        if entry is None:
+            continue
+        if (
+            entry.token is not frame.token
+            or not _same_canonical_turn_owner(entry.owner, owner)
+            or entry.turn_id != frame.turn_id
+        ):
+            return None
+        live_frames.append(frame)
+    return tuple(live_frames)
+
+
+def publish_canonical_turn_id(turn_id: object) -> object | None:
+    """Push an exact turn id into this thread/task's scoped carrier."""
+    if type(turn_id) is not str or not turn_id.strip():
+        return None
+    owner = _canonical_turn_owner()
+    token = object()
+    entry = _CanonicalTurnEntry(token=token, owner=owner, turn_id=turn_id)
+    with _CANONICAL_TURN_REGISTRY_LOCK:
+        if len(_CANONICAL_TURN_REGISTRY) >= _CANONICAL_TURN_REGISTRY_LIMIT:
+            return None
+        frames = _live_canonical_turn_frames_locked(
+            _HFC_CANONICAL_TURN_CARRIER.get(), owner
+        )
+        if frames is None:
+            return None
+        _CANONICAL_TURN_REGISTRY[token] = entry
+        _HFC_CANONICAL_TURN_CARRIER.set(
+            (*frames, _CanonicalTurnFrame(turn_id=turn_id, token=token))
+        )
+    return token
+
+
+def clear_canonical_turn_id(token: object) -> bool:
+    """Pop only the exact innermost frame owned by the current thread/task."""
+    if type(token) is not object:
+        return False
+    owner = _canonical_turn_owner()
+    with _CANONICAL_TURN_REGISTRY_LOCK:
+        frames = _live_canonical_turn_frames_locked(
+            _HFC_CANONICAL_TURN_CARRIER.get(), owner
+        )
+        if frames is None:
+            return False
+        if not frames or frames[-1].token is not token:
+            _HFC_CANONICAL_TURN_CARRIER.set(frames)
+            return False
+        frame = frames[-1]
+        entry = _CANONICAL_TURN_REGISTRY.get(token)
+        if (
+            entry is None
+            or entry.token is not token
+            or not _same_canonical_turn_owner(entry.owner, owner)
+            or entry.turn_id != frame.turn_id
+        ):
+            return False
+        del _CANONICAL_TURN_REGISTRY[token]
+        _HFC_CANONICAL_TURN_CARRIER.set(frames[:-1])
+    return True
+
+
+def consume_canonical_turn_id(explicit_turn_id: object = None) -> str | None:
+    """Return an exact explicit/carried id; mismatches are a hard fence."""
+    if explicit_turn_id is not None and (
+        type(explicit_turn_id) is not str or not explicit_turn_id.strip()
+    ):
+        return None
+    owner = _canonical_turn_owner()
+    carried: str | None = None
+    with _CANONICAL_TURN_REGISTRY_LOCK:
+        original_frames = _HFC_CANONICAL_TURN_CARRIER.get()
+        frames = _live_canonical_turn_frames_locked(original_frames, owner)
+        if frames is None:
+            return None
+        if frames != original_frames:
+            _HFC_CANONICAL_TURN_CARRIER.set(frames)
+        if frames:
+            frame = frames[-1]
+            entry = _CANONICAL_TURN_REGISTRY.get(frame.token)
+            if (
+                entry is None
+                or entry.token is not frame.token
+                or not _same_canonical_turn_owner(entry.owner, owner)
+                or entry.turn_id != frame.turn_id
+            ):
+                return None
+            carried = entry.turn_id
+    if explicit_turn_id is None:
+        return carried
+    if carried is not None and carried != explicit_turn_id:
+        return None
+    return explicit_turn_id
+
+
+def _canonical_turn_registry_size() -> int:
+    """Testing/diagnostic count only; never exposes turn identities."""
+    with _CANONICAL_TURN_REGISTRY_LOCK:
+        return len(_CANONICAL_TURN_REGISTRY)
+
+
+def _plugin_runtime() -> Any | None:
+    """Use only the production runtime's explicit process-level getter."""
+    try:
+        from . import hermes_plugin_runtime
+
+        getter = getattr(hermes_plugin_runtime, "active_plugin_runtime", None)
+        if not callable(getter):
+            return None
+        return getter()
+    except Exception:
+        return None
+
+
+def _thin_bridge_turn(local_vars: object) -> str | None:
+    if type(local_vars) is not dict:
+        return None
+    if not all(type(key) is str for key in local_vars):
+        return None
+    if local_vars.get("_hfc_authorized") is not True:
+        return None
+    platform = local_vars.get("platform")
+    if type(platform) is not str or platform != "feishu":
+        return None
+    return consume_canonical_turn_id(local_vars.get("turn_id"))
+
+
+def _exact_nonblank_string(value: object) -> bool:
+    return type(value) is str and bool(value.strip())
+
+
+def bind_ingress_from_hermes_locals(local_vars: object) -> bool:
+    """Delegate authenticated ingress values without producing lifecycle events."""
+    try:
+        if type(local_vars) is not dict:
+            return False
+        if not all(type(key) is str for key in local_vars):
+            return False
+        if local_vars.get("_hfc_authorized") is not True:
+            return False
+        platform = local_vars.get("platform")
+        if type(platform) is not str or platform != "feishu":
+            return False
+        explicit_turn_id = local_vars.get("turn_id")
+        if explicit_turn_id is not None and consume_canonical_turn_id(
+            explicit_turn_id
+        ) is None:
+            return False
+        names = (
+            "profile_id",
+            "profile_source",
+            "session_id",
+            "gateway_session_key",
+            "generation",
+            "chat_id",
+            "incoming_message_id",
+            "reply_to_message_id",
+        )
+        values = tuple(local_vars.get(name) for name in names)
+        if not all(_exact_nonblank_string(value) for value in values):
+            return False
+        if values[1] not in TRUSTED_PROFILE_SOURCES:
+            return False
+        profile_identity = validate_trusted_profile_identity(
+            values[0],
+            values[1],
+            hermes_home_membership_verified=local_vars.get(
+                "hermes_home_membership_verified", False
+            ),
+        )
+        if profile_identity != values[:2]:
+            return False
+        thread_id = local_vars.get("thread_id", "")
+        if type(thread_id) is not str:
+            return False
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "bind_ingress_from_values", None)
+        if not callable(method):
+            return False
+        return method(*values, thread_id) is True
+    except Exception:
+        return False
+
+
+def emit_delta_from_hermes_locals_threadsafe(
+    local_vars: object,
+    event_name: object,
+) -> bool:
+    """Delegate one exact Hybrid delta; never enter the Legacy emitter path."""
+    try:
+        turn_id = _thin_bridge_turn(local_vars)
+        if turn_id is None or type(event_name) is not str:
+            return False
+        if event_name not in {"thinking.delta", "answer.delta"}:
+            return False
+        assert type(local_vars) is dict
+        text = local_vars.get("text")
+        if type(text) is not str or not text:
+            return False
+        mode = "append_block" if event_name == "thinking.delta" else "delta"
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "submit_patch_delta", None)
+        if not callable(method):
+            return False
+        return method(turn_id, event_name, text, mode) is True
+    except Exception:
+        return False
+
+
+def submit_status_notice_from_hermes_locals(
+    local_vars: object,
+    *,
+    event_type: object,
+    message: object,
+) -> bool:
+    """Classify one fixed Hermes status and submit only sanitized tags."""
+    try:
+        if (
+            type(event_type) is not str
+            or event_type != "context"
+            or type(message) is not str
+            or len(message) > _THIN_STATUS_MESSAGE_MAX_BYTES
+            or len(message.encode("utf-8")) > _THIN_STATUS_MESSAGE_MAX_BYTES
+            or message not in _THIN_CONTEXT_COMPACTION_MESSAGES
+        ):
+            return False
+        turn_id = _thin_bridge_turn(local_vars)
+        if turn_id is None:
+            return False
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "submit_patch_status_notice", None)
+        if not callable(method):
+            return False
+        return method(
+            turn_id,
+            notice_kind="context-compaction",
+            notice_id="context-compaction:active",
+        ) is True
+    except Exception:
+        return False
+
+
+def _thin_interaction_values(
+    local_vars: object,
+    kind: object,
+    interaction_data: object,
+    pending_handle: object,
+) -> tuple[str, str, str, str, str, object] | None:
+    turn_id = _thin_bridge_turn(local_vars)
+    if turn_id is None or type(kind) is not str or kind not in _THIN_INTERACTION_KINDS:
+        return None
+    if type(interaction_data) is not dict or set(interaction_data) != {
+        "session_identity",
+        "interaction_id",
+        "fingerprint",
+    }:
+        return None
+    if not all(type(key) is str for key in interaction_data):
+        return None
+    session_identity = interaction_data.get("session_identity")
+    interaction_id = interaction_data.get("interaction_id")
+    fingerprint = interaction_data.get("fingerprint")
+    if not all(
+        _exact_nonblank_string(value)
+        for value in (session_identity, interaction_id, fingerprint)
+    ):
+        return None
+    if _LOWER_SHA256_RE.fullmatch(fingerprint) is None or pending_handle is None:
+        return None
+    return (
+        kind,
+        session_identity,
+        turn_id,
+        interaction_id,
+        fingerprint,
+        pending_handle,
+    )
+
+
+def _delegate_pending_interaction(
+    operation: str,
+    local_vars: object,
+    kind: object,
+    interaction_data: object,
+    pending_handle: object,
+    selected_value: object = None,
+) -> bool:
+    try:
+        values = _thin_interaction_values(
+            local_vars, kind, interaction_data, pending_handle
+        )
+        if values is None:
+            return False
+        runtime = _plugin_runtime()
+        method = getattr(runtime, f"{operation}_patch_interaction", None)
+        if not callable(method):
+            return False
+        if operation == "resolve":
+            if not _exact_nonblank_string(selected_value):
+                return False
+            return method(*values, selected_value) is True
+        return method(*values) is True
+    except Exception:
+        return False
+
+
+def register_pending_interaction_from_hermes_locals(
+    local_vars: object,
+    kind: object,
+    interaction_data: object,
+    pending_handle: object,
+) -> bool:
+    return _delegate_pending_interaction(
+        "register", local_vars, kind, interaction_data, pending_handle
+    )
+
+
+def resolve_pending_interaction_from_hermes_locals(
+    local_vars: object,
+    kind: object,
+    interaction_data: object,
+    pending_handle: object,
+    selected_value: object,
+) -> bool:
+    return _delegate_pending_interaction(
+        "resolve",
+        local_vars,
+        kind,
+        interaction_data,
+        pending_handle,
+        selected_value,
+    )
+
+
+def admit_pending_interaction_from_hermes_locals(
+    local_vars: object,
+    kind: object,
+    interaction_data: object,
+    pending_handle: object,
+    resolver: object,
+    ui_data: object,
+) -> bool:
+    """Attempt one synchronous HFC UI admission for an existing Hermes handle."""
+    try:
+        values = _thin_interaction_values(
+            local_vars, kind, interaction_data, pending_handle
+        )
+        if (
+            values is None
+            or not callable(resolver)
+            or type(ui_data) is not dict
+            or not all(type(key) is str for key in ui_data)
+            or set(ui_data)
+            != {
+                "prompt",
+                "description",
+                "allow_custom_input",
+                "multi_select",
+                "timeout_seconds",
+                "options",
+            }
+            or type(ui_data.get("prompt")) is not str
+            or type(ui_data.get("description")) is not str
+            or type(ui_data.get("allow_custom_input")) is not bool
+            or type(ui_data.get("multi_select")) is not bool
+            or type(ui_data.get("timeout_seconds")) not in (int, float)
+            or type(ui_data.get("options")) is not list
+            or not _is_ordinary_json_value(ui_data)
+        ):
+            return False
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "admit_patch_interaction", None)
+        if not callable(method):
+            return False
+        return method(
+            *values,
+            resolver,
+            copy.deepcopy(ui_data),
+        ) is True
+    except Exception:
+        return False
+
+
+def claim_pending_interaction_from_hermes_locals(
+    local_vars: object,
+    kind: object,
+    interaction_data: object,
+    pending_handle: object,
+) -> str | None:
+    try:
+        values = _thin_interaction_values(
+            local_vars, kind, interaction_data, pending_handle
+        )
+        if values is None:
+            return None
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "claim_patch_interaction", None)
+        if not callable(method):
+            return None
+        selected_value = method(*values)
+        if (
+            type(selected_value) is not str
+            or not selected_value
+            or len(selected_value) > 4096
+            or not selected_value.strip()
+            or len(selected_value.encode("utf-8")) > 4096
+        ):
+            return None
+        return selected_value
+    except Exception:
+        return None
+
+
+def _is_ordinary_json_value(value: object) -> bool:
+    if value is None or type(value) in (str, int, bool):
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is list:
+        return all(_is_ordinary_json_value(item) for item in value)
+    if type(value) is dict:
+        return all(
+            type(key) is str and _is_ordinary_json_value(item)
+            for key, item in value.items()
+        )
+    return False
+
+
+def consume_terminal_record_from_hermes_locals(
+    local_vars: object,
+) -> HybridTerminalRecord | None:
+    """Consume detached PluginRuntime evidence without deciding native suppression."""
+    try:
+        turn_id = _thin_bridge_turn(local_vars)
+        if turn_id is None:
+            return None
+        runtime = _plugin_runtime()
+        method = getattr(runtime, "take_terminal_record", None)
+        if not callable(method):
+            return None
+        record = method(turn_id)
+        if (
+            type(record) is not dict
+            or not all(type(key) is str for key in record)
+            or set(record) != {"payload", "response"}
+        ):
+            return None
+        payload = record.get("payload")
+        response = record.get("response")
+        if type(payload) is not dict or not _is_ordinary_json_value(payload):
+            return None
+        if response is not None and (
+            type(response) is not dict or not _is_ordinary_json_value(response)
+        ):
+            return None
+        event = payload.get("event")
+        if type(event) is not str or event not in {
+            "message.completed",
+            "message.failed",
+        }:
+            return None
+        payload_turn_id = payload.get("turn_id")
+        if type(payload_turn_id) is not str or payload_turn_id != turn_id:
+            return None
+        return HybridTerminalRecord(
+            terminal_kind=(
+                "completed" if event == "message.completed" else "failed"
+            ),
+            payload=copy.deepcopy(payload),
+            response=copy.deepcopy(response),
+        )
+    except Exception:
+        return None
+
+
+def apply_hybrid_terminal_record(record: object) -> str | None:
+    """Turn detached terminal evidence into one exact delivery decision."""
+    try:
+        if type(record) is not HybridTerminalRecord:
+            return None
+        if record.terminal_kind != "completed":
+            return None
+        if type(record.payload) is not dict or not _is_ordinary_json_value(
+            record.payload
+        ):
+            return None
+        response = record.response
+        if (
+            type(response) is not dict
+            or not all(type(key) is str for key in response)
+        ):
+            return None
+        keys = set(response)
+        if keys == {"ok", "applied"}:
+            return (
+                "card"
+                if response.get("ok") is True
+                and response.get("applied") is True
+                else None
+            )
+        if keys not in (
+            {"ok", "applied", "disposition"},
+            {"ok", "applied", "disposition", "native_handoff"},
+        ):
+            return None
+        if (
+            response.get("ok") is not True
+            or response.get("applied") is not False
+            or type(response.get("disposition")) is not str
+            or response.get("disposition") != "native"
+        ):
+            return None
+        if "native_handoff" in response and not _register_native_handoff_descriptor(
+            record.payload,
+            response,
+        ):
+            return None
+        return "native"
+    except Exception:
+        return None
 
 
 def _ensure_runtime_control_started(config: RuntimeConfig | None = None) -> bool:
@@ -2281,6 +2884,19 @@ def _command_operator(
     return ""
 
 
+def _message_sender_open_id(
+    local_vars: dict[str, Any], source_obj: Any, gateway_event_obj: Any
+) -> str:
+    candidate = _command_operator(local_vars, source_obj, gateway_event_obj)
+    if not candidate:
+        candidate = _hfc_resume_operator_open_id(gateway_event_obj)
+    return (
+        candidate
+        if type(candidate) is str and _FEISHU_OPEN_ID_RE.fullmatch(candidate)
+        else ""
+    )
+
+
 def _parse_hfc_command(text: str) -> str | None:
     stripped = str(text or "").strip()
     if not stripped:
@@ -3610,6 +4226,19 @@ def _hfc_exception_summary(exc: BaseException) -> str:
             details.append(f"{name}={value!r}")
     suffix = f" ({', '.join(details)})" if details else ""
     return f"{exc.__class__.__name__}{suffix}"
+
+
+def _hfc_is_transient_sidecar_error(exc: BaseException) -> bool:
+    if isinstance(exc, urlerror.HTTPError):
+        return False
+    if isinstance(exc, (ConnectionError, BrokenPipeError, TimeoutError)):
+        return True
+    if isinstance(exc, urlerror.URLError):
+        return isinstance(
+            getattr(exc, "reason", None),
+            (ConnectionError, BrokenPipeError, TimeoutError),
+        )
+    return False
 
 
 def _hfc_response_summary(response: Any) -> str:
@@ -6367,11 +6996,48 @@ def _hfc_handle_interaction_select_action(
         config = load_runtime_config()
         base_url = _summary_base_url(config.event_url)
         url = f"{base_url}/card/actions"
-        result = _post_json_sync_response(url, sidecar_payload, 5.0)
     except Exception as exc:
         _hfc_warn(
-            "interaction.select forward failed: "
+            "interaction.select forward setup failed: "
             f"{_hfc_exception_summary(exc)}"
+        )
+        return _hfc_empty_feishu_callback_response(adapter)
+
+    started_at = time.monotonic()
+    result: Any = None
+    last_error: BaseException | None = None
+    for attempt in range(INTERACTION_ACTION_FORWARD_ATTEMPTS):
+        if attempt == 0:
+            timeout = INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS
+        else:
+            timeout = INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS - (
+                time.monotonic() - started_at
+            )
+        if timeout <= 0:
+            break
+        try:
+            result = _post_json_sync_response(url, sidecar_payload, timeout)
+        except Exception as exc:
+            last_error = exc
+            if (
+                not _hfc_is_transient_sidecar_error(exc)
+                or attempt + 1 >= INTERACTION_ACTION_FORWARD_ATTEMPTS
+            ):
+                break
+            remaining = INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS - (
+                time.monotonic() - started_at
+            )
+            if remaining <= 0:
+                break
+            time.sleep(min(INTERACTION_ACTION_RETRY_DELAY_SECONDS, remaining))
+            continue
+        last_error = None
+        break
+
+    if last_error is not None:
+        _hfc_warn(
+            "interaction.select forward failed: "
+            f"{_hfc_exception_summary(last_error)}"
         )
         return _hfc_empty_feishu_callback_response(adapter)
 
@@ -7721,6 +8387,8 @@ def _hfc_interaction_card_confirmed(
 def _timeout_for_event(config: RuntimeConfig, event_name: str) -> float:
     if event_name in {"message.completed", "message.failed"}:
         return max(config.timeout_seconds, TERMINAL_TIMEOUT_SECONDS)
+    if event_name == "interaction.requested":
+        return max(config.timeout_seconds, INTERACTION_ADMISSION_TIMEOUT_SECONDS)
     return config.timeout_seconds
 
 
@@ -8584,6 +9252,11 @@ def _event_data(
             "tokens": _completion_tokens(local_vars, answer),
             "context": _completion_context(local_vars),
         })
+        sender_open_id = _message_sender_open_id(
+            local_vars, source_obj, local_vars.get("event")
+        )
+        if sender_open_id:
+            data["sender_open_id"] = sender_open_id
         delivery_kind = _first_string(local_vars, ("delivery_kind",))
         if delivery_kind:
             data["delivery_kind"] = delivery_kind
@@ -8593,6 +9266,11 @@ def _event_data(
         data["error"] = error
         return data
     if event_name == "message.started":
+        sender_open_id = _message_sender_open_id(
+            local_vars, source_obj, local_vars.get("event")
+        )
+        if sender_open_id:
+            data["sender_open_id"] = sender_open_id
         for source_key, data_key in (
             ("chat_type", "chat_type"),
             ("tenant_key", "tenant_key"),
@@ -8678,18 +9356,18 @@ def _is_lower_hex(value: str, length: int) -> bool:
 def _profile_identity(local_vars: dict[str, Any], source_obj: Any, message_obj: Any) -> tuple[str, str]:
     env_profile = os.environ.get("HERMES_FEISHU_CARD_PROFILE_ID", "").strip()
     if env_profile:
-        return _safe_profile_identity(env_profile, "env")
+        return legacy_profile_identity(env_profile, "env")
     direct = (
         _first_string(local_vars, ("profile_id", "hermes_profile", "profile"))
         or _first_attr_string(source_obj, ("profile_id", "hermes_profile", "profile"))
         or _first_attr_string(message_obj, ("profile_id", "hermes_profile", "profile"))
     )
     if direct:
-        return _safe_profile_identity(direct, "locals")
+        return legacy_profile_identity(direct, "locals")
     hermes_home = os.environ.get("HERMES_HOME", "").strip()
-    profile = _profile_from_path(hermes_home)
+    profile = profile_from_hermes_home_path(hermes_home)
     if profile:
-        return _safe_profile_identity(profile, "hermes_home")
+        return legacy_profile_identity(profile, "hermes_home")
     return "default", "fallback_default"
 
 
@@ -8746,32 +9424,15 @@ def _json_safe_tool_value(value: Any) -> Any:
 
 
 def _safe_profile_identity(value: str, source: str) -> tuple[str, str]:
-    profile_id = _safe_profile_id(value)
-    if profile_id == "default" and value.strip() != "default":
-        return profile_id, f"sanitized_{source}"
-    return profile_id, source
+    return legacy_profile_identity(value, source)
 
 
 def _safe_profile_id(value: str) -> str:
-    candidate = value.strip()
-    if PROFILE_ID_PATTERN.fullmatch(candidate):
-        return candidate
-    return "default"
+    return legacy_safe_profile_id(value)
 
 
 def _profile_from_path(path: str) -> str | None:
-    if not path:
-        return None
-    normalized = str(Path(path).expanduser()).replace("\\", "/")
-    parts = tuple(part for part in normalized.split("/") if part)
-    for index in range(len(parts) - 2):
-        if parts[index] in {".hermes", "hermes"} and parts[index + 1] == "profiles":
-            if index + 3 != len(parts):
-                return None
-            candidate = parts[index + 2].strip()
-            if candidate:
-                return candidate
-    return None
+    return profile_from_hermes_home_path(path)
 
 
 def _thread_id_for_runtime_event(

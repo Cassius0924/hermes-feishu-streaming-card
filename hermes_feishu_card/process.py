@@ -15,6 +15,7 @@ from typing import Any
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 
 DEFAULT_STATE_DIR = Path.home() / ".hermes_feishu_card"
@@ -34,6 +35,42 @@ def process_token_hash(token: str | None) -> str:
     if not isinstance(token, str) or not token:
         return ""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _current_boot_id() -> str:
+    if not sys.platform.startswith("linux"):
+        return ""
+    try:
+        raw = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="ascii"
+        ).strip()
+        normalized = str(uuid.UUID(raw))
+    except (OSError, UnicodeError, ValueError):
+        return ""
+    return normalized if raw == normalized else ""
+
+
+def _record_boot_is_stale(record: dict[str, Any]) -> bool:
+    stored = record.get("boot_id")
+    current = _current_boot_id()
+    return type(stored) is str and bool(current) and stored != current
+
+
+def _pid_is_hfc_runner(pid: int) -> bool | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    if len(raw) > 8192:
+        return None
+    arguments = tuple(part for part in raw.split(b"\0") if part)
+    return any(
+        arguments[index : index + 2]
+        == (b"-m", b"hermes_feishu_card.runner")
+        for index in range(max(0, len(arguments) - 1))
+    )
 
 
 def status_sidecar(config: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -143,14 +180,23 @@ def start_sidecar(
         return "failed: invalid pidfile exists; start refused"
     elif record is not None:
         record_manager = _record_manager(record)
-        if (
+        pid_running = pid_is_running(record["pid"])
+        legacy_pid_reused = (
+            record_manager == "detached"
+            and "boot_id" not in record
+            and pid_running
+            and _pid_is_hfc_runner(record["pid"]) is False
+        )
+        if _record_boot_is_stale(record) or legacy_pid_reused:
+            clear_pid()
+        elif (
             record_manager in {"systemd-user", "systemd-system"}
             and _explicit_systemd_manager(config) == record_manager
         ):
             if _stop_owned_record(record, config) != "stopped":
                 return "failed: owned systemd sidecar could not be stopped for recovery"
             clear_pid()
-        elif record_manager != "detached" or pid_is_running(record["pid"]):
+        elif record_manager != "detached" or pid_running:
             return "failed: owned sidecar health is unavailable; start refused"
         else:
             clear_pid()
@@ -284,6 +330,15 @@ def stop_sidecar(config: dict[str, dict[str, Any]]) -> str:
     pid = record["pid"]
     manager = _record_manager(record)
     health = fetch_health(config)
+    if health is None:
+        if _record_boot_is_stale(record):
+            clear_pid()
+            return "not running"
+        if manager == "detached" and "boot_id" not in record:
+            pid_running = pid_is_running(pid)
+            if pid_running and _pid_is_hfc_runner(pid) is False:
+                clear_pid()
+                return "not running"
     if manager in {"systemd-user", "systemd-system"}:
         if health is None:
             if _explicit_systemd_manager(config) != manager:
@@ -524,6 +579,9 @@ def read_pid_record() -> dict[str, Any] | None:
     unit = record.get("unit")
     if unit is not None:
         result["unit"] = unit
+    boot_id = record.get("boot_id")
+    if boot_id is not None:
+        result["boot_id"] = boot_id
     return result if _record_identity_valid(result) else None
 
 
@@ -537,6 +595,9 @@ def write_pid_record(
     payload: dict[str, Any] = {"pid": pid, "token": token, "manager": manager}
     if unit:
         payload["unit"] = unit
+    boot_id = _current_boot_id()
+    if boot_id:
+        payload["boot_id"] = boot_id
     if not _record_identity_valid(payload):
         raise ValueError("invalid pidfile manager identity")
     path = pid_path()
@@ -614,6 +675,9 @@ def wait_for_managed_pidfile(
     while time.monotonic() < deadline:
         record = read_pid_record()
         expected = {"pid": pid, "token": token, "manager": "detached"}
+        boot_id = _current_boot_id()
+        if boot_id:
+            expected["boot_id"] = boot_id
         if record == expected:
             return True
         if sys.platform == "win32":
@@ -739,6 +803,15 @@ def _record_identity_valid(record: dict[str, Any]) -> bool:
         return False
     if not isinstance(token, str) or not token:
         return False
+    boot_id = record.get("boot_id")
+    if boot_id is not None:
+        if type(boot_id) is not str:
+            return False
+        try:
+            if boot_id != str(uuid.UUID(boot_id)):
+                return False
+        except ValueError:
+            return False
     manager = _record_manager(record)
     unit = record.get("unit", "")
     if manager == "detached":

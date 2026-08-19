@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from contextlib import suppress
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -17,7 +18,7 @@ import logging
 import re
 from typing import Any, Callable, Dict
 
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 
 from .bots import RouteResult
 from .config import load_config, merge_card_config, resolve_operations_hermes_root
@@ -41,6 +42,7 @@ from .event_auth import (
     SidecarRequestAuthenticationError,
     SidecarRequestProofVerifier,
     is_loopback_host,
+    sign_runtime_interaction_request,
 )
 from .flush import FlushController
 from .feishu_client import FeishuAPIError, build_delivery_uuid
@@ -74,6 +76,7 @@ from .operations_transport import (
 from .profile_sources import PROFILE_SOURCE_FALLBACK, PROFILE_SOURCES
 from .render import (
     CardRenderResult,
+    _format_duration,
     _is_initial_loading,
     render_card_result,
     render_terminal_limit_handoff_card,
@@ -92,6 +95,7 @@ from .runtime_control import (
     RuntimeIntegritySupervisor,
     RuntimeProofVerifier,
 )
+from .runtime_interaction_transport import RUNTIME_INTERACTION_PATH
 from .integrity import RuntimeIntegrityCoordinator, sanitize_integrity_snapshot
 from .maintenance_card import (
     render_update_inspection_card,
@@ -155,6 +159,8 @@ RUNTIME_INTEGRITY_COORDINATOR_KEY = web.AppKey(
     "runtime_integrity_coordinator", RuntimeIntegrityCoordinator
 )
 RUNTIME_INTEGRITY_TASK_KEY = web.AppKey("runtime_integrity_task", asyncio.Task)
+RUNTIME_INTERACTION_CALLBACK_TIMEOUT_SECONDS = 2.0
+MAX_RUNTIME_INTERACTION_RESPONSE_BYTES = 512
 DELIVERY_POLICY_KEY = web.AppKey("delivery_policy", Any)
 POLICY_AUTH_VERIFIER_KEY = web.AppKey("policy_auth_verifier", PolicyProofVerifier)
 NATIVE_HANDOFF_ACK_AUTH_VERIFIER_KEY = web.AppKey(
@@ -165,6 +171,9 @@ NATIVE_HANDOFF_RECOVERY_AUTH_VERIFIER_KEY = web.AppKey(
 )
 MESSAGE_LOCKS_KEY = web.AppKey("message_locks", dict)
 MESSAGE_LOCK_USERS_KEY = web.AppKey("message_lock_users", dict)
+RUNTIME_INTERACTION_RESERVATIONS_KEY = web.AppKey(
+    "runtime_interaction_reservations", dict
+)
 FOOTER_FIELDS_KEY = web.AppKey("footer_fields", Any)
 CARD_TITLE_KEY = web.AppKey("card_title", str)
 BASE_CARD_CONFIG_KEY = web.AppKey("base_card_config", dict)
@@ -202,6 +211,10 @@ NATIVE_HANDOFF_REPAIR_TASKS_KEY = web.AppKey(
 NATIVE_HANDOFF_CURRENT_REPAIRS_KEY = web.AppKey(
     "native_handoff_current_repairs", dict
 )
+EVENT_ID_FENCE_KEY = web.AppKey("event_id_fence", object)
+EVENT_ID_FENCE_MAX_ENTRIES = 4096
+EVENT_ID_FENCE_TTL_SECONDS = 3600.0
+EVENT_ID_FENCE_WAIT_SECONDS = 30.0
 UPDATE_MAX_ATTEMPTS = 3
 UPDATE_MIN_INTERVAL_SECONDS = 0.2
 CARD_ANIMATION_INTERVAL_SECONDS = 0.8
@@ -246,6 +259,160 @@ class CardDeliveryResult:
 
 class _OperationsDiagnosticCapacityError(RuntimeError):
     pass
+
+
+@dataclass
+class EventIdFenceEntry:
+    fingerprint: str
+    future: asyncio.Future[tuple[int, dict[str, object]]]
+    response_status: int | None = None
+    response_payload: dict[str, object] | None = None
+    expires_at: float = 0.0
+
+    @property
+    def completed(self) -> bool:
+        return self.response_status is not None and self.response_payload is not None
+
+
+@dataclass(frozen=True)
+class EventIdFenceClaim:
+    kind: str
+    entry: EventIdFenceEntry | None = None
+
+
+@dataclass(frozen=True, repr=False)
+class RuntimeInteractionDeliveryReservation:
+    owner: object
+    session_key: str
+    session: CardSession
+    interaction: object
+    admission_fingerprint: str
+    sequence: int
+    rollback_session: CardSession
+    card: dict[str, Any]
+    chat_id: str
+    bot_id: str | None
+    thread_id: str | None
+    reply_to_message_id: str | None
+    predecessor_message_id: str
+    delivery_key: str
+
+
+class EventIdFence:
+    def __init__(
+        self,
+        metrics: SidecarMetrics,
+        *,
+        max_entries: int = EVENT_ID_FENCE_MAX_ENTRIES,
+        ttl_seconds: float = EVENT_ID_FENCE_TTL_SECONDS,
+        wait_seconds: float = EVENT_ID_FENCE_WAIT_SECONDS,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.metrics = metrics
+        self.max_entries = max_entries
+        self.ttl_seconds = ttl_seconds
+        self.wait_seconds = wait_seconds
+        self.now = now
+        self.entries: OrderedDict[str, EventIdFenceEntry] = OrderedDict()
+        # Python 3.9 requires a current event loop when constructing a Lock.
+        # create_app() is intentionally safe to call from synchronous startup,
+        # so bind the fence lock lazily from the first async claim instead.
+        self._lock: asyncio.Lock | None = None
+
+    async def claim(self, event_id: str, fingerprint: str) -> EventIdFenceClaim:
+        lock = self._lock
+        if lock is None:
+            lock = asyncio.Lock()
+            self._lock = lock
+        async with lock:
+            self._evict_expired_completed_locked()
+            entry = self.entries.get(event_id)
+            if entry is not None:
+                if entry.fingerprint != fingerprint:
+                    self.metrics.event_id_conflicts += 1
+                    return EventIdFenceClaim("conflict", entry)
+                if entry.completed:
+                    self.metrics.event_id_replays += 1
+                    return EventIdFenceClaim("replay", entry)
+                return EventIdFenceClaim("wait", entry)
+            if len(self.entries) >= self.max_entries:
+                self._evict_oldest_completed_locked()
+            if len(self.entries) >= self.max_entries:
+                return EventIdFenceClaim("full")
+            future = asyncio.get_running_loop().create_future()
+            entry = EventIdFenceEntry(fingerprint=fingerprint, future=future)
+            self.entries[event_id] = entry
+            return EventIdFenceClaim("owner", entry)
+
+    async def wait(
+        self, entry: EventIdFenceEntry
+    ) -> tuple[int, dict[str, object]] | None:
+        try:
+            status, payload = await asyncio.wait_for(
+                asyncio.shield(entry.future),
+                timeout=self.wait_seconds,
+            )
+        except asyncio.TimeoutError:
+            return None
+        if payload.get("error") != "event unavailable":
+            self.metrics.event_id_replays += 1
+        return status, copy.deepcopy(payload)
+
+    async def finalize(
+        self,
+        event_id: str,
+        entry: EventIdFenceEntry,
+        status: int,
+        payload: dict[str, object],
+    ) -> None:
+        canonical_payload = copy.deepcopy(payload)
+        async with self._lock:
+            if self.entries.get(event_id) is not entry or entry.completed:
+                return
+            entry.response_status = int(status)
+            entry.response_payload = canonical_payload
+            entry.expires_at = self.now() + self.ttl_seconds
+            if not entry.future.done():
+                entry.future.set_result((int(status), copy.deepcopy(canonical_payload)))
+
+    async def abandon(self, event_id: str, entry: EventIdFenceEntry) -> None:
+        async with self._lock:
+            if self.entries.get(event_id) is not entry or entry.completed:
+                return
+            self.entries.pop(event_id, None)
+            if not entry.future.done():
+                entry.future.set_result((503, {"ok": False, "error": "event unavailable"}))
+
+    def replay_response(self, entry: EventIdFenceEntry) -> web.Response:
+        assert entry.response_status is not None
+        assert entry.response_payload is not None
+        return web.json_response(
+            copy.deepcopy(entry.response_payload),
+            status=entry.response_status,
+        )
+
+    def _evict_expired_completed_locked(self) -> None:
+        now = self.now()
+        expired = [
+            event_id
+            for event_id, entry in self.entries.items()
+            if entry.completed and entry.expires_at <= now
+        ]
+        for event_id in expired:
+            self.entries.pop(event_id, None)
+            self.metrics.event_id_evictions += 1
+
+    def _evict_oldest_completed_locked(self) -> None:
+        completed = [
+            (entry.expires_at, index, event_id)
+            for index, (event_id, entry) in enumerate(self.entries.items())
+            if entry.completed
+        ]
+        if not completed:
+            return
+        _expires_at, _index, event_id = min(completed)
+        self.entries.pop(event_id, None)
+        self.metrics.event_id_evictions += 1
 
 
 class _AfterEofJsonResponse(web.Response):
@@ -329,6 +496,7 @@ def create_app(
     app[PYTHON_IDENTITY_KEY] = str(python_identity)
     app[SHUTDOWN_CALLBACK_KEY] = shutdown_callback
     app[METRICS_KEY] = SidecarMetrics()
+    app[EVENT_ID_FENCE_KEY] = EventIdFence(app[METRICS_KEY])
     app[NOOP_MODE_KEY] = bool(noop_mode)
     app[EVENT_AUTH_REQUIRED_KEY] = bool(event_auth_required)
     if event_auth_required:
@@ -366,6 +534,7 @@ def create_app(
         )
     app[MESSAGE_LOCKS_KEY] = {}
     app[MESSAGE_LOCK_USERS_KEY] = {}
+    app[RUNTIME_INTERACTION_RESERVATIONS_KEY] = {}
     app[FLUSH_CONTROLLERS_KEY] = {}
     app[CARD_ANIMATION_TASKS_KEY] = {}
     app[NATIVE_HANDOFF_STORE_KEY] = (
@@ -445,6 +614,7 @@ def create_app(
     app.on_cleanup.append(_stop_native_handoff_repairs)
     app.on_cleanup.append(_stop_runtime_cleanup)
     app.on_cleanup.append(_stop_runtime_integrity_monitor)
+    app.on_cleanup.append(_clear_runtime_interaction_admissions)
     return app
 
 
@@ -461,6 +631,15 @@ async def _stop_runtime_cleanup(app: web.Application) -> None:
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task
+
+
+async def _clear_runtime_interaction_admissions(app: web.Application) -> None:
+    for session in tuple(app[SESSIONS_KEY].values()):
+        interaction = session.active_interaction
+        if interaction is not None:
+            interaction.runtime_admission = None
+            interaction.runtime_turn_id = ""
+    app[RUNTIME_INTERACTION_RESERVATIONS_KEY].clear()
 
 
 async def _start_runtime_integrity_monitor(app: web.Application) -> None:
@@ -793,6 +972,117 @@ async def _authenticate_sensitive_request(
     return None
 
 
+def _runtime_admission_fingerprint(descriptor: dict[str, Any]) -> str:
+    try:
+        body = json.dumps(
+            descriptor,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return ""
+    return hashlib.sha256(b"hfc-sidecar-runtime-admission-v1\0" + body).hexdigest()
+
+
+async def _resolve_runtime_interaction_callback(
+    app: web.Application,
+    descriptor: dict[str, Any],
+    choice: str,
+) -> bool:
+    secret = app.get(OPERATIONS_TRANSPORT_ROOT_KEY)
+    if type(secret) is not bytes or len(secret) != 32:
+        return False
+    if (
+        type(descriptor) is not dict
+        or set(descriptor)
+        != {
+            "protocol",
+            "runtime_id",
+            "resolve_url",
+            "interaction_key",
+            "token",
+            "expires_at",
+        }
+        or type(choice) is not str
+        or not choice.strip()
+    ):
+        return False
+    expires_at = descriptor.get("expires_at")
+    if type(expires_at) not in (int, float) or time.time() >= expires_at:
+        return False
+    body_value = {
+        "protocol": descriptor["protocol"],
+        "runtime_id": descriptor["runtime_id"],
+        "interaction_key": descriptor["interaction_key"],
+        "token": descriptor["token"],
+        "choice": choice,
+        "expires_at": expires_at,
+    }
+    try:
+        body = json.dumps(
+            body_value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        headers.update(
+            sign_runtime_interaction_request(
+                secret,
+                RUNTIME_INTERACTION_PATH,
+                body,
+            )
+        )
+        timeout = ClientTimeout(total=RUNTIME_INTERACTION_CALLBACK_TIMEOUT_SECONDS)
+        async with ClientSession(
+            trust_env=False,
+            timeout=timeout,
+            auto_decompress=False,
+        ) as client:
+            async with client.post(
+                descriptor["resolve_url"],
+                data=body,
+                headers=headers,
+                allow_redirects=False,
+            ) as response:
+                if response.status != 200:
+                    return False
+                lengths = response.headers.getall("Content-Length", [])
+                if len(lengths) > 1:
+                    return False
+                if lengths:
+                    try:
+                        declared = int(lengths[0])
+                    except (TypeError, ValueError):
+                        return False
+                    if not 0 <= declared <= MAX_RUNTIME_INTERACTION_RESPONSE_BYTES:
+                        return False
+                raw = await response.content.read(
+                    MAX_RUNTIME_INTERACTION_RESPONSE_BYTES + 1
+                )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+    if len(raw) > MAX_RUNTIME_INTERACTION_RESPONSE_BYTES or time.time() >= expires_at:
+        return False
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    return (
+        type(result) is dict
+        and all(type(key) is str for key in result)
+        and set(result) == {"ok", "status"}
+        and result["ok"] is True
+        and type(result["status"]) is str
+        and result["status"] == "resolved"
+    )
+
+
 def _parse_form_action_name(payload: dict[str, Any]) -> tuple[str, str] | None:
     """Identify a clarify form submit from the button name.
 
@@ -954,6 +1244,7 @@ async def _interaction_action(
     expired_card: dict[str, Any] | None = None
     expired_interaction = None
     expiry_sequence = -1
+    runtime_callback: dict[str, Any] | None = None
     async with lock:
         current_session = request.app[SESSIONS_KEY].get(session_key)
         current_interaction = (
@@ -970,6 +1261,11 @@ async def _interaction_action(
             return web.json_response(
                 {"ok": False, "error": "interaction not found"},
                 status=404,
+            )
+        if session_key in request.app[RUNTIME_INTERACTION_RESERVATIONS_KEY]:
+            return web.json_response(
+                {"ok": False, "error": "interaction delivery pending"},
+                status=409,
             )
         expired_at = time.time()
         if current_interaction.expire(expired_at):
@@ -995,9 +1291,109 @@ async def _interaction_action(
                 {"ok": False, "error": "interaction already completed"},
                 status=409,
             )
+        elif current_interaction.runtime_admission is not None:
+            expected_profile_id = (
+                session_key.split(":", 1)[0] if ":" in session_key else "default"
+            )
+            if _extract_callback_profile_id(payload) != expected_profile_id:
+                return web.json_response(
+                    {"ok": False, "error": "interaction not found"},
+                    status=404,
+                )
+            descriptor = dict(current_interaction.runtime_admission)
+            runtime_callback = {
+                "session_key": session_key,
+                "session": current_session,
+                "interaction": current_interaction,
+                "interaction_id": interaction_id,
+                "callback_token": token,
+                "chat_id": callback_chat_id,
+                "profile_id": expected_profile_id,
+                "fingerprint": _runtime_admission_fingerprint(descriptor),
+                "descriptor": descriptor,
+                "choice": choice,
+                "turn_id": current_interaction.runtime_turn_id,
+            }
+            response = None
+            post_lock_task = None
         else:
             event = replace(
                 event,
+                sequence=current_session.last_sequence + 1,
+                created_at=time.time(),
+            )
+            response, post_lock_task = await _apply_event_locked(request, event)
+    if runtime_callback is not None:
+        try:
+            resolved = await _resolve_runtime_interaction_callback(
+                request.app,
+                runtime_callback["descriptor"],
+                runtime_callback["choice"],
+            )
+        except asyncio.CancelledError:
+            raise
+        if not resolved:
+            async with lock:
+                current_session = request.app[SESSIONS_KEY].get(session_key)
+                current_interaction = (
+                    current_session.active_interaction
+                    if current_session is runtime_callback["session"]
+                    else None
+                )
+                if current_interaction is runtime_callback["interaction"]:
+                    _expire_runtime_admission_locked(
+                        request.app,
+                        session_key,
+                        current_session,
+                        current_interaction,
+                        now=time.time(),
+                    )
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "interaction resolution unavailable",
+                    "retryable": True,
+                },
+                status=503,
+            )
+        async with lock:
+            current_session = request.app[SESSIONS_KEY].get(session_key)
+            current_interaction = (
+                current_session.active_interaction
+                if current_session is runtime_callback["session"]
+                else None
+            )
+            changed = bool(
+                current_interaction is not runtime_callback["interaction"]
+                or current_interaction is None
+                or current_interaction.interaction_id != interaction_id
+                or current_interaction.callback_token != token
+                or current_session.chat_id != callback_chat_id
+                or current_interaction.status != "pending"
+                or current_interaction.runtime_admission is None
+                or _runtime_admission_fingerprint(
+                    dict(current_interaction.runtime_admission)
+                )
+                != runtime_callback["fingerprint"]
+            )
+            if changed:
+                runtime_callback["interaction"].runtime_admission = None
+                return web.json_response(
+                    {"ok": False, "error": "interaction changed"}, status=409
+                )
+            if _expire_runtime_admission_locked(
+                request.app,
+                session_key,
+                current_session,
+                current_interaction,
+                now=time.time(),
+            ):
+                return web.json_response(
+                    {"ok": False, "error": "interaction changed"}, status=409
+                )
+            event = replace(
+                event,
+                turn_id=runtime_callback["turn_id"],
                 sequence=current_session.last_sequence + 1,
                 created_at=time.time(),
             )
@@ -3050,15 +3446,99 @@ async def _events(request: web.Request) -> web.Response:
         metrics.events_rejected += 1
         return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
+    fence_claim: EventIdFenceClaim | None = None
+    fence = request.app[EVENT_ID_FENCE_KEY]
+    if event.event_id:
+        try:
+            fingerprint = _event_id_fingerprint(event)
+        except (TypeError, ValueError):
+            metrics.events_rejected += 1
+            return web.json_response(
+                {"ok": False, "error": "event payload is not canonicalizable"},
+                status=400,
+            )
+        fence_claim = await fence.claim(event.event_id, fingerprint)
+        if fence_claim.kind == "conflict":
+            return web.json_response(
+                {"ok": False, "error": "event_id payload conflict"},
+                status=409,
+            )
+        if fence_claim.kind == "replay":
+            assert fence_claim.entry is not None
+            return fence.replay_response(fence_claim.entry)
+        if fence_claim.kind == "wait":
+            assert fence_claim.entry is not None
+            waited = await fence.wait(fence_claim.entry)
+            if waited is None:
+                return web.json_response(
+                    {"ok": False, "error": "event_id owner pending"},
+                    status=503,
+                )
+            status, response_payload = waited
+            return web.json_response(response_payload, status=status)
+        if fence_claim.kind == "full":
+            return web.json_response(
+                {"ok": False, "error": "event_id fence unavailable"},
+                status=503,
+            )
+        assert fence_claim.kind == "owner" and fence_claim.entry is not None
+
     metrics.events_received += 1
     message_locks: Dict[str, asyncio.Lock] = request.app[MESSAGE_LOCKS_KEY]
     lock_users: Dict[str, int] = request.app[MESSAGE_LOCK_USERS_KEY]
     lock_key = _session_key(event)
     lock = message_locks.setdefault(lock_key, asyncio.Lock())
     lock_users[lock_key] = lock_users.get(lock_key, 0) + 1
+    response_finalized = False
+    cancelled_after_runtime_delivery = False
     try:
         async with lock:
             response, post_lock_task = await _apply_event_locked(request, event)
+        if isinstance(post_lock_task, RuntimeInteractionDeliveryReservation):
+            completion_task = asyncio.create_task(
+                _complete_runtime_interaction_delivery(request, post_lock_task)
+            )
+            try:
+                response = await asyncio.shield(completion_task)
+            except asyncio.CancelledError:
+                response = await completion_task
+                cancelled_after_runtime_delivery = True
+            post_lock_task = None
+        if fence_claim is not None:
+            response_payload = _json_response_payload(response)
+            if (
+                _event_has_runtime_admission(event)
+                and not _is_exact_runtime_admission_response_payload(
+                    response.status, response_payload
+                )
+            ):
+                finalize_task = asyncio.create_task(
+                    fence.abandon(event.event_id, fence_claim.entry)
+                )
+            else:
+                finalize_task = asyncio.create_task(
+                    fence.finalize(
+                        event.event_id,
+                        fence_claim.entry,
+                        response.status,
+                        response_payload,
+                    )
+                )
+            try:
+                await asyncio.shield(finalize_task)
+            except asyncio.CancelledError:
+                await finalize_task
+                response_finalized = True
+                raise
+            response_finalized = True
+        if cancelled_after_runtime_delivery:
+            raise asyncio.CancelledError
+    except BaseException:
+        if fence_claim is not None and not response_finalized:
+            await asyncio.shield(
+                fence.abandon(event.event_id, fence_claim.entry)
+            )
+        raise
     finally:
         remaining_users = lock_users.get(lock_key, 1) - 1
         if remaining_users > 0:
@@ -3071,6 +3551,72 @@ async def _events(request: web.Request) -> web.Response:
     if _event_is_terminal(event) and post_lock_task is None:
         cleanup_runtime_state(request.app, time.time())
     return response
+
+
+def _event_has_runtime_admission(event: SidecarEvent) -> bool:
+    return (
+        event.event == "interaction.requested"
+        and type(event.data) is dict
+        and "_hfc_runtime_admission" in event.data
+    )
+
+
+def _is_exact_runtime_admission_response_payload(
+    status: int, payload: object
+) -> bool:
+    if (
+        status != 200
+        or type(payload) is not dict
+        or not all(type(key) is str for key in payload)
+        or set(payload) != {"ok", "applied", "delivery", "runtime_admission"}
+        or payload["ok"] is not True
+        or payload["applied"] is not True
+        or payload["runtime_admission"] is not True
+    ):
+        return False
+    delivery = payload["delivery"]
+    return (
+        type(delivery) is dict
+        and all(type(key) is str for key in delivery)
+        and set(delivery) == {"outcome"}
+        and type(delivery["outcome"]) is str
+        and delivery["outcome"] == "delivered"
+    )
+
+
+def _event_id_fingerprint(event: SidecarEvent) -> str:
+    canonical = {
+        "schema_version": event.schema_version,
+        "event": event.event,
+        "turn_id": event.canonical_turn_id,
+        "conversation_id": event.conversation_id,
+        "message_id": event.message_id,
+        "chat_id": event.chat_id,
+        "thread_id": event.thread_id,
+        "sequence": event.sequence,
+        "created_at": event.created_at,
+        "producer": event.producer,
+        "phase": event.phase,
+        "data": event.data,
+    }
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _json_response_payload(response: web.Response) -> dict[str, object]:
+    body = response.body
+    if not isinstance(body, bytes):
+        raise ValueError("event response body is not JSON")
+    payload = json.loads(body.decode(response.charset or "utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("event response body is not an object")
+    return copy.deepcopy(payload)
 
 
 def _normalize_hfc_command(value: Any) -> str:
@@ -3914,6 +4460,10 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
     _record_attachment_diagnostics(request.app, event)
     incoming_event = event
     session_key = _resolve_session_key(request.app, incoming_event)
+    if session_key in request.app[RUNTIME_INTERACTION_RESERVATIONS_KEY]:
+        return web.json_response(
+            {"ok": False, "error": "interaction delivery pending"}, status=409
+        ), None
     session = sessions.get(session_key)
     if session is not None:
         event = _event_for_session(incoming_event, session)
@@ -4488,10 +5038,18 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             if applied:
                 response_payload["delivery"] = _delivery_payload(delivery)
             if event.event == "interaction.requested":
-                response_payload["interaction_mode"] = _interaction_mode_for_session_key(
-                    request.app,
-                    session_key,
-                )
+                if _session_has_runtime_admission(session):
+                    response_payload = {
+                        "ok": True,
+                        "applied": True,
+                        "delivery": {"outcome": "delivered"},
+                        "runtime_admission": True,
+                    }
+                else:
+                    response_payload["interaction_mode"] = _interaction_mode_for_session_key(
+                        request.app,
+                        session_key,
+                    )
             return web.json_response(response_payload), None
         metrics.events_ignored += 1
         return web.json_response({"ok": True, "applied": False}), None
@@ -4613,6 +5171,43 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             or session.reply_to_message_id
             or None
         )
+        if _session_has_runtime_admission(session):
+            if rollback_session_snapshot is None or interaction is None:
+                metrics.events_rejected += 1
+                return web.json_response(
+                    {"ok": False, "error": "interaction admission unavailable"},
+                    status=503,
+                ), None
+            descriptor = dict(interaction.runtime_admission)
+            fingerprint = _runtime_admission_fingerprint(descriptor)
+            if not fingerprint:
+                _restore_session_snapshot(session, rollback_session_snapshot)
+                metrics.events_rejected += 1
+                return web.json_response(
+                    {"ok": False, "error": "interaction admission unavailable"},
+                    status=503,
+                ), None
+            owner = object()
+            reservation = RuntimeInteractionDeliveryReservation(
+                owner=owner,
+                session_key=session_key,
+                session=session,
+                interaction=interaction,
+                admission_fingerprint=fingerprint,
+                sequence=event.sequence,
+                rollback_session=rollback_session_snapshot,
+                card=copy.deepcopy(render_result.card),
+                chat_id=event.chat_id,
+                bot_id=bot_id,
+                thread_id=_thread_id_for_event(incoming_event),
+                reply_to_message_id=reply_to_message_id,
+                predecessor_message_id=feishu_message_id,
+                delivery_key=f"{session_key}:interaction:{interaction_id}",
+            )
+            request.app[RUNTIME_INTERACTION_RESERVATIONS_KEY][session_key] = reservation
+            return web.json_response(
+                {"ok": False, "error": "interaction delivery pending"}, status=503
+            ), reservation
         delivery = await _send_card(
             request,
             event.chat_id,
@@ -4659,6 +5254,15 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             bot_id=bot_id,
         )
         metrics.events_applied += 1
+        if _session_has_runtime_admission(session):
+            return web.json_response(
+                {
+                    "ok": True,
+                    "applied": True,
+                    "delivery": {"outcome": "delivered"},
+                    "runtime_admission": True,
+                }
+            ), None
         return web.json_response(
             {
                 "ok": True,
@@ -4763,6 +5367,18 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                     handoff_identity,
                     handoff_record,
                 )
+            if (
+                updated
+                and is_terminal
+                and event.event == "message.completed"
+                and render_result.disposition == "card"
+            ):
+                await _maybe_send_completion_notify(
+                    request.app,
+                    session_key,
+                    latest_session,
+                    event,
+                )
             return updated
 
         if is_terminal:
@@ -4814,11 +5430,79 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
     ):
         response_payload["delivery"] = {"outcome": "accepted"}
     if event.event == "interaction.requested":
+        if _session_has_runtime_admission(session):
+            return web.json_response(
+                {
+                    "ok": True,
+                    "applied": True,
+                    "delivery": {"outcome": "delivered"},
+                    "runtime_admission": True,
+                }
+            ), post_lock_task
         response_payload["interaction_mode"] = _interaction_mode_for_session_key(
             request.app,
             _session_key(event),
         )
     return web.json_response(response_payload), post_lock_task
+
+
+async def _maybe_send_completion_notify(
+    app: web.Application,
+    session_key: str,
+    session: CardSession,
+    event: SidecarEvent,
+) -> None:
+    card_config = app[SESSION_CARD_CONFIGS_KEY].get(session_key, {})
+    notify_config = (
+        card_config.get("completion_notify")
+        if type(card_config) is dict
+        else None
+    )
+    if (
+        type(notify_config) is not dict
+        or notify_config.get("enabled") is not True
+        or session.status != "completed"
+        or session.delivery_kind != "chat"
+        or session.completion_notify_state != "idle"
+        or re.fullmatch(r"ou_[A-Za-z0-9_-]{1,128}", session.sender_open_id)
+        is None
+    ):
+        return
+    client = _client_for_bot(app, app[MESSAGE_BOT_IDS_KEY].get(session_key))
+    send_text = getattr(client, "send_text_message", None)
+    if not callable(send_text):
+        return
+
+    session.completion_notify_state = "sending"
+    duration_text = _format_duration(session.duration) if session.duration > 0 else ""
+    suffix = f"（用时 {duration_text}）" if duration_text else ""
+    text = (
+        f'<at user_id="{session.sender_open_id}"></at> '
+        f"✅ 任务已完成{suffix}"
+    )
+    try:
+        await send_text(
+            session.chat_id,
+            text,
+            thread_id=_thread_id_for_event(event) or None,
+            reply_to_message_id=session.reply_to_message_id or None,
+        )
+    except asyncio.CancelledError:
+        session.completion_notify_state = "idle"
+        raise
+    except Exception as exc:
+        session.completion_notify_state = "idle"
+        logger.warning(
+            "completion notify send failed: %s",
+            exc.__class__.__name__,
+        )
+        return
+    session.completion_notify_state = "sent"
+    logger.info(
+        "completion notify sent (sender_hash=%s session_hash=%s)",
+        _diagnostic_id_hash(session.sender_open_id, domain="completion-sender"),
+        _diagnostic_id_hash(session_key, domain="completion-session"),
+    )
 
 
 def _post_terminal_cleanup(
@@ -4887,12 +5571,7 @@ async def _finalize_interaction_predecessor(
         animation_task.cancel()
         await asyncio.gather(animation_task, return_exceptions=True)
 
-    predecessor_interaction = predecessor_snapshot.active_interaction
-    if (
-        predecessor_interaction is not None
-        and predecessor_interaction.status == "pending"
-    ):
-        predecessor_snapshot.active_interaction = None
+    predecessor_snapshot.active_interaction = None
     predecessor_snapshot.latest_tool_preview = ""
     predecessor_snapshot.runtime_phase_text = ""
     predecessor_snapshot.display_status = "completed"
@@ -4919,6 +5598,129 @@ async def _finalize_interaction_predecessor(
         predecessor_message_id,
         card,
         bot_id,
+    )
+
+
+async def _complete_runtime_interaction_delivery(
+    request: web.Request,
+    reservation: RuntimeInteractionDeliveryReservation,
+) -> web.Response:
+    app = request.app
+    metrics: SidecarMetrics = app[METRICS_KEY]
+    delivery = await _send_card(
+        request,
+        reservation.chat_id,
+        copy.deepcopy(reservation.card),
+        reservation.bot_id,
+        thread_id=reservation.thread_id,
+        reply_to_message_id=reservation.reply_to_message_id,
+        delivery_key=reservation.delivery_key,
+        delivery_kind="interaction",
+    )
+
+    lock = app[MESSAGE_LOCKS_KEY].setdefault(
+        reservation.session_key, asyncio.Lock()
+    )
+    animation_task: asyncio.Task[None] | None = None
+    committed = False
+    async with lock:
+        reservations = app[RUNTIME_INTERACTION_RESERVATIONS_KEY]
+        current_reservation = reservations.get(reservation.session_key)
+        current_session = app[SESSIONS_KEY].get(reservation.session_key)
+        current_interaction = (
+            current_session.active_interaction
+            if current_session is reservation.session
+            else None
+        )
+        current_fingerprint = (
+            _runtime_admission_fingerprint(
+                dict(current_interaction.runtime_admission)
+            )
+            if current_interaction is reservation.interaction
+            and current_interaction.runtime_admission is not None
+            else ""
+        )
+        still_owner = bool(
+            current_reservation is reservation
+            and current_session is reservation.session
+            and current_interaction is reservation.interaction
+            and current_interaction.status == "pending"
+            and current_fingerprint == reservation.admission_fingerprint
+            and current_session.last_sequence == reservation.sequence
+        )
+        if not delivery.delivered:
+            if still_owner:
+                _restore_session_snapshot(
+                    reservation.session, reservation.rollback_session
+                )
+            elif (
+                current_interaction is reservation.interaction
+                and current_fingerprint == reservation.admission_fingerprint
+            ):
+                current_interaction.runtime_admission = None
+            if reservations.get(reservation.session_key) is reservation:
+                reservations.pop(reservation.session_key, None)
+            metrics.events_rejected += 1
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "feishu interaction send failed",
+                    "delivery": _delivery_payload(delivery),
+                },
+                status=502,
+            )
+        if not still_owner:
+            if (
+                current_interaction is reservation.interaction
+                and current_fingerprint == reservation.admission_fingerprint
+            ):
+                current_interaction.runtime_admission = None
+            if reservations.get(reservation.session_key) is reservation:
+                reservations.pop(reservation.session_key, None)
+            metrics.events_rejected += 1
+            return web.json_response(
+                {"ok": False, "error": "interaction delivery state changed"},
+                status=409,
+            )
+
+        promoted_message_id = str(delivery.message_id)
+        animation_task = app[CARD_ANIMATION_TASKS_KEY].pop(
+            reservation.session_key, None
+        )
+        app[FEISHU_MESSAGE_IDS_KEY][reservation.session_key] = promoted_message_id
+        _store_interaction_result(app, reservation.session)
+        reservations.pop(reservation.session_key, None)
+        committed = True
+
+    if committed:
+        try:
+            await _finalize_interaction_predecessor(
+                app,
+                session_key=reservation.session_key,
+                predecessor_message_id=reservation.predecessor_message_id,
+                bot_id=reservation.bot_id,
+                predecessor_snapshot=reservation.rollback_session,
+                animation_task=animation_task,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("interaction predecessor finalization failed")
+        _ensure_card_animation(
+            app,
+            session_key=reservation.session_key,
+            session=reservation.session,
+            feishu_message_id=str(delivery.message_id),
+            bot_id=reservation.bot_id,
+        )
+        metrics.events_applied += 1
+    return web.json_response(
+        {
+            "ok": True,
+            "applied": True,
+            "delivery": {"outcome": "delivered"},
+            "runtime_admission": True,
+        }
     )
 
 
@@ -5042,6 +5844,35 @@ def _mark_interaction_expired_locked(
         StatusConfig.from_mapping(card_config.get("status"))
     )
     _store_interaction_result(app, session)
+
+
+def _expire_runtime_admission_locked(
+    app: web.Application,
+    session_key: str,
+    session: CardSession,
+    interaction: Any,
+    *,
+    now: float,
+) -> bool:
+    if interaction.status != "pending" or interaction.runtime_admission is None:
+        return False
+    descriptor = dict(interaction.runtime_admission)
+    expires_at = descriptor.get("expires_at")
+    descriptor_expired = bool(
+        type(expires_at) in (int, float) and now >= expires_at
+    )
+    if not descriptor_expired and not interaction.is_expired(now):
+        return False
+    interaction.status = "failed"
+    interaction.error = "交互已过期"
+    interaction.runtime_admission = None
+    _mark_interaction_expired_locked(
+        app,
+        session_key,
+        session,
+        now=now,
+    )
+    return True
 
 
 def _expired_interaction_response(card: dict[str, Any]) -> web.Response:
@@ -5290,6 +6121,15 @@ def _skip_native_text_fallback_interaction(
     if fallback_policy != "native_text":
         return False
     return _interaction_mode_for_session_key(app, _session_key(event)) == "text"
+
+
+def _session_has_runtime_admission(session: CardSession | None) -> bool:
+    interaction = session.active_interaction if session is not None else None
+    return bool(
+        interaction is not None
+        and interaction.status == "pending"
+        and interaction.runtime_admission is not None
+    )
 
 
 def _is_independent_notice_event(event: SidecarEvent) -> bool:

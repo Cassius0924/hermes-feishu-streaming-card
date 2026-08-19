@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.3.0 — 2026-08-19
+
+See also: [docs/release-notes-v4.3.0.md](docs/release-notes-v4.3.0.md)
+
+### Added
+- A source-proven Hermes Agent `v2026.8.3` Hybrid integration combines verified native Plugin hooks with 17 exact patch groups across seven targets. Capability selection binds fixed source hashes/call sites and real PluginManager subprocess evidence rather than trusting a version string.
+- Signed runtime bootstrap, event-id single-flight replay fences, direct original-pending-handle interaction callbacks, terminal ownership, profile/status routing, and distinct subagent timelines keep the sidecar as the only Feishu card owner.
+- `manifest_version: 3` binds Hermes home, venv/runtime identity, plugin entrypoint, official config preimage, source backups, and transaction phase. Install is idempotent, incomplete phases are repairable, and restore/uninstall recover config and sources byte-for-byte.
+- Issue #212: `enable` / `disable` manage a real linger-verified systemd user service with SHA-256-bound unit ownership and safe transient-service migration.
+- PR #213 completed-interaction hover context and PR #220 opt-in completion notifications are incorporated with stricter identity and delivery boundaries; CodeQL action updates from PRs #218/#219 are aligned.
+
+### Fixed
+- Issues #210/#211: predecessor-card terminal statistics and consecutive clarify selected-option context remain attached to the correct interaction.
+- Issue #214: fixed Hermes `2026.8.3` installations can activate the verified Hybrid card path instead of silently remaining native-only.
+- Issue #215: verified Hermes upgrades can restore old ownership and re-probe through `--accept-hermes-upgrade`; drift still refuses automation.
+- Issue #217: approval uses one UI owner and exact turn/tool-call/pending-handle correlation, preventing duplicate authorization cards and ineffective choices.
+- Issue #221: stable tool callbacks are anchored after Hermes core's final callback assignment, so tool entries reach terminal state.
+- Issue #222 / PR #223 goal: transient `interaction.select` forwards use bounded retry without replaying canonical success, conflicts, or unknown outcomes.
+- Stale cross-boot or confirmed reused-PID sidecar records self-heal without killing or adopting unknown processes.
+
+### Safety
+- Fixed-tag install, patch detection/removal, runtime callbacks, event replay, native handoff, interaction expiry, and persistent-service ownership all use closed schemas and fail closed on malformed, spoofed, ambiguous, or drifting evidence.
+- Issue #216 remains a platform-delivery boundary: when Feishu sends no `card.action.trigger`, HFC cannot infer a missing click and does not claim a local fix.
+- PR #203 remains excluded because it changes only archived `legacy/`; V4.3.0 does not restore dual runtime ownership.
+- Real fixed-tag installer acceptance passed install/idempotence/restore with 17 groups, seven targets, compile checks, Git-clean source recovery, exact config SHA-256, and evidence cleanup. Focused installer gate: `340 passed, 5 skipped`; persistent process/CLI gate: `302 passed`.
+- Local candidate gate: full pytest `3227 passed, 6 skipped in 378.84s`; sdist/wheel build; fresh Python 3.12 wheel-only `site-packages` provenance; exactly one Hermes plugin entrypoint; 24 provenance slices; main CLI and `enable/disable --help` exit 0.
+
 ## V4.2.12 — 2026-08-11
 
 See also: [docs/release-notes-v4.2.12.md](docs/release-notes-v4.2.12.md)

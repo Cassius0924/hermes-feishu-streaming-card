@@ -110,6 +110,18 @@ New installs write `integrity.mode: safe`; an old config without the section loa
 
 `service.manager: auto` selects an available `systemd-user` manager or falls back to `detached`; it never silently enters `systemd-system` or invokes sudo. `systemd-system` is an explicit Linux-only transient-unit opt-in. Docker stays an ordinary container process with `detached`. See [V4.1 safety controls and troubleshooting](wiki/v4.1-safety-controls.md) for the full boundary.
 
+V4.3.0 also provides explicit boot persistence without changing the transient default used by `start`. A Linux user or administrator first confirms linger, then creates the real ownership-protected user unit:
+
+```bash
+loginctl enable-linger "$USER"
+hermes-feishu-card enable \
+  --config ~/.hermes_feishu_card/config.yaml \
+  --hermes-dir ~/.hermes/hermes-agent \
+  --yes
+```
+
+`enable` safely stops an existing verified transient/detached sidecar, writes a mode-`0600` unit and private SHA-256 manifest, runs `systemctl --user enable --now`, and verifies package/Python identity through `/health`. Missing linger, an unknown same-name unit, unit/manifest drift, failed shutdown, or an uninstalled Hermes integration refuses the operation. Use `hermes-feishu-card disable` to remove it; do not delete the unit or ownership manifest manually.
+
 ## V4.0.0 Live Dual-Stream Cards
 
 - The running Header title keeps the user-configured card name (`Hermes Agent` by default), while the subtitle derives concise searching, reading, editing, browsing, or terminal action summaries from the tool name and Hermes `progress_callback.preview`.
@@ -500,14 +512,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.2.12`.
+The Compose example defaults `HFC_VERSION` to `v4.3.0`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.12
+export HFC_VERSION=v4.3.0
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -750,6 +762,7 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.3.0](release-notes-v4.3.0.en.md) | 2026-08-19 | Hermes v2026.8.3 Hybrid capability proof and V3 installer, single-owner runtime interactions, fixed-tag restore, linger-backed systemd persistence, and local candidate fixes across Issues #210–#223 |
 | [v4.2.12](release-notes-v4.2.12.en.md) | 2026-08-11 | Capability-aware approval cards with server-side choice validation, plus a stable zero-tool reasoning timeline |
 | [v4.2.11](release-notes-v4.2.11.en.md) | 2026-08-10 | Issue #202 freezes superseded interaction cards as “moved to the interaction card” history snapshots while preserving content, tool history, and fail-open PATCH behavior |
 | [v4.2.10](release-notes-v4.2.10.en.md) | 2026-08-10 | Non-loopback sidecar HMAC, absolute interaction expiry and late-callback rejection, plus cross-platform CI, CodeQL, Dependabot, and immutable Action pins |

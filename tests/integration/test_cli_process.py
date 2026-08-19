@@ -129,7 +129,7 @@ def test_status_reports_stopped_when_sidecar_is_not_running(tmp_path):
     assert "status: stopped" in result.stdout
 
 
-def test_stop_rejects_pidfile_without_matching_health_token(tmp_path):
+def test_stop_recovers_legacy_pidfile_reused_by_non_hfc_process(tmp_path):
     config = write_config(tmp_path, free_port())
     env = process_env(tmp_path)
     pidfile_path(tmp_path).parent.mkdir(mode=0o700)
@@ -144,8 +144,14 @@ def test_stop_rejects_pidfile_without_matching_health_token(tmp_path):
 
         result = run_cli("stop", "--config", str(config), env=env)
 
-        assert result.returncode != 0
-        assert "pidfile identity mismatch" in result.stderr
+        if sys.platform.startswith("linux"):
+            assert result.returncode == 0
+            assert "stop: not running" in result.stdout
+            assert not pidfile_path(tmp_path).exists()
+        else:
+            assert result.returncode != 0
+            assert "pidfile identity mismatch" in result.stderr
+            assert pidfile_path(tmp_path).exists()
         assert sleeper.poll() is None
     finally:
         sleeper.terminate()

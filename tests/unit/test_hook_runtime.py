@@ -1,8 +1,10 @@
 import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import json
 import inspect
+from http.client import RemoteDisconnected
 import math
 import re
 import sys
@@ -33,6 +35,1054 @@ def _operation_token(operation_id="operation-1"):
         separators=(",", ":"),
     ).encode("utf-8")
     return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=") + ".signature"
+
+
+class _ThinBridgeRuntime:
+    def __init__(self):
+        self.calls = []
+        self.terminal_records = []
+
+    def bind_ingress_from_values(self, *values):
+        self.calls.append(("ingress", values))
+        return True
+
+    def submit_patch_delta(self, *values):
+        self.calls.append(("delta", values))
+        return True
+
+    def submit_patch_status_notice(self, turn_id, *, notice_kind, notice_id):
+        self.calls.append(("status", (turn_id, notice_kind, notice_id)))
+        return True
+
+    def register_patch_interaction(self, *values):
+        self.calls.append(("register", values))
+        return True
+
+    def resolve_patch_interaction(self, *values):
+        self.calls.append(("resolve", values))
+        return True
+
+    def claim_patch_interaction(self, *values):
+        self.calls.append(("claim", values))
+        return "selected"
+
+    def admit_patch_interaction(self, *values):
+        self.calls.append(("admit", values))
+        return True
+
+    def take_terminal_record(self, turn_id):
+        self.calls.append(("terminal", (turn_id,)))
+        if not self.terminal_records:
+            return None
+        return self.terminal_records.pop(0)
+
+
+class StringSubclass(str):
+    pass
+
+
+@pytest.fixture
+def thin_runtime(monkeypatch):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    return runtime
+
+
+def _thin_bridge_locals(**overrides):
+    values = {
+        "_hfc_authorized": True,
+        "platform": "feishu",
+        "turn_id": "turn-1",
+    }
+    values.update(overrides)
+    return values
+
+
+def _thin_ingress_locals(**overrides):
+    values = _thin_bridge_locals(
+        profile_id="default",
+        profile_source="fallback_default",
+        session_id="session-1",
+        gateway_session_key="gateway-session-1",
+        generation="generation-1",
+        chat_id="oc_1",
+        incoming_message_id="om_1",
+        reply_to_message_id="om_1",
+        thread_id="",
+    )
+    values.update(overrides)
+    return values
+
+
+def _thin_interaction_data(**overrides):
+    values = {
+        "session_identity": "gateway-session-1",
+        "interaction_id": "approval-1",
+        "fingerprint": "a" * 64,
+    }
+    values.update(overrides)
+    return values
+
+
+def _thin_interaction_ui():
+    return {
+        "prompt": "允许继续吗？",
+        "description": "仅用于本次操作",
+        "allow_custom_input": False,
+        "multi_select": False,
+        "timeout_seconds": 20.0,
+        "options": [
+            {"label": "允许一次", "value": "once", "style": "primary"},
+            {"label": "拒绝", "value": "deny", "style": "danger"},
+        ],
+    }
+
+
+def test_thin_carrier_nested_scope_restores_outer_and_rejects_stale_token():
+    outer = hook_runtime.publish_canonical_turn_id("turn-outer")
+    assert hook_runtime.consume_canonical_turn_id() == "turn-outer"
+    inner = hook_runtime.publish_canonical_turn_id("turn-inner")
+    assert hook_runtime.consume_canonical_turn_id() == "turn-inner"
+
+    assert hook_runtime.clear_canonical_turn_id(outer) is False
+    assert hook_runtime.consume_canonical_turn_id() == "turn-inner"
+    assert hook_runtime.clear_canonical_turn_id(inner) is True
+    assert hook_runtime.consume_canonical_turn_id() == "turn-outer"
+    assert hook_runtime.clear_canonical_turn_id(inner) is False
+    assert hook_runtime.clear_canonical_turn_id(outer) is True
+    assert hook_runtime.consume_canonical_turn_id() is None
+
+
+def test_thin_carrier_explicit_value_is_a_hard_fence_against_mismatch():
+    token = hook_runtime.publish_canonical_turn_id("turn-carried")
+    try:
+        assert hook_runtime.consume_canonical_turn_id("turn-carried") == "turn-carried"
+        assert hook_runtime.consume_canonical_turn_id("turn-other") is None
+        assert hook_runtime.consume_canonical_turn_id(StringSubclass("turn-carried")) is None
+    finally:
+        assert hook_runtime.clear_canonical_turn_id(token) is True
+
+
+def test_thin_carrier_does_not_leak_across_threads_or_allow_cross_thread_clear():
+    token = hook_runtime.publish_canonical_turn_id("turn-main")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        observed, cleared = executor.submit(
+            lambda: (
+                hook_runtime.consume_canonical_turn_id(),
+                hook_runtime.clear_canonical_turn_id(token),
+            )
+        ).result()
+
+    assert observed is None
+    assert cleared is False
+    assert hook_runtime.consume_canonical_turn_id() == "turn-main"
+    assert hook_runtime.clear_canonical_turn_id(token) is True
+
+
+def test_thin_carrier_does_not_leak_to_a_different_asyncio_task():
+    async def scenario():
+        token = hook_runtime.publish_canonical_turn_id("turn-parent-task")
+
+        async def child_task():
+            return (
+                hook_runtime.consume_canonical_turn_id(),
+                hook_runtime.clear_canonical_turn_id(token),
+            )
+
+        observed, cleared = await asyncio.create_task(child_task())
+        assert observed is None
+        assert cleared is False
+        assert hook_runtime.consume_canonical_turn_id() == "turn-parent-task"
+        assert hook_runtime.clear_canonical_turn_id(token) is True
+
+    asyncio.run(scenario())
+
+
+def test_thin_carrier_clear_invalidates_previously_copied_context():
+    token = hook_runtime.publish_canonical_turn_id("turn-copied")
+    copied = copy_context()
+
+    assert copied.run(hook_runtime.consume_canonical_turn_id) == "turn-copied"
+    assert hook_runtime.clear_canonical_turn_id(token) is True
+    assert hook_runtime.consume_canonical_turn_id() is None
+    assert copied.run(hook_runtime.consume_canonical_turn_id) is None
+    assert copied.run(hook_runtime.clear_canonical_turn_id, token) is False
+
+
+def test_thin_carrier_token_cannot_be_reused_after_a_new_frame_is_published():
+    first = hook_runtime.publish_canonical_turn_id("turn-first")
+    assert hook_runtime.clear_canonical_turn_id(first) is True
+    second = hook_runtime.publish_canonical_turn_id("turn-second")
+    try:
+        assert hook_runtime.clear_canonical_turn_id(first) is False
+        assert hook_runtime.consume_canonical_turn_id() == "turn-second"
+    finally:
+        assert hook_runtime.clear_canonical_turn_id(second) is True
+
+
+def test_thin_carrier_concurrent_copied_context_clear_succeeds_exactly_once(
+    monkeypatch,
+):
+    shared_owner = object()
+    monkeypatch.setattr(hook_runtime, "_canonical_turn_owner", lambda: shared_owner)
+    token = hook_runtime.publish_canonical_turn_id("turn-concurrent")
+    copied_contexts = [copy_context(), copy_context()]
+    barrier = threading.Barrier(2)
+
+    def clear_in_context(context):
+        return context.run(
+            lambda: (barrier.wait(), hook_runtime.clear_canonical_turn_id(token))[1]
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(clear_in_context, copied_contexts))
+
+    assert results.count(True) == 1
+    assert results.count(False) == 1
+    assert hook_runtime.consume_canonical_turn_id() is None
+    assert all(
+        context.run(hook_runtime.consume_canonical_turn_id) is None
+        for context in copied_contexts
+    )
+    assert hook_runtime.clear_canonical_turn_id(token) is False
+
+
+def test_thin_carrier_reset_revokes_active_token_in_previously_copied_context():
+    token = hook_runtime.publish_canonical_turn_id("turn-before-reset")
+    copied = copy_context()
+
+    assert copied.run(hook_runtime.consume_canonical_turn_id) == "turn-before-reset"
+    hook_runtime.reset_runtime_state()
+
+    assert hook_runtime.consume_canonical_turn_id() is None
+    assert copied.run(hook_runtime.consume_canonical_turn_id) is None
+    assert copied.run(hook_runtime.clear_canonical_turn_id, token) is False
+
+
+def test_thin_carrier_token_is_opaque_and_cannot_be_mutated_or_reactivated():
+    token = hook_runtime.publish_canonical_turn_id("turn-opaque")
+    copied = copy_context()
+
+    for name, value in (
+        ("active", True),
+        ("owner", object()),
+        ("nonce", object()),
+        ("_identity", object()),
+    ):
+        with pytest.raises((AttributeError, TypeError)):
+            setattr(token, name, value)
+
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(token, "_identity", object())
+
+    assert hook_runtime.clear_canonical_turn_id(token) is True
+    for name in ("active", "owner", "nonce"):
+        assert not hasattr(token, name)
+    with pytest.raises((AttributeError, TypeError)):
+        token.active = True
+    assert copied.run(hook_runtime.consume_canonical_turn_id) is None
+    assert copied.run(hook_runtime.clear_canonical_turn_id, token) is False
+
+
+def test_thin_carrier_token_rejects_layout_compatible_class_rebinding():
+    class LayoutCompatibleAlias:
+        __slots__ = ()
+
+    token = hook_runtime.publish_canonical_turn_id("turn-class-rebind")
+
+    with pytest.raises((AttributeError, TypeError)):
+        token.__class__ = LayoutCompatibleAlias
+    assert type(token) is object
+    assert hook_runtime.consume_canonical_turn_id() == "turn-class-rebind"
+    assert hook_runtime.clear_canonical_turn_id(token) is True
+    assert hook_runtime._canonical_turn_registry_size() == 0
+
+
+def test_thin_carrier_foreign_object_alias_and_subclass_tokens_fail_closed():
+    OpaqueAlias = object
+
+    class ForeignToken:
+        __slots__ = ()
+
+    class ForeignTokenSubclass(ForeignToken):
+        __slots__ = ()
+
+    token = hook_runtime.publish_canonical_turn_id("turn-real-token")
+    foreign_tokens = (
+        object(),
+        OpaqueAlias(),
+        ForeignToken(),
+        ForeignTokenSubclass(),
+        [],
+    )
+
+    for foreign_token in foreign_tokens:
+        assert hook_runtime.clear_canonical_turn_id(foreign_token) is False
+        assert hook_runtime.consume_canonical_turn_id() == "turn-real-token"
+        assert hook_runtime._canonical_turn_registry_size() == 1
+
+    assert hook_runtime.clear_canonical_turn_id(token) is True
+    assert hook_runtime._canonical_turn_registry_size() == 0
+
+
+def test_thin_carrier_registry_is_bounded_and_full_publish_fails_closed(monkeypatch):
+    monkeypatch.setattr(hook_runtime, "_CANONICAL_TURN_REGISTRY_LIMIT", 3)
+    tokens = [
+        hook_runtime.publish_canonical_turn_id(f"turn-{index}")
+        for index in range(3)
+    ]
+    assert all(token is not None for token in tokens)
+    assert hook_runtime._canonical_turn_registry_size() == 3
+
+    assert hook_runtime.publish_canonical_turn_id("turn-overflow") is None
+    assert hook_runtime._canonical_turn_registry_size() == 3
+    assert hook_runtime.consume_canonical_turn_id() == "turn-2"
+
+    for token in reversed(tokens):
+        assert hook_runtime.clear_canonical_turn_id(token) is True
+    assert hook_runtime._canonical_turn_registry_size() == 0
+
+
+def test_thin_carrier_clear_and_reset_remove_registry_entries_without_reuse():
+    first = hook_runtime.publish_canonical_turn_id("turn-first-cleanup")
+    assert hook_runtime._canonical_turn_registry_size() == 1
+    assert hook_runtime.clear_canonical_turn_id(first) is True
+    assert hook_runtime._canonical_turn_registry_size() == 0
+    assert hook_runtime.clear_canonical_turn_id(first) is False
+
+    second = hook_runtime.publish_canonical_turn_id("turn-second-cleanup")
+    copied = copy_context()
+    assert hook_runtime._canonical_turn_registry_size() == 1
+    hook_runtime.reset_runtime_state()
+    assert hook_runtime._canonical_turn_registry_size() == 0
+    assert hook_runtime.clear_canonical_turn_id(second) is False
+    assert copied.run(hook_runtime.consume_canonical_turn_id) is None
+
+
+def test_thin_carrier_copied_context_restores_live_outer_after_inner_clear():
+    outer = hook_runtime.publish_canonical_turn_id("turn-outer-copied")
+    inner = hook_runtime.publish_canonical_turn_id("turn-inner-copied")
+    copied = copy_context()
+
+    assert hook_runtime.clear_canonical_turn_id(inner) is True
+    assert hook_runtime.consume_canonical_turn_id() == "turn-outer-copied"
+    assert copied.run(hook_runtime.consume_canonical_turn_id) == "turn-outer-copied"
+    assert copied.run(hook_runtime.clear_canonical_turn_id, outer) is True
+
+    assert hook_runtime.consume_canonical_turn_id() is None
+    assert copied.run(hook_runtime.consume_canonical_turn_id) is None
+    assert hook_runtime._canonical_turn_registry_size() == 0
+
+
+def test_thin_carrier_nested_reset_revokes_every_frame_in_copied_contexts():
+    outer = hook_runtime.publish_canonical_turn_id("turn-outer-reset")
+    inner = hook_runtime.publish_canonical_turn_id("turn-inner-reset")
+    copied_contexts = [copy_context(), copy_context()]
+
+    hook_runtime.reset_runtime_state()
+
+    assert hook_runtime._canonical_turn_registry_size() == 0
+    assert hook_runtime.consume_canonical_turn_id() is None
+    for copied in copied_contexts:
+        assert copied.run(hook_runtime.consume_canonical_turn_id) is None
+        assert copied.run(hook_runtime.clear_canonical_turn_id, inner) is False
+        assert copied.run(hook_runtime.clear_canonical_turn_id, outer) is False
+
+    replacement = hook_runtime.publish_canonical_turn_id("turn-after-reset")
+    assert hook_runtime.consume_canonical_turn_id() == "turn-after-reset"
+    assert hook_runtime.clear_canonical_turn_id(replacement) is True
+    assert hook_runtime._canonical_turn_registry_size() == 0
+
+
+@pytest.mark.parametrize(
+    "local_vars",
+    [
+        _thin_ingress_locals(_hfc_authorized=False),
+        _thin_ingress_locals(_hfc_authorized=1),
+        _thin_ingress_locals(platform="telegram"),
+        _thin_ingress_locals(platform=StringSubclass("feishu")),
+        _thin_ingress_locals(turn_id="turn-other"),
+        _thin_ingress_locals(profile_id=StringSubclass("default")),
+        _thin_ingress_locals(profile_source=StringSubclass("fallback_default")),
+        _thin_ingress_locals(session_id=StringSubclass("session-1")),
+        _thin_ingress_locals(gateway_session_key=""),
+        _thin_ingress_locals(generation=""),
+        _thin_ingress_locals(chat_id=""),
+        _thin_ingress_locals(incoming_message_id=""),
+        _thin_ingress_locals(reply_to_message_id=""),
+        type("DictSubclass", (dict,), {})(_thin_ingress_locals()),
+    ],
+)
+def test_thin_ingress_requires_auth_feishu_exact_values_and_matching_carrier(
+    monkeypatch, local_vars
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.bind_ingress_from_hermes_locals(local_vars) is False
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+    assert runtime.calls == []
+
+
+def test_thin_ingress_delegates_only_values_and_does_not_allocate_legacy_sequence(
+    monkeypatch,
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        hook_runtime,
+        "_next_sequence",
+        lambda *_args, **_kwargs: pytest.fail("legacy sequence must not be used"),
+    )
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.bind_ingress_from_hermes_locals(_thin_ingress_locals()) is True
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+    assert runtime.calls == [
+        (
+            "ingress",
+            (
+                "default",
+                "fallback_default",
+                "session-1",
+                "gateway-session-1",
+                "generation-1",
+                "oc_1",
+                "om_1",
+                "om_1",
+                "",
+            ),
+        )
+    ]
+
+
+def test_thin_ingress_before_turn_publish_accepts_authenticated_exact_values(monkeypatch):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+
+    assert hook_runtime.bind_ingress_from_hermes_locals(
+        _thin_ingress_locals(turn_id=None)
+    ) is True
+    assert runtime.calls[0][0] == "ingress"
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "profile_source", "extra"),
+    (
+        ("work", "env", {}),
+        ("work", "locals", {}),
+        (
+            "work",
+            "hermes_home",
+            {"hermes_home_membership_verified": True},
+        ),
+        ("default", "fallback_default", {}),
+    ),
+)
+def test_thin_ingress_accepts_only_exact_trusted_profile_evidence(
+    monkeypatch, profile_id, profile_source, extra
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+
+    assert hook_runtime.bind_ingress_from_hermes_locals(
+        _thin_ingress_locals(
+            turn_id=None,
+            profile_id=profile_id,
+            profile_source=profile_source,
+            **extra,
+        )
+    ) is True
+    assert runtime.calls[0][1][:2] == (profile_id, profile_source)
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "profile_source", "extra"),
+    (
+        ("work", "hermes_home", {}),
+        ("work", "hermes_home", {"hermes_home_membership_verified": 1}),
+        ("work", "sanitized_env", {}),
+        ("work", "sanitized_locals", {}),
+        ("work", "sanitized_hermes_home", {}),
+        ("work", "fallback_default", {}),
+        ("bad/profile", "env", {}),
+    ),
+)
+def test_thin_ingress_rejects_unverified_sanitized_or_mismatched_profile_evidence(
+    monkeypatch, profile_id, profile_source, extra
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+
+    assert hook_runtime.bind_ingress_from_hermes_locals(
+        _thin_ingress_locals(
+            turn_id=None,
+            profile_id=profile_id,
+            profile_source=profile_source,
+            **extra,
+        )
+    ) is False
+    assert runtime.calls == []
+
+
+def test_thin_delta_delegates_exact_active_turn_without_legacy_emit_or_queue(monkeypatch):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        hook_runtime,
+        "emit_from_hermes_locals_threadsafe",
+        lambda *_args, **_kwargs: pytest.fail("legacy emit must not be used"),
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "_queue_coalesced_delta",
+        lambda *_args, **_kwargs: pytest.fail("legacy delta queue must not be used"),
+    )
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.emit_delta_from_hermes_locals_threadsafe(
+            _thin_bridge_locals(text="delta"), "answer.delta"
+        ) is True
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+    assert runtime.calls == [("delta", ("turn-1", "answer.delta", "delta", "delta"))]
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Compacting context",
+        "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
+    ),
+)
+def test_thin_status_classifies_exact_compaction_and_delegates_only_fixed_tags(
+    monkeypatch, message
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    for forbidden_name in (
+        "_policy_identity",
+        "_next_sequence",
+        "emit_from_hermes_locals",
+        "emit_from_hermes_locals_threadsafe",
+        "emit_from_hermes_locals_async",
+        "build_event",
+        "handle_status_from_hermes_locals",
+        "_hfc_send_system_notice_card",
+        "_hfc_classify_system_notice",
+        "handle_platform_notice_from_hermes",
+    ):
+        monkeypatch.setattr(
+            hook_runtime,
+            forbidden_name,
+            lambda *_args, _name=forbidden_name, **_kwargs: pytest.fail(
+                f"forbidden Legacy/native owner: {_name}"
+            ),
+            raising=False,
+        )
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.submit_status_notice_from_hermes_locals(
+            _thin_bridge_locals(), event_type="context", message=message
+        ) is True
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+
+    assert runtime.calls == [
+        (
+            "status",
+            (
+                "turn-1",
+                "context-compaction",
+                "context-compaction:active",
+            ),
+        )
+    ]
+    assert message not in repr(runtime.calls)
+
+
+@pytest.mark.parametrize(
+    ("local_vars", "event_type", "message"),
+    (
+        (_thin_bridge_locals(_hfc_authorized=False), "context", "Compacting context"),
+        (_thin_bridge_locals(_hfc_authorized=1), "context", "Compacting context"),
+        (_thin_bridge_locals(platform="telegram"), "context", "Compacting context"),
+        (_thin_bridge_locals(platform=StringSubclass("feishu")), "context", "Compacting context"),
+        (_thin_bridge_locals(turn_id="turn-other"), "context", "Compacting context"),
+        (_thin_bridge_locals(), StringSubclass("context"), "Compacting context"),
+        (_thin_bridge_locals(), "tool", "Compacting context"),
+        (_thin_bridge_locals(), "provider", "Compacting context"),
+        (_thin_bridge_locals(), "context", StringSubclass("Compacting context")),
+        (_thin_bridge_locals(), "context", ""),
+        (_thin_bridge_locals(), "context", "COMPACTING CONTEXT"),
+        (_thin_bridge_locals(), "context", "Compacting   context"),
+        (_thin_bridge_locals(), "context", "Compacting context completed"),
+        (_thin_bridge_locals(), "context", "Compacting context failed"),
+        (_thin_bridge_locals(), "context", "tool: Compacting context"),
+        (_thin_bridge_locals(), "context", "provider status: Compacting context"),
+        (_thin_bridge_locals(), "context", "x" * 1025),
+        (
+            type("DictSubclass", (dict,), {})(_thin_bridge_locals()),
+            "context",
+            "Compacting context",
+        ),
+    ),
+)
+def test_thin_status_rejects_mismatch_nonordinary_unknown_and_terminal_text(
+    monkeypatch, local_vars, event_type, message
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.submit_status_notice_from_hermes_locals(
+            local_vars, event_type=event_type, message=message
+        ) is False
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+    assert runtime.calls == []
+
+
+def test_thin_status_requires_literal_true_and_fails_open_on_runtime_exception(
+    monkeypatch,
+):
+    class EqualitySpoof:
+        def __eq__(self, other):
+            return other is True
+
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        runtime.submit_patch_status_notice = lambda *_args, **_kwargs: EqualitySpoof()
+        assert hook_runtime.submit_status_notice_from_hermes_locals(
+            _thin_bridge_locals(),
+            event_type="context",
+            message="Compacting context",
+        ) is False
+        runtime.submit_patch_status_notice = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("canary")
+        )
+        assert hook_runtime.submit_status_notice_from_hermes_locals(
+            _thin_bridge_locals(),
+            event_type="context",
+            message="Compacting context",
+        ) is False
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+
+
+@pytest.mark.parametrize(
+    ("local_vars", "event_name"),
+    [
+        (_thin_bridge_locals(_hfc_authorized=False, text="x"), "answer.delta"),
+        (_thin_bridge_locals(_hfc_authorized=1, text="x"), "answer.delta"),
+        (_thin_bridge_locals(platform="telegram", text="x"), "answer.delta"),
+        (_thin_bridge_locals(platform=StringSubclass("feishu"), text="x"), "answer.delta"),
+        (_thin_bridge_locals(turn_id="turn-other", text="x"), "answer.delta"),
+        (_thin_bridge_locals(text=StringSubclass("x")), "answer.delta"),
+        (_thin_bridge_locals(text=""), "answer.delta"),
+        (_thin_bridge_locals(text="x"), StringSubclass("answer.delta")),
+        (_thin_bridge_locals(text="x"), "message.completed"),
+        (type("DictSubclass", (dict,), {})(_thin_bridge_locals(text="x")), "answer.delta"),
+    ],
+)
+def test_thin_delta_rejects_unauthorized_mismatched_or_nonordinary_input(
+    monkeypatch, local_vars, event_name
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.emit_delta_from_hermes_locals_threadsafe(
+            local_vars, event_name
+        ) is False
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+    assert runtime.calls == []
+
+
+@pytest.mark.parametrize("operation", ("register", "resolve", "claim"))
+@pytest.mark.parametrize("kind", ("approval", "clarify", "slash"))
+def test_thin_interaction_facades_delegate_exact_original_pending_handle(
+    monkeypatch, operation, kind
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    pending_handle = object()
+    data = _thin_interaction_data(interaction_id=f"{kind}-1")
+    function = getattr(hook_runtime, f"{operation}_pending_interaction_from_hermes_locals")
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        if operation == "resolve":
+            result = function(
+                _thin_bridge_locals(), kind, data, pending_handle, "selected"
+            )
+        else:
+            result = function(_thin_bridge_locals(), kind, data, pending_handle)
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+    if operation == "claim":
+        assert result == "selected"
+        assert type(result) is str
+    else:
+        assert result is True
+    expected = (
+        kind,
+        "gateway-session-1",
+        "turn-1",
+        f"{kind}-1",
+        "a" * 64,
+        pending_handle,
+    )
+    if operation == "resolve":
+        expected = (*expected, "selected")
+    assert runtime.calls == [(operation, expected)]
+
+
+def test_thin_interaction_admission_delegates_exact_handle_resolver_and_detached_ui(monkeypatch):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    pending_handle = object()
+    resolver = lambda choice: choice == "once"
+    ui_data = _thin_interaction_ui()
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.admit_pending_interaction_from_hermes_locals(
+            _thin_bridge_locals(),
+            "approval",
+            _thin_interaction_data(),
+            pending_handle,
+            resolver,
+            ui_data,
+        ) is True
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+
+    operation, values = runtime.calls[0]
+    assert operation == "admit"
+    assert values[:6] == (
+        "approval",
+        "gateway-session-1",
+        "turn-1",
+        "approval-1",
+        "a" * 64,
+        pending_handle,
+    )
+    assert values[6] is resolver
+    assert values[7] == ui_data
+    assert values[7] is not ui_data
+
+
+@pytest.mark.parametrize(
+    ("resolver", "ui_data"),
+    (
+        (None, _thin_interaction_ui()),
+        (lambda choice: True, type("DictSubclass", (dict,), {})(_thin_interaction_ui())),
+        (lambda choice: True, dict(_thin_interaction_ui(), extra=False)),
+        (lambda choice: True, dict(_thin_interaction_ui(), prompt=StringSubclass("x"))),
+    ),
+)
+def test_thin_interaction_admission_rejects_inexact_resolver_or_ui(
+    monkeypatch, resolver, ui_data
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.admit_pending_interaction_from_hermes_locals(
+            _thin_bridge_locals(),
+            "approval",
+            _thin_interaction_data(),
+            object(),
+            resolver,
+            ui_data,
+        ) is False
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+    assert runtime.calls == []
+
+
+@pytest.mark.parametrize(
+    ("local_vars", "kind", "data", "pending_handle"),
+    [
+        (_thin_bridge_locals(_hfc_authorized=False), "approval", _thin_interaction_data(), object()),
+        (_thin_bridge_locals(platform="telegram"), "approval", _thin_interaction_data(), object()),
+        (_thin_bridge_locals(turn_id="turn-other"), "approval", _thin_interaction_data(), object()),
+        (_thin_bridge_locals(), StringSubclass("approval"), _thin_interaction_data(), object()),
+        (_thin_bridge_locals(), "other", _thin_interaction_data(), object()),
+        (_thin_bridge_locals(), "approval", dict(_thin_interaction_data(), extra="x"), object()),
+        (_thin_bridge_locals(), "approval", _thin_interaction_data(fingerprint="A" * 64), object()),
+        (_thin_bridge_locals(), "approval", _thin_interaction_data(), None),
+        (_thin_bridge_locals(), "approval", type("DictSubclass", (dict,), {})(_thin_interaction_data()), object()),
+    ],
+)
+def test_thin_interaction_facades_reject_mismatch_spoof_and_inexact_metadata(
+    monkeypatch, local_vars, kind, data, pending_handle
+):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        for function in (
+            hook_runtime.register_pending_interaction_from_hermes_locals,
+        ):
+            assert function(local_vars, kind, data, pending_handle) is False
+        assert hook_runtime.claim_pending_interaction_from_hermes_locals(
+            local_vars, kind, data, pending_handle
+        ) is None
+        assert hook_runtime.resolve_pending_interaction_from_hermes_locals(
+            local_vars, kind, data, pending_handle, "selected"
+        ) is False
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+    assert runtime.calls == []
+
+
+def test_thin_interaction_facades_do_not_create_wait_queue_future_or_ui(monkeypatch):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    for forbidden_name in (
+        "wait_for_approval_choice_from_hermes_locals",
+        "wait_for_clarify_response_from_hermes_locals",
+        "wait_for_slash_confirm_from_hermes_locals",
+        "emit_from_hermes_locals",
+    ):
+        monkeypatch.setattr(
+            hook_runtime,
+            forbidden_name,
+            lambda *_args, _name=forbidden_name, **_kwargs: pytest.fail(
+                f"forbidden secondary owner: {_name}"
+            ),
+            raising=False,
+        )
+    pending_handle = object()
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.register_pending_interaction_from_hermes_locals(
+            _thin_bridge_locals(),
+            "approval",
+            _thin_interaction_data(),
+            pending_handle,
+        ) is True
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+
+
+def test_thin_bridges_fail_closed_when_runtime_or_exact_method_is_unavailable(monkeypatch):
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: None)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.bind_ingress_from_hermes_locals(_thin_ingress_locals()) is False
+        assert hook_runtime.emit_delta_from_hermes_locals_threadsafe(
+            _thin_bridge_locals(text="x"), "answer.delta"
+        ) is False
+        assert hook_runtime.register_pending_interaction_from_hermes_locals(
+            _thin_bridge_locals(), "approval", _thin_interaction_data(), object()
+        ) is False
+        assert hook_runtime.consume_terminal_record_from_hermes_locals(
+            _thin_bridge_locals()
+        ) is None
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: object())
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.emit_delta_from_hermes_locals_threadsafe(
+            _thin_bridge_locals(text="x"), "answer.delta"
+        ) is False
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+
+
+def test_thin_terminal_consumes_once_and_returns_detached_safe_record(monkeypatch):
+    runtime = _ThinBridgeRuntime()
+    source_payload = {
+        "event": "message.completed",
+        "turn_id": "turn-1",
+        "data": {"answer": "done"},
+    }
+    source_response = {"ok": True, "applied": True}
+    runtime.terminal_records.append(
+        {"payload": source_payload, "response": source_response}
+    )
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        record = hook_runtime.consume_terminal_record_from_hermes_locals(
+            _thin_bridge_locals()
+        )
+        assert record.terminal_kind == "completed"
+        assert record.payload == source_payload
+        assert record.response == source_response
+        record.payload["data"]["answer"] = "changed"
+        assert source_payload["data"]["answer"] == "done"
+        assert hook_runtime.consume_terminal_record_from_hermes_locals(
+            _thin_bridge_locals()
+        ) is None
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+
+
+def test_thin_terminal_failed_record_stays_failed_and_has_no_suppression_flag(monkeypatch):
+    runtime = _ThinBridgeRuntime()
+    runtime.terminal_records.append(
+        {
+            "payload": {
+                "event": "message.failed",
+                "turn_id": "turn-1",
+                "data": {"error": "safe"},
+            },
+            "response": {"ok": True, "applied": True},
+        }
+    )
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        record = hook_runtime.consume_terminal_record_from_hermes_locals(
+            _thin_bridge_locals()
+        )
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+    assert record.terminal_kind == "failed"
+    assert not hasattr(record, "suppress_native")
+    assert not hasattr(record, "applied")
+
+
+def test_hybrid_terminal_record_applies_only_exact_completed_delivery(monkeypatch):
+    payload = {
+        "event": "message.completed",
+        "turn_id": "turn-1",
+        "data": {"answer": "done"},
+    }
+    assert hook_runtime.apply_hybrid_terminal_record(
+        hook_runtime.HybridTerminalRecord(
+            terminal_kind="completed",
+            payload=payload,
+            response={"ok": True, "applied": True},
+        )
+    ) == "card"
+    assert hook_runtime.apply_hybrid_terminal_record(
+        hook_runtime.HybridTerminalRecord(
+            terminal_kind="failed",
+            payload={**payload, "event": "message.failed"},
+            response={"ok": True, "applied": True},
+        )
+    ) is None
+    assert hook_runtime.apply_hybrid_terminal_record(
+        hook_runtime.HybridTerminalRecord(
+            terminal_kind="completed",
+            payload=payload,
+            response={"ok": 1, "applied": True},
+        )
+    ) is None
+
+
+def test_hybrid_terminal_record_installs_only_validated_native_descriptor(monkeypatch):
+    payload = {
+        "event": "message.completed",
+        "turn_id": "turn-1",
+        "data": {"answer": "done"},
+    }
+    plain = {"ok": True, "applied": False, "disposition": "native"}
+    assert hook_runtime.apply_hybrid_terminal_record(
+        hook_runtime.HybridTerminalRecord("completed", payload, plain)
+    ) == "native"
+
+    calls = []
+    monkeypatch.setattr(
+        hook_runtime,
+        "_register_native_handoff_descriptor",
+        lambda candidate_payload, response: calls.append(
+            (candidate_payload, response)
+        )
+        or True,
+    )
+    response = {
+        **plain,
+        "native_handoff": {
+            "protocol": "hfc-native-handoff-v2",
+            "id": "a" * 32,
+            "uuid_seed": "b" * 32,
+            "expires_at": 9999999999.0,
+        },
+    }
+    assert hook_runtime.apply_hybrid_terminal_record(
+        hook_runtime.HybridTerminalRecord("completed", payload, response)
+    ) == "native"
+    assert calls == [(payload, response)]
+
+    monkeypatch.setattr(
+        hook_runtime, "_register_native_handoff_descriptor", lambda *_args: False
+    )
+    assert hook_runtime.apply_hybrid_terminal_record(
+        hook_runtime.HybridTerminalRecord("completed", payload, response)
+    ) is None
+
+
+def test_thin_facades_require_literal_true_from_runtime(monkeypatch):
+    class EqualitySpoof:
+        def __eq__(self, other):
+            return other is True
+
+    runtime = _ThinBridgeRuntime()
+    runtime.submit_patch_delta = lambda *_args: EqualitySpoof()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.emit_delta_from_hermes_locals_threadsafe(
+            _thin_bridge_locals(text="x"), "answer.delta"
+        ) is False
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+
+
+@pytest.mark.parametrize(
+    "runtime_result",
+    (True, False, None, "", StringSubclass("selected")),
+)
+def test_thin_claim_requires_exact_selected_string_result(monkeypatch, runtime_result):
+    runtime = _ThinBridgeRuntime()
+    runtime.claim_patch_interaction = lambda *_args: runtime_result
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.claim_pending_interaction_from_hermes_locals(
+            _thin_bridge_locals(),
+            "approval",
+            _thin_interaction_data(),
+            object(),
+        ) is None
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"payload": {"event": "message.completed", "turn_id": "turn-other", "data": {}}, "response": {"ok": True, "applied": True}},
+        {"payload": {"event": StringSubclass("message.completed"), "turn_id": "turn-1", "data": {}}, "response": {"ok": True, "applied": True}},
+        {"payload": {"event": "message.completed", "turn_id": "turn-1", "data": {}}, "response": dict},
+        {"payload": type("DictSubclass", (dict,), {})({"event": "message.completed", "turn_id": "turn-1", "data": {}}), "response": None},
+        {"payload": {"event": "message.completed", "turn_id": "turn-1", "data": {}}, "response": type("DictSubclass", (dict,), {})({"ok": True, "applied": True})},
+    ],
+)
+def test_thin_terminal_rejects_mismatch_and_nonordinary_records(monkeypatch, record):
+    runtime = _ThinBridgeRuntime()
+    runtime.terminal_records.append(record)
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    try:
+        assert hook_runtime.consume_terminal_record_from_hermes_locals(
+            _thin_bridge_locals()
+        ) is None
+    finally:
+        hook_runtime.clear_canonical_turn_id(token)
 
 
 @pytest.fixture(autouse=True)
@@ -5487,6 +6537,59 @@ def test_request_interaction_does_not_retry_when_sidecar_reports_not_applied(
     assert [payload["sequence"] for payload in posted] == [0]
 
 
+def test_interaction_request_uses_dedicated_five_second_delivery_timeout(
+    monkeypatch,
+):
+    observed = []
+    monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
+    monkeypatch.delenv("HERMES_FEISHU_CARD_TIMEOUT_MS", raising=False)
+
+    def fake_post(local_vars, url, payload, timeout):
+        observed.append(timeout)
+        return {"ok": True, "applied": False}
+
+    monkeypatch.setattr(hook_runtime, "_post_interaction_event", fake_post)
+
+    result = hook_runtime.request_interaction_from_hermes_locals(
+        {"chat_id": "oc_abc", "message_id": "msg_1"},
+        kind="approval",
+        interaction_id="approval-timeout",
+        prompt="允许执行吗？",
+        options=[{"label": "允许一次", "value": "once"}],
+        timeout_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    assert result is None
+    assert observed == [5.0]
+    config = hook_runtime.load_runtime_config()
+    assert hook_runtime._timeout_for_event(config, "answer.delta") == 0.8
+
+
+@pytest.mark.parametrize("event_name", ("message.started", "message.completed"))
+def test_message_lifecycle_event_carries_only_strict_feishu_sender_open_id(
+    event_name,
+):
+    local_vars = {
+        "platform": "feishu",
+        "chat_id": "oc_abc",
+        "conversation_id": "conversation-sender",
+        "message_id": f"om_{event_name.replace('.', '_')}",
+        "sender_open_id": "ou_sender-01",
+        "answer": "done",
+    }
+
+    payload = hook_runtime.build_event(event_name, local_vars)
+
+    assert payload["data"]["sender_open_id"] == "ou_sender-01"
+
+    invalid = dict(local_vars)
+    invalid["message_id"] += "_invalid"
+    invalid["sender_open_id"] = 'ou_bad"><at user_id="ou_other"'
+    invalid_payload = hook_runtime.build_event(event_name, invalid)
+    assert "sender_open_id" not in invalid_payload["data"]
+
+
 def test_post_interaction_event_does_not_retry_transport_failure(monkeypatch):
     calls = []
 
@@ -9784,6 +10887,131 @@ def test_interaction_select_forwards_to_sidecar_and_returns_card(monkeypatch):
     assert sent["operator"] == {"name": "Bailey", "open_id": "ou_user"}
     assert response.card.type == "raw"
     assert response.card.data["header"]["template"] == "green"
+
+
+def test_interaction_select_retries_fast_transient_disconnect_within_one_budget(
+    monkeypatch,
+):
+    class FakeCallBackCard:
+        def __init__(self):
+            self.type = None
+            self.data = None
+
+    class FakeP2Response:
+        def __init__(self):
+            self.card = None
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        def _on_card_action_trigger(self, data):
+            raise AssertionError("interaction.select must stay inside HFC")
+
+    DummyFeishuAdapter.__module__ = hook_runtime.__name__
+    monkeypatch.setattr(
+        hook_runtime, "P2CardActionTriggerResponse", FakeP2Response, raising=False
+    )
+    monkeypatch.setattr(hook_runtime, "CallBackCard", FakeCallBackCard, raising=False)
+    monkeypatch.setattr(
+        hook_runtime,
+        "load_runtime_config",
+        lambda: SimpleNamespace(event_url="http://127.0.0.1:8765/events"),
+    )
+    calls = []
+    sleeps = []
+
+    def fake_post(url, payload, timeout):
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise RemoteDisconnected("sidecar closed before response")
+        return {"ok": True, "card": {"header": {}, "elements": []}}
+
+    monkeypatch.setattr(hook_runtime, "_post_json_sync_response", fake_post)
+    monkeypatch.setattr(hook_runtime.time, "sleep", sleeps.append)
+
+    response = hook_runtime._hfc_on_feishu_card_action_trigger(
+        DummyFeishuAdapter(),
+        SimpleNamespace(
+            event=SimpleNamespace(
+                action=SimpleNamespace(
+                    value={
+                        "hfc_action": "interaction.select",
+                        "interaction_id": "int-retry",
+                        "choice": "approve",
+                        "choice_label": "Approve",
+                        "token": "tok-retry",
+                    }
+                ),
+                context=SimpleNamespace(open_chat_id="oc_retry"),
+                operator=SimpleNamespace(open_id="ou_user"),
+            )
+        ),
+    )
+
+    assert len(calls) == 2
+    assert calls[0] == hook_runtime.INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS
+    assert 0 < calls[1] <= hook_runtime.INTERACTION_ACTION_TOTAL_TIMEOUT_SECONDS
+    assert sleeps == [hook_runtime.INTERACTION_ACTION_RETRY_DELAY_SECONDS]
+    assert response.card.type == "raw"
+
+
+def test_interaction_select_never_retries_http_or_propagates_application_error(
+    monkeypatch,
+):
+    class FakeP2Response:
+        def __init__(self):
+            self.card = None
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        def _on_card_action_trigger(self, data):
+            raise AssertionError("interaction.select must stay inside HFC")
+
+    DummyFeishuAdapter.__module__ = hook_runtime.__name__
+    monkeypatch.setattr(
+        hook_runtime, "P2CardActionTriggerResponse", FakeP2Response, raising=False
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "load_runtime_config",
+        lambda: SimpleNamespace(event_url="http://127.0.0.1:8765/events"),
+    )
+    action = SimpleNamespace(
+        event=SimpleNamespace(
+            action=SimpleNamespace(
+                value={
+                    "hfc_action": "interaction.select",
+                    "interaction_id": "int-error",
+                    "choice": "deny",
+                    "choice_label": "Deny",
+                    "token": "tok-error",
+                }
+            ),
+            context=SimpleNamespace(open_chat_id="oc_error"),
+            operator=SimpleNamespace(open_id="ou_user"),
+        )
+    )
+
+    for exc in (
+        error.HTTPError(
+            "http://127.0.0.1:8765/card/actions", 409, "conflict", {}, None
+        ),
+        ValueError("invalid sidecar response"),
+    ):
+        calls = []
+
+        def fail_once(url, payload, timeout, *, _exc=exc):
+            calls.append(timeout)
+            raise _exc
+
+        monkeypatch.setattr(hook_runtime, "_post_json_sync_response", fail_once)
+        response = hook_runtime._hfc_on_feishu_card_action_trigger(
+            DummyFeishuAdapter(), action
+        )
+
+        assert len(calls) == 1
+        assert response.card is None
 
 
 def test_interaction_select_ignores_incomplete_action(monkeypatch):

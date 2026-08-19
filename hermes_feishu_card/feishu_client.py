@@ -276,6 +276,52 @@ class FeishuClient:
             json_body={"content": content},
         )
 
+    async def send_text_message(
+        self,
+        chat_id: str,
+        text: str,
+        thread_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+    ) -> str:
+        if not isinstance(chat_id, str) or not chat_id.strip():
+            raise ValueError("chat_id is required")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("text must be a non-empty string")
+
+        token = await self._tenant_token()
+        content = json.dumps({"text": text}, ensure_ascii=False)
+        if reply_to_message_id:
+            body = await self._request_json(
+                "POST",
+                f"/im/v1/messages/{quote(reply_to_message_id, safe='')}/reply",
+                token=token,
+                json_body={
+                    "msg_type": "text",
+                    "content": content,
+                    "reply_in_thread": bool(thread_id),
+                },
+            )
+        else:
+            body = await self._request_json(
+                "POST",
+                "/im/v1/messages",
+                token=token,
+                params={"receive_id_type": "chat_id"},
+                json_body={
+                    "receive_id": chat_id,
+                    "msg_type": "text",
+                    "content": content,
+                },
+            )
+        data = body.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("message_id"), str):
+            raise FeishuAPIError(
+                "Feishu send response missing message_id",
+                retryable=False,
+                outcome="unknown",
+            )
+        return data["message_id"]
+
     async def _tenant_token(self) -> str:
         now = time.time()
         if self._tenant_access_token and now < self._tenant_access_token_expires_at:

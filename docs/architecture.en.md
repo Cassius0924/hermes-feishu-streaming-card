@@ -16,6 +16,10 @@ Hermes Gateway
   -> policy + readiness + session + render + Feishu CardKit send/update
 ```
 
+On the fixed Hermes `v2026.8.3` source, V4.3 implements this path as Hybrid. Real `hermes_agent.plugins` lifecycle hooks drive the sidecar through signed loopback transport, while 17 exact patch groups add only the ingress, delta, interaction, terminal, cron, and exact-Base evidence missing from hook call sites. Capability selection jointly verifies fixed source hashes/slices, runtime Python, entrypoint origin, and a real PluginManager subprocess. The V3 manifest owns seven targets, the official plugin-config preimage, and venv identity in one transaction.
+
+Approval, clarify, and slash callbacks use a separate runtime interaction listener that invokes the original Hermes pending handle/future resolver directly; it creates no second wait, poll, or queue. The sidecar event-id fence retains the first canonical response, and Feishu create/PATCH plus listener POST run outside session/message locks. Only successful card terminal delivery can suppress native success text; failed and interrupted turns remain native fail-open.
+
 V4.1 domain-separates the event data plane from four control actions: `hfc-policy-v1` per-chat policy, `hfc-runtime-v1` runtime readiness, `hfc-native-handoff-recovery-v2` pending-descriptor recovery, and `hfc-native-handoff-ack-v1` post-delivery confirmation. Policy is enforced in both hook and sidecar. Runtime events prove liveness only and cannot authorize a file write. Recovery submits only one-way obligation, exact-content, delivery-plan, and target-scope hashes plus a canonical-route enum, never answer text or raw routing identifiers. ACK can run only after the Hermes ledger durably marks `delivered`. A control-plane failure must not stop Hermes Agent work, while install/recovery mutations remain fail closed.
 
 The Hermes hook-to-sidecar `/events` path is fail-open. Sidecar unavailability or event rejection must not bring down Hermes; a message not confirmed as accepted by the card path continues through Hermes' native fallback. Once the card path accepts delivery, the hook suppresses duplicate gray native text.

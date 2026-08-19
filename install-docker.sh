@@ -4,6 +4,7 @@ set -euo pipefail
 REPO="${HFC_REPO:-baileyh8/hermes-feishu-streaming-card}"
 VERSION="${HFC_VERSION:-}"
 HERMES_DIR="${HERMES_DIR:-/opt/hermes}"
+HERMES_HOME_DIR="${HERMES_HOME:-}"
 CONFIG_PATH="${HFC_CONFIG:-}"
 ENV_FILE="${HFC_ENV_FILE:-}"
 PROFILE_ID="${HERMES_FEISHU_CARD_PROFILE_ID:-}"
@@ -36,7 +37,7 @@ have() {
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --config|--env-file|--version|--profile-id|--event-url)
+      --config|--env-file|--version|--profile-id|--event-url|--hermes-home)
         [ "$#" -ge 2 ] || fail "$1 requires a value"
         case "$1" in
           --config) CONFIG_PATH="$2" ;;
@@ -44,6 +45,7 @@ parse_args() {
           --version) VERSION="$2" ;;
           --profile-id) PROFILE_ID="$2" ;;
           --event-url) EVENT_URL="$2" ;;
+          --hermes-home) HERMES_HOME_DIR="$2" ;;
         esac
         shift 2
         ;;
@@ -323,6 +325,7 @@ run_doctor() {
   "$python_bin" -m hermes_feishu_card.cli doctor \
     --config "$CONFIG_PATH" \
     --hermes-dir "$HERMES_DIR" \
+    --hermes-home "$HERMES_HOME_DIR" \
     --profile-id "$PROFILE_ID" \
     --explain
 }
@@ -333,6 +336,7 @@ run_setup() {
     local install_args=(
       -m hermes_feishu_card.cli install
       --hermes-dir "$HERMES_DIR"
+      --hermes-home "$HERMES_HOME_DIR"
       --yes
     )
     if [ "$NO_REPAIR" = "1" ]; then
@@ -345,6 +349,7 @@ run_setup() {
   local setup_args=(
     -m hermes_feishu_card.cli setup
     --hermes-dir "$HERMES_DIR"
+    --hermes-home "$HERMES_HOME_DIR"
     --config "$CONFIG_PATH"
     --env-file "$ENV_FILE"
     --profile-id "$PROFILE_ID"
@@ -373,6 +378,11 @@ main() {
   EVENT_URL="${EVENT_URL:-http://127.0.0.1:8765/events}"
   NO_REPAIR="${NO_REPAIR:-0}"
   HERMES_DIR="$(expand_path "$HERMES_DIR")"
+  if [ -n "$HERMES_HOME_DIR" ]; then
+    HERMES_HOME_DIR="$(expand_path "$HERMES_HOME_DIR")"
+  else
+    HERMES_HOME_DIR="$(dirname "$HERMES_DIR")"
+  fi
   CONFIG_PATH="$(expand_path "$CONFIG_PATH")"
   STATE_DIR="${STATE_DIR:-$(dirname "$CONFIG_PATH")/state}"
   STATE_DIR="$(expand_path "$STATE_DIR")"

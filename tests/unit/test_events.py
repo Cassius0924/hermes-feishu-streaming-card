@@ -1,4 +1,5 @@
 import pytest
+import time
 
 from hermes_feishu_card.events import EventValidationError, SidecarEvent
 
@@ -23,6 +24,73 @@ def test_parses_valid_event():
     assert event.sequence == 2
 
 
+def _runtime_admission():
+    return {
+        "protocol": "hfc-runtime-interaction-v1",
+        "runtime_id": "a" * 64,
+        "resolve_url": "http://127.0.0.1:43210/runtime/interactions/resolve",
+        "interaction_key": "b" * 64,
+        "token": "c" * 64,
+        "expires_at": time.time() + 20.0,
+    }
+
+
+def test_runtime_interaction_admission_requires_exact_closed_fresh_descriptor():
+    payload = valid_payload(event="interaction.requested", sequence=3)
+    payload.update(
+        turn_id="turn-1",
+        event_id="patch:turn-1:interaction:approval-1:3",
+        producer="patch",
+        phase="started",
+    )
+    descriptor = _runtime_admission()
+    payload["data"] = {
+        "interaction_id": "approval-1",
+        "kind": "approval",
+        "prompt": "请选择",
+        "options": [{"label": "允许", "value": "once"}],
+        "_hfc_runtime_admission": descriptor,
+    }
+
+    event = SidecarEvent.from_dict(payload)
+
+    assert event.data["_hfc_runtime_admission"] == descriptor
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda value: value.update(extra=False),
+        lambda value: value.update(protocol="future"),
+        lambda value: value.update(runtime_id="A" * 64),
+        lambda value: value.update(resolve_url="http://localhost:43210/runtime/interactions/resolve"),
+        lambda value: value.update(resolve_url="http://127.0.0.1:43210/runtime/interactions/resolve?x=1"),
+        lambda value: value.update(expires_at=time.time() - 1.0),
+        lambda value: value.update(expires_at=True),
+    ),
+)
+def test_runtime_interaction_admission_rejects_malformed_before_session_mutation(mutate):
+    payload = valid_payload(event="interaction.requested", sequence=3)
+    payload.update(
+        turn_id="turn-1",
+        event_id="patch:turn-1:interaction:approval-1:3",
+        producer="patch",
+        phase="started",
+    )
+    descriptor = _runtime_admission()
+    mutate(descriptor)
+    payload["data"] = {
+        "interaction_id": "approval-1",
+        "kind": "approval",
+        "prompt": "请选择",
+        "options": [{"label": "允许", "value": "once"}],
+        "_hfc_runtime_admission": descriptor,
+    }
+
+    with pytest.raises(EventValidationError, match="runtime admission"):
+        SidecarEvent.from_dict(payload)
+
+
 def test_parses_optional_turn_id_and_exposes_canonical_turn_id():
     payload = valid_payload(event="answer.delta", sequence=1)
     payload["data"] = {"text": "x"}
@@ -33,6 +101,109 @@ def test_parses_optional_turn_id_and_exposes_canonical_turn_id():
 
     assert event.turn_id == "om_turn"
     assert event.canonical_turn_id == "om_turn"
+
+
+def test_parses_strict_plugin_identity_and_subagent_event():
+    payload = valid_payload(event="subagent.updated", sequence=4)
+    payload.update(
+        {
+            "turn_id": " turn-1 ",
+            "event_id": " subagent:turn-1:child-1:started ",
+            "producer": " plugin ",
+            "phase": " started ",
+        }
+    )
+    payload["data"] = {
+        "child_id": "child-1",
+        "role": "research",
+        "status": "running",
+    }
+
+    event = SidecarEvent.from_dict(payload)
+
+    assert event.event_id == "subagent:turn-1:child-1:started"
+    assert event.producer == "plugin"
+    assert event.phase == "started"
+    assert event.turn_id == "turn-1"
+
+
+class _StringSubclass(str):
+    pass
+
+
+@pytest.mark.parametrize("field", ["event_id", "producer", "phase"])
+@pytest.mark.parametrize("value", [None, 1, [], {}, _StringSubclass("plugin")])
+def test_rejects_non_exact_optional_identity_strings(field, value):
+    payload = valid_payload()
+    payload[field] = value
+
+    with pytest.raises(EventValidationError, match=field):
+        SidecarEvent.from_dict(payload)
+
+
+@pytest.mark.parametrize("field", ["event_id", "producer", "phase"])
+def test_rejects_overlength_optional_identity_strings(field):
+    payload = valid_payload()
+    payload[field] = "x" * 257
+
+    with pytest.raises(EventValidationError, match=field):
+        SidecarEvent.from_dict(payload)
+
+
+def test_optional_identity_length_is_checked_after_stripping():
+    payload = valid_payload()
+    payload.update(
+        {
+            "turn_id": "turn-1",
+            "event_id": f" {'x' * 256} ",
+            "producer": " plugin ",
+            "phase": " update ",
+        }
+    )
+
+    event = SidecarEvent.from_dict(payload)
+
+    assert event.event_id == "x" * 256
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("producer", "other"), ("phase", "finished")],
+)
+def test_rejects_unknown_optional_identity_values(field, value):
+    payload = valid_payload()
+    payload[field] = value
+
+    with pytest.raises(EventValidationError, match=field):
+        SidecarEvent.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"event_id": "turn:turn-1:started"},
+        {"event_id": "turn:turn-1:started", "turn_id": "turn-1"},
+        {
+            "event_id": "turn:turn-1:started",
+            "turn_id": "turn-1",
+            "producer": "plugin",
+        },
+        {"producer": "plugin"},
+        {"phase": "started"},
+    ],
+)
+def test_rejects_partial_plugin_identity(identity):
+    payload = valid_payload()
+    payload.update(identity)
+
+    with pytest.raises(EventValidationError, match="identity"):
+        SidecarEvent.from_dict(payload)
+
+
+def test_legacy_event_identity_defaults_remain_empty():
+    event = SidecarEvent.from_dict(valid_payload())
+
+    assert (event.event_id, event.producer, event.phase) == ("", "", "")
 
 
 def test_missing_turn_id_falls_back_to_message_id():

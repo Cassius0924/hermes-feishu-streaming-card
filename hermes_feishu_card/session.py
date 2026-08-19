@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from copy import deepcopy
 import json
 import math
 import re
 import secrets
 import time
 from typing import Any, Dict, Optional
+from types import MappingProxyType
 from urllib.parse import urlsplit
 
 from .card_timeline import CardTimeline, TERMINAL_TOOL_STATUSES
@@ -27,10 +29,19 @@ _RUNTIME_ACTION_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _SEARCH_SITE_OPERATOR_RE = re.compile(r"(?:^|\s)site:\S+", re.IGNORECASE)
+_FEISHU_OPEN_ID_RE = re.compile(r"ou_[A-Za-z0-9_-]{1,128}")
 
 
 def _now() -> float:
     return time.time()
+
+
+def _exact_feishu_open_id(value: object) -> str:
+    return (
+        value
+        if type(value) is str and _FEISHU_OPEN_ID_RE.fullmatch(value)
+        else ""
+    )
 
 
 @dataclass
@@ -66,6 +77,23 @@ class InteractionState:
     choice_label: str = ""
     user_name: str = ""
     error: str = ""
+    runtime_admission: object | None = field(default=None, repr=False)
+    runtime_turn_id: str = field(default="", repr=False)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "InteractionState":
+        admission = self.runtime_admission
+        copied_admission = (
+            MappingProxyType(deepcopy(dict(admission), memo))
+            if admission is not None
+            else None
+        )
+        copied = replace(
+            self,
+            options=deepcopy(self.options, memo),
+            runtime_admission=copied_admission,
+        )
+        memo[id(self)] = copied
+        return copied
 
     @property
     def expires_at(self) -> float:
@@ -81,6 +109,7 @@ class InteractionState:
             return False
         self.status = "failed"
         self.error = "交互已过期"
+        self.runtime_admission = None
         return True
 
 
@@ -110,6 +139,8 @@ class CardSession:
     active_interaction: InteractionState | None = None
     delivery_kind: str = "chat"
     reply_to_message_id: str = ""
+    sender_open_id: str = ""
+    completion_notify_state: str = "idle"
     notice_title: str = ""
     notice_level: str = "info"
     terminal_disposition: str = ""
@@ -260,17 +291,59 @@ class CardSession:
             self.timeline.record_tool(tool_id, resolved_name, resolved_status, resolved_detail)
             if previous_tool is None or previous_is_terminal:
                 self._tool_call_count += 1
+        elif event.event == "subagent.updated":
+            child_id = event.data.get("child_id")
+            if type(child_id) is str and child_id.strip():
+                role = event.data.get("role")
+                status = event.data.get("status")
+                resolved_role = (
+                    normalize_stream_text(role).strip()[:240]
+                    if type(role) is str
+                    else ""
+                )
+                resolved_status = (
+                    status.strip().lower()[:64]
+                    if type(status) is str and status.strip()
+                    else "running"
+                )
+                detail_lines: list[str] = []
+                preview_key = (
+                    "summary_preview"
+                    if type(event.data.get("summary_preview")) is str
+                    else "goal_preview"
+                )
+                preview = event.data.get(preview_key)
+                if type(preview) is str:
+                    safe_preview = normalize_stream_text(preview).strip()[:240]
+                    if safe_preview:
+                        detail_lines.append(safe_preview)
+                duration_ms = _subagent_duration_milliseconds(
+                    event.data.get("duration_ms")
+                )
+                if duration_ms is not None:
+                    detail_lines.append(f"耗时: {_duration_milliseconds_text(duration_ms)}")
+                self.timeline.record_subagent(
+                    child_id.strip(),
+                    resolved_role,
+                    resolved_status,
+                    "\n".join(detail_lines),
+                )
         elif event.event == "message.started":
             delivery_kind = event.data.get("delivery_kind")
             if isinstance(delivery_kind, str) and delivery_kind.strip():
                 self.delivery_kind = delivery_kind.strip()
+            sender_open_id = _exact_feishu_open_id(event.data.get("sender_open_id"))
+            if sender_open_id:
+                self.sender_open_id = sender_open_id
             reply_to_message_id = event.data.get("reply_to_message_id")
             if isinstance(reply_to_message_id, str):
                 self.reply_to_message_id = reply_to_message_id
             elif event.message_id.startswith("om_"):
                 self.reply_to_message_id = event.message_id
         elif event.event == "interaction.requested":
-            self.active_interaction = _interaction_from_event_data(event.data)
+            self.active_interaction = _interaction_from_event_data(
+                event.data, runtime_turn_id=event.turn_id
+            )
         elif event.event == "interaction.completed":
             self._complete_interaction(event.data)
         elif event.event == "interaction.failed":
@@ -311,6 +384,8 @@ class CardSession:
             if not is_runtime_phase:
                 self.timeline.record_notice(notice_id, title, level, content)
         elif event.event == "message.completed":
+            if self.active_interaction is not None:
+                self.active_interaction.runtime_admission = None
             completed_answer = normalize_stream_text(str(event.data.get("answer") or ""))
             if completed_answer.strip():
                 completed_answer = self._prepare_completed_answer(completed_answer)
@@ -319,6 +394,9 @@ class CardSession:
             self.latest_tool_preview = ""
             if completed_answer.strip():
                 self.answer_text = completed_answer
+            sender_open_id = _exact_feishu_open_id(event.data.get("sender_open_id"))
+            if sender_open_id:
+                self.sender_open_id = sender_open_id
             delivery_kind = event.data.get("delivery_kind")
             if isinstance(delivery_kind, str) and delivery_kind.strip():
                 self.delivery_kind = delivery_kind.strip()
@@ -343,6 +421,8 @@ class CardSession:
                     if isinstance(attachment, dict) and isinstance(attachment.get("name"), str)
                 ]
         elif event.event == "message.failed":
+            if self.active_interaction is not None:
+                self.active_interaction.runtime_admission = None
             self._archive_current_answer_to_reasoning()
             self.timeline.complete()
             self.status = "failed"
@@ -403,6 +483,7 @@ class CardSession:
             data.get("choice_label") or self.active_interaction.choice
         ).strip()
         self.active_interaction.user_name = str(data.get("user_name") or "").strip()
+        self.active_interaction.runtime_admission = None
 
     def _fail_interaction(self, data: dict[str, Any]) -> None:
         interaction_id = str(data.get("interaction_id") or "").strip()
@@ -414,9 +495,12 @@ class CardSession:
             return
         self.active_interaction.status = "failed"
         self.active_interaction.error = str(data.get("error") or "交互请求失败").strip()
+        self.active_interaction.runtime_admission = None
 
 
-def _interaction_from_event_data(data: dict[str, Any]) -> InteractionState:
+def _interaction_from_event_data(
+    data: dict[str, Any], *, runtime_turn_id: str = ""
+) -> InteractionState:
     interaction_id = str(data.get("interaction_id") or "").strip()
     if not interaction_id:
         interaction_id = secrets.token_hex(8)
@@ -427,6 +511,12 @@ def _interaction_from_event_data(data: dict[str, Any]) -> InteractionState:
         # capability became explicit. Hermes clarify has always exposed an
         # Other/free-text path; fixed-choice interactions have not.
         allow_custom_input = kind == "clarify"
+    runtime_admission = data.get("_hfc_runtime_admission")
+    frozen_runtime_admission = (
+        MappingProxyType(deepcopy(runtime_admission))
+        if type(runtime_admission) is dict
+        else None
+    )
     return InteractionState(
         interaction_id=interaction_id,
         kind=kind,
@@ -437,6 +527,12 @@ def _interaction_from_event_data(data: dict[str, Any]) -> InteractionState:
         multi_select=bool(data.get("multi_select", False)),
         allow_custom_input=allow_custom_input,
         timeout_seconds=_safe_timeout_seconds(data.get("timeout_seconds")),
+        runtime_admission=frozen_runtime_admission,
+        runtime_turn_id=(
+            runtime_turn_id
+            if frozen_runtime_admission is not None and type(runtime_turn_id) is str
+            else ""
+        ),
     )
 
 
@@ -607,6 +703,22 @@ def _tool_duration_milliseconds(data: dict[str, Any]) -> float | None:
         if value >= 0:
             return value * 1000
     return None
+
+
+def _subagent_duration_milliseconds(value: Any) -> float | None:
+    if type(value) not in {int, float}:
+        return None
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return parsed
+
+
+def _duration_milliseconds_text(milliseconds: float) -> str:
+    if milliseconds < 1000:
+        return f"{int(round(milliseconds))} ms"
+    seconds = milliseconds / 1000.0
+    return f"{seconds:.2f}".rstrip("0").rstrip(".") + " s"
 
 
 def _notice_level(value: Any) -> str:

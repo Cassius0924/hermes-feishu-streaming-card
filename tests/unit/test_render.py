@@ -656,6 +656,7 @@ def test_render_completed_interaction_replaces_buttons_with_choice():
                 "interaction_id": "approval-1",
                 "kind": "approval",
                 "prompt": "允许执行命令吗？",
+                "description": "敏感命令详情不应保留在完成态 tooltip",
                 "options": [{"label": "允许一次", "value": "once"}],
             },
         )
@@ -681,9 +682,29 @@ def test_render_completed_interaction_replaces_buttons_with_choice():
 
     card = render_card(session)
 
-    assert not any(element.get("tag") == "button" for element in card["body"]["elements"])
+    assert not any(
+        element.get("tag") == "button" and element.get("behaviors")
+        for element in card["body"]["elements"]
+    )
     assert "已选择：允许一次" in str(card)
     assert "Bailey" in str(card)
+    hover = next(
+        element
+        for element in card["body"]["elements"]
+        if element.get("element_id") == "interaction_hover"
+    )
+    assert hover == {
+        "tag": "button",
+        "element_id": "interaction_hover",
+        "type": "text",
+        "size": "small",
+        "text": {"tag": "plain_text", "content": "已选择：允许一次 by Bailey"},
+        "hover_tips": {
+            "tag": "plain_text",
+            "content": "❓ 允许执行命令吗？\n📋 ① 允许一次",
+        },
+    }
+    assert "敏感命令详情" not in hover["hover_tips"]["content"]
 
 
 def test_render_completed_card_shows_attachment_summary():
@@ -1190,6 +1211,19 @@ def test_footer_still_static_for_failed():
     assert _render_footer(session) == "已停止"
 
 
+def test_footer_treats_explicit_completed_snapshot_as_terminal():
+    from hermes_feishu_card.render import _render_footer
+
+    session = CardSession(conversation_id="c", message_id="m", chat_id="c")
+    session.status = "running"
+    session.duration = 1.25
+
+    footer = _render_footer(session, display_status="completed")
+
+    assert "生成中" not in footer
+    assert footer.startswith("1s · ")
+
+
 def test_waiting_footer_uses_absolute_remaining_deadline(monkeypatch):
     from hermes_feishu_card import render as render_module
     from hermes_feishu_card.render import _render_footer
@@ -1558,6 +1592,93 @@ def test_render_tool_timeline_uses_compact_semantic_event_rows():
     assert '<font color="grey">　失败: exit 1</font>' in failed
     assert all(not row["content"].startswith("> ") for row in rows)
     assert timeline["border"]["corner_radius"] == "8px"
+
+
+def test_render_subagent_uses_dedicated_escaped_semantic_row():
+    from hermes_feishu_card.events import SidecarEvent
+
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    assert session.apply(
+        SidecarEvent(
+            schema_version="1",
+            event="subagent.updated",
+            conversation_id="chat-1",
+            message_id="msg-1",
+            chat_id="oc_abc",
+            platform="feishu",
+            sequence=1,
+            created_at=1.0,
+            data={
+                "child_id": "child-1",
+                "role": "研究 <Lead>",
+                "status": "running",
+                "goal_preview": "检查 <script>alert(1)</script>",
+            },
+        )
+    )
+
+    card = render_card(session, timeline_expanded=True)
+    timeline = next(
+        item
+        for item in card["body"]["elements"]
+        if item.get("element_id") == "auxiliary_timeline"
+    )
+    subagent = next(
+        item
+        for item in timeline["elements"]
+        if str(item.get("element_id", "")).startswith(
+            "auxiliary_timeline_subagententry_"
+        )
+    )
+    content = subagent["content"]
+    assert "子代理：研究 &lt;Lead&gt;" in content
+    assert "进行中" in content
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in content
+    assert "<script>" not in content
+    assert session.tool_count == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("queued", "等待中"),
+        ("completed", "已完成"),
+        ("failed", "失败"),
+        ("cancelled", "已取消"),
+        ("interrupted", "已中断"),
+    ],
+)
+def test_render_subagent_distinguishes_lifecycle_statuses(status, expected):
+    from hermes_feishu_card.card_timeline import TimelineEntry
+
+    session = CardSession("chat-1", "msg-1", "oc_abc")
+    session.timeline._entries.append(
+        TimelineEntry(
+            kind="subagent",
+            title="research",
+            status=status,
+            subagent_id="child-1",
+        )
+    )
+
+    card = render_card(session, timeline_expanded=True)
+    timeline = next(
+        item
+        for item in card["body"]["elements"]
+        if item.get("element_id") == "auxiliary_timeline"
+    )
+    subagent = next(
+        item
+        for item in timeline["elements"]
+        if str(item.get("element_id", "")).startswith(
+            "auxiliary_timeline_subagententry_"
+        )
+    )
+
+    assert expected in subagent["content"]
+    assert "子代理：research" in subagent["content"]
+    if status == "interrupted":
+        assert "进行中" not in subagent["content"]
 
 
 def test_render_tool_timeline_removes_all_duration_lines_from_detail():

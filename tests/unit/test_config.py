@@ -62,6 +62,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path):
             "max_reasoning_chars": 1200,
             "max_tool_result_chars": 600,
             "table_overflow_mode": "compact",
+            "completion_notify": {"enabled": False},
             "footer_fields": [
                 "duration",
                 "model",
@@ -295,6 +296,7 @@ card:
         "max_reasoning_chars": 1200,
         "max_tool_result_chars": 600,
         "table_overflow_mode": "compact",
+        "completion_notify": {"enabled": False},
         "footer_fields": [
             "duration",
             "model",

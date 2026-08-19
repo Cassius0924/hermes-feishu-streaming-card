@@ -15,6 +15,14 @@ Hermes Gateway
 
 Hermes 进程内的 hook 只负责提取和转发。sidecar 负责会话状态、卡片渲染、Feishu API、重试、诊断和 metrics。
 
+## V4.3 固定 tag Hybrid 流
+
+Hermes `v2026.8.3` 先由真实 PluginManager 加载 `hermes-feishu-card` entrypoint。`pre_llm_call` 把 authenticated ingress 与 canonical turn 绑定；`post_llm_call` 只暂存 answer；唯一 terminal authority 来自 exact `on_session_end`。原生 hooks 缺失的 answer/thinking delta、approval/clarify/slash round-trip、command/status、cron 与 exact Base final delivery 由 17 个 target-aware patch group 补齐。probe、render、detect、remove 和 install 全部绑定同一固定源码证据，不能只凭版本号或存在 hook 名进入 Hybrid。
+
+`/events` 对带 `event_id` 的请求先建立 single-flight owner：第一个请求完成后保存 exact status 与 JSON response；同 payload 重放相同结果，不同 payload 返回 conflict。pending owner 不因 TTL/容量驱逐，全 pending 时新 event fail-closed；completed 才进入 TTL/LRU。`subagent.updated` 使用独立 item，terminal status（含 interrupted）不能被迟到 running 重开。
+
+交互卡实际送达后，Sidecar 才保存不含 plaintext callback token 的 descriptor template。用户选择通过 domain-separated signed loopback listener 回到 PluginRuntime，按 opaque interaction key/token digest/expiry/session binding 找到原 pending entry，在 runtime lock 外直接执行原 resolver；resolver 成功后，Hermes 原 wait 被唤醒，原 claim 再一次性消费 choice。callback、Feishu create/PATCH、terminal finalize 与 cleanup 都有明确 owner/generation fence，不以第二套 wait/poll 代替 Hermes 原流程。
+
 ## V4.1 投递与完整性控制流
 
 新 turn 在任何 sequence、pending delta、session 或原生抑制发生前，通过 `hfc-policy-v1` 查询 per-chat 决策。card decision 在 turn 内固定；native decision 让 original Hermes 路径继续。sidecar 收到 `/events` 后在创建 CardSession、reply alias、动画或 Feishu client state 前再查一次。未知 profile、配置 reload 失败、proof 无效/过期/重放、timeout 或 malformed response 全部走 native fail-open。

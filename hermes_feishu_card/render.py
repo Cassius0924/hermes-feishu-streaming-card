@@ -560,8 +560,20 @@ def _render_interaction_elements(
         choice = interaction.choice_label or interaction.choice or "已完成"
         user = f" by {interaction.user_name}" if interaction.user_name else ""
         content = f"已选择：{choice}{user}"
-    else:
-        content = interaction.error or "交互请求失败"
+        original_hover = _render_interaction_original_hover(interaction, content)
+        if original_hover is not None:
+            elements.append(original_hover)
+        else:
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "element_id": "interaction_result",
+                    "content": content,
+                }
+            )
+        return elements
+
+    content = interaction.error or "交互请求失败"
     elements.append(
         {
             "tag": "markdown",
@@ -570,6 +582,49 @@ def _render_interaction_elements(
         }
     )
     return elements
+
+
+_HOVER_ORDINALS = ("①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩")
+
+
+def _render_interaction_original_hover(
+    interaction: Any,
+    content: str,
+) -> Dict[str, Any] | None:
+    lines: list[str] = []
+    question = _hover_plain_line(interaction.prompt or interaction.description)
+    if question:
+        lines.append(f"❓ {question}")
+    option_texts: list[str] = []
+    for index, option in enumerate(interaction.options or [], start=1):
+        label = _hover_plain_line(getattr(option, "label", ""))
+        if not label:
+            continue
+        ordinal = (
+            _HOVER_ORDINALS[index - 1]
+            if index <= len(_HOVER_ORDINALS)
+            else f"{index}."
+        )
+        option_texts.append(f"{ordinal} {label}")
+    if option_texts:
+        lines.append("📋 " + "  ".join(option_texts))
+    if not lines:
+        return None
+    tooltip = "\n".join(lines)
+    if len(tooltip) > 500:
+        tooltip = tooltip[:497].rstrip() + "…"
+    return {
+        "tag": "button",
+        "element_id": "interaction_hover",
+        "type": "text",
+        "size": "small",
+        "text": {"tag": "plain_text", "content": content},
+        "hover_tips": {"tag": "plain_text", "content": tooltip},
+    }
+
+
+def _hover_plain_line(text: Any) -> str:
+    return " ".join(normalize_stream_text(str(text or "")).strip().split())
 
 
 def _interaction_callback_value(
@@ -831,6 +886,28 @@ def _render_timeline_elements(
                     ),
                 )
             )
+        elif item.kind == "subagent":
+            detail = _limit_text(
+                normalize_stream_text(item.detail),
+                max_tool_result_chars,
+                overflow_label="子代理详情过长，已截断",
+            )
+            panel_elements.extend(
+                _timeline_markdown_elements(
+                    _render_subagent_timeline_row(
+                        item.title,
+                        item.status,
+                        detail,
+                    ),
+                    f"auxiliary_timeline_subagententry_{index}",
+                    text_size=_role_text_size(
+                        text_sizes,
+                        "tool",
+                        default="x-small",
+                        used_roles=used_text_size_roles,
+                    ),
+                )
+            )
         elif item.kind == "notice":
             content = _limit_text(
                 normalize_stream_text(item.content),
@@ -929,6 +1006,28 @@ def _render_tool_timeline_row(
     for line in str(detail or "").splitlines():
         safe_line = html.escape(line, quote=False)
         lines.append(f'<font color="grey">　{safe_line}</font>')
+    return "\n".join(lines)
+
+
+def _render_subagent_timeline_row(title: str, status: str, detail: str) -> str:
+    normalized_status = str(status or "running").strip().lower()
+    safe_title = html.escape(str(title or "子代理"), quote=False)
+    label = f"子代理：{safe_title}"
+    if normalized_status in {"completed", "success", "succeeded"}:
+        color, headline = "green", f"✓ **{label}** · 已完成"
+    elif normalized_status in {"failed", "error", "timeout", "blocked"}:
+        color, headline = "red", f"✕ **{label}** · 失败"
+    elif normalized_status in {"cancelled", "canceled"}:
+        color, headline = "grey", f"⊘ **{label}** · 已取消"
+    elif normalized_status == "interrupted":
+        color, headline = "grey", f"⊘ **{label}** · 已中断"
+    elif normalized_status in {"queued", "waiting"}:
+        color, headline = "grey", f"○ **{label}** · 等待中"
+    else:
+        color, headline = "blue", f"{_spinner_frame()} **{label}** · 进行中"
+    lines = [f'<font color="{color}">{headline}</font>']
+    for line in str(detail or "").splitlines():
+        lines.append(f'<font color="grey">　{html.escape(line, quote=False)}</font>')
     return "\n".join(lines)
 
 
@@ -1046,7 +1145,7 @@ def _render_footer(
         )
         minutes = max(1, int(math.ceil(remaining_seconds / 60.0)))
         return f"等待选择 · ⏳ {minutes} 分钟后过期"
-    if session.status != "completed":
+    if session.status != "completed" and display_status != "completed":
         return _spinner_text("生成中")
     tokens = session.tokens if isinstance(session.tokens, dict) else {}
     input_tokens = _safe_int(tokens.get("input_tokens"))

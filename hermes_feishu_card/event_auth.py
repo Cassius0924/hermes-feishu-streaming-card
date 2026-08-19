@@ -6,6 +6,7 @@ from ipaddress import ip_address
 import secrets
 import threading
 import time
+import re
 from collections.abc import Mapping
 from typing import Callable
 
@@ -25,6 +26,10 @@ NATIVE_HANDOFF_RECOVERY_SIGNATURE_HEADER = "X-HFC-Native-Recovery-Signature"
 SIDECAR_REQUEST_TIMESTAMP_HEADER = "X-HFC-Sidecar-Timestamp"
 SIDECAR_REQUEST_NONCE_HEADER = "X-HFC-Sidecar-Nonce"
 SIDECAR_REQUEST_SIGNATURE_HEADER = "X-HFC-Sidecar-Signature"
+RUNTIME_INTERACTION_TIMESTAMP_HEADER = "X-HFC-Runtime-Interaction-Timestamp"
+RUNTIME_INTERACTION_NONCE_HEADER = "X-HFC-Runtime-Interaction-Nonce"
+RUNTIME_INTERACTION_SIGNATURE_HEADER = "X-HFC-Runtime-Interaction-Signature"
+RUNTIME_INTERACTION_PATH = "/runtime/interactions/resolve"
 
 _ROOT_SECRET_BYTES = 32
 _PROOF_MAX_AGE_SECONDS = 30
@@ -33,6 +38,9 @@ _EVENT_MAX_NONCES = 16_384
 _POLICY_MAX_NONCES = 512
 _NATIVE_HANDOFF_CONTROL_MAX_NONCES = 512
 _SIDECAR_REQUEST_MAX_NONCES = 16_384
+_RUNTIME_INTERACTION_MAX_NONCES = 1024
+_RUNTIME_INTERACTION_NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
+_LOWER_HEX_64_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class EventAuthenticationError(ValueError):
@@ -52,6 +60,10 @@ class NativeHandoffRecoveryAuthenticationError(ValueError):
 
 
 class SidecarRequestAuthenticationError(ValueError):
+    pass
+
+
+class RuntimeInteractionAuthenticationError(ValueError):
     pass
 
 
@@ -154,6 +166,42 @@ def sign_sidecar_request(
         timestamp=timestamp,
         nonce=nonce,
         label="sidecar request",
+    )
+
+
+def sign_runtime_interaction_request(
+    secret: bytes,
+    path: str,
+    body: bytes,
+    *,
+    timestamp: int | None = None,
+    nonce: str | None = None,
+) -> dict[str, str]:
+    """Sign one exact process-local interaction resolution request."""
+    if type(path) is not str or path != RUNTIME_INTERACTION_PATH:
+        raise ValueError("runtime interaction target is invalid")
+    if type(body) is not bytes:
+        raise ValueError("runtime interaction request body must be bytes")
+    if timestamp is not None and type(timestamp) is not int:
+        raise ValueError("runtime interaction proof metadata is invalid")
+    if (
+        nonce is not None
+        and (
+            type(nonce) is not str
+            or _RUNTIME_INTERACTION_NONCE_RE.fullmatch(nonce) is None
+        )
+    ):
+        raise ValueError("runtime interaction proof metadata is invalid")
+    return _sign_domain_request(
+        secret,
+        _runtime_interaction_payload(path, body),
+        domain="hfc-runtime-interaction-callback-v1",
+        timestamp_header=RUNTIME_INTERACTION_TIMESTAMP_HEADER,
+        nonce_header=RUNTIME_INTERACTION_NONCE_HEADER,
+        signature_header=RUNTIME_INTERACTION_SIGNATURE_HEADER,
+        timestamp=timestamp,
+        nonce=nonce,
+        label="runtime interaction",
     )
 
 
@@ -285,6 +333,57 @@ class SidecarRequestProofVerifier:
         except ValueError as exc:
             raise SidecarRequestAuthenticationError(
                 "invalid sidecar-request proof"
+            ) from exc
+        self._verifier.verify(headers, payload)
+
+
+class RuntimeInteractionProofVerifier:
+    def __init__(
+        self,
+        secret: bytes,
+        *,
+        now: Callable[[], float] = time.time,
+        max_nonces: int = _RUNTIME_INTERACTION_MAX_NONCES,
+    ) -> None:
+        self._verifier = _DomainProofVerifier(
+            secret,
+            domain="hfc-runtime-interaction-callback-v1",
+            timestamp_header=RUNTIME_INTERACTION_TIMESTAMP_HEADER,
+            nonce_header=RUNTIME_INTERACTION_NONCE_HEADER,
+            signature_header=RUNTIME_INTERACTION_SIGNATURE_HEADER,
+            max_age_seconds=_PROOF_MAX_AGE_SECONDS,
+            error_type=RuntimeInteractionAuthenticationError,
+            now=now,
+            max_nonces=max_nonces,
+        )
+
+    def verify(
+        self,
+        headers: Mapping[str, str],
+        path: str,
+        body: bytes,
+    ) -> None:
+        timestamp_text = _header_value(headers, RUNTIME_INTERACTION_TIMESTAMP_HEADER)
+        nonce = _header_value(headers, RUNTIME_INTERACTION_NONCE_HEADER)
+        signature = _header_value(headers, RUNTIME_INTERACTION_SIGNATURE_HEADER)
+        if (
+            type(timestamp_text) is not str
+            or not timestamp_text.isascii()
+            or not timestamp_text.isdecimal()
+            or str(int(timestamp_text)) != timestamp_text
+            or type(nonce) is not str
+            or _RUNTIME_INTERACTION_NONCE_RE.fullmatch(nonce) is None
+            or type(signature) is not str
+            or _LOWER_HEX_64_RE.fullmatch(signature) is None
+        ):
+            raise RuntimeInteractionAuthenticationError(
+                "invalid runtime interaction proof"
+            )
+        try:
+            payload = _runtime_interaction_payload(path, body)
+        except ValueError as exc:
+            raise RuntimeInteractionAuthenticationError(
+                "invalid runtime interaction proof"
             ) from exc
         self._verifier.verify(headers, payload)
 
@@ -441,6 +540,16 @@ def _sidecar_request_payload(method: str, path: str, body: bytes) -> bytes:
         + b"\0"
         + body
     )
+
+
+def _runtime_interaction_payload(path: str, body: bytes) -> bytes:
+    if (
+        type(path) is not str
+        or path != RUNTIME_INTERACTION_PATH
+        or type(body) is not bytes
+    ):
+        raise ValueError("runtime interaction target is invalid")
+    return b"POST\0" + path.encode("ascii") + b"\0" + body
 
 
 def _body_hash(body: bytes) -> str:

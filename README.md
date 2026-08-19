@@ -139,7 +139,7 @@ Hermes `v2026.4.23` 起的旧版和 Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0
 已有 Hermes 容器优先使用：
 
 ```bash
-export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.2.12
+export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.3.0
 bash install-docker.sh
 ```
 
@@ -178,6 +178,7 @@ bash install-docker.sh
 ## 最新版本
 | 版本 | 重点 |
 |---|---|
+| [v4.3.0](docs/release-notes-v4.3.0.md) | Hermes `v2026.8.3` 使用源码能力证明的 Hybrid Plugin/patch 集成；V3 installer 可幂等安装与逐字恢复，runtime interaction 只有一个卡片 owner，并提供 linger 校验的 systemd 开机常驻 |
 | [v4.2.12](docs/release-notes-v4.2.12.md) | 审批卡按 Hermes 能力只展示可用授权范围并拒绝未声明输入；零工具调用的卡片在启用 reasoning timeline 时保持稳定折叠入口 |
 | [v4.2.11](docs/release-notes-v4.2.11.md) | 修复 Issue #202：新交互卡发送成功后，旧流式卡会冻结为绿色“已转入交互卡片”历史快照；旧卡 PATCH 失败保持 fail-open，只有最新卡继续接收选择与后续更新 |
 | [v4.2.10](docs/release-notes-v4.2.10.md) | 非回环 sidecar 的回调/结果读取使用 method/path/body 绑定 HMAC；交互绝对过期会拒绝晚到按钮与表单并刷新原卡；跨平台 CI、CodeQL、Dependabot 和 Node 24 Action SHA 门禁同步落地，上一版见 [v4.2.9](docs/release-notes-v4.2.9.md) |
@@ -273,7 +274,6 @@ Hermes Gateway
 - [sthnow](https://github.com/sthnow) - [Issue #110](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/110) Markdown 代码中的 `MEDIA:` 字面量误解析复现、根因与期望边界（V4.0.4）
 - [zkyken](https://github.com/zkyken) - [Issue #112](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/112) lark SDK 预绑定 callback 下交互按钮失效的日志、根因线索与修复方向（V4.0.4）
 - [ShakuOvO](https://github.com/ShakuOvO) / [blakejia](https://github.com/blakejia) - [Issue #106](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/106) 与 [#111](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/111) 图片回答灰色正文重复的报告、复测与截图（V4.0.1–V4.0.3）；另感谢 [blakejia](https://github.com/blakejia) 在 [#115](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/115) 提供 Gateway venv 旧版本证据、完整升级步骤与复测指标（V4.0.5）；感谢 [nasvip](https://github.com/nasvip) / [hzy](https://github.com/hzy) / [lRoccoon](https://github.com/lRoccoon) 贡献 V4.0.6 的 Hermes 升级恢复复现、background 通知卡片实现，以及 Hermes 0.18.x completion hook 生产诊断与修复；V4.0.7 继续感谢 [nasvip](https://github.com/nasvip) 的 [Issue #125](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/125) systemd/Python 环境完整证据，以及 [hzy](https://github.com/hzy) 的 [PR #124](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/124) 自我改进通知卡片实现与回归测试；V4.0.8 感谢 [zyq2552899783-lgtm](https://github.com/zyq2552899783-lgtm) 报告 [Issue #127](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/127) 的 cron 附件只显示文件名问题；V4.0.9 感谢 [Jasonsun77](https://github.com/Jasonsun77) 在 [Issue #130](https://github.com/baileyh8/hermes-feishu-streaming-card/issues/130) 提供 Linux crash-loop A/B、完整时间线、SDK 版本与上游 reconnect 关联证据
-
 ## 安全说明
 默认 `127.0.0.1` 采用本机进程互信；不要把 sidecar 未鉴权暴露到网络。非 loopback 只有显式设置 `server.allow_non_loopback: true` 才能启动，并强制使用私有 state directory 的 HMAC 事件鉴权；它不替代 TLS。不要把 App Secret、tenant token、真实 chat_id、未脱敏截图提交到仓库，生产凭据应保存在本机配置或环境变量中。Windows non-loopback 在无法验证 state directory 的 ACL 私有性时会拒绝启动；Windows loopback 仍可使用本机进程互信，但不会宣称 ACL 私有性已经验证。
 ## License

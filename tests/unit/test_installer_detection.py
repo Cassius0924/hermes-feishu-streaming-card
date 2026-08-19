@@ -6,8 +6,10 @@ import subprocess
 
 import pytest
 
+from hermes_feishu_card.install import detect
 from hermes_feishu_card.install.detect import detect_hermes
 from hermes_feishu_card.install.patcher import PATCH_BEGIN, PATCH_END
+from hermes_feishu_card.integration import IntegrationMode, NativeHookCapabilities
 
 
 FIXTURE_ROOT = (
@@ -44,6 +46,34 @@ def test_detect_legacy_strategy_for_v2026_4_23_fixture():
     assert detection.hook_strategy == "legacy_gateway_run"
     assert detection.compatibility == "partial"
     assert detection.capabilities["message_handler"] is True
+
+
+def test_fixed_tag_integration_detection_selects_hybrid_only_from_probe_facts(
+    monkeypatch,
+):
+    class Probe:
+        capabilities = NativeHookCapabilities.from_names(
+            {
+                "turn_start",
+                "turn_terminal_result",
+                "stable_tool_lifecycle",
+                "approval_observe",
+            }
+        )
+        reason_code = "verified"
+
+    monkeypatch.setattr(
+        detect, "probe_native_hook_capabilities", lambda *args, **kwargs: Probe()
+    )
+
+    result = detect.detect_fixed_tag_integration(
+        FIXTURE_ROOT,
+        runtime_python=Path("/verified/venv/bin/python"),
+    )
+
+    assert result.native_probe is not None
+    assert result.decision.supported is True
+    assert result.decision.mode is IntegrationMode.HYBRID
 
 
 def test_detect_013_plus_strategy_reports_optional_capabilities(tmp_path):
