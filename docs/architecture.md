@@ -16,6 +16,10 @@ Hermes Gateway
   -> policy + readiness + session + render + Feishu CardKit send/update
 ```
 
+V4.3 在固定 Hermes `v2026.8.3` 上把这条链路实现为 Hybrid：真实 `hermes_agent.plugins` lifecycle hooks 通过 signed loopback transport 驱动 sidecar，17 个精确 patch group 只补齐 hook call-site 未提供的 ingress、delta、interaction、terminal、cron 与 exact Base delivery 证据。能力选择必须同时通过固定源码 hashes/slices、runtime Python、entrypoint origin 与真实 PluginManager subprocess；V3 manifest 把 7 个 target、官方 plugin config preimage 和 venv identity 纳入同一 ownership transaction。
+
+approval/clarify/slash callback 使用独立的 runtime interaction listener，直接调用 Hermes 原 pending handle/future 的 resolver，不创建第二套 wait/poll/queue。Sidecar 的 event-id fence 保留首次 canonical response；Feishu create/PATCH 与 listener POST 都在 session/message lock 外发生。只有 card terminal success 可以抑制原生成功正文，failed/interrupted 保持 native fail-open。
+
 V4.1 使用域分隔的事件数据面与四条控制动作：`hfc-policy-v1` per-chat policy、`hfc-runtime-v1` runtime readiness、`hfc-native-handoff-recovery-v2` pending descriptor 恢复，以及 `hfc-native-handoff-ack-v1` delivered 后确认。policy 在 hook 和 sidecar 两侧执行；runtime 事件只证明活性，不授权文件写入；handoff recovery 只提交 obligation、exact content、delivery plan、canonical route 与目标作用域的单向 hash/枚举，不提交正文或原始路由标识，ACK 只能发生在 Hermes ledger 已持久化 `delivered` 之后。任一控制面失败都不应阻断 Hermes Agent 工作，安装/恢复 mutation 则继续 fail-closed。
 
 Hermes hook 到 sidecar `/events` 的 fail-open 转发链路已经落地：sidecar 不可用或拒绝事件时，hook 不拖垮 Hermes，未被卡片路径确认接管的消息继续遵循 Hermes 原生 fallback。卡片已经接受的路径则抑制重复灰色原生文本。

@@ -74,9 +74,9 @@ choice requests at the latest chat position, preserves a substantial streamed
 answer before a short terminal postscript, and repairs bare Feishu `/update`
 for standard venv symlinks, slow Git fetches, and Hermes 0.20 version reporting.
 
-V4.2.12 makes approval cards follow Hermes' declared approval capabilities,
-rejects undeclared custom input at the sidecar boundary, and keeps a stable
-collapsed timeline on zero-tool cards when reasoning display is enabled.
+V4.3.0 adds a source-proven Hybrid integration for Hermes `v2026.8.3`,
+transactional V3 install/restore ownership, direct single-owner runtime
+interactions, and an optional linger-verified persistent systemd user service.
 V4.2.11 freezes superseded streaming cards as read-only interaction handoff
 snapshots while the newest interaction card remains authoritative. V4.2.10
 authenticates non-loopback sidecar callbacks and result reads, enforces
@@ -271,6 +271,19 @@ uses the owned detached process; it never probes the system bus, invokes
 explicit Linux-only transient-unit opt-in and writes no persistent unit under
 `/etc`. Docker and other containers should select `detached`.
 
+V4.3.0 adds a separate explicit persistent path on Linux. After installation,
+enable linger through the normal user/admin policy and run:
+
+```bash
+hermes-feishu-card enable --config /absolute/config.yaml \
+  --hermes-dir /absolute/hermes-agent --yes
+```
+
+This writes a real systemd user unit plus a private SHA-256 ownership manifest,
+then verifies the running package/Python identity. It refuses missing linger,
+unknown same-name units, drift, or unsafe shutdown. Remove the owned unit with
+`hermes-feishu-card disable`; `start` remains transient by default.
+
 ## macOS / Linux
 
 ```bash
@@ -317,7 +330,7 @@ a privileged container, or mount host system-service directories.
 ```
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.2.12
+export HFC_VERSION=v4.3.0
 bash install-docker.sh
 ```
 

@@ -2,6 +2,17 @@
 
 自动化测试不能完全证明 Feishu/Lark 客户端体验。涉及卡片 UX、topic、系统提示、命令卡片的版本，发布前需要真实飞书 smoke。
 
+## V4.3.0 Hermes 0.20 Hybrid 验收
+
+- 在固定 Hermes `v2026.8.3` 安装后，`doctor --explain` 与 installer 显示 `integration.mode: hybrid`；manifest 为 V3，列出 17 个 patch group 与 7 个 target。重复 install 不改 manifest，restore 后 checkout Git clean。
+- 普通回答只出现一张 streaming card；完成后没有第二条灰色原生正文。failed/interrupted 不得因为 `applied=true` 错误抑制 Hermes 原生失败信息。
+- approval 只出现一张卡，点击 once/session/always/deny 必须唤醒当前 exact tool call；连续 approval、clarify、slash confirm 不串 choice、pending handle 或上一轮 hover 内容。
+- subagent start/running/terminal 使用独立 timeline，`interrupted` 属于终态且迟到 running 不得重开；工具调用数不包含 subagent item。
+- 断开 callback、过期 descriptor、session replacement、重复同选项和冲突选项都要保持原 pending/终态契约；不得出现第二套 poll/wait UI。
+- Linux persistent smoke：确认 `loginctl show-user "$USER" -p Linger --value` 为 `yes`，执行 `enable` 后重启 user manager/主机，`systemctl --user is-enabled/is-active hermes-feishu-card-sidecar.service` 与 `status` 均正确；`disable` 后 unit 与私有 manifest 都消失。
+- Issue #216 单独记录平台原始事件证据：如果应用长连接收到的 `card.action.trigger` 为零，不把“按钮无效”写成 HFC callback 失败。核对订阅、发布版本、应用身份与飞书开放平台日志；没有事件时本版不宣称本地修复。
+- 真实飞书消息、截图、chat/user/app identity 必须脱敏；本地 fixed-tag、loopback 与自动化通过不等同于真实客户端验收。
+
 ## V4.2.12 审批能力与零工具时间线验收
 
 - approval 默认不显示或接受“其他”自定义输入；选项严格跟随 `smart_denied`、`allow_session`、`allow_permanent`，伪造固定值或 form input 返回拒绝且原 interaction 保持 pending。

@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.2.12`. This cycle derives approval-card choices from Hermes `smart_denied`, `allow_session`, and `allow_permanent` capabilities and carries an explicit `allow_custom_input` contract through the hook, event, session, renderer, and sidecar callback boundary. With the reasoning timeline enabled, zero-tool cards retain one stable collapsed entry throughout their lifecycle. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.3.0`. This cycle adds a source-proven Hybrid Plugin/patch integration for Hermes `v2026.8.3`, V3 installer ownership, single-owner runtime interactions, and a linger-verified persistent systemd user service, while incorporating the locally fixable feedback from Issues #210–#223. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -146,6 +146,17 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.3.0 Release Gates
+
+- The fixed Hermes `v2026.8.3` / commit `3c27eb6234bf91b8ceee9e9071591b31e9b148cb` probe must jointly verify source hashes/call-site slices, runtime Python, entrypoint/distribution origin, and real PluginManager subprocess evidence. A version string or hook-name list is not capability proof.
+- Hybrid must detect exactly 17 patch groups across seven targets and compile every file. Repeated install must preserve the manifest hash; restore must leave a Git-clean Hermes checkout, recover the exact pre-install config SHA-256, and remove ownership evidence.
+- Interaction callbacks must wake the original Hermes pending handle/future directly. Sidecar listener POST and Feishu create/PATCH must hold no session/message lock; event-id fence, terminal/native handoff, expiry, session replacement, and caller-cancellation attacks must pass.
+- Persistent `enable` must require `Linger=yes`, safely migrate a verified transient owner, bind mode-`0600` unit/manifest by SHA-256, and retain ownership when shutdown fails. `disable` fails closed on drift.
+- Completed focused evidence: V3 installer/restore/scripts `340 passed, 5 skipped`; persistent process/CLI loopback `302 passed`; real fixed-tag install/idempotence/restore passed end to end.
+- Full pytest: **`3227 passed, 6 skipped in 378.84s`**. Sdist/wheel, fresh Python 3.12 isolated-`site-packages` provenance, exactly one Hermes plugin entrypoint, all 24 provenance slices, and the main CLI plus `enable/disable --help`: **passed locally**. The post-commit gate still reruns `git diff --check` and docs/package tests.
+- Issue #216 is a platform zero-event boundary and is not represented as fixed. PR #203 changes only archived `legacy/` and is excluded from the active runtime.
+- Exact merge SHA, remote CI, annotated tag, public tag/install, and Release assets: **recorded during publication**.
 
 ## V4.2.12 Release Gates
 

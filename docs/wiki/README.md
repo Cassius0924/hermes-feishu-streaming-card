@@ -33,6 +33,7 @@
 - 全命令反馈卡片：所有进入 Hermes 的 slash command（含 built-in、alias、plugin/quick 和 unknown command）只要产生非空文本反馈，就由独立 Feishu interactive card 承载；V4.2.0 的私聊裸 `/update` 使用专用维护确认卡，群聊/非飞书/别名/参数化更新保持 Hermes 原路径。
 - 安装与诊断：`install/setup/doctor/repair/restore/uninstall` 覆盖本机、Hermes venv、Docker/source-stripped Hermes。
 - V4.1 安全控制：exact `native_chats`、无损 table compact、认证 runtime readiness、strict repair 与不隐式提权的 service manager。
+- V4.3 Hybrid runtime：固定 Hermes v2026.8.3 capability proof、真实 Plugin entrypoint、17-group/7-target V3 ownership、single-owner runtime interaction 与 linger 校验的 persistent user service。
 
 ## 文档分层
 
