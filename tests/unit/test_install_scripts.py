@@ -1689,7 +1689,16 @@ def test_installers_resolve_profile_arguments_with_shared_precedence(
     )
     if no_repair == "1":
         setup += " --no-repair"
+    elif script_name == "install.sh":
+        setup += " --accept-hermes-upgrade"
     assert f"args={setup}" in log
+    setup_line = next(
+        line
+        for line in log.splitlines()
+        if line.startswith("args=-m hermes_feishu_card.cli setup ")
+    )
+    if no_repair == "1":
+        assert "--accept-hermes-upgrade" not in setup_line
 
 
 def test_install_powershell_declares_and_forwards_profile_parameters():

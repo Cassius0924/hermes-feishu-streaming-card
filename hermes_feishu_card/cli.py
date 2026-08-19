@@ -3260,6 +3260,7 @@ def _run_install(args: argparse.Namespace) -> int:
                 + _recovery_refusal_message(
                     recovery_plan,
                     accept_hermes_upgrade=accept_hermes_upgrade,
+                    hermes_root=detection.root,
                 ),
                 file=sys.stderr,
             )
@@ -3546,6 +3547,7 @@ def _repair_install_state(
             _recovery_refusal_message(
                 plan,
                 accept_hermes_upgrade=accept_hermes_upgrade,
+                hermes_root=detection.root,
             )
         )
     if not plan.executable:
@@ -3553,6 +3555,7 @@ def _repair_install_state(
             _recovery_refusal_message(
                 plan,
                 accept_hermes_upgrade=accept_hermes_upgrade,
+                hermes_root=detection.root,
             )
         )
     if dry_run:
@@ -3570,13 +3573,19 @@ def _recovery_refusal_message(
     plan,
     *,
     accept_hermes_upgrade: bool,
+    hermes_root: Path | None = None,
 ) -> str:
     message = _first_refusal(plan)
     if plan.state == "stale_unpatched" and not accept_hermes_upgrade:
-        message += (
-            " If Hermes was intentionally upgraded, rerun with "
-            "--accept-hermes-upgrade --yes."
-        )
+        if hermes_root is None:
+            command = "--accept-hermes-upgrade --yes"
+        else:
+            command = (
+                "python -m hermes_feishu_card.cli install --hermes-dir "
+                f"{shlex.quote(str(hermes_root))} "
+                "--accept-hermes-upgrade --yes"
+            )
+        message += f" If Hermes was intentionally upgraded, rerun: {command}."
     return message
 
 

@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -3129,6 +3130,11 @@ def test_repair_refuses_changed_stale_state_after_hermes_upgrade(tmp_path):
     assert result.returncode != 0
     assert "run.py changed since install" in result.stderr
     assert "--accept-hermes-upgrade" in result.stderr
+    expected_command = (
+        "python -m hermes_feishu_card.cli install --hermes-dir "
+        f"{shlex.quote(str(hermes_dir))} --accept-hermes-upgrade --yes"
+    )
+    assert expected_command in result.stderr
     assert run_py(hermes_dir).read_text(encoding="utf-8") == upgraded
     assert backup_path(hermes_dir).read_text(encoding="utf-8") == original_backup
     assert manifest_path(hermes_dir).read_text(encoding="utf-8") == original_manifest

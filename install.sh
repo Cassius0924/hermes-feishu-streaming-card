@@ -309,6 +309,8 @@ run_setup() {
   fi
   if [ "$NO_REPAIR" = "1" ]; then
     setup_args+=(--no-repair)
+  else
+    setup_args+=(--accept-hermes-upgrade)
   fi
   log "running setup"
   "$PYTHON_BIN" "${setup_args[@]}"
