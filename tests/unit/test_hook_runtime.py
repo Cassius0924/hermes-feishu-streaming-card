@@ -6465,6 +6465,35 @@ def test_request_interaction_does_not_retry_when_sidecar_reports_not_applied(
     assert [payload["sequence"] for payload in posted] == [0]
 
 
+def test_interaction_request_uses_dedicated_five_second_delivery_timeout(
+    monkeypatch,
+):
+    observed = []
+    monkeypatch.setenv("HERMES_FEISHU_CARD_EVENT_URL", "http://sidecar.test/events")
+    monkeypatch.delenv("HERMES_FEISHU_CARD_TIMEOUT_MS", raising=False)
+
+    def fake_post(local_vars, url, payload, timeout):
+        observed.append(timeout)
+        return {"ok": True, "applied": False}
+
+    monkeypatch.setattr(hook_runtime, "_post_interaction_event", fake_post)
+
+    result = hook_runtime.request_interaction_from_hermes_locals(
+        {"chat_id": "oc_abc", "message_id": "msg_1"},
+        kind="approval",
+        interaction_id="approval-timeout",
+        prompt="允许执行吗？",
+        options=[{"label": "允许一次", "value": "once"}],
+        timeout_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    assert result is None
+    assert observed == [5.0]
+    config = hook_runtime.load_runtime_config()
+    assert hook_runtime._timeout_for_event(config, "answer.delta") == 0.8
+
+
 def test_post_interaction_event_does_not_retry_transport_failure(monkeypatch):
     calls = []
 

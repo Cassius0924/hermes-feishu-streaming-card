@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_EVENT_URL = "http://127.0.0.1:8765/events"
 DEFAULT_TIMEOUT_SECONDS = 0.8
+INTERACTION_ADMISSION_TIMEOUT_SECONDS = 5.0
 TERMINAL_TIMEOUT_SECONDS = 10.0
 NATIVE_HANDOFF_PROTOCOL = "hfc-native-handoff-v2"
 NATIVE_HANDOFF_MAX_LIFETIME_SECONDS = 3600.0
@@ -8272,6 +8273,8 @@ def _hfc_interaction_card_confirmed(
 def _timeout_for_event(config: RuntimeConfig, event_name: str) -> float:
     if event_name in {"message.completed", "message.failed"}:
         return max(config.timeout_seconds, TERMINAL_TIMEOUT_SECONDS)
+    if event_name == "interaction.requested":
+        return max(config.timeout_seconds, INTERACTION_ADMISSION_TIMEOUT_SECONDS)
     return config.timeout_seconds
 
 
