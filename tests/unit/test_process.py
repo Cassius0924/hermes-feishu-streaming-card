@@ -1704,6 +1704,7 @@ def test_start_sidecar_refuses_live_pid_record_when_health_is_unavailable(
         lambda: {"pid": 1234, "token": "owned", "manager": "detached"},
     )
     monkeypatch.setattr(process, "pid_is_running", lambda _pid: True)
+    monkeypatch.setattr(process, "_pid_is_hfc_runner", lambda _pid: None)
     monkeypatch.setattr(
         process.subprocess,
         "Popen",
