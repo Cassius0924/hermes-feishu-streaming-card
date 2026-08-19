@@ -954,6 +954,77 @@ def test_thin_terminal_failed_record_stays_failed_and_has_no_suppression_flag(mo
     assert not hasattr(record, "applied")
 
 
+def test_hybrid_terminal_record_applies_only_exact_completed_delivery(monkeypatch):
+    payload = {
+        "event": "message.completed",
+        "turn_id": "turn-1",
+        "data": {"answer": "done"},
+    }
+    assert hook_runtime.apply_hybrid_terminal_record(
+        hook_runtime.HybridTerminalRecord(
+            terminal_kind="completed",
+            payload=payload,
+            response={"ok": True, "applied": True},
+        )
+    ) == "card"
+    assert hook_runtime.apply_hybrid_terminal_record(
+        hook_runtime.HybridTerminalRecord(
+            terminal_kind="failed",
+            payload={**payload, "event": "message.failed"},
+            response={"ok": True, "applied": True},
+        )
+    ) is None
+    assert hook_runtime.apply_hybrid_terminal_record(
+        hook_runtime.HybridTerminalRecord(
+            terminal_kind="completed",
+            payload=payload,
+            response={"ok": 1, "applied": True},
+        )
+    ) is None
+
+
+def test_hybrid_terminal_record_installs_only_validated_native_descriptor(monkeypatch):
+    payload = {
+        "event": "message.completed",
+        "turn_id": "turn-1",
+        "data": {"answer": "done"},
+    }
+    plain = {"ok": True, "applied": False, "disposition": "native"}
+    assert hook_runtime.apply_hybrid_terminal_record(
+        hook_runtime.HybridTerminalRecord("completed", payload, plain)
+    ) == "native"
+
+    calls = []
+    monkeypatch.setattr(
+        hook_runtime,
+        "_register_native_handoff_descriptor",
+        lambda candidate_payload, response: calls.append(
+            (candidate_payload, response)
+        )
+        or True,
+    )
+    response = {
+        **plain,
+        "native_handoff": {
+            "protocol": "hfc-native-handoff-v2",
+            "id": "a" * 32,
+            "uuid_seed": "b" * 32,
+            "expires_at": 9999999999.0,
+        },
+    }
+    assert hook_runtime.apply_hybrid_terminal_record(
+        hook_runtime.HybridTerminalRecord("completed", payload, response)
+    ) == "native"
+    assert calls == [(payload, response)]
+
+    monkeypatch.setattr(
+        hook_runtime, "_register_native_handoff_descriptor", lambda *_args: False
+    )
+    assert hook_runtime.apply_hybrid_terminal_record(
+        hook_runtime.HybridTerminalRecord("completed", payload, response)
+    ) is None
+
+
 def test_thin_facades_require_literal_true_from_runtime(monkeypatch):
     class EqualitySpoof:
         def __eq__(self, other):

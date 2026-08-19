@@ -14,6 +14,16 @@ TURN_RUNNER_FIXTURE = (
 EXACT_BASE_V020_FIXTURE = (
     Path(__file__).resolve().parents[1] / "fixtures" / "hermes_exact_base_v020.py"
 )
+FIXED_TAG_SOURCE_ROOT = Path("/private/tmp/hermes-agent-v2026.8.3-v430-audit")
+FIXED_TAG_HYBRID_SHA256 = {
+    "gateway/run.py": "0b749a90ff5740b5c8ce9d138f869aca19295f4c458e3b680e9be9fd7b0fb2ec",
+    "agent/turn_context.py": "a0e136367b64007d7b49ea006ab0aa7dcc66b12134b512a463a03bd69fb8a90c",
+    "agent/turn_finalizer.py": "8ac4e0f6529e0142fc2c53cef9089ac99107063d79968197cabc368dd11f4115",
+    "tools/approval.py": "651b2ad8041aad4c862ff793937646c3541de9786b8fbabc8301665ef7c3cfbc",
+    "tools/delegate_tool.py": "c8b028d4199064ceb3d5aeead076afd81006d1cf3faa88e8395ba539073929d4",
+    "cron/scheduler.py": "aba4c2b9c8691ccc86518cfa10dcd92e55d7b2103c1c6807f54ddf58919f3f48",
+    "gateway/platforms/base.py": "67262c97333b9e8274d269229ae6d0adecee104eaf5729208d0ea9b0ae8b814c",
+}
 
 
 def test_apply_patch_accepts_explicit_legacy_strategy():
@@ -2311,8 +2321,11 @@ def test_hybrid_descriptor_registry_tracks_ordered_fragment_completeness():
     )
 
 
-def test_structural_hybrid_descriptors_do_not_claim_renderer_capability():
-    assert patcher.HYBRID_PATCH_REGISTRY.available_groups == frozenset()
+def test_hybrid_registry_claims_all_reviewed_fixed_tag_renderers():
+    assert (
+        patcher.HYBRID_PATCH_REGISTRY.available_groups
+        == HYBRID_REQUIRED_PATCH_GROUPS
+    )
 
 
 @pytest.mark.parametrize(
@@ -2674,8 +2687,8 @@ def test_native_aggregate_render_is_a_byte_identical_noop():
     assert all(rendered[target] is originals[target] for target in originals)
 
 
-def test_production_hybrid_renderer_refuses_structural_only_descriptors():
-    with pytest.raises(ValueError, match="reviewed renderer unavailable"):
+def test_production_hybrid_renderer_refuses_non_fixed_tag_source_snapshots():
+    with pytest.raises(ValueError, match="fixed-tag"):
         _render_aggregate(
             patcher.HYBRID_PATCH_REGISTRY,
             required_groups=HYBRID_REQUIRED_PATCH_GROUPS,
@@ -2964,3 +2977,80 @@ def test_legacy_target_adapters_expose_only_strict_removal():
         not hasattr(adapter, "manifestless_lenient_remover")
         for adapter in adapters.values()
     )
+
+
+def test_fixed_tag_real_sources_render_detect_compile_and_restore_exactly():
+    assert FIXED_TAG_SOURCE_ROOT.is_dir()
+    originals = {
+        target: (FIXED_TAG_SOURCE_ROOT / target).read_bytes()
+        for target in patcher.HYBRID_PATCH_TARGET_ORDER
+    }
+    actual_sha256 = _aggregate_sha256(originals)
+    assert actual_sha256 == FIXED_TAG_HYBRID_SHA256
+
+    registry = patcher.HYBRID_PATCH_REGISTRY
+    expected_matrix = registry.target_fragments(HYBRID_REQUIRED_PATCH_GROUPS)
+    rendered = patcher.render_patch_snapshots_from_verified_originals(
+        originals,
+        verified_original_sha256=FIXED_TAG_HYBRID_SHA256,
+        integration_mode="hybrid",
+        required_patch_groups=HYBRID_REQUIRED_PATCH_GROUPS,
+        expected_fragment_matrix=expected_matrix,
+    )
+
+    for target, content in rendered.items():
+        compile(content, target, "exec")
+    assert patcher.detect_patch_groups_by_target(
+        rendered,
+        expected_groups=HYBRID_REQUIRED_PATCH_GROUPS,
+        expected_fragment_matrix=expected_matrix,
+    ) == registry.target_groups(HYBRID_REQUIRED_PATCH_GROUPS)
+
+    combined = b"\n".join(rendered.values())
+    for forbidden in (
+        b"# HERMES_FEISHU_CARD_PATCH_BEGIN",
+        b"# HERMES_FEISHU_CARD_COMPLETE_PATCH_BEGIN",
+        b"# HERMES_FEISHU_CARD_QUEUED_COMPLETE_PATCH_BEGIN",
+        b"# HERMES_FEISHU_CARD_TOOL_PATCH_BEGIN",
+        b"# HERMES_FEISHU_CARD_STABLE_TOOL_PATCH_BEGIN",
+        b"# HERMES_FEISHU_CARD_APPROVAL_PATCH_BEGIN",
+        b"emit_from_hermes_locals_threadsafe",
+    ):
+        assert forbidden not in combined
+    for required in (
+        b"bind_ingress_from_hermes_locals",
+        b"emit_delta_from_hermes_locals_threadsafe",
+        b"admit_pending_interaction_from_hermes_locals",
+        b"apply_hybrid_terminal_record",
+    ):
+        assert required in combined
+    assert b'getattr(child, "_parent_turn_id", "")' in rendered[
+        "tools/delegate_tool.py"
+    ]
+    assert b"_slash_confirm_mod._pending.get(session_key)" in rendered[
+        "gateway/run.py"
+    ]
+    assert b"_slash_confirm_mod.get_pending(session_key)" not in rendered[
+        "gateway/run.py"
+    ]
+    for descriptor in registry.descriptors:
+        if descriptor.group not in {
+            "approval_round_trip",
+            "clarify_round_trip",
+            "slash_confirm",
+        }:
+            continue
+        target_content = rendered[descriptor.target]
+        for fragment in descriptor.fragments:
+            begin = target_content.index(fragment.begin_marker)
+            end = target_content.index(fragment.end_marker, begin)
+            block = target_content[begin:end]
+            for line in block.splitlines():
+                if b'{"label":' in line:
+                    assert b'"style":' in line
+
+    assert patcher.remove_patch_snapshots(
+        rendered,
+        expected_groups=HYBRID_REQUIRED_PATCH_GROUPS,
+        expected_fragment_matrix=expected_matrix,
+    ) == originals

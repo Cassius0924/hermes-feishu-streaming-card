@@ -924,6 +924,53 @@ def consume_terminal_record_from_hermes_locals(
         return None
 
 
+def apply_hybrid_terminal_record(record: object) -> str | None:
+    """Turn detached terminal evidence into one exact delivery decision."""
+    try:
+        if type(record) is not HybridTerminalRecord:
+            return None
+        if record.terminal_kind != "completed":
+            return None
+        if type(record.payload) is not dict or not _is_ordinary_json_value(
+            record.payload
+        ):
+            return None
+        response = record.response
+        if (
+            type(response) is not dict
+            or not all(type(key) is str for key in response)
+        ):
+            return None
+        keys = set(response)
+        if keys == {"ok", "applied"}:
+            return (
+                "card"
+                if response.get("ok") is True
+                and response.get("applied") is True
+                else None
+            )
+        if keys not in (
+            {"ok", "applied", "disposition"},
+            {"ok", "applied", "disposition", "native_handoff"},
+        ):
+            return None
+        if (
+            response.get("ok") is not True
+            or response.get("applied") is not False
+            or type(response.get("disposition")) is not str
+            or response.get("disposition") != "native"
+        ):
+            return None
+        if "native_handoff" in response and not _register_native_handoff_descriptor(
+            record.payload,
+            response,
+        ):
+            return None
+        return "native"
+    except Exception:
+        return None
+
+
 def _ensure_runtime_control_started(config: RuntimeConfig | None = None) -> bool:
     try:
         resolved = config or load_runtime_config()

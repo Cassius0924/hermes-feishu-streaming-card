@@ -86,9 +86,10 @@ def detect_patch_groups_by_target(
     *,
     expected_groups,
     expected_fragment_matrix,
-    registry=HYBRID_PATCH_REGISTRY,
+    registry=None,
 ):
     """Strictly detect a complete logical patch matrix in byte snapshots."""
+    registry = HYBRID_PATCH_REGISTRY if registry is None else registry
     return _detect_patch_groups_by_target(
         snapshots,
         expected_groups=expected_groups,
@@ -102,9 +103,10 @@ def remove_patch_snapshots(
     *,
     expected_groups,
     expected_fragment_matrix,
-    registry=HYBRID_PATCH_REGISTRY,
+    registry=None,
 ):
     """Strictly remove a complete aggregate patch set in memory."""
+    registry = HYBRID_PATCH_REGISTRY if registry is None else registry
     return _remove_patch_snapshots(
         snapshots,
         expected_groups=expected_groups,
@@ -120,9 +122,10 @@ def render_patch_snapshots_from_verified_originals(
     integration_mode,
     required_patch_groups,
     expected_fragment_matrix,
-    registry=HYBRID_PATCH_REGISTRY,
+    registry=None,
 ):
     """Render only from an externally verified, complete original snapshot."""
+    registry = HYBRID_PATCH_REGISTRY if registry is None else registry
     return _render_patch_snapshots_from_verified_originals(
         verified_originals,
         verified_original_sha256=verified_original_sha256,
@@ -3627,4 +3630,14 @@ LEGACY_TARGET_PATCH_ADAPTERS = (
             ),
         ),
     ),
+)
+
+
+from .hybrid_renderers import reviewed_descriptors as _reviewed_hybrid_descriptors
+
+
+HYBRID_PATCH_DESCRIPTORS = _reviewed_hybrid_descriptors(HYBRID_PATCH_DESCRIPTORS)
+HYBRID_PATCH_REGISTRY = PatchDescriptorRegistry(
+    descriptors=HYBRID_PATCH_DESCRIPTORS,
+    required_groups=HYBRID_PATCH_GROUPS,
 )

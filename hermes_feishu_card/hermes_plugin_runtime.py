@@ -595,6 +595,7 @@ class PendingApproval:
     surface: str
     interaction_id: str
     expires_at: float
+    hfc_owned: bool = False
 
 
 @dataclass(frozen=True, repr=False)
@@ -660,6 +661,7 @@ class PluginRuntime:
     _PATCH_INTERACTION_KINDS = frozenset({"approval", "clarify", "slash"})
     _MAX_PATCH_INTERACTIONS = 1024
     _PATCH_INTERACTION_TTL_SECONDS = 300.0
+    _PATCH_INTERACTION_MAX_TTL_SECONDS = 3600.0
     _MAX_PATCH_DELTA_BYTES = 64 * 1024
     _MAX_PATCH_SELECTED_BYTES = 4096
     _RUNTIME_INTERACTION_PROTOCOL = "hfc-runtime-interaction-v1"
@@ -1038,8 +1040,23 @@ class PluginRuntime:
         fingerprint: object,
         pending_handle: object,
         resolver: object,
+        descriptor_ttl_seconds: object = None,
     ) -> dict[str, object] | None:
         if not callable(resolver):
+            return None
+        if descriptor_ttl_seconds is None:
+            descriptor_ttl = self._RUNTIME_INTERACTION_DESCRIPTOR_TTL_SECONDS
+        elif type(descriptor_ttl_seconds) in (int, float):
+            try:
+                descriptor_ttl = float(descriptor_ttl_seconds)
+                if (
+                    not isfinite(descriptor_ttl)
+                    or not 0 < descriptor_ttl <= self._PATCH_INTERACTION_MAX_TTL_SECONDS
+                ):
+                    return None
+            except (OverflowError, TypeError, ValueError):
+                return None
+        else:
             return None
         try:
             with self._lock:
@@ -1078,7 +1095,7 @@ class PluginRuntime:
                     state.token_digest = token_digest
                     state.descriptor_expires_at = min(
                         state.expires_at,
-                        now + self._RUNTIME_INTERACTION_DESCRIPTOR_TTL_SECONDS,
+                        now + descriptor_ttl,
                     )
                     state.resolver = resolver
                 elif (
@@ -1115,6 +1132,32 @@ class PluginRuntime:
         """Synchronously select HFC UI only after exact Sidecar delivery proof."""
         if not callable(resolver) or not self._valid_interaction_ui_data(ui_data):
             return False
+        assert type(ui_data) is dict
+        interaction_ttl = float(ui_data["timeout_seconds"])
+        try:
+            with self._lock:
+                now = self._now()
+                self._expire_locked(now)
+                key = self._patch_interaction_key_locked(
+                    kind,
+                    session_identity,
+                    turn_id,
+                    interaction_id,
+                    fingerprint,
+                )
+                state = None if key is None else self._patch_interactions.get(key)
+                if (
+                    self._closed
+                    or type(state) is not _PatchInteraction
+                    or state.pending_handle is not pending_handle
+                    or state.turn_digest in self._interaction_cleanup_turns
+                    or state.selected_value is not None
+                    or state.resolving_value is not None
+                ):
+                    return False
+                state.expires_at = max(state.expires_at, now + interaction_ttl)
+        except Exception:
+            return False
         descriptor = self.arm_patch_interaction_descriptor(
             kind,
             session_identity,
@@ -1123,6 +1166,7 @@ class PluginRuntime:
             fingerprint,
             pending_handle,
             resolver,
+            interaction_ttl,
         )
         if descriptor is None:
             return False
@@ -1271,13 +1315,19 @@ class PluginRuntime:
             or type(value["multi_select"]) is not bool
             or type(value["timeout_seconds"]) not in (int, float)
             or type(value["options"]) is not list
-            or not value["options"]
             or len(value["options"]) > 32
+            or (
+                not value["options"]
+                and value["allow_custom_input"] is not True
+            )
         ):
             return False
         try:
             timeout = value["timeout_seconds"]
-            if not isfinite(timeout) or not 0 < timeout <= cls._PATCH_INTERACTION_TTL_SECONDS:
+            if (
+                not isfinite(timeout)
+                or not 0 < timeout <= cls._PATCH_INTERACTION_MAX_TTL_SECONDS
+            ):
                 return False
         except (OverflowError, TypeError, ValueError):
             return False
@@ -1672,26 +1722,44 @@ class PluginRuntime:
             return None
         session_key, turn_id, tool_call_id, surface, fingerprint = values
         interaction_id = f"approval:{turn_id}:{tool_call_id}:{fingerprint[:16]}"
-        pending = PendingApproval(
-            session_key=session_key,
-            turn_id=turn_id,
-            tool_call_id=tool_call_id,
-            command_fingerprint=fingerprint,
-            surface=surface,
-            interaction_id=interaction_id,
-            expires_at=self._now() + self._STATE_TTL_SECONDS,
-        )
         key = (session_key, turn_id, tool_call_id, surface, fingerprint)
         with self._lock:
-            self._expire_locked(self._now())
+            now = self._now()
+            self._expire_locked(now)
             if key in self._pending_approvals:
                 return None
             coordinator = self._card_active_coordinator_locked(turn_id)
             if coordinator is None:
                 return None
+            patch_key = self._patch_interaction_key_locked(
+                "approval",
+                session_key,
+                turn_id,
+                interaction_id,
+                fingerprint,
+            )
+            patch_state = (
+                None if patch_key is None else self._patch_interactions.get(patch_key)
+            )
+            hfc_owned = (
+                type(patch_state) is _PatchInteraction
+                and patch_state.hfc_owned is True
+            )
+            pending = PendingApproval(
+                session_key=session_key,
+                turn_id=turn_id,
+                tool_call_id=tool_call_id,
+                command_fingerprint=fingerprint,
+                surface=surface,
+                interaction_id=interaction_id,
+                expires_at=now + self._STATE_TTL_SECONDS,
+                hfc_owned=hfc_owned,
+            )
             self._pending_approvals[key] = pending
             self._pending_approvals.move_to_end(key)
             self._trim_pending_approvals_locked()
+        if hfc_owned:
+            return None
         payload = self._observer_payload(
             turn_id,
             event="interaction.requested",
@@ -1735,6 +1803,8 @@ class PluginRuntime:
             self._claimed_approvals.discard(key)
             coordinator = self._card_active_coordinator_locked(turn_id)
         if pending is None or coordinator is None:
+            return None
+        if pending.hfc_owned:
             return None
         event = "interaction.completed" if choice != "timeout" else "interaction.failed"
         data: dict[str, object] = {"interaction_id": pending.interaction_id}

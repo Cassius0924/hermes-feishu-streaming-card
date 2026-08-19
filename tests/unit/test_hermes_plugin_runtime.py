@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from hashlib import sha256
 from threading import Barrier, Event, Thread, current_thread
 
 import pytest
@@ -1081,6 +1082,71 @@ def test_task4_take_claim_is_one_shot_but_official_post_still_closes_interaction
         "interaction.completed",
     ]
     assert posted[0]["data"]["interaction_id"] == posted[1]["data"]["interaction_id"]
+
+
+def test_hybrid_owned_approval_keeps_official_hooks_observer_only_without_second_ui():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    command = "  git   status  "
+    fingerprint = sha256(b"git status").hexdigest()
+    interaction_id = f"approval:turn-1:approval-call-1:{fingerprint[:16]}"
+    handle = object()
+    values = (
+        "approval",
+        "gateway-session-1",
+        "turn-1",
+        interaction_id,
+        fingerprint,
+        handle,
+    )
+    assert runtime.register_patch_interaction(*values) is True
+    state = next(iter(runtime._patch_interactions.values()))
+    state.hfc_owned = True
+
+    official = {
+        "session_key": "gateway-session-1",
+        "turn_id": "turn-1",
+        "tool_call_id": "approval-call-1",
+        "command": command,
+        "surface": "gateway",
+    }
+    runtime.handle_pre_approval_request(**official)
+    runtime.handle_post_approval_response(**official, choice="once")
+    runtime.drain_observers(1.0)
+
+    assert posted == []
+
+
+def test_hybrid_approval_ui_ownership_is_exact_not_turn_wide():
+    posted = []
+    runtime = active_task4_runtime(posted)
+    handle = object()
+    first_fingerprint = sha256(b"git status").hexdigest()
+    first_interaction_id = (
+        f"approval:turn-1:approval-call-1:{first_fingerprint[:16]}"
+    )
+    values = (
+        "approval",
+        "gateway-session-1",
+        "turn-1",
+        first_interaction_id,
+        first_fingerprint,
+        handle,
+    )
+    assert runtime.register_patch_interaction(*values) is True
+    state = next(iter(runtime._patch_interactions.values()))
+    state.hfc_owned = True
+
+    runtime.handle_pre_approval_request(
+        session_key="gateway-session-1",
+        turn_id="turn-1",
+        tool_call_id="approval-call-2",
+        command="git diff",
+        surface="gateway",
+    )
+    runtime.drain_observers(1.0)
+
+    assert [payload["event"] for payload in posted] == ["interaction.requested"]
 
 
 @pytest.mark.parametrize(
@@ -2326,6 +2392,61 @@ def _runtime_interaction_ui():
             {"label": "拒绝", "value": "deny", "style": "danger"},
         ],
     }
+
+
+def test_runtime_interaction_ui_allows_empty_options_only_for_custom_input():
+    custom = {
+        **_runtime_interaction_ui(),
+        "allow_custom_input": True,
+        "options": [],
+    }
+    assert plugin_runtime.PluginRuntime._valid_interaction_ui_data(custom) is True
+    assert plugin_runtime.PluginRuntime._valid_interaction_ui_data(
+        {**custom, "allow_custom_input": False}
+    ) is False
+
+
+def test_runtime_interaction_admission_descriptor_matches_original_wait_window():
+    posted = []
+    now = [100.0]
+    runtime = active_task4_runtime(posted, now=lambda: now[0])
+
+    class Listener:
+        resolve_url = "http://127.0.0.1:12345/runtime/interactions/resolve"
+
+        @staticmethod
+        def accepts():
+            return True
+
+    runtime._runtime_interaction_listener = Listener()
+    handle = object()
+    values = patch_interaction_args(
+        handle, kind="clarify", interaction_id="clarify:safe_1"
+    )
+    assert runtime.register_patch_interaction(*values) is True
+    runtime._post = lambda payload, timeout: posted.append(payload) or {
+        "ok": True,
+        "applied": True,
+        "delivery": {"outcome": "delivered"},
+        "runtime_admission": True,
+    }
+    ui = {
+        **_runtime_interaction_ui(),
+        "allow_custom_input": True,
+        "options": [],
+        "timeout_seconds": 3600.0,
+    }
+
+    assert runtime.admit_patch_interaction(
+        *values, lambda choice: True, ui
+    ) is True
+    descriptor = posted[0]["data"]["_hfc_runtime_admission"]
+    state = next(iter(runtime._patch_interactions.values()))
+    assert descriptor["expires_at"] == 3700.0
+    assert state.expires_at == 3700.0
+    assert plugin_runtime.PluginRuntime._valid_interaction_ui_data(
+        {**ui, "timeout_seconds": 3600.001}
+    ) is False
 
 
 def test_runtime_interaction_admission_posts_once_and_owns_ui_only_on_exact_delivery():
