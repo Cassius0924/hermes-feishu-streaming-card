@@ -292,11 +292,15 @@ def _normalize_inputs(
         or any(character in expected_package_version for character in "\r\n\0")
     ):
         raise ValueError("package version is invalid")
+    python_identity_prefix = "python-sha256:"
     if (
         type(expected_python_identity) is not str
-        or not expected_python_identity.startswith("sha256:")
-        or len(expected_python_identity) != 71
-        or any(character not in "0123456789abcdef" for character in expected_python_identity[7:])
+        or not expected_python_identity.startswith(python_identity_prefix)
+        or len(expected_python_identity) != len(python_identity_prefix) + 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in expected_python_identity[len(python_identity_prefix) :]
+        )
     ):
         raise ValueError("Python identity is invalid")
     return {
@@ -334,7 +338,7 @@ def _render_unit(inputs: Mapping[str, str]) -> bytes:
         "[Service]\n"
         "Type=simple\n"
         f"Environment={_systemd_quote(state_assignment)}\n"
-        f"WorkingDirectory={_systemd_quote(inputs['state_dir'])}\n"
+        f"WorkingDirectory={_systemd_working_directory(inputs['state_dir'])}\n"
         f"ExecStart={exec_start}\n"
         "Restart=on-failure\n"
         "RestartSec=2s\n"
@@ -583,6 +587,20 @@ def _systemd_quote(value: str) -> str:
         raise ValueError("systemd argument is invalid")
     escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
     return f'"{escaped}"'
+
+
+def _systemd_working_directory(value: str) -> str:
+    if (
+        type(value) is not str
+        or not value.startswith("/")
+        or any(character in value for character in "\r\n\0")
+    ):
+        raise ValueError("systemd working directory is invalid")
+    # WorkingDirectory= is a single path value, not an ExecStart word.  Keep
+    # it unquoted for the systemd path parser, double percent specifiers, and
+    # escape every backslash so a path ending in one cannot continue the next
+    # unit line.
+    return value.replace("\\", "\\\\").replace("%", "%%")
 
 
 def _digest(contents: bytes) -> str:
