@@ -109,6 +109,7 @@ def render_card(
     status_config: Optional[StatusConfig] = None,
     text_sizes: Mapping[str, Any] | None = None,
     table_overflow_mode: str = "compact",
+    interaction_profile_id: str = "default",
 ) -> Dict[str, Any]:
     return render_card_result(
         session,
@@ -123,6 +124,7 @@ def render_card(
         status_config=status_config,
         text_sizes=text_sizes,
         table_overflow_mode=table_overflow_mode,
+        interaction_profile_id=interaction_profile_id,
     ).card
 
 
@@ -139,6 +141,7 @@ def render_card_result(
     status_config: Optional[StatusConfig] = None,
     text_sizes: Mapping[str, Any] | None = None,
     table_overflow_mode: str = "compact",
+    interaction_profile_id: str = "default",
 ) -> CardRenderResult:
     primary_text = _primary_text_for_session(session)
     table_overflow = transform_table_overflow(
@@ -158,6 +161,7 @@ def render_card_result(
         status_config=status_config,
         text_sizes=text_sizes,
         table_overflow_mode=table_overflow_mode,
+        interaction_profile_id=interaction_profile_id,
     )
     inspection = inspect_card_limits(card)
     if inspection.safe:
@@ -197,6 +201,7 @@ def _render_card_unchecked(
     status_config: Optional[StatusConfig] = None,
     text_sizes: Mapping[str, Any] | None = None,
     table_overflow_mode: str = "compact",
+    interaction_profile_id: str = "default",
 ) -> Dict[str, Any]:
     used_text_size_roles: set[str] = set()
     status = _render_status(session, status_config=status_config)
@@ -328,7 +333,124 @@ def _render_card_unchecked(
         card["config"]["style"] = {"text_size": mapped_styles}
     if not native_reply_completed:
         card["header"] = header
+    if _uses_legacy_callback_card(session, interaction_mode=interaction_mode):
+        return _render_legacy_callback_card(
+            session,
+            header=header,
+            profile_id=_normalize_interaction_profile_id(interaction_profile_id),
+        )
     return card
+
+
+def _uses_legacy_callback_card(
+    session: CardSession, *, interaction_mode: str
+) -> bool:
+    interaction = session.active_interaction
+    return (
+        interaction is not None
+        and interaction.status == "pending"
+        and _normalize_interaction_mode(interaction_mode) == "callback"
+    )
+
+
+def _render_legacy_callback_card(
+    session: CardSession, *, header: Mapping[str, Any], profile_id: str
+) -> Dict[str, Any]:
+    """Render the pending choice on Feishu's server-callback card rail.
+
+    CardKit v2 ``behaviors`` callbacks are client-side interactions and do not
+    reach Hermes' ``p2.card.action.trigger`` WebSocket handler.  Conversely,
+    the legacy ``action`` container is rejected when embedded in a schema-2.0
+    card.  A pending interaction therefore uses one ordinary legacy card; the
+    next render switches back to the normal CardKit v2 streaming card after
+    the choice is resolved.
+    """
+    interaction = session.active_interaction
+    if interaction is None:  # Defensive: caller already checked the state.
+        return {}
+
+    elements: list[Dict[str, Any]] = []
+    description = normalize_stream_text(interaction.description).strip()
+    if description:
+        elements.append({"tag": "markdown", "content": description})
+
+    if interaction.multi_select:
+        elements.append(
+            _legacy_form(
+                _render_multi_select_form(interaction, profile_id=profile_id)
+            )
+        )
+    else:
+        hint = "请选择一个选项"
+        if interaction.allow_custom_input:
+            hint += "，或输入自定义内容"
+        elements.append({"tag": "markdown", "content": hint})
+        buttons = [
+            _legacy_button(
+                _render_choice_button(
+                    interaction,
+                    index,
+                    option,
+                    profile_id=profile_id,
+                )
+            )
+            for index, option in enumerate(interaction.options)
+        ]
+        for offset in range(0, len(buttons), 5):
+            elements.append({"tag": "action", "actions": buttons[offset : offset + 5]})
+        if interaction.allow_custom_input:
+            elements.append(
+                _legacy_form(_render_other_form(interaction, profile_id=profile_id))
+            )
+
+    elements.extend(
+        [
+            {"tag": "hr"},
+            {"tag": "markdown", "content": "等待选择…"},
+        ]
+    )
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": dict(header),
+        "elements": elements,
+    }
+
+
+def _legacy_button(button: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in button.items()
+        if key not in {"element_id", "size", "width", "behaviors"}
+    }
+
+
+def _legacy_form(form: Mapping[str, Any]) -> Dict[str, Any]:
+    elements: list[Dict[str, Any]] = []
+    for raw_element in form.get("elements", []):
+        if not isinstance(raw_element, Mapping):
+            continue
+        element = {
+            key: value
+            for key, value in raw_element.items()
+            if key not in {"element_id", "size", "width", "behaviors"}
+        }
+        if element.pop("form_action_type", None) == "submit":
+            element["action_type"] = "form_submit"
+        elements.append(element)
+    return {
+        "tag": "form",
+        "name": form.get("name", "hfc_interaction_form"),
+        "elements": elements,
+    }
+
+
+def _normalize_interaction_profile_id(value: Any) -> str:
+    if type(value) is not str:
+        return "default"
+    candidate = value.strip()
+    if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", candidate) is None:
+        return "default"
+    return candidate
 
 
 def _card_quote_summary(
@@ -550,8 +672,22 @@ def _render_interaction_elements(
                     "content": hint,
                 }
             )
-            for index, option in enumerate(interaction.options):
-                elements.append(_render_choice_button(interaction, index, option))
+            choice_buttons = [
+                _render_choice_button(interaction, index, option)
+                for index, option in enumerate(interaction.options)
+            ]
+            # The Feishu long-connection p2.card.action.trigger channel only
+            # dispatches server-side button events from an ``action`` element.
+            # Keep groups within the legacy five-action limit while retaining
+            # the surrounding CardKit v2 streaming card.
+            for offset in range(0, len(choice_buttons), 5):
+                elements.append(
+                    {
+                        "tag": "action",
+                        "element_id": f"hfc_choice_actions_{offset // 5}",
+                        "actions": choice_buttons[offset : offset + 5],
+                    }
+                )
             if interaction.allow_custom_input:
                 elements.append(_render_other_form(interaction))
         return elements
@@ -642,7 +778,11 @@ def _interaction_callback_value(
 
 
 def _render_choice_button(
-    interaction: Any, index: int, option: Any
+    interaction: Any,
+    index: int,
+    option: Any,
+    *,
+    profile_id: str = "default",
 ) -> Dict[str, Any]:
     return {
         "tag": "button",
@@ -656,16 +796,17 @@ def _render_choice_button(
         "type": _button_type(option.style),
         "size": "medium",
         "width": "default",
-        "behaviors": [
-            {
-                "type": "callback",
-                "value": _interaction_callback_value(
-                    interaction,
-                    choice=option.value,
-                    choice_label=option.label,
-                ),
-            }
-        ],
+        # Hermes Feishu receives card actions through the server-side
+        # p2.card.action.trigger WebSocket callback.  That callback exposes the
+        # button's top-level ``value`` as event.action.value.  A CardKit
+        # ``behaviors: callback`` entry only drives client callback behavior and
+        # does not reach this long-connection handler.
+        "value": _interaction_callback_value(
+            interaction,
+            choice=option.value,
+            choice_label=option.label,
+            profile_id=_normalize_interaction_profile_id(profile_id),
+        ),
     }
 
 
@@ -682,7 +823,9 @@ def _render_other_input() -> Dict[str, Any]:
     }
 
 
-def _render_other_form(interaction: Any) -> Dict[str, Any]:
+def _render_other_form(
+    interaction: Any, *, profile_id: str = "default"
+) -> Dict[str, Any]:
     """Single-select card footer: a form with the free-text input + submit
     button. On submit, Feishu returns action.form_value.hfc_other with the
     user's typed answer and action.name = hfc_other_<callback_token>.
@@ -701,12 +844,17 @@ def _render_other_form(interaction: Any) -> Dict[str, Any]:
                 "width": "default",
                 "form_action_type": "submit",
                 "name": f"hfc_other_{interaction.callback_token}",
+                "value": {
+                    "profile_id": _normalize_interaction_profile_id(profile_id)
+                },
             },
         ],
     }
 
 
-def _render_multi_select_form(interaction: Any) -> Dict[str, Any]:
+def _render_multi_select_form(
+    interaction: Any, *, profile_id: str = "default"
+) -> Dict[str, Any]:
     """Multi-select card body: a form with a native multi-select dropdown
     (multi_select_static) + a single confirm button, plus the free-text
     'Other' input.
@@ -756,6 +904,9 @@ def _render_multi_select_form(interaction: Any) -> Dict[str, Any]:
             "width": "fill",
             "form_action_type": "submit",
             "name": f"hfc_confirm_{interaction.callback_token}",
+            "value": {
+                "profile_id": _normalize_interaction_profile_id(profile_id)
+            },
         }
     )
     return {

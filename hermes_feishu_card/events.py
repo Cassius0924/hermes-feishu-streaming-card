@@ -30,7 +30,7 @@ _RUNTIME_ADMISSION_FIELD = "_hfc_runtime_admission"
 _RUNTIME_ADMISSION_PROTOCOL = "hfc-runtime-interaction-v1"
 _RUNTIME_ADMISSION_PATH = "/runtime/interactions/resolve"
 _LOWER_HEX_64_RE = re.compile(r"[0-9a-f]{64}")
-_RUNTIME_ADMISSION_MAX_FUTURE_SECONDS = 60.0
+_RUNTIME_ADMISSION_MAX_FUTURE_SECONDS = 3600.0
 
 
 class EventValidationError(ValueError):

@@ -2,6 +2,14 @@
 
 自动化测试不能完全证明 Feishu/Lark 客户端体验。涉及卡片 UX、topic、系统提示、命令卡片的版本，发布前需要真实飞书 smoke。
 
+## V4.3.1 Hermes 0.20 交互恢复验收
+
+- 在非 default profile 发起一次 clarify 和一次 approval；卡片按钮必须携带 exact profile，Hermes WebSocket action 转发后 sidecar runtime callback attempts/successes 各增加，failures 不增加。
+- 点击后不要再发送消息；同一 turn 必须继续显示 answer/thinking 流式 PATCH 并正常终结。不能只看到“已选择”后长时间无更新、最后才一次刷新。
+- 显式切换 `card.interaction_mode: text`，发起一轮 interaction 后只回复一次编号或文本；Hermes 必须立即继续，Sidecar 不建立 runtime callback admission，旧卡不得一直显示“交互已过期”。
+- callback 404/409/timeout/expired 与 profile mismatch 用脱敏 health 分类定位；不得记录真实 choice、token、chat/user/profile id 或回答正文。
+- 若应用长连接确实收到零个 `card.action.trigger`，仍属于平台/应用订阅边界；先核对订阅、发布版本、应用身份和开放平台原始事件，再与“事件已到但本地 profile/callback 失败”区分。
+
 ## V4.3.0 Hermes 0.20 Hybrid 验收
 
 - 在固定 Hermes `v2026.8.3` 安装后，`doctor --explain` 与 installer 显示 `integration.mode: hybrid`；manifest 为 V3，列出 17 个 patch group 与 7 个 target。重复 install 不改 manifest，restore 后 checkout Git clean。
@@ -10,7 +18,7 @@
 - subagent start/running/terminal 使用独立 timeline，`interrupted` 属于终态且迟到 running 不得重开；工具调用数不包含 subagent item。
 - 断开 callback、过期 descriptor、session replacement、重复同选项和冲突选项都要保持原 pending/终态契约；不得出现第二套 poll/wait UI。
 - Linux persistent smoke：确认 `loginctl show-user "$USER" -p Linger --value` 为 `yes`，执行 `enable` 后重启 user manager/主机，`systemctl --user is-enabled/is-active hermes-feishu-card-sidecar.service` 与 `status` 均正确；`disable` 后 unit 与私有 manifest 都消失。
-- Issue #216 单独记录平台原始事件证据：如果应用长连接收到的 `card.action.trigger` 为零，不把“按钮无效”写成 HFC callback 失败。核对订阅、发布版本、应用身份与飞书开放平台日志；没有事件时本版不宣称本地修复。
+- V4.3.0 原验收只覆盖 Issue #216 的平台零事件边界；V4.3.1 增加“事件已到、runtime 已继续但流式卡片未恢复”和 text fallback 首次回复的独立验收。
 - 真实飞书消息、截图、chat/user/app identity 必须脱敏；本地 fixed-tag、loopback 与自动化通过不等同于真实客户端验收。
 
 ## V4.2.12 审批能力与零工具时间线验收

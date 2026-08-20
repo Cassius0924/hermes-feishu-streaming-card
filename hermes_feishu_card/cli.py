@@ -2362,6 +2362,41 @@ def _lifecycle_hook_check(args: argparse.Namespace) -> dict[str, object] | None:
             "root": hermes_root,
         }
 
+    manifest_path = verified_root / MANIFEST_NAME
+    if _manifest_version_candidate(manifest_path) == 3:
+        try:
+            binding = resolve_runtime_binding(
+                checkout_root=verified_root,
+                hermes_home=getattr(args, "hermes_home", None),
+                profile_id=getattr(args, "profile_id", None),
+            )
+            entrypoint = probe_plugin_entrypoint(
+                binding,
+                expected_version=PACKAGE_VERSION,
+            )
+            inspect_fixed_tag_hybrid_install(
+                binding=binding,
+                entrypoint=entrypoint,
+                package_version=PACKAGE_VERSION,
+            )
+        except (
+            FixedTagInstallRefused,
+            RuntimeBindingRefused,
+            OSError,
+            UnicodeError,
+            ValueError,
+        ):
+            return {
+                "status": "manual_review_required",
+                "blocking": True,
+                "root": verified_root,
+            }
+        return {
+            "status": "installed",
+            "blocking": False,
+            "root": verified_root,
+        }
+
     plan = plan_recovery(detection)
     if plan.state == "installed" and not plan.actions:
         return {"status": "installed", "blocking": False, "root": verified_root}

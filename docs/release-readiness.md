@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.3.0`。本轮为 Hermes `v2026.8.3` 增加 source-proven Hybrid Plugin/patch 集成、V3 installer ownership、single-owner runtime interaction 与 linger 校验的 persistent systemd user service，并吸收 Issues #210–#223 中可由本地代码修复的反馈。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.3.1`。本轮修复 Hermes 0.20 / 飞书 WebSocket 的 Issue #216 交互恢复链路，吸收 PR #226 的 persistent service 根因，并补齐历史贡献者署名。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -147,6 +147,16 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
 
+## V4.3.1 发布门禁
+
+- Issue #216：真实飞书点击必须先到 Hermes WebSocket card-action channel，再带 exact profile 转发 sidecar，并由签名 listener 直接唤醒原 pending handle；同一 turn 后续 answer/thinking delta 必须继续 PATCH 最新卡片，不得要求再发一句话。
+- 显式 `card.interaction_mode: text` 必须在 session mutation 前拒绝 runtime callback ownership；第一条编号/文本回复由 Hermes 原生 interceptor 消费，不产生第二套 waiter 或过期卡片。
+- PR #226：persistent enable 接受 exact `python-sha256:` identity；systemd `WorkingDirectory` 拒绝 relative/control-character 并安全处理 `%`/反斜杠；tokenless health 明确返回空 hash，有 token 时只返回 SHA-256。
+- 真实 fixed-tag Hermes `v2026.8.3` + 飞书 WebSocket 两次物理点击已到达 listener 并 resolved，交互后卡片继续显示新结果；验收记录不保存真实标识符、token、正文或截图。
+- README 中英文贡献者名单必须与历史 release、merged/absorbed PR、accepted issue evidence、commit author/co-author 对账；GitHub Contributors 图只使用真实提交归属，禁止为改图伪造 authorship。
+- 完整 pytest：**`3245 passed, 6 skipped in 425.58s`**；sdist/wheel 与 fresh Python 3.12 wheel-only venv 的版本、`site-packages` origin、唯一 plugin entrypoint、24 slices 和 CLI help：**通过**。
+- diff-check、exact merge SHA、远端 CI、annotated tag、public install 与 Release assets：**发布流程中逐项记录**。
+
 ## V4.3.0 发布门禁
 
 - 固定 Hermes `v2026.8.3` / commit `3c27eb6234bf91b8ceee9e9071591b31e9b148cb` 的 probe 必须同时通过源码哈希/call-site slices、runtime Python、entrypoint/distribution origin 与真实 PluginManager subprocess evidence；不能用版本字符串或 hook 名列表代替能力证明。
@@ -155,7 +165,7 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - persistent `enable` 必须要求 `Linger=yes`、安全迁移 verified transient owner、用 SHA-256 绑定 mode `0600` unit/manifest，并在停服失败时保留 ownership；`disable` 对 drift fail-closed。
 - 已完成聚焦证据：V3 installer/restore/script `340 passed, 5 skipped`；persistent process/CLI loopback `302 passed`；真实 fixed-tag install/idempotence/restore 全链路通过。
 - 完整 pytest：**`3227 passed, 6 skipped in 378.84s`**；sdist/wheel、全新 Python 3.12 venv 的隔离 `site-packages` provenance、唯一 Hermes plugin entrypoint、24 个 provenance slices、主 CLI 与 `enable/disable --help`：**本地通过**。最终提交后仍需再跑 `git diff --check` 与 docs/package 快速门禁。
-- Issue #216 属于平台零事件边界，不写成已修复；PR #203 仅改归档 `legacy/`，不纳入 active runtime。
+- V4.3.0 发布时把 Issue #216 限定为平台零事件边界；后续真实复测证明还存在本地 profile/callback/streaming 恢复缺口，已由 V4.3.1 单独修复。PR #203 仅改归档 `legacy/`，不纳入 active runtime。
 - exact merge SHA、远端 CI、annotated tag、public tag/install 与 Release assets：**发布流程中逐项记录**。
 
 ## V4.2.12 发布门禁

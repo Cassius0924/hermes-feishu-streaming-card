@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.3.1 — 2026-08-20
+
+See also: [docs/release-notes-v4.3.1.md](docs/release-notes-v4.3.1.md)
+
+### Fixed
+- Issue #216: Hermes 0.20 Hybrid clarify/approval cards now use a Feishu WebSocket callback-compatible interactive-card payload, carry the exact profile identity through `interaction.select`, and wake the original pending Hermes interaction on the first click. Streaming answer/thinking updates continue after the choice instead of appearing frozen until the terminal refresh.
+- Explicit `card.interaction_mode: text` declines runtime callback ownership before session mutation, so Hermes' native numbered/text interceptor consumes the first reply instead of leaving an expired interaction card.
+- PR #226: persistent service enable accepts the package's canonical `python-sha256:` runtime identity, renders a systemd-safe `WorkingDirectory`, and reconciles tokenless `/health` with an explicit empty `process_token_hash`.
+- Runtime interaction callback attempts, successes, failures, and a sanitized last outcome are exposed in health diagnostics without callback tokens, identities, choices, or answer text.
+
+### Safety
+- Pending choice cards remain single-owner: callback resolution validates the exact session, profile, interaction, operator/chat binding, expiry, and opaque descriptor before terminal mutation. Text mode does not create a second waiter.
+- Systemd service paths reject relative/control-character input and escape specifiers/backslashes; health never echoes the process token.
+- The fixed Hermes `v2026.8.3` source and PluginManager evidence remain mandatory. `legacy/` and PR #203 remain outside the active runtime.
+- Local release gate: full pytest `3245 passed, 6 skipped`; sdist/wheel build; fresh Python 3.12 wheel-only `site-packages` provenance; exactly one Hermes plugin entrypoint; 24 provenance slices; main CLI and `enable/disable --help` exit 0.
+
+### Credits
+- Thanks to @saulgoodmanngabriel for Issue #216 and to @zhangzq for the Hermes 0.20 retest that distinguished a resolved interaction from the missing streaming/thinking refresh.
+- Thanks to @RanHuang for PR #226. The accepted implementation keeps the contribution's three root-cause findings while tightening systemd escaping and adversarial tests.
+- The README contributor audit was reconciled against historical release notes, merged and materially absorbed PRs, accepted issue evidence, commit authors, and co-author trailers so earlier-version contributors remain credited.
+
 ## V4.3.0 — 2026-08-19
 
 See also: [docs/release-notes-v4.3.0.md](docs/release-notes-v4.3.0.md)

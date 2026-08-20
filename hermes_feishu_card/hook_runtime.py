@@ -523,7 +523,28 @@ def consume_canonical_turn_id(explicit_turn_id: object = None) -> str | None:
         original_frames = _HFC_CANONICAL_TURN_CARRIER.get()
         frames = _live_canonical_turn_frames_locked(original_frames, owner)
         if frames is None:
-            return None
+            # Hermes copies ContextVars into tool worker threads.  Such a
+            # worker must not gain implicit access to the turn, and it must
+            # never be allowed to clear the owning frame.  It may, however,
+            # present the exact explicit turn id carried by the still-live
+            # opaque frame.  This keeps clarify/approval callbacks correlated
+            # without weakening reset/clear revocation or accepting a guessed
+            # id from an unrelated context.
+            if explicit_turn_id is None or type(original_frames) is not tuple:
+                return None
+            copied_live: list[_CanonicalTurnFrame] = []
+            for frame in original_frames:
+                if type(frame) is not _CanonicalTurnFrame:
+                    return None
+                entry = _CANONICAL_TURN_REGISTRY.get(frame.token)
+                if entry is None:
+                    continue
+                if entry.token is not frame.token or entry.turn_id != frame.turn_id:
+                    return None
+                copied_live.append(frame)
+            if not copied_live or copied_live[-1].turn_id != explicit_turn_id:
+                return None
+            return explicit_turn_id
         if frames != original_frames:
             _HFC_CANONICAL_TURN_CARRIER.set(frames)
         if frames:
@@ -820,8 +841,11 @@ def admit_pending_interaction_from_hermes_locals(
         ):
             return False
         runtime = _plugin_runtime()
+        register = getattr(runtime, "register_patch_interaction", None)
         method = getattr(runtime, "admit_patch_interaction", None)
-        if not callable(method):
+        if not callable(register) or not callable(method):
+            return False
+        if register(*values) is not True:
             return False
         return method(
             *values,
@@ -6748,15 +6772,25 @@ def _hfc_form_submit_payload(data: Any) -> dict[str, Any] | None:
             form_value = {}
     if not isinstance(form_value, dict):
         form_value = {}
+    action_value = _hfc_action_value_from_data(data)
+    raw_profile_id = action_value.get("profile_id")
+    profile_id = (
+        _safe_profile_id(raw_profile_id)
+        if type(raw_profile_id) is str
+        else "default"
+    )
 
     payload: dict[str, Any] = {
         "event": {
             "action": {
-                "value": {},
+                "value": {"profile_id": profile_id},
                 "name": name,
                 "form_value": form_value,
             },
-            "context": {"open_chat_id": _hfc_action_chat_id(data)},
+            "context": {
+                "open_chat_id": _hfc_action_chat_id(data),
+                "profile_id": profile_id,
+            },
             "operator": {},
         }
     }
@@ -6954,6 +6988,12 @@ def _hfc_handle_interaction_select_action(
     token = str(action_value.get("token") or "").strip()
     choice = str(action_value.get("choice") or action_value.get("hfc_choice") or "").strip()
     choice_label = str(action_value.get("choice_label") or choice).strip()
+    raw_profile_id = action_value.get("profile_id")
+    profile_id = (
+        _safe_profile_id(raw_profile_id)
+        if type(raw_profile_id) is str
+        else "default"
+    )
     if not interaction_id or not token or not choice:
         _hfc_info("interaction.select ignored: missing interaction_id/token/choice")
         return _hfc_empty_feishu_callback_response(adapter)
@@ -6985,9 +7025,13 @@ def _hfc_handle_interaction_select_action(
                     "choice": choice,
                     "choice_label": choice_label,
                     "token": token,
+                    "profile_id": profile_id,
                 }
             },
-            "context": {"open_chat_id": chat_id},
+            "context": {
+                "open_chat_id": chat_id,
+                "profile_id": profile_id,
+            },
             "operator": operator_payload,
         }
     }

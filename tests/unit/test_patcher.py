@@ -3039,6 +3039,11 @@ def test_fixed_tag_real_sources_render_detect_compile_and_restore_exactly():
     assert b"_slash_confirm_mod.get_pending(session_key)" not in rendered[
         "gateway/run.py"
     ]
+    run_source = rendered["gateway/run.py"]
+    explicit_turn = (
+        b'"turn_id": str(getattr(agent, "_current_turn_id", "") or "")'
+    )
+    assert run_source.count(explicit_turn) >= 3
     for descriptor in registry.descriptors:
         if descriptor.group not in {
             "approval_round_trip",

@@ -1,6 +1,7 @@
 import pytest
 import time
 
+from hermes_feishu_card import events as events_module
 from hermes_feishu_card.events import EventValidationError, SidecarEvent
 
 
@@ -55,6 +56,33 @@ def test_runtime_interaction_admission_requires_exact_closed_fresh_descriptor():
     event = SidecarEvent.from_dict(payload)
 
     assert event.data["_hfc_runtime_admission"] == descriptor
+
+
+def test_runtime_interaction_admission_accepts_full_clarify_wait_window(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(events_module.time, "time", lambda: now)
+    payload = valid_payload(event="interaction.requested", sequence=3)
+    payload.update(
+        turn_id="turn-1",
+        event_id="patch:turn-1:interaction:clarify-1:3",
+        producer="patch",
+        phase="started",
+    )
+    descriptor = _runtime_admission()
+    descriptor["expires_at"] = now + 3600.0
+    payload["data"] = {
+        "interaction_id": "clarify-1",
+        "kind": "clarify",
+        "prompt": "请选择",
+        "options": [{"label": "继续", "value": "once"}],
+        "_hfc_runtime_admission": descriptor,
+    }
+
+    assert SidecarEvent.from_dict(payload).data["_hfc_runtime_admission"] == descriptor
+
+    descriptor["expires_at"] = now + 3600.001
+    with pytest.raises(EventValidationError, match="runtime admission"):
+        SidecarEvent.from_dict(payload)
 
 
 @pytest.mark.parametrize(

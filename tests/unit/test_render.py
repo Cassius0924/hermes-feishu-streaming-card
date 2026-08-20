@@ -252,18 +252,18 @@ def test_v4_waiting_prompt_moves_to_header_without_body_duplication():
     )
 
     card = render_card(session)
-    footer = next(
+    waiting = next(
         item
-        for item in card["body"]["elements"]
-        if item.get("element_id") == "footer"
+        for item in reversed(card["elements"])
+        if item.get("tag") == "markdown"
     )
 
     assert card["header"]["title"]["content"] == "允许覆盖文件吗？"
     assert "subtitle" not in card["header"]
     assert str(card).count("允许覆盖文件吗？") == 1
     assert "目标文件：report.html" in str(card)
-    assert "等待" in footer["content"]
-    assert "ctx " not in footer["content"]
+    assert "等待" in waiting["content"]
+    assert "ctx " not in waiting["content"]
 
 
 def test_multi_select_form_binds_submit_action_to_callback_token():
@@ -281,7 +281,7 @@ def test_multi_select_form_binds_submit_action_to_callback_token():
 
     form = next(
         item
-        for item in card["body"]["elements"]
+        for item in card["elements"]
         if item.get("tag") == "form"
     )
     submit = next(
@@ -289,7 +289,8 @@ def test_multi_select_form_binds_submit_action_to_callback_token():
         for item in form["elements"]
         if item.get("tag") == "button"
     )
-    assert submit["form_action_type"] == "submit"
+    assert submit["action_type"] == "form_submit"
+    assert submit["value"] == {"profile_id": "default"}
     assert submit["name"] == "hfc_confirm_callback-secret"
     assert "approval-1" not in submit["name"]
 
@@ -552,18 +553,24 @@ def test_render_pending_interaction_as_buttons():
         )
     )
 
-    card = render_card(session)
+    card = render_card(session, interaction_profile_id="work")
 
-    buttons = [
+    assert "schema" not in card
+    assert "body" not in card
+    assert card["config"] == {"wide_screen_mode": True, "update_multi": True}
+    action = next(
         element
-        for element in card["body"]["elements"]
-        if element.get("tag") == "button"
-    ]
+        for element in card["elements"]
+        if element.get("tag") == "action"
+    )
+    buttons = action["actions"]
     assert [item["text"]["content"] for item in buttons] == ["1. 允许一次", "2. 拒绝"]
-    assert buttons[0]["behaviors"][0]["type"] == "callback"
-    assert buttons[0]["behaviors"][0]["value"]["interaction_id"] == "approval-1"
-    assert buttons[0]["behaviors"][0]["value"]["choice"] == "once"
-    assert buttons[0]["behaviors"][0]["value"]["token"]
+    assert "behaviors" not in buttons[0]
+    assert buttons[0]["value"]["hfc_action"] == "interaction.select"
+    assert buttons[0]["value"]["interaction_id"] == "approval-1"
+    assert buttons[0]["value"]["choice"] == "once"
+    assert buttons[0]["value"]["token"]
+    assert buttons[0]["value"]["profile_id"] == "work"
     assert "interaction_actions" not in str(card)
     assert "rm -rf /tmp/demo" in str(card)
     assert "hfc_other" not in str(card)

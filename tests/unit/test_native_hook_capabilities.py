@@ -952,6 +952,101 @@ def test_second_review_stale_record_missing_loaded_runtime_is_rejected(
         record_path.write_text(original, encoding="utf-8")
 
 
+def _replace_distribution_direct_url(runtime: Path, payload: dict[str, object]):
+    purelib = runtime.parents[1] / "lib" / (
+        f"python{sys.version_info.major}.{sys.version_info.minor}"
+    ) / "site-packages"
+    metadata_path = next(purelib.glob("hermes_feishu_streaming_card-*.dist-info"))
+    direct_url_path = metadata_path / "direct_url.json"
+    original = direct_url_path.read_bytes() if direct_url_path.exists() else None
+    direct_url_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return direct_url_path, original
+
+
+def _restore_distribution_direct_url(path: Path, original: bytes | None) -> None:
+    if original is None:
+        path.unlink(missing_ok=True)
+    else:
+        path.write_bytes(original)
+
+
+def test_release_git_tag_install_provenance_is_verified(installed_fixed_runtime):
+    direct_url_path, original = _replace_distribution_direct_url(
+        installed_fixed_runtime,
+        {
+            "url": (
+                "https://github.com/baileyh8/"
+                "hermes-feishu-streaming-card.git"
+            ),
+            "vcs_info": {
+                "vcs": "git",
+                "commit_id": "b13fccbf72f912890d452ec0cfc126b0adc07c88",
+                "requested_revision": "v4.3.1",
+            },
+        },
+    )
+    try:
+        result = _run_installed_probe(installed_fixed_runtime, FIXED_SOURCE_ROOT)
+    finally:
+        _restore_distribution_direct_url(direct_url_path, original)
+
+    assert result["reason_code"] == "verified"
+
+
+@pytest.mark.parametrize(
+    "direct_url",
+    [
+        {
+            "url": "https://github.com/example/hermes-feishu-streaming-card.git",
+            "vcs_info": {
+                "vcs": "git",
+                "commit_id": "b13fccbf72f912890d452ec0cfc126b0adc07c88",
+                "requested_revision": "v4.3.1",
+            },
+        },
+        {
+            "url": (
+                "https://github.com/baileyh8/"
+                "hermes-feishu-streaming-card.git"
+            ),
+            "vcs_info": {
+                "vcs": "git",
+                "commit_id": "b13fccbf72f912890d452ec0cfc126b0adc07c88",
+                "requested_revision": "main",
+            },
+        },
+        {
+            "url": (
+                "https://github.com/baileyh8/"
+                "hermes-feishu-streaming-card.git"
+            ),
+            "vcs_info": {
+                "vcs": "git",
+                "commit_id": "b13fccb",
+                "requested_revision": "v4.3.1",
+            },
+        },
+    ],
+)
+def test_untrusted_git_install_provenance_is_rejected(
+    installed_fixed_runtime,
+    direct_url,
+):
+    direct_url_path, original = _replace_distribution_direct_url(
+        installed_fixed_runtime,
+        direct_url,
+    )
+    try:
+        result = _run_installed_probe(installed_fixed_runtime, FIXED_SOURCE_ROOT)
+    finally:
+        _restore_distribution_direct_url(direct_url_path, original)
+
+    assert result["reason_code"] == "entrypoint_identity_mismatch"
+
+
 def test_second_review_real_ignored_unchecked_pyc_cannot_influence_probe(
     tmp_path, installed_fixed_runtime,
 ):

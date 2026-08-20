@@ -17,6 +17,9 @@ class SidecarMetrics:
     runtime_control_events_received: int = 0
     runtime_control_events_accepted: int = 0
     runtime_control_auth_rejections: int = 0
+    runtime_interaction_callback_attempts: int = 0
+    runtime_interaction_callback_successes: int = 0
+    runtime_interaction_callback_failures: int = 0
     integrity_repair_attempts: int = 0
     integrity_repair_successes: int = 0
     integrity_repair_refusals: int = 0

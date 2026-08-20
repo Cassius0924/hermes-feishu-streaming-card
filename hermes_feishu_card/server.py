@@ -548,6 +548,7 @@ def create_app(
         "last_update_error": "",
         "last_route_error": "",
         "last_terminal_event": {},
+        "last_runtime_interaction_callback": "none",
     }
     app[ROUTING_DIAGNOSTICS_KEY] = _initial_routing_diagnostics(feishu_client)
     app[PROFILE_DIAGNOSTICS_KEY] = {}
@@ -990,9 +991,17 @@ async def _resolve_runtime_interaction_callback(
     descriptor: dict[str, Any],
     choice: str,
 ) -> bool:
+    metrics: SidecarMetrics = app[METRICS_KEY]
+    metrics.runtime_interaction_callback_attempts += 1
+
+    def failed(reason: str) -> bool:
+        metrics.runtime_interaction_callback_failures += 1
+        app[DIAGNOSTICS_KEY]["last_runtime_interaction_callback"] = reason
+        return False
+
     secret = app.get(OPERATIONS_TRANSPORT_ROOT_KEY)
     if type(secret) is not bytes or len(secret) != 32:
-        return False
+        return failed("secret_unavailable")
     if (
         type(descriptor) is not dict
         or set(descriptor)
@@ -1007,10 +1016,10 @@ async def _resolve_runtime_interaction_callback(
         or type(choice) is not str
         or not choice.strip()
     ):
-        return False
+        return failed("invalid_descriptor")
     expires_at = descriptor.get("expires_at")
     if type(expires_at) not in (int, float) or time.time() >= expires_at:
-        return False
+        return failed("expired_before_request")
     body_value = {
         "protocol": descriptor["protocol"],
         "runtime_id": descriptor["runtime_id"],
@@ -1048,31 +1057,38 @@ async def _resolve_runtime_interaction_callback(
                 allow_redirects=False,
             ) as response:
                 if response.status != 200:
-                    return False
+                    return failed(f"http_{response.status}")
                 lengths = response.headers.getall("Content-Length", [])
                 if len(lengths) > 1:
-                    return False
+                    return failed("invalid_response")
                 if lengths:
                     try:
                         declared = int(lengths[0])
                     except (TypeError, ValueError):
-                        return False
+                        return failed("invalid_response")
                     if not 0 <= declared <= MAX_RUNTIME_INTERACTION_RESPONSE_BYTES:
-                        return False
+                        return failed("invalid_response")
                 raw = await response.content.read(
                     MAX_RUNTIME_INTERACTION_RESPONSE_BYTES + 1
                 )
     except asyncio.CancelledError:
+        failed("cancelled")
         raise
+    except (asyncio.TimeoutError, TimeoutError):
+        return failed("timeout")
     except Exception:
-        return False
+        return failed("transport_error")
     if len(raw) > MAX_RUNTIME_INTERACTION_RESPONSE_BYTES or time.time() >= expires_at:
-        return False
+        return failed(
+            "invalid_response"
+            if len(raw) > MAX_RUNTIME_INTERACTION_RESPONSE_BYTES
+            else "expired_after_request"
+        )
     try:
         result = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        return False
-    return (
+        return failed("invalid_response")
+    resolved = (
         type(result) is dict
         and all(type(key) is str for key in result)
         and set(result) == {"ok", "status"}
@@ -1080,6 +1096,11 @@ async def _resolve_runtime_interaction_callback(
         and type(result["status"]) is str
         and result["status"] == "resolved"
     )
+    if not resolved:
+        return failed("invalid_response")
+    metrics.runtime_interaction_callback_successes += 1
+    app[DIAGNOSTICS_KEY]["last_runtime_interaction_callback"] = "resolved"
+    return True
 
 
 def _parse_form_action_name(payload: dict[str, Any]) -> tuple[str, str] | None:
@@ -4739,6 +4760,22 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
         event = incoming_event
         event_is_terminal = _event_is_terminal(event)
 
+    if _decline_runtime_interaction_in_text_mode(request.app, event):
+        # The runtime callback listener can only be completed by a card
+        # action.  Claiming ownership while rendering text-only choices leaves
+        # Hermes blocked on an Event that the Sidecar has no text-message path
+        # to resolve.  Decline before mutating the session so the Hybrid patch
+        # falls through to Hermes' native clarify text interceptor, which
+        # consumes the first numbered/text reply.
+        metrics.events_ignored += 1
+        return web.json_response(
+            {
+                "ok": True,
+                "applied": False,
+                "interaction_mode": "text",
+            }
+        ), None
+
     if _skip_native_text_fallback_interaction(request.app, event):
         metrics.events_ignored += 1
         return web.json_response(
@@ -6122,6 +6159,17 @@ def _skip_native_text_fallback_interaction(
     return _interaction_mode_for_session_key(app, _session_key(event)) == "text"
 
 
+def _decline_runtime_interaction_in_text_mode(
+    app: web.Application,
+    event: SidecarEvent,
+) -> bool:
+    if event.event != "interaction.requested" or type(event.data) is not dict:
+        return False
+    if type(event.data.get("_hfc_runtime_admission")) is not dict:
+        return False
+    return _interaction_mode_for_session_key(app, _session_key(event)) == "text"
+
+
 def _session_has_runtime_admission(session: CardSession | None) -> bool:
     interaction = session.active_interaction if session is not None else None
     return bool(
@@ -6261,6 +6309,11 @@ def _render_session_card_result_for_app(
         app,
         resolved_session_key,
     )
+    interaction_profile_id = (
+        resolved_session_key.split(":", 1)[0]
+        if ":" in resolved_session_key
+        else "default"
+    )
     raw_table_overflow_mode = card_config.get("table_overflow_mode", "compact")
     table_overflow_mode = (
         raw_table_overflow_mode.strip().lower()
@@ -6274,6 +6327,7 @@ def _render_session_card_result_for_app(
         footer_fields=footer_fields,
         title=title,
         interaction_mode=interaction_mode,
+        interaction_profile_id=interaction_profile_id,
         show_reasoning=_safe_bool(card_config.get("show_reasoning"), True),
         timeline_expanded=_safe_bool(card_config.get("timeline_expanded"), False),
         max_timeline_items=_safe_positive_int(

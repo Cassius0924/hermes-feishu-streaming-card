@@ -436,6 +436,32 @@ def operations_button(card, label):
     raise AssertionError(f"missing operations button: {label}")
 
 
+def interaction_buttons(card):
+    found = []
+
+    def walk(elements):
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            if element.get("tag") == "button" and isinstance(element.get("value"), dict):
+                found.append(element)
+            for key in ("elements", "actions"):
+                nested = element.get(key)
+                if isinstance(nested, list):
+                    walk(nested)
+            columns = element.get("columns")
+            if isinstance(columns, list):
+                for column in columns:
+                    if isinstance(column, dict) and isinstance(column.get("elements"), list):
+                        walk(column["elements"])
+
+    root_elements = card.get("elements")
+    if not isinstance(root_elements, list):
+        root_elements = card.get("body", {}).get("elements", [])
+    walk(root_elements)
+    return found
+
+
 def operations_action_payload(
     value,
     *,
@@ -1755,6 +1781,9 @@ async def test_health_reports_healthy_status_and_active_sessions(client):
         "runtime_control_events_received": 0,
         "runtime_control_events_accepted": 0,
         "runtime_control_auth_rejections": 0,
+        "runtime_interaction_callback_attempts": 0,
+        "runtime_interaction_callback_successes": 0,
+        "runtime_interaction_callback_failures": 0,
         "integrity_repair_attempts": 0,
         "integrity_repair_successes": 0,
         "integrity_repair_refusals": 0,
@@ -7490,10 +7519,8 @@ async def test_v4_interaction_restores_cached_preview_on_promoted_card(client):
     waiting = feishu_client.sent[-1][1]
     assert "允许读取精确位置吗？" in str(waiting)
     assert waiting["header"]["title"]["content"] == "允许读取精确位置吗？"
-    button = next(
-        item for item in waiting["body"]["elements"] if item.get("tag") == "button"
-    )
-    action_value = button["behaviors"][0]["value"]
+    button = interaction_buttons(waiting)[0]
+    action_value = button["value"]
 
     response = await test_client.post(
         "/card/actions",
@@ -7590,18 +7617,12 @@ async def test_interaction_promotion_finalizes_predecessor_snapshot(client):
     assert "我先检查天气客户端。" in str(snapshot)
     assert "read_file" in str(snapshot)
     assert "正在读取：weather_client.py" not in str(snapshot["header"])
-    assert not any(
-        element.get("tag") == "button"
-        for element in snapshot["body"]["elements"]
-    )
+    assert interaction_buttons(snapshot) == []
     assert "approval-handoff" not in str(snapshot)
 
     replacement = feishu_client.sent[-1][1]
     assert "允许读取精确位置吗？" in str(replacement)
-    assert any(
-        element.get("tag") == "button"
-        for element in replacement["body"]["elements"]
-    )
+    assert interaction_buttons(replacement)
 
 
 async def test_v4_preview_burst_coalesces_and_late_preview_cannot_reopen_card(
@@ -8490,12 +8511,8 @@ async def test_interaction_request_renders_buttons_and_callback_resolves(client)
     }
     assert len(feishu_client.sent) == 2
     interaction_card = feishu_client.sent[-1][1]
-    button = next(
-        element
-        for element in interaction_card["body"]["elements"]
-        if element.get("tag") == "button"
-    )
-    action_value = button["behaviors"][0]["value"]
+    button = interaction_buttons(interaction_card)[0]
+    action_value = button["value"]
 
     custom = await test_client.post(
         "/card/actions",
@@ -8620,11 +8637,7 @@ async def test_runtime_interaction_action_resolves_listener_before_terminal_muta
         )
         assert requested.status == 200
         card = feishu_client.sent[-1][1]
-        action_value = next(
-            item["behaviors"][0]["value"]
-            for item in card["body"]["elements"]
-            if item.get("tag") == "button"
-        )
+        action_value = interaction_buttons(card)[0]["value"]
 
         callback = await test_client.post(
             "/card/actions",
@@ -8669,11 +8682,7 @@ async def test_runtime_interaction_callback_failure_keeps_pending_and_hides_desc
         )
         assert requested.status == 200
         card = feishu_client.sent[-1][1]
-        action_value = next(
-            item["behaviors"][0]["value"]
-            for item in card["body"]["elements"]
-            if item.get("tag") == "button"
-        )
+        action_value = interaction_buttons(card)[0]["value"]
         callback = await test_client.post(
             "/card/actions",
             json={
@@ -8688,7 +8697,13 @@ async def test_runtime_interaction_callback_failure_keeps_pending_and_hides_desc
         assert callback.status == 503
         result = await test_client.get("/interactions/runtime-approval-1")
         assert (await result.json())["status"] == "pending"
-        health = await (await test_client.get("/health")).text()
+        health_response = await test_client.get("/health")
+        health_body = await health_response.json()
+        assert health_body["metrics"]["runtime_interaction_callback_attempts"] == 1
+        assert health_body["metrics"]["runtime_interaction_callback_successes"] == 0
+        assert health_body["metrics"]["runtime_interaction_callback_failures"] == 1
+        assert health_body["diagnostics"]["last_runtime_interaction_callback"] == "http_409"
+        health = json.dumps(health_body, ensure_ascii=False)
         result_text = await result.text()
         rendered = json.dumps(card, ensure_ascii=False)
         for canary in (descriptor["runtime_id"], descriptor["interaction_key"], descriptor["token"], descriptor["resolve_url"]):
@@ -8803,11 +8818,7 @@ async def test_runtime_interaction_expiry_during_blocked_callback_erases_admissi
             )
         ).status == 200
         card = feishu_client.sent[-1][1]
-        action_value = next(
-            item["behaviors"][0]["value"]
-            for item in card["body"]["elements"]
-            if item.get("tag") == "button"
-        )
+        action_value = interaction_buttons(card)[0]["value"]
         action = asyncio.create_task(
             test_client.post(
                 "/card/actions",
@@ -8865,11 +8876,7 @@ async def test_runtime_interaction_session_replacement_during_callback_clears_ol
         ).status == 200
         old_session = test_client.app[SESSIONS_KEY]["turn-runtime"]
         card = feishu_client.sent[-1][1]
-        action_value = next(
-            item["behaviors"][0]["value"]
-            for item in card["body"]["elements"]
-            if item.get("tag") == "button"
-        )
+        action_value = interaction_buttons(card)[0]["value"]
         action = asyncio.create_task(
             test_client.post(
                 "/card/actions",
@@ -8963,11 +8970,7 @@ async def test_runtime_interaction_concurrent_same_and_conflicting_actions_compl
             )
         ).status == 200
         card = feishu_client.sent[-1][1]
-        values = [
-            item["behaviors"][0]["value"]
-            for item in card["body"]["elements"]
-            if item.get("tag") == "button"
-        ]
+        values = [item["value"] for item in interaction_buttons(card)]
         once = next(value for value in values if value["choice"] == "once")
         deny = next(value for value in values if value["choice"] == "deny")
 
@@ -9023,10 +9026,7 @@ async def test_repeated_interactions_each_promote_a_fresh_latest_card(client):
         assert len(feishu_client.sent) == sequence + 1
         newest_card = feishu_client.sent[-1][1]
         assert f"第 {sequence} 轮请选择" in str(newest_card)
-        assert any(
-            element.get("tag") == "button"
-            for element in newest_card["body"]["elements"]
-        )
+        assert interaction_buttons(newest_card)
 
     assert feishu_client.sent[1][1] != feishu_client.sent[2][1]
     for predecessor_message_id in ("feishu-message-1", "feishu-message-2"):
@@ -9037,19 +9037,13 @@ async def test_repeated_interactions_each_promote_a_fresh_latest_card(client):
             and "已转入交互卡片" in str(card)
         ]
         assert len(snapshots) == 1
-        assert not any(
-            element.get("tag") == "button"
-            for element in snapshots[0]["body"]["elements"]
-        )
+        assert interaction_buttons(snapshots[0]) == []
         assert "choice-1" not in str(snapshots[0])
         assert "choice-2" not in str(snapshots[0])
 
     latest_card = feishu_client.sent[-1][1]
     assert "第 2 轮请选择" in str(latest_card)
-    assert any(
-        element.get("tag") == "button"
-        for element in latest_card["body"]["elements"]
-    )
+    assert interaction_buttons(latest_card)
 
 
 async def test_completed_previous_interaction_choice_never_leaks_into_next_snapshot(
@@ -9159,18 +9153,14 @@ async def test_interaction_predecessor_update_failure_still_promotes_replacement
     assert metrics.feishu_update_attempts == sidecar_server.UPDATE_MAX_ATTEMPTS
 
     replacement = feishu_client.sent[-1][1]
-    button = next(
-        element
-        for element in replacement["body"]["elements"]
-        if element.get("tag") == "button"
-    )
+    button = interaction_buttons(replacement)[0]
     callback = await test_client.post(
         "/card/actions",
         json={
             "event": {
                 "operator": {"open_id": "ou_bailey", "name": "Bailey"},
                 "context": {"open_chat_id": "oc_abc"},
-                "action": {"value": button["behaviors"][0]["value"]},
+                "action": {"value": button["value"]},
             }
         },
     )
@@ -9299,12 +9289,52 @@ async def test_interaction_request_uses_text_fallback_when_configured():
         assert len(feishu_client.sent) == 2
         interaction_card = feishu_client.sent[-1][1]
         content = str(interaction_card)
-        assert not any(
-            element.get("tag") == "button"
-            for element in interaction_card["body"]["elements"]
-        )
+        assert interaction_buttons(interaction_card) == []
         assert "1. 删除空文件" in content
         assert "2. 保留并补索引" in content
+    finally:
+        await test_client.close()
+
+
+async def test_runtime_interaction_text_mode_declines_callback_ownership_without_mutation():
+    feishu_client = FakeFeishuClient()
+    app = create_app(feishu_client, card_config={"interaction_mode": "text"})
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        started = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started", 0, turn_id="turn-runtime", created_at=time.time()
+            ),
+        )
+        assert started.status == 200
+        assert len(feishu_client.sent) == 1
+
+        listener = SimpleNamespace(
+            resolve_url="http://127.0.0.1:54321/runtime/interactions/resolve"
+        )
+        payload = runtime_interaction_payload(runtime_descriptor(listener))
+        declined = await test_client.post("/events", json=payload)
+
+        assert declined.status == 200
+        assert await declined.json() == {
+            "ok": True,
+            "applied": False,
+            "interaction_mode": "text",
+        }
+        session = test_client.app[SESSIONS_KEY]["turn-runtime"]
+        assert session.active_interaction is None
+        assert session.last_sequence == 0
+        assert len(feishu_client.sent) == 1
+
+        replay = await test_client.post("/events", json=payload)
+        assert replay.status == 200
+        assert await replay.json() == await declined.json()
+        assert session.active_interaction is None
+        assert session.last_sequence == 0
+        assert len(feishu_client.sent) == 1
     finally:
         await test_client.close()
 
@@ -9543,12 +9573,8 @@ async def test_zero_timeout_interaction_rejects_late_choice_and_refreshes_card(c
     )
     assert requested.status == 200
     waiting_card = feishu_client.sent[-1][1]
-    button = next(
-        element
-        for element in waiting_card["body"]["elements"]
-        if element.get("tag") == "button"
-    )
-    action_value = button["behaviors"][0]["value"]
+    button = interaction_buttons(waiting_card)[0]
+    action_value = button["value"]
 
     callback = await test_client.post(
         "/card/actions",

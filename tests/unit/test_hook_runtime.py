@@ -180,6 +180,27 @@ def test_thin_carrier_does_not_leak_across_threads_or_allow_cross_thread_clear()
     assert hook_runtime.clear_canonical_turn_id(token) is True
 
 
+def test_thin_carrier_accepts_only_explicit_matching_turn_in_copied_worker_context():
+    token = hook_runtime.publish_canonical_turn_id("turn-worker")
+    copied = copy_context()
+
+    def consume_from_worker():
+        return (
+            hook_runtime.consume_canonical_turn_id("turn-worker"),
+            hook_runtime.consume_canonical_turn_id(),
+            hook_runtime.consume_canonical_turn_id("turn-other"),
+            hook_runtime.clear_canonical_turn_id(token),
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            observed = executor.submit(copied.run, consume_from_worker).result()
+        assert observed == ("turn-worker", None, None, False)
+        assert hook_runtime.consume_canonical_turn_id() == "turn-worker"
+    finally:
+        assert hook_runtime.clear_canonical_turn_id(token) is True
+
+
 def test_thin_carrier_does_not_leak_to_a_different_asyncio_task():
     async def scenario():
         token = hook_runtime.publish_canonical_turn_id("turn-parent-task")
@@ -763,7 +784,18 @@ def test_thin_interaction_admission_delegates_exact_handle_resolver_and_detached
     finally:
         hook_runtime.clear_canonical_turn_id(token)
 
-    operation, values = runtime.calls[0]
+    assert len(runtime.calls) == 2
+    register_operation, register_values = runtime.calls[0]
+    assert register_operation == "register"
+    assert register_values == (
+        "approval",
+        "gateway-session-1",
+        "turn-1",
+        "approval-1",
+        "a" * 64,
+        pending_handle,
+    )
+    operation, values = runtime.calls[1]
     assert operation == "admit"
     assert values[:6] == (
         "approval",
@@ -776,6 +808,39 @@ def test_thin_interaction_admission_delegates_exact_handle_resolver_and_detached
     assert values[6] is resolver
     assert values[7] == ui_data
     assert values[7] is not ui_data
+
+
+def test_thin_interaction_admission_uses_explicit_turn_in_copied_tool_worker(monkeypatch):
+    runtime = _ThinBridgeRuntime()
+    monkeypatch.setattr(hook_runtime, "_plugin_runtime", lambda: runtime)
+    pending_handle = object()
+    resolver = lambda choice: choice == "Alpha"
+    token = hook_runtime.publish_canonical_turn_id("turn-1")
+    copied = copy_context()
+
+    def admit_from_worker():
+        return hook_runtime.admit_pending_interaction_from_hermes_locals(
+            _thin_bridge_locals(),
+            "clarify",
+            _thin_interaction_data(interaction_id="clarify-1"),
+            pending_handle,
+            resolver,
+            _thin_interaction_ui(),
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(copied.run, admit_from_worker).result() is True
+    finally:
+        assert hook_runtime.clear_canonical_turn_id(token) is True
+
+    assert [call[0] for call in runtime.calls] == ["register", "admit"]
+    assert runtime.calls[1][1][1:5] == (
+        "gateway-session-1",
+        "turn-1",
+        "clarify-1",
+        "a" * 64,
+    )
 
 
 @pytest.mark.parametrize(
@@ -10864,6 +10929,7 @@ def test_interaction_select_forwards_to_sidecar_and_returns_card(monkeypatch):
                     "choice": "opt_b",
                     "choice_label": "Option B",
                     "token": "tok-1",
+                    "profile_id": "work",
                 }
             ),
             context=SimpleNamespace(open_chat_id="oc_abc"),
@@ -10882,8 +10948,9 @@ def test_interaction_select_forwards_to_sidecar_and_returns_card(monkeypatch):
         "choice": "opt_b",
         "choice_label": "Option B",
         "token": "tok-1",
+        "profile_id": "work",
     }
-    assert sent["context"]["open_chat_id"] == "oc_abc"
+    assert sent["context"] == {"open_chat_id": "oc_abc", "profile_id": "work"}
     assert sent["operator"] == {"name": "Bailey", "open_id": "ou_user"}
     assert response.card.type == "raw"
     assert response.card.data["header"]["template"] == "green"

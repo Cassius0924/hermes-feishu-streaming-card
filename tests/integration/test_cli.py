@@ -352,6 +352,147 @@ def test_status_fails_closed_when_process_state_is_untrusted(
     )
 
 
+def test_lifecycle_hook_check_accepts_verified_v3_manifest(
+    tmp_path,
+    monkeypatch,
+):
+    hermes_root = tmp_path / "hermes-agent"
+    hermes_root.mkdir()
+    (hermes_root / cli_module.MANIFEST_NAME).write_text(
+        '{"manifest_version":3}',
+        encoding="utf-8",
+    )
+    hermes_home = tmp_path / "hermes-home"
+    binding = object()
+    entrypoint = SimpleNamespace(status="verified")
+    calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "detect_hermes",
+        lambda root: SimpleNamespace(supported=True, root=Path(root)),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_verified_explicit_hermes_root",
+        lambda root, detection: Path(root),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "resolve_runtime_binding",
+        lambda **kwargs: calls.append(("binding", kwargs)) or binding,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "probe_plugin_entrypoint",
+        lambda resolved, *, expected_version: calls.append(
+            ("entrypoint", resolved, expected_version)
+        )
+        or entrypoint,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "inspect_fixed_tag_hybrid_install",
+        lambda **kwargs: calls.append(("inspect", kwargs)) or object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "plan_recovery",
+        lambda _detection: (_ for _ in ()).throw(
+            AssertionError("V3 manifests must not use the Legacy recovery parser")
+        ),
+    )
+
+    result = cli_module._lifecycle_hook_check(
+        SimpleNamespace(
+            hermes_dir=str(hermes_root),
+            hermes_home=str(hermes_home),
+            profile_id=None,
+            env_file=None,
+            config="config.yaml",
+        )
+    )
+
+    assert result == {
+        "status": "installed",
+        "blocking": False,
+        "root": hermes_root,
+    }
+    assert calls == [
+        (
+            "binding",
+            {
+                "checkout_root": hermes_root,
+                "hermes_home": str(hermes_home),
+                "profile_id": None,
+            },
+        ),
+        ("entrypoint", binding, PACKAGE_VERSION),
+        (
+            "inspect",
+            {
+                "binding": binding,
+                "entrypoint": entrypoint,
+                "package_version": PACKAGE_VERSION,
+            },
+        ),
+    ]
+
+
+def test_lifecycle_hook_check_rejects_invalid_v3_manifest(
+    tmp_path,
+    monkeypatch,
+):
+    hermes_root = tmp_path / "hermes-agent"
+    hermes_root.mkdir()
+    (hermes_root / cli_module.MANIFEST_NAME).write_text(
+        '{"manifest_version":3}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "detect_hermes",
+        lambda root: SimpleNamespace(supported=True, root=Path(root)),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_verified_explicit_hermes_root",
+        lambda root, detection: Path(root),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "resolve_runtime_binding",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "probe_plugin_entrypoint",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "inspect_fixed_tag_hybrid_install",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            cli_module.FixedTagInstallRefused("tampered V3 evidence")
+        ),
+    )
+
+    result = cli_module._lifecycle_hook_check(
+        SimpleNamespace(
+            hermes_dir=str(hermes_root),
+            hermes_home=str(tmp_path / "hermes-home"),
+            profile_id=None,
+            env_file=None,
+            config="config.yaml",
+        )
+    )
+
+    assert result == {
+        "status": "manual_review_required",
+        "blocking": True,
+        "root": hermes_root,
+    }
+
+
 def test_start_passes_explicit_env_file_to_sidecar(tmp_path, monkeypatch, capsys):
     config_path = tmp_path / "config.yaml"
     env_path = tmp_path / "CUSTOM.env"

@@ -82,6 +82,10 @@ _RELATIVE_PATHS = {
 }
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
+_PACKAGE_VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
+_OFFICIAL_HFC_VCS_URL = (
+    "https://github.com/baileyh8/hermes-feishu-streaming-card.git"
+)
 _MAX_SOURCE_BYTES = 2 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 128 * 1024
 _MAX_SLICE_BYTES = 128 * 1024
@@ -2179,12 +2183,9 @@ def _validate_installed_distribution(
             direct_bytes = b""
         if direct_bytes:
             direct = json.loads(direct_bytes.decode("utf-8"))
-            if (
-                type(direct) is not dict
-                or "dir_info" in direct
-                or type(direct.get("url")) is not str
-                or not direct["url"].endswith(".whl")
-                or type(direct.get("archive_info")) is not dict
+            if not _valid_distribution_direct_url(
+                direct,
+                payload["distribution_version"],
             ):
                 return False
         return metadata_bytes == _read_absolute_regular_file(
@@ -2195,6 +2196,37 @@ def _validate_installed_distribution(
         json.JSONDecodeError, TypeError, ValueError,
     ):
         return False
+
+
+def _valid_distribution_direct_url(
+    direct: object,
+    distribution_version: object,
+) -> bool:
+    if (
+        type(direct) is not dict
+        or type(distribution_version) is not str
+        or _PACKAGE_VERSION_RE.fullmatch(distribution_version) is None
+        or type(direct.get("url")) is not str
+        or "dir_info" in direct
+    ):
+        return False
+    if set(direct) == {"url", "archive_info"}:
+        return (
+            direct["url"].endswith(".whl")
+            and type(direct["archive_info"]) is dict
+        )
+    if set(direct) != {"url", "vcs_info"}:
+        return False
+    vcs_info = direct["vcs_info"]
+    return (
+        direct["url"] == _OFFICIAL_HFC_VCS_URL
+        and type(vcs_info) is dict
+        and set(vcs_info) == {"vcs", "commit_id", "requested_revision"}
+        and vcs_info["vcs"] == "git"
+        and type(vcs_info["commit_id"]) is str
+        and _COMMIT_RE.fullmatch(vcs_info["commit_id"]) is not None
+        and vcs_info["requested_revision"] == f"v{distribution_version}"
+    )
 
 
 def _urlsafe_sha256(data: bytes) -> str:

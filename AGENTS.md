@@ -72,9 +72,25 @@ claims.
 1. Bump `pyproject.toml` and `hermes_feishu_card/__init__.py`.
 2. Update `CHANGELOG.md`, `docs/release-notes-vX.Y.Z.md`, README files, and
    affected docs/wiki pages.
-3. Run full tests and `git diff --check`.
-4. Commit, create annotated tag, push branch and tag.
-5. Ensure GitHub Release exists and release-assets workflow uploaded packages.
+3. Audit every merged/absorbed PR and issue since the previous tag. Credit the
+   relevant GitHub users, with links and accurate contribution descriptions,
+   in both README languages and the release notes; do not omit issue reporters
+   whose evidence materially shaped a fix.
+   Before publishing, also compare the README contributor sections against the
+   repository's full tag/release history, merged or materially absorbed PRs,
+   accepted issue evidence, commit authors, and `Co-authored-by` trailers. A
+   new release must preserve and, when needed, restore credits from earlier
+   versions rather than replacing them with only the latest cycle's names.
+4. Preserve real code authorship when merging, cherry-picking, squashing, or
+   reimplementing a PR. Keep the original author where Git permits, or add an
+   accurate `Co-authored-by` trailer, so code contributors are represented in
+   Git history and GitHub's commit-based Contributors graph. Never fabricate a
+   commit or authorship merely to change that graph. Issue-only contributors
+   may not appear in the graph and must still be acknowledged in README and
+   release notes.
+5. Run full tests and `git diff --check`.
+6. Commit, create annotated tag, push branch and tag.
+7. Ensure GitHub Release exists and release-assets workflow uploaded packages.
 
 ## Obsidian / LLM Wiki
 

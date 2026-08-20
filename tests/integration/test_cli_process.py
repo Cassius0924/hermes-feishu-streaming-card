@@ -113,7 +113,11 @@ def test_sidecar_process_rejects_non_loopback_listener_without_opt_in(tmp_path):
         capture_output=True,
         text=True,
         env={**os.environ, **process_env(tmp_path)},
-        timeout=5,
+        # This test verifies fail-closed listener validation, not import
+        # latency.  Keep the same bounded 30-second cold-import allowance used
+        # by installer/runtime probes so synced or cold filesystems do not turn
+        # a correct rejection into an unrelated TimeoutExpired failure.
+        timeout=30,
     )
 
     assert result.returncode != 0

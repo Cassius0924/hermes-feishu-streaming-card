@@ -157,7 +157,7 @@ def find_elements(elements, tag):
     for element in elements:
         if element.get("tag") == tag:
             found.append(element)
-        for key in ("elements", "columns"):
+        for key in ("elements", "columns", "actions"):
             nested = element.get(key)
             if isinstance(nested, list):
                 for item in nested:
@@ -175,7 +175,8 @@ async def test_multi_select_request_renders_single_confirm_button_form(client):
     assert interaction.multi_select is True
 
     rendered = sidecar_server._render_session_card_for_app(app, session)
-    elements = rendered["body"]["elements"]
+    assert "schema" not in rendered
+    elements = rendered["elements"]
 
     multi = find_elements(elements, "multi_select_static")
     assert multi, "multi_select_static component missing"
@@ -187,7 +188,7 @@ async def test_multi_select_request_renders_single_confirm_button_form(client):
     # ONE submit button only (user requirement)
     assert labels == ["✅ 确认选择"]
     confirm = buttons[0]
-    assert confirm["form_action_type"] == "submit"
+    assert confirm["action_type"] == "form_submit"
     assert confirm["name"] == f"hfc_confirm_{interaction.callback_token}"
     # form-submit buttons must NOT carry behaviors callbacks
     assert "behaviors" not in confirm
@@ -196,8 +197,9 @@ async def test_multi_select_request_renders_single_confirm_button_form(client):
     inputs = find_elements(elements, "input")
     assert inputs and inputs[0]["name"] == "hfc_other"
 
-    # noop behavior on the multi select so selection changes don't error
-    assert multi[0]["behaviors"][0]["value"]["hfc_action"] == "interaction.noop"
+    # The legacy server-callback form submits only from its confirm button;
+    # selection changes do not install a client-only CardKit behavior.
+    assert "behaviors" not in multi[0]
 
 
 async def test_single_select_request_renders_buttons_plus_other_form(client):
@@ -207,7 +209,8 @@ async def test_single_select_request_renders_buttons_plus_other_form(client):
     assert session.active_interaction.multi_select is False
 
     rendered = sidecar_server._render_session_card_for_app(app, session)
-    elements = rendered["body"]["elements"]
+    assert "schema" not in rendered
+    elements = rendered["elements"]
 
     buttons = find_elements(elements, "button")
     labels = [b["text"]["content"] for b in buttons]
@@ -219,8 +222,10 @@ async def test_single_select_request_renders_buttons_plus_other_form(client):
     inputs = find_elements(elements, "input")
     assert inputs and inputs[0]["name"] == "hfc_other"
 
-    # choice buttons keep their behaviors callbacks (they work)
-    assert buttons[0]["behaviors"][0]["value"]["choice"] == "A"
+    # Choice buttons use the server-event value field consumed by the
+    # Feishu WebSocket card.action.trigger callback.
+    assert "behaviors" not in buttons[0]
+    assert buttons[0]["value"]["choice"] == "A"
 
 
 async def test_confirm_form_submit_completes_with_json_array(client):

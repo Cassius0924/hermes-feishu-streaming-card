@@ -146,7 +146,10 @@ def _corrupt_gateway_completion(installed_state):
     return detection, corrupt, manifest_path
 
 
-def _wait_for_path(path, timeout=5.0):
+def _wait_for_path(path, timeout=30.0):
+    # These subprocess tests exercise recovery locking, not interpreter import
+    # speed.  Match the project's bounded cold-import allowance so a synced or
+    # cold filesystem cannot fail before the child reaches the lock protocol.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
