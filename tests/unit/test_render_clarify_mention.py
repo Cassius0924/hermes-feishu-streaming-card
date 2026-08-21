@@ -75,7 +75,9 @@ def test_clarify_mention_absent_invalid_open_id():
 
 
 def test_clarify_mention_absent_for_non_clarify_kind():
-    session = _clarify_session(kind="approval")
+    # kind=approval is handled by the sibling task through the same shared
+    # helper; use a kind excluded from both to prove the kind gate works.
+    session = _clarify_session(kind="slash_confirm")
 
     card = render_card(session)
 
