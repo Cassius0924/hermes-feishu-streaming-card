@@ -44,6 +44,10 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "max_tool_result_chars": 600,
         "table_overflow_mode": "compact",
         "completion_notify": {"enabled": False},
+        # @ mention rendering in cards (interaction/approval cards and the
+        # completion notification). Defaults to enabled when the key is absent,
+        # so existing configs keep mentioning users without migration.
+        "mentions_in_cards": True,
         "footer_fields": [
             "duration",
             "model",
@@ -155,6 +159,26 @@ def merge_card_config(
         else:
             resolved["text_sizes"] = copy.deepcopy(incoming_sizes)
     return resolved
+
+
+def card_mentions_enabled(card_config: Mapping[str, Any] | None) -> bool:
+    """Whether card content may include @ mentions of the Feishu user.
+
+    Controlled by the ``card.mentions_in_cards`` config key (default True).
+    Missing, null, or malformed values fall back to enabled (True) so that
+    existing configs keep mentioning users without any migration.
+    """
+    if not isinstance(card_config, Mapping):
+        return True
+    raw = card_config.get("mentions_in_cards", True)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return _normalize_boolean(raw, "card.mentions_in_cards")
+        except ValueError:
+            return True
+    return True
 
 
 def _normalize_text_size_value(value: object, path: str) -> str:
@@ -333,6 +357,10 @@ def _normalize_card_config(value: object, *, path: str) -> None:
     if "table_overflow_mode" in value:
         value["table_overflow_mode"] = normalize_table_overflow_mode(
             value["table_overflow_mode"], path=f"{path}.table_overflow_mode"
+        )
+    if "mentions_in_cards" in value:
+        value["mentions_in_cards"] = _normalize_boolean(
+            value["mentions_in_cards"], f"{path}.mentions_in_cards"
         )
 
 

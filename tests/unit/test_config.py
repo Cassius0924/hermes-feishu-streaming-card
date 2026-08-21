@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 from hermes_feishu_card.config import (
+    card_mentions_enabled,
     load_config,
     normalize_text_sizes,
     resolve_operations_hermes_root,
@@ -63,6 +64,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path):
             "max_tool_result_chars": 600,
             "table_overflow_mode": "compact",
             "completion_notify": {"enabled": False},
+            "mentions_in_cards": True,
             "footer_fields": [
                 "duration",
                 "model",
@@ -297,6 +299,7 @@ card:
         "max_tool_result_chars": 600,
         "table_overflow_mode": "compact",
         "completion_notify": {"enabled": False},
+        "mentions_in_cards": True,
         "footer_fields": [
             "duration",
             "model",

@@ -110,6 +110,7 @@ def render_card(
     text_sizes: Mapping[str, Any] | None = None,
     table_overflow_mode: str = "compact",
     interaction_profile_id: str = "default",
+    mentions_enabled: bool = True,
 ) -> Dict[str, Any]:
     return render_card_result(
         session,
@@ -125,6 +126,7 @@ def render_card(
         text_sizes=text_sizes,
         table_overflow_mode=table_overflow_mode,
         interaction_profile_id=interaction_profile_id,
+        mentions_enabled=mentions_enabled,
     ).card
 
 
@@ -142,6 +144,7 @@ def render_card_result(
     text_sizes: Mapping[str, Any] | None = None,
     table_overflow_mode: str = "compact",
     interaction_profile_id: str = "default",
+    mentions_enabled: bool = True,
 ) -> CardRenderResult:
     primary_text = _primary_text_for_session(session)
     table_overflow = transform_table_overflow(
@@ -162,6 +165,7 @@ def render_card_result(
         text_sizes=text_sizes,
         table_overflow_mode=table_overflow_mode,
         interaction_profile_id=interaction_profile_id,
+        mentions_enabled=mentions_enabled,
     )
     inspection = inspect_card_limits(card)
     if inspection.safe:
@@ -202,6 +206,7 @@ def _render_card_unchecked(
     text_sizes: Mapping[str, Any] | None = None,
     table_overflow_mode: str = "compact",
     interaction_profile_id: str = "default",
+    mentions_enabled: bool = True,
 ) -> Dict[str, Any]:
     used_text_size_roles: set[str] = set()
     status = _render_status(session, status_config=status_config)
@@ -259,7 +264,13 @@ def _render_card_unchecked(
             used_text_size_roles=used_text_size_roles,
         )
         elements.extend(timeline_elements)
-    elements.extend(_render_interaction_elements(session, interaction_mode=interaction_mode))
+    elements.extend(
+        _render_interaction_elements(
+            session,
+            interaction_mode=interaction_mode,
+            mentions_enabled=mentions_enabled,
+        )
+    )
     if attachment_summary:
         elements.append(
             {
@@ -338,6 +349,7 @@ def _render_card_unchecked(
             session,
             header=header,
             profile_id=_normalize_interaction_profile_id(interaction_profile_id),
+            mentions_enabled=mentions_enabled,
         )
     return card
 
@@ -354,7 +366,11 @@ def _uses_legacy_callback_card(
 
 
 def _render_legacy_callback_card(
-    session: CardSession, *, header: Mapping[str, Any], profile_id: str
+    session: CardSession,
+    *,
+    header: Mapping[str, Any],
+    profile_id: str,
+    mentions_enabled: bool = True,
 ) -> Dict[str, Any]:
     """Render the pending choice on Feishu's server-callback card rail.
 
@@ -621,7 +637,10 @@ def _render_main_content_elements(
 
 
 def _render_interaction_elements(
-    session: CardSession, *, interaction_mode: str = "callback"
+    session: CardSession,
+    *,
+    interaction_mode: str = "callback",
+    mentions_enabled: bool = True,
 ) -> list[Dict[str, Any]]:
     interaction = session.active_interaction
     if interaction is None:
