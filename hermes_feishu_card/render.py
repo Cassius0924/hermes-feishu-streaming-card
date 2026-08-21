@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from typing import Any, Dict, Literal, Optional
 
 from .card_limits import CardLimitInspection, inspect_card_limits
-from .session import CardSession
+from .session import CardSession, _exact_feishu_open_id
 from .status import StatusConfig, resolve_display_status
 from .text import (
     TableOverflowResult,
@@ -386,6 +386,13 @@ def _render_legacy_callback_card(
         return {}
 
     elements: list[Dict[str, Any]] = []
+    mention = _interaction_mention_content(
+        session,
+        interaction,
+        mentions_enabled=mentions_enabled,
+    )
+    if mention:
+        elements.append({"tag": "markdown", "content": mention})
     description = normalize_stream_text(interaction.description).strip()
     if description:
         elements.append({"tag": "markdown", "content": description})
@@ -636,6 +643,32 @@ def _render_main_content_elements(
     return elements
 
 
+def _interaction_mention_content(
+    session: CardSession,
+    interaction: Any,
+    *,
+    mentions_enabled: bool = True,
+) -> str:
+    """Return the in-card @ mention line for a clarify card, or ``""``.
+
+    The @ mention of the user being clarified is embedded in the card text
+    (markdown ``<at id=...>`` syntax) instead of a separate @ message. Only
+    pending clarify interactions are mentioned, only when the
+    ``mentions_in_cards`` flag is enabled, and only when the session carries a
+    valid Feishu open_id for the requester.
+    """
+    if not mentions_enabled:
+        return ""
+    if getattr(interaction, "status", "") != "pending":
+        return ""
+    if getattr(interaction, "kind", "") != "clarify":
+        return ""
+    open_id = _exact_feishu_open_id(getattr(session, "sender_open_id", ""))
+    if not open_id:
+        return ""
+    return f'<at id="{open_id}"></at> 请选择'
+
+
 def _render_interaction_elements(
     session: CardSession,
     *,
@@ -647,6 +680,19 @@ def _render_interaction_elements(
         return []
 
     elements: list[Dict[str, Any]] = []
+    mention = _interaction_mention_content(
+        session,
+        interaction,
+        mentions_enabled=mentions_enabled,
+    )
+    if mention:
+        elements.append(
+            {
+                "tag": "markdown",
+                "element_id": "interaction_mention",
+                "content": mention,
+            }
+        )
     if interaction.status == "pending" and interaction.description:
         elements.append(
             {
