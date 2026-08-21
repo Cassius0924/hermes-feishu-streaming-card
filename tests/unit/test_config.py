@@ -4,7 +4,7 @@ import pytest
 import yaml
 
 from hermes_feishu_card.config import (
-    card_mentions_enabled,
+    card_interaction_mention_enabled,
     load_config,
     normalize_text_sizes,
     resolve_operations_hermes_root,
@@ -63,8 +63,8 @@ def test_load_config_missing_file_returns_defaults(tmp_path):
             "max_reasoning_chars": 1200,
             "max_tool_result_chars": 600,
             "table_overflow_mode": "compact",
-            "completion_notify": {"enabled": False},
-            "mentions_in_cards": True,
+            "completion_notify": {"enabled": False, "mention": True},
+            "interaction_mentions": {"clarify": True, "approval": True},
             "footer_fields": [
                 "duration",
                 "model",
@@ -298,8 +298,8 @@ card:
         "max_reasoning_chars": 1200,
         "max_tool_result_chars": 600,
         "table_overflow_mode": "compact",
-        "completion_notify": {"enabled": False},
-        "mentions_in_cards": True,
+        "completion_notify": {"enabled": False, "mention": True},
+        "interaction_mentions": {"clarify": True, "approval": True},
         "footer_fields": [
             "duration",
             "model",

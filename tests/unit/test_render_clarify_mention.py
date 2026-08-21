@@ -46,7 +46,7 @@ def test_clarify_pending_legacy_card_includes_mention():
     elements = _card_elements(card)
     assert elements[0] == {
         "tag": "markdown",
-        "content": '<at id="ou_clarify_123"></at> 请选择',
+        "content": '<at id="ou_clarify_123"></at> 请选择一个选项',
     }
 
 
@@ -105,10 +105,13 @@ def test_clarify_mention_in_text_mode_card_uses_v2_element():
     mention_elements = [
         element
         for element in elements
-        if element.get("element_id") == "interaction_mention"
+        if element.get("element_id") == "interaction_hint"
     ]
     assert len(mention_elements) == 1
-    assert mention_elements[0]["content"] == '<at id="ou_clarify_123"></at> 请选择'
+    assert (
+        mention_elements[0]["content"]
+        == '<at id="ou_clarify_123"></at> 请选择一个选项'
+    )
 
 
 def test_clarify_mention_multiselect_legacy_precedes_form():
@@ -117,7 +120,10 @@ def test_clarify_mention_multiselect_legacy_precedes_form():
     card = render_card(session)
 
     elements = _card_elements(card)
-    assert elements[0]["content"] == '<at id="ou_clarify_123"></at> 请选择'
+    assert (
+        elements[0]["content"]
+        == '<at id="ou_clarify_123"></at> 请选择（可多选）'
+    )
     assert any(
         isinstance(element, dict) and element.get("tag") == "form"
         for element in elements

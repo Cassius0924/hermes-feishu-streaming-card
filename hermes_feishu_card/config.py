@@ -43,11 +43,17 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "max_reasoning_chars": 1200,
         "max_tool_result_chars": 600,
         "table_overflow_mode": "compact",
-        "completion_notify": {"enabled": False},
-        # @ mention rendering in cards (interaction/approval cards and the
-        # completion notification). Defaults to enabled when the key is absent,
-        # so existing configs keep mentioning users without migration.
-        "mentions_in_cards": True,
+        "completion_notify": {"enabled": False, "mention": True},
+        # Per-kind @ mention switches in interaction cards (clarify /
+        # approval). ``clarify`` covers clarify cards, ``approval`` covers
+        # approval cards. Missing/null/malformed values fall back to enabled
+        # for both kinds (backwards compatible: the old boolean
+        # ``mentions_in_cards`` key is still honored as the global default
+        # when present).
+        "interaction_mentions": {
+            "clarify": True,
+            "approval": True,
+        },
         "footer_fields": [
             "duration",
             "model",
@@ -161,23 +167,80 @@ def merge_card_config(
     return resolved
 
 
-def card_mentions_enabled(card_config: Mapping[str, Any] | None) -> bool:
-    """Whether card content may include @ mentions of the Feishu user.
+def card_interaction_mention_enabled(
+    card_config: Mapping[str, Any] | None, *, kind: str
+) -> bool:
+    """Whether card content may include @ mentions for a given interaction kind.
 
-    Controlled by the ``card.mentions_in_cards`` config key (default True).
-    Missing, null, or malformed values fall back to enabled (True) so that
-    existing configs keep mentioning users without any migration.
+    Controlled by ``card.interaction_mentions.clarify`` and
+    ``card.interaction_mentions.approval`` (defaults: both True). Missing,
+    null, or malformed values fall back to per-kind defaults.
+
+    Backwards compatibility: the old ``card.mentions_in_cards`` boolean key is
+    still honored as a global default when present -- True enables mentions
+    for every interaction kind, False disables them all.
+    """
+    if not isinstance(card_config, Mapping):
+        return _default_interaction_mention(kind)
+    raw_mentions = card_config.get("interaction_mentions")
+    if isinstance(raw_mentions, Mapping):
+        raw = raw_mentions.get(kind)
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            try:
+                return _normalize_boolean(raw, f"card.interaction_mentions.{kind}")
+            except ValueError:
+                return _default_interaction_mention(kind)
+        return _default_interaction_mention(kind)
+    # Legacy global switch: maps any interaction kind onto itself.
+    legacy = card_config.get("mentions_in_cards")
+    if legacy is not None:
+        if isinstance(legacy, bool):
+            return legacy
+        if isinstance(legacy, str):
+            try:
+                return _normalize_boolean(legacy, "card.mentions_in_cards")
+            except ValueError:
+                return _default_interaction_mention(kind)
+    return _default_interaction_mention(kind)
+
+
+def _default_interaction_mention(kind: str) -> bool:
+    return True
+
+
+def card_completion_mention_enabled(
+    card_config: Mapping[str, Any] | None,
+) -> bool:
+    """Whether the completion notification may @ mention the requester.
+
+    Controlled by ``card.completion_notify.mention`` (default True when the
+    key is absent, preserving the historical behaviour). The legacy
+    ``card.mentions_in_cards`` boolean is honored as the global default.
     """
     if not isinstance(card_config, Mapping):
         return True
-    raw = card_config.get("mentions_in_cards", True)
-    if isinstance(raw, bool):
-        return raw
-    if isinstance(raw, str):
-        try:
-            return _normalize_boolean(raw, "card.mentions_in_cards")
-        except ValueError:
-            return True
+    notify = card_config.get("completion_notify")
+    if isinstance(notify, Mapping):
+        raw = notify.get("mention")
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            try:
+                return _normalize_boolean(raw, "card.completion_notify.mention")
+            except ValueError:
+                return True
+        return True
+    legacy = card_config.get("mentions_in_cards")
+    if legacy is not None:
+        if isinstance(legacy, bool):
+            return legacy
+        if isinstance(legacy, str):
+            try:
+                return _normalize_boolean(legacy, "card.mentions_in_cards")
+            except ValueError:
+                return True
     return True
 
 
@@ -362,6 +425,22 @@ def _normalize_card_config(value: object, *, path: str) -> None:
         value["mentions_in_cards"] = _normalize_boolean(
             value["mentions_in_cards"], f"{path}.mentions_in_cards"
         )
+    if "interaction_mentions" in value:
+        raw_mentions = value["interaction_mentions"]
+        if not isinstance(raw_mentions, dict):
+            raise ValueError(f"{path}.interaction_mentions must be a mapping")
+        normalized = {}
+        for kind, raw in raw_mentions.items():
+            normalized[str(kind)] = _normalize_boolean(
+                raw, f"{path}.interaction_mentions.{kind}"
+            )
+        value["interaction_mentions"] = normalized
+    if "completion_notify" in value and isinstance(value["completion_notify"], dict):
+        notify = value["completion_notify"]
+        if "mention" in notify:
+            notify["mention"] = _normalize_boolean(
+                notify["mention"], f"{path}.completion_notify.mention"
+            )
 
 
 def _merge_sections(config: dict[str, dict[str, Any]], loaded: dict[str, Any]) -> None:

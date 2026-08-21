@@ -239,6 +239,18 @@ def _render_card_unchecked(
         if runtime_summary
         else _runtime_header_title(session, configured_title)
     )
+    pending_interaction = session.active_interaction
+    if (
+        pending_interaction is not None
+        and pending_interaction.status == "pending"
+        and pending_interaction.kind in {"approval", "clarify"}
+    ):
+        prefix = (
+            "待审批："
+            if pending_interaction.kind == "approval"
+            else "待选择："
+        )
+        header_title = f"{prefix}{header_title}"
     main_role = "notice" if session.delivery_kind == "notice" else "body"
     elements = []
     if primary_text:
@@ -357,12 +369,22 @@ def _render_card_unchecked(
 def _uses_legacy_callback_card(
     session: CardSession, *, interaction_mode: str
 ) -> bool:
+    """Whether the session card must render in the legacy (schema-V1) layout.
+
+    An interaction card is ALWAYS sent as a legacy card (CardKit v2 ``action``
+    containers are rejected by Feishu when embedded in a schema-2.0 card). The
+    card is then updated in place after the choice by PATCHing the same
+    message -- Feishu refuses a schema-2.0 card onto a schema-V1 message
+    (api_code 230099, ext 200830: "schemaV2 card can not change schemaV1"), so
+    the post-choice render MUST stay on the legacy layout too, while the
+    interaction is still carrying that message.
+    """
     interaction = session.active_interaction
-    return (
-        interaction is not None
-        and interaction.status == "pending"
-        and _normalize_interaction_mode(interaction_mode) == "callback"
-    )
+    if interaction is None:
+        return False
+    if interaction.kind not in {"approval", "clarify"}:
+        return False
+    return _normalize_interaction_mode(interaction_mode) == "callback"
 
 
 def _render_legacy_callback_card(
@@ -372,14 +394,15 @@ def _render_legacy_callback_card(
     profile_id: str,
     mentions_enabled: bool = True,
 ) -> Dict[str, Any]:
-    """Render the pending choice on Feishu's server-callback card rail.
+    """Render an interaction card in the legacy (schema-V1) layout.
 
     CardKit v2 ``behaviors`` callbacks are client-side interactions and do not
     reach Hermes' ``p2.card.action.trigger`` WebSocket handler.  Conversely,
     the legacy ``action`` container is rejected when embedded in a schema-2.0
-    card.  A pending interaction therefore uses one ordinary legacy card; the
-    next render switches back to the normal CardKit v2 streaming card after
-    the choice is resolved.
+    card.  An interaction therefore uses one ordinary legacy card, and stays
+    on the legacy layout for any in-place update on the same message (Feishu
+    rejects a schema-2.0 card onto a schema-V1 message: 230099/200830
+    "schemaV2 card can not change schemaV1").
     """
     interaction = session.active_interaction
     if interaction is None:  # Defensive: caller already checked the state.
@@ -391,13 +414,35 @@ def _render_legacy_callback_card(
         interaction,
         mentions_enabled=mentions_enabled,
     )
-    if mention:
-        elements.append({"tag": "markdown", "content": mention})
     description = normalize_stream_text(interaction.description).strip()
     if description:
         elements.append({"tag": "markdown", "content": description})
 
-    if interaction.multi_select:
+    if interaction.status == "completed":
+        choice = interaction.choice_label or interaction.choice or "已完成"
+        user = f" by {interaction.user_name}" if interaction.user_name else ""
+        elements.extend(
+            [
+                {"tag": "markdown", "content": f"已选择：{choice}{user}"},
+                {"tag": "hr"},
+                {"tag": "markdown", "content": "✅ 选择已确认"},
+            ]
+        )
+    elif interaction.status == "failed":
+        error_text = interaction.error or "交互请求失败"
+        elements.extend(
+            [
+                {"tag": "markdown", "content": error_text},
+                {"tag": "hr"},
+                {"tag": "markdown", "content": "❌ 交互已失效"},
+            ]
+        )
+    elif interaction.multi_select:
+        if mention:
+            hint = f"{mention} 请选择（可多选）"
+            if interaction.allow_custom_input:
+                hint += "，或输入自定义内容"
+            elements.append({"tag": "markdown", "content": hint})
         elements.append(
             _legacy_form(
                 _render_multi_select_form(interaction, profile_id=profile_id)
@@ -407,6 +452,8 @@ def _render_legacy_callback_card(
         hint = "请选择一个选项"
         if interaction.allow_custom_input:
             hint += "，或输入自定义内容"
+        if mention:
+            hint = f"{mention} {hint}"
         elements.append({"tag": "markdown", "content": hint})
         buttons = [
             _legacy_button(
@@ -425,13 +472,13 @@ def _render_legacy_callback_card(
             elements.append(
                 _legacy_form(_render_other_form(interaction, profile_id=profile_id))
             )
+        elements.extend(
+            [
+                {"tag": "hr"},
+                {"tag": "markdown", "content": "等待选择…"},
+            ]
+        )
 
-    elements.extend(
-        [
-            {"tag": "hr"},
-            {"tag": "markdown", "content": "等待选择…"},
-        ]
-    )
     return {
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": dict(header),
@@ -649,12 +696,13 @@ def _interaction_mention_content(
     *,
     mentions_enabled: bool = True,
 ) -> str:
-    """Return the in-card @ mention line for an approval/clarify card, or ``""``.
+    """Return the in-card @ mention prefix for an approval/clarify card, or ``""``.
 
     The @ mention of the requester (approval) / user being clarified is
-    embedded in the card text (markdown ``<at id=...>`` syntax) instead of a
-    separate @ message. Only pending approval/clarify interactions are
-    mentioned, only when the ``mentions_in_cards`` flag is enabled, and only
+    returned as a bare ``<at id=...>`` prefix (no trailing text) so callers
+    can merge it into the interaction hint line instead of rendering a
+    separate mention row. Only pending approval/clarify interactions are
+    mentioned, only when the per-kind mention flag is enabled, and only
     when the session carries a valid Feishu open_id for the requester.
     """
     if not mentions_enabled:
@@ -666,7 +714,7 @@ def _interaction_mention_content(
     open_id = _exact_feishu_open_id(getattr(session, "sender_open_id", ""))
     if not open_id:
         return ""
-    return f'<at id="{open_id}"></at> 请选择'
+    return f'<at id="{open_id}"></at>'
 
 
 def _render_interaction_elements(
@@ -685,14 +733,6 @@ def _render_interaction_elements(
         interaction,
         mentions_enabled=mentions_enabled,
     )
-    if mention:
-        elements.append(
-            {
-                "tag": "markdown",
-                "element_id": "interaction_mention",
-                "content": mention,
-            }
-        )
     if interaction.status == "pending" and interaction.description:
         elements.append(
             {
@@ -706,6 +746,19 @@ def _render_interaction_elements(
             f"{index}. {option.label}"
             for index, option in enumerate(interaction.options, start=1)
         ]
+        if mention:
+            hint = (
+                f"{mention} 请选择（可多选）"
+                if interaction.multi_select
+                else f"{mention} 请选择一个选项"
+            )
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "element_id": "interaction_hint",
+                    "content": hint,
+                }
+            )
         if choice_lines:
             if interaction.multi_select:
                 instruction = "Reply with numbers separated by commas or the option text."
@@ -725,11 +778,24 @@ def _render_interaction_elements(
 
     if interaction.status == "pending":
         if interaction.multi_select:
+            if mention:
+                hint = f"{mention} 请选择（可多选）"
+                if interaction.allow_custom_input:
+                    hint += "，或输入自定义内容"
+                elements.append(
+                    {
+                        "tag": "markdown",
+                        "element_id": "interaction_hint",
+                        "content": hint,
+                    }
+                )
             elements.append(_render_multi_select_form(interaction))
         else:
-            hint = "（单选）请选择"
+            hint = "请选择一个选项"
             if interaction.allow_custom_input:
                 hint += "，或输入自定义内容"
+            if mention:
+                hint = f"{mention} {hint}"
             elements.append(
                 {
                     "tag": "markdown",

@@ -4,7 +4,7 @@ from hermes_feishu_card.render import render_card, render_card_result
 from hermes_feishu_card.session import CardSession, InteractionState
 
 SENDER_OU = "ou_abc123DEF_xyz"
-EXPECTED_MENTION = f'<at id="{SENDER_OU}"></at> 请选择'
+EXPECTED_MENTION = f'<at id="{SENDER_OU}"></at> 请选择一个选项'
 
 
 def _approval_session(*, sender_open_id: str = SENDER_OU, kind: str = "approval") -> CardSession:
@@ -44,6 +44,14 @@ def test_approval_legacy_callback_card_contains_mention():
     mentions = _mention_elements(card)
     assert len(mentions) == 1
     assert mentions[0]["content"] == EXPECTED_MENTION
+
+
+def test_approval_legacy_callback_card_title_prefix():
+    session = _approval_session()
+
+    card = render_card(session, title="研发助手")
+
+    assert card["header"]["title"]["content"] == "待审批：需要授权后继续执行"
 
 
 def test_approval_mention_absent_when_config_disabled():

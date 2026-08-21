@@ -22,7 +22,8 @@ from aiohttp import ClientSession, ClientTimeout, web
 
 from .bots import RouteResult
 from .config import (
-    card_mentions_enabled,
+    card_completion_mention_enabled,
+    card_interaction_mention_enabled,
     load_config,
     merge_card_config,
     resolve_operations_hermes_root,
@@ -5519,7 +5520,7 @@ async def _maybe_send_completion_notify(
     suffix = f"（用时 {duration_text}）" if duration_text else ""
     mention_prefix = (
         f'<at user_id="{session.sender_open_id}"></at> '
-        if card_mentions_enabled(card_config)
+        if card_completion_mention_enabled(card_config)
         else ""
     )
     text = f"{mention_prefix}✅ 任务已完成{suffix}"
@@ -6353,7 +6354,10 @@ def _render_session_card_result_for_app(
             else None
         ),
         table_overflow_mode=table_overflow_mode,
-        mentions_enabled=card_mentions_enabled(card_config),
+        mentions_enabled=card_interaction_mention_enabled(
+            card_config,
+            kind=getattr(session.active_interaction, "kind", "") or "",
+        ),
     )
 
 
