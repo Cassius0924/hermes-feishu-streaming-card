@@ -4,6 +4,7 @@ from hermes_feishu_card.render import render_card, render_card_result
 from hermes_feishu_card.session import CardSession, InteractionState
 
 SENDER_OU = "ou_abc123DEF_xyz"
+EXPECTED_MENTION = f'<at id="{SENDER_OU}"></at> 请选择'
 
 
 def _approval_session(*, sender_open_id: str = SENDER_OU, kind: str = "approval") -> CardSession:
@@ -28,7 +29,9 @@ def _mention_elements(card: dict) -> list[dict]:
     return [
         element
         for element in _body_elements(card)
-        if isinstance(element, dict) and element.get("element_id") == "interaction_mention"
+        if isinstance(element, dict)
+        and element.get("tag") == "markdown"
+        and "<at id=" in str(element.get("content", ""))
     ]
 
 
@@ -40,7 +43,7 @@ def test_approval_legacy_callback_card_contains_mention():
 
     mentions = _mention_elements(card)
     assert len(mentions) == 1
-    assert mentions[0]["content"] == f'<at id="{SENDER_OU}"></at>'
+    assert mentions[0]["content"] == EXPECTED_MENTION
 
 
 def test_approval_mention_absent_when_config_disabled():
@@ -68,7 +71,7 @@ def test_approval_mention_absent_with_invalid_sender_open_id():
 
 
 def test_approval_mention_scoped_to_approval_kind_only():
-    """kind != approval (e.g. slash) gets no mention from the approval feature."""
+    """kind outside approval/clarify (e.g. slash) gets no mention."""
     session = _approval_session(kind="slash")
 
     card = render_card(session, title="研发助手")
@@ -98,7 +101,7 @@ def test_approval_mention_present_in_text_mode_interaction_elements():
 
     mentions = _mention_elements(card)
     assert len(mentions) == 1
-    assert mentions[0]["content"] == f'<at id="{SENDER_OU}"></at>'
+    assert mentions[0]["content"] == EXPECTED_MENTION
 
 
 def test_render_card_result_legacy_disposition_contains_mention():
@@ -109,4 +112,4 @@ def test_render_card_result_legacy_disposition_contains_mention():
     assert result.disposition == "card"
     mentions = _mention_elements(result.card)
     assert len(mentions) == 1
-    assert mentions[0]["content"] == f'<at id="{SENDER_OU}"></at>'
+    assert mentions[0]["content"] == EXPECTED_MENTION

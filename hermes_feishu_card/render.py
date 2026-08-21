@@ -386,9 +386,13 @@ def _render_legacy_callback_card(
         return {}
 
     elements: list[Dict[str, Any]] = []
-    mention = _approval_mention_element(session, mentions_enabled=mentions_enabled)
-    if mention is not None:
-        elements.append(mention)
+    mention = _interaction_mention_content(
+        session,
+        interaction,
+        mentions_enabled=mentions_enabled,
+    )
+    if mention:
+        elements.append({"tag": "markdown", "content": mention})
     description = normalize_stream_text(interaction.description).strip()
     if description:
         elements.append({"tag": "markdown", "content": description})
@@ -639,32 +643,30 @@ def _render_main_content_elements(
     return elements
 
 
-def _approval_mention_element(
-    session: CardSession, *, mentions_enabled: bool
-) -> Dict[str, Any] | None:
-    """Build the in-card @ mention for a pending approval card.
+def _interaction_mention_content(
+    session: CardSession,
+    interaction: Any,
+    *,
+    mentions_enabled: bool = True,
+) -> str:
+    """Return the in-card @ mention line for an approval/clarify card, or ``""``.
 
-    Feishu card markdown renders ``<at id=ou_xxx></at>`` as an @ mention of
-    the user whose approval is requested.  Returns ``None`` when mentions are
-    disabled, the interaction is not a pending approval, or the session does
-    not know the sender's open id (so no mention is ever emitted outside the
-    approval card payload — no standalone @ message is sent).
+    The @ mention of the requester (approval) / user being clarified is
+    embedded in the card text (markdown ``<at id=...>`` syntax) instead of a
+    separate @ message. Only pending approval/clarify interactions are
+    mentioned, only when the ``mentions_in_cards`` flag is enabled, and only
+    when the session carries a valid Feishu open_id for the requester.
     """
     if not mentions_enabled:
-        return None
-    interaction = session.active_interaction
-    if interaction is None or interaction.kind != "approval":
-        return None
-    if interaction.status != "pending":
-        return None
-    open_id = _exact_feishu_open_id(session.sender_open_id)
+        return ""
+    if getattr(interaction, "status", "") != "pending":
+        return ""
+    if getattr(interaction, "kind", "") not in {"approval", "clarify"}:
+        return ""
+    open_id = _exact_feishu_open_id(getattr(session, "sender_open_id", ""))
     if not open_id:
-        return None
-    return {
-        "tag": "markdown",
-        "element_id": "interaction_mention",
-        "content": f'<at id="{open_id}"></at>',
-    }
+        return ""
+    return f'<at id="{open_id}"></at> 请选择'
 
 
 def _render_interaction_elements(
@@ -678,9 +680,19 @@ def _render_interaction_elements(
         return []
 
     elements: list[Dict[str, Any]] = []
-    mention = _approval_mention_element(session, mentions_enabled=mentions_enabled)
-    if mention is not None:
-        elements.append(mention)
+    mention = _interaction_mention_content(
+        session,
+        interaction,
+        mentions_enabled=mentions_enabled,
+    )
+    if mention:
+        elements.append(
+            {
+                "tag": "markdown",
+                "element_id": "interaction_mention",
+                "content": mention,
+            }
+        )
     if interaction.status == "pending" and interaction.description:
         elements.append(
             {
