@@ -353,23 +353,73 @@ def _uses_legacy_callback_card(
     )
 
 
+def render_legacy_interaction_callback_card(
+    session: CardSession,
+    *,
+    title: str = DEFAULT_TITLE,
+    interaction_profile_id: str = "default",
+) -> Dict[str, Any]:
+    """Render one interaction entirely on Feishu's legacy callback rail."""
+    interaction = session.active_interaction
+    if interaction is None:
+        raise ValueError("active interaction is required")
+    template = {
+        "completed": "green",
+        "failed": "red",
+    }.get(interaction.status, "blue")
+    header = {
+        "template": template,
+        "title": {
+            "tag": "plain_text",
+            "content": interaction.prompt or title,
+        },
+    }
+    return _render_legacy_callback_card(
+        session,
+        header=header,
+        profile_id=_normalize_interaction_profile_id(interaction_profile_id),
+    )
+
+
 def _render_legacy_callback_card(
     session: CardSession, *, header: Mapping[str, Any], profile_id: str
 ) -> Dict[str, Any]:
-    """Render the pending choice on Feishu's server-callback card rail.
+    """Render an interaction on Feishu's server-callback card rail.
 
     CardKit v2 ``behaviors`` callbacks are client-side interactions and do not
     reach Hermes' ``p2.card.action.trigger`` WebSocket handler.  Conversely,
     the legacy ``action`` container is rejected when embedded in a schema-2.0
-    card.  A pending interaction therefore uses one ordinary legacy card; the
-    next render switches back to the normal CardKit v2 streaming card after
-    the choice is resolved.
+    card.  Pending and terminal renders therefore stay in the legacy dialect.
     """
     interaction = session.active_interaction
     if interaction is None:  # Defensive: caller already checked the state.
         return {}
 
     elements: list[Dict[str, Any]] = []
+    if interaction.status == "completed":
+        choice = interaction.choice_label or interaction.choice or "已完成"
+        user = f" by {interaction.user_name}" if interaction.user_name else ""
+        elements.append(
+            {"tag": "markdown", "content": f"已选择：{choice}{user}"}
+        )
+        return {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": dict(header),
+            "elements": elements,
+        }
+    if interaction.status != "pending":
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": interaction.error or "交互请求失败",
+            }
+        )
+        return {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": dict(header),
+            "elements": elements,
+        }
+
     description = normalize_stream_text(interaction.description).strip()
     if description:
         elements.append({"tag": "markdown", "content": description})
