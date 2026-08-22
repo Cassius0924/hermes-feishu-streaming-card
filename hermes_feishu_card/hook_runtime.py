@@ -4190,6 +4190,21 @@ def _hfc_raw_feishu_callback_response(adapter: Any, card_data: dict[str, Any]) -
     return response
 
 
+def _hfc_interaction_success_response(
+    adapter: Any,
+    card_data: dict[str, Any],
+    toast_content: str,
+) -> Any:
+    if card_data.get("schema") == "2.0" or "body" in card_data:
+        _hfc_warn("interaction callback card suppressed: schema 2.0")
+        return _hfc_toast_feishu_callback_response(
+            adapter,
+            toast_content,
+            toast_type="success",
+        )
+    return _hfc_raw_feishu_callback_response(adapter, card_data)
+
+
 def _hfc_response_success(response: Any) -> bool:
     success_value = getattr(response, "success", None)
     if callable(success_value):
@@ -6831,7 +6846,11 @@ def _hfc_forward_form_submit_action(
 
     if isinstance(result, dict) and isinstance(result.get("card"), dict):
         _hfc_info("form submit resolved and card updated")
-        return _hfc_raw_feishu_callback_response(adapter, result["card"])
+        return _hfc_interaction_success_response(
+            adapter,
+            result["card"],
+            "已选择",
+        )
     _hfc_info("form submit forwarded but no card returned")
     return _hfc_empty_feishu_callback_response(adapter)
 
@@ -7090,7 +7109,11 @@ def _hfc_handle_interaction_select_action(
             "interaction.select resolved: "
             f"{_hfc_log_reference('interaction', interaction_id)}"
         )
-        return _hfc_raw_feishu_callback_response(adapter, result["card"])
+        return _hfc_interaction_success_response(
+            adapter,
+            result["card"],
+            "已选择",
+        )
     _hfc_info("interaction.select forwarded but no card returned")
     return _hfc_empty_feishu_callback_response(adapter)
 
