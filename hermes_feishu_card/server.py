@@ -5720,11 +5720,9 @@ async def _complete_runtime_interaction_delivery(
                 status=409,
             )
 
-        promoted_message_id = str(delivery.message_id)
         animation_task = app[CARD_ANIMATION_TASKS_KEY].pop(
             reservation.session_key, None
         )
-        app[FEISHU_MESSAGE_IDS_KEY][reservation.session_key] = promoted_message_id
         _store_interaction_result(app, reservation.session)
         reservations.pop(reservation.session_key, None)
         committed = True
@@ -5743,13 +5741,6 @@ async def _complete_runtime_interaction_delivery(
             raise
         except Exception:
             logger.warning("interaction predecessor finalization failed")
-        _ensure_card_animation(
-            app,
-            session_key=reservation.session_key,
-            session=reservation.session,
-            feishu_message_id=str(delivery.message_id),
-            bot_id=reservation.bot_id,
-        )
         metrics.events_applied += 1
     return web.json_response(
         {

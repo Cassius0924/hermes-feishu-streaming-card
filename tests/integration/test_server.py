@@ -8689,6 +8689,67 @@ async def test_runtime_interaction_admission_requires_actual_delivery_and_canoni
         listener.close()
 
 
+async def test_runtime_interaction_keeps_v2_owner_and_never_patches_legacy_card():
+    feishu_client = DialectAwareFeishuClient()
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
+    listener.start()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                turn_id="turn-runtime",
+                created_at=time.time(),
+            ),
+        )
+        admitted = await test_client.post(
+            "/events",
+            json=runtime_interaction_payload(runtime_descriptor(listener)),
+        )
+
+        assert admitted.status == 200
+        assert app[FEISHU_MESSAGE_IDS_KEY]["turn-runtime"] == "feishu-message-1"
+        assert feishu_client.dialects == {
+            "feishu-message-1": "v2",
+            "feishu-message-2": "legacy",
+        }
+        action_value = interaction_buttons(feishu_client.sent[-1][1])[0]["value"]
+
+        callback = await test_client.post(
+            "/card/actions",
+            json={
+                "event": {
+                    "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                    "context": {
+                        "open_chat_id": "oc_abc",
+                        "profile_id": "default",
+                    },
+                    "action": {"value": action_value},
+                }
+            },
+        )
+        callback_body = await callback.json()
+
+        assert callback.status == 200
+        assert callback_body["card"].get("schema") is None
+        assert "body" not in callback_body["card"]
+        assert any(
+            message_id == "feishu-message-1" and "已选择：允许一次" in str(card)
+            for message_id, card in feishu_client.updated
+        )
+        assert all(
+            message_id != "feishu-message-2"
+            for message_id, _card in feishu_client.updated
+        )
+    finally:
+        listener.close()
+        await test_client.close()
+
+
 async def test_runtime_interaction_delivery_failure_rolls_back_fence_for_exact_retry(client):
     test_client, feishu_client = client
     listener = RuntimeInteractionListener(TRANSPORT_ROOT_SECRET, lambda payload: True)
