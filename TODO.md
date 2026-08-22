@@ -12,7 +12,8 @@
 - [x] `/card/actions` 返回 legacy completed/failed 终态卡；Gateway 对意外 schema 2.0 callback card 降级为 success toast。
 - [x] standard/runtime admission、direct/form、连续 interaction、过期和 predecessor failure 使用方言感知 fake 覆盖。
 - [x] 热区联合回归 `932 passed, 1 skipped`；`git diff --check` 通过。
-- [ ] 完整 pytest、候选包 provenance、PR CI、exact merge SHA、tag、public install、Release assets/checksums 与真实飞书验收。
+- [x] 隔离候选完整 pytest `3253 passed, 5 skipped`；sdist/wheel、fresh Python 3.12 + lark-oapi 1.6.8 wheel-only provenance、唯一 plugin entrypoint、24 slices 与 CLI help。
+- [ ] PR CI、exact merge SHA、tag、public install、Release assets/checksums 与真实飞书验收。
 
 ### V4.3.1：Hermes 0.20 交互恢复与 persistent service 热修（发布候选）
 

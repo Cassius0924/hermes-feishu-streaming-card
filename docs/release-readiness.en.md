@@ -153,7 +153,7 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 - Direct select, custom-input form, runtime admission, repeated interactions, and expiry must return same-dialect legacy terminal cards. If the Gateway receives a schema 2.0 callback card, it returns a success toast instead of a raw callback card.
 - The dialect-aware fake must reject cross-dialect PATCH operations like Feishu. Every later answer/thinking/tool/terminal update targets only the original schema 2.0 message.
 - Combined renderer/hook/server/Feishu SDK compatibility regression: **passed (`932 passed, 1 skipped`)**; `git diff --check`: **passed**.
-- Full pytest, sdist/wheel, fresh Python 3.12 wheel provenance, unique Hermes plugin entrypoint, all 24 slices, and CLI help: **recorded during candidate verification**.
+- Full pytest: **passed (`3253 passed, 5 skipped in 413.97s`)**. PEP 517 sdist/wheel, fresh Python 3.12 + `lark-oapi 1.6.8` wheel-only `site-packages` provenance, package/distribution `4.3.2`, unique Hermes plugin entrypoint, all 24 slices, and main CLI/`enable`/`disable` help: **passed**.
 - Exact merge SHA, remote CI, annotated tag, public install, Release assets/checksums, and real Feishu direct-choice/custom-input-form acceptance: **recorded during publication**.
 
 ## V4.3.1 Release Gates

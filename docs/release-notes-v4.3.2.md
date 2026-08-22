@@ -22,11 +22,11 @@ V4.3.2 修复 Issue #227 中 clarify/approval 点击后的两层飞书卡片方�
 ## 验证状态
 
 - renderer、Gateway hook、sidecar server 与 Feishu SDK compatibility 联合回归：`932 passed, 1 skipped`。
-- 候选 full pytest、sdist/wheel、fresh-venv provenance、GitHub CI、exact merge SHA、public tag/install、Release assets 与 checksum 按 [发布准备说明](release-readiness.md) 记录；只有实际完成后才标记通过。
+- 隔离候选 Python 3.12 完整 pytest：`3253 passed, 5 skipped in 413.97s`。PEP 517 sdist/wheel 构建通过；全新 venv 固定 `lark-oapi 1.6.8` 并只从候选 wheel 安装 HFC 后，package/distribution version 均为 `4.3.2`，import origin 位于该 venv 的 `site-packages`，Hermes plugin entrypoint 精确为 1，24 个 provenance slices 齐全，主 CLI 与 `enable/disable --help` 均 exit 0。
+- GitHub CI、exact merge SHA、public tag/install、Release assets 与 checksum 按 [发布准备说明](release-readiness.md) 记录；只有实际完成后才标记通过。
 - 真实飞书 direct choice 与 custom-input form 验收在发布流程中单独执行。自动化通过不冒充真实客户端证据；若发布前无法获得可用测试会话，Issue #227 保持 Open 并请求报告者复测。
 
 ## 致谢
 
 - 感谢 @saulgoodmanngabriel 提供 Hermes 0.20.0 + hfc 4.3.1 + lark-oapi 1.6.8 的完整复现、`230099/200800` 计数与“普通卡成功、交互卡失败”的决定性直连 API 对照。
 - 感谢 @lyp88997 提供 toast-only `200673` 修复方向和不同环境下的更新观察，帮助把 callback 响应问题与消息更新问题拆成两层。
-

@@ -22,11 +22,11 @@ V4.3.2 fixes the two Feishu card-dialect failures reported in Issue #227 after a
 ## Verification status
 
 - Combined renderer, Gateway hook, sidecar server, and Feishu SDK compatibility regression: `932 passed, 1 skipped`.
-- Candidate full pytest, sdist/wheel, fresh-venv provenance, GitHub CI, exact merge SHA, public tag/install, Release assets, and checksums are recorded in [release readiness](release-readiness.en.md) and are marked passed only after completion.
+- The isolated Python 3.12 candidate ran full pytest with `3253 passed, 5 skipped in 413.97s`. PEP 517 sdist/wheel builds passed. In a fresh venv pinned to `lark-oapi 1.6.8` with HFC installed only from the candidate wheel, package and distribution versions were both `4.3.2`, import origin was inside that venv's `site-packages`, exactly one Hermes plugin entrypoint was present, all 24 provenance slices were packaged, and the main CLI plus `enable/disable --help` exited 0.
+- GitHub CI, exact merge SHA, public tag/install, Release assets, and checksums are recorded in [release readiness](release-readiness.en.md) and are marked passed only after completion.
 - Real Feishu acceptance for a direct choice and a custom-input form remains a distinct release step. Automation is not presented as real-client evidence; if no approved test session is available before publishing, Issue #227 stays open for reporter retesting.
 
 ## Credits
 
 - Thanks @saulgoodmanngabriel for the complete Hermes 0.20.0 + hfc 4.3.1 + lark-oapi 1.6.8 reproduction, the `230099/200800` counters, and the decisive direct-API comparison in which ordinary card messages succeeded while interaction-card messages failed.
 - Thanks @lyp88997 for the toast-only `200673` fix direction and the contrasting update observation that helped separate the callback-response failure from the message-update failure.
-

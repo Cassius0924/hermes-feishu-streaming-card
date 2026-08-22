@@ -153,7 +153,7 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - direct-select、custom-input form、runtime admission、连续 interaction 和过期路径都必须返回同方言 legacy 终态卡；Gateway 若收到 schema 2.0 callback card 必须降级为 success toast，不能生成 raw callback card。
 - 方言感知 fake 必须像飞书一样拒绝 cross-dialect PATCH；全部后续 answer/thinking/tool/terminal 更新只落在原 schema 2.0 message。
 - renderer/hook/server/Feishu SDK compatibility 联合回归：**已通过（`932 passed, 1 skipped`）**；`git diff --check`：**已通过**。
-- 完整 pytest、sdist/wheel、fresh Python 3.12 wheel provenance、唯一 Hermes plugin entrypoint、24 slices 与 CLI help：**发布候选阶段记录**。
+- 完整 pytest：**已通过（`3253 passed, 5 skipped in 413.97s`）**。PEP 517 sdist/wheel、fresh Python 3.12 + `lark-oapi 1.6.8` wheel-only `site-packages` provenance、package/distribution `4.3.2`、唯一 Hermes plugin entrypoint、24 slices 与主 CLI/`enable`/`disable` help：**已通过**。
 - exact merge SHA、远端 CI、annotated tag、public install、Release assets/checksums 与真实飞书 direct choice/custom-input form：**发布流程中逐项记录**。
 
 ## V4.3.1 发布门禁
