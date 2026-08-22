@@ -485,9 +485,18 @@ class _CallbackCard:
         self.data = None
 
 
+class _CallbackToast:
+    def __init__(self):
+        self.type = None
+        self.content = None
+
+
 class _CallbackResponse:
+    _types = {"toast": _CallbackToast}
+
     def __init__(self):
         self.card = None
+        self.toast = None
 
 
 def _card_action_data(action, *, open_id="ou_operator", chat_id="oc_group"):
@@ -1159,7 +1168,7 @@ def test_installed_ws_unknown_action_keeps_native_fallback():
     assert adapter.native_actions == [data]
 
 
-def test_installed_ws_interaction_select_behavior_is_unchanged(monkeypatch):
+def test_installed_ws_interaction_select_suppresses_schema2_callback_card(monkeypatch):
     monkeypatch.setattr(hook_runtime, "CallBackCard", _CallbackCard, raising=False)
     monkeypatch.setattr(
         hook_runtime, "P2CardActionTriggerResponse", _CallbackResponse, raising=False
@@ -1193,7 +1202,9 @@ def test_installed_ws_interaction_select_behavior_is_unchanged(monkeypatch):
     assert adapter.allowed == []
     assert adapter.native_actions == []
     assert posted[0]["event"]["action"]["value"]["hfc_action"] == "interaction.select"
-    assert response.card.type == "raw"
+    assert response.card is None
+    assert response.toast.type == "success"
+    assert response.toast.content == "已选择"
 
 
 class _OperationsFeishuClient:
