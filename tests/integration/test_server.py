@@ -199,6 +199,40 @@ class FakeFeishuClient:
         return f"feishu-text-{len(self.texts)}"
 
 
+class DialectAwareFeishuClient(FakeFeishuClient):
+    def __init__(self):
+        super().__init__()
+        self.dialects = {}
+
+    async def send_card(
+        self,
+        chat_id,
+        card,
+        thread_id=None,
+        reply_to_message_id=None,
+    ):
+        message_id = await super().send_card(
+            chat_id,
+            card,
+            thread_id,
+            reply_to_message_id,
+        )
+        self.dialects[message_id] = (
+            "v2" if card.get("schema") == "2.0" else "legacy"
+        )
+        return message_id
+
+    async def update_card_message(self, message_id, card):
+        dialect = "v2" if card.get("schema") == "2.0" else "legacy"
+        if self.dialects[message_id] != dialect:
+            raise FeishuAPIError(
+                "card dialect mismatch",
+                status_code=400,
+                api_code=230099,
+            )
+        await super().update_card_message(message_id, card)
+
+
 class PermanentFailureClient(FakeFeishuClient):
     async def send_card_delivery(self, *args, **kwargs):
         raise FeishuAPIError(
@@ -7477,7 +7511,7 @@ async def test_v4_runtime_header_and_interim_body_share_one_card(client):
     assert "gpt-5.5" in str(completed)
 
 
-async def test_v4_interaction_restores_cached_preview_on_promoted_card(client):
+async def test_v4_interaction_restores_cached_preview_on_stable_v2_card(client):
     test_client, feishu_client = client
 
     await test_client.post("/events", json=event_payload("message.started", 0))
@@ -7538,7 +7572,7 @@ async def test_v4_interaction_restores_cached_preview_on_promoted_card(client):
     assert resumed["header"]["title"]["content"] == "Hermes Agent"
     assert resumed["header"]["subtitle"]["content"] == "正在读取：weather_client.py"
     assert len(feishu_client.sent) == 2
-    assert feishu_client.updated[-1][0] == "feishu-message-2"
+    assert feishu_client.updated[-1][0] == "feishu-message-1"
 
 
 async def test_interaction_promotion_finalizes_predecessor_snapshot(client):
@@ -8547,6 +8581,9 @@ async def test_interaction_request_renders_buttons_and_callback_resolves(client)
     callback_body = await callback.json()
     assert callback_body["ok"] is True
     assert callback_body["toast"]["type"] == "success"
+    assert callback_body["card"].get("schema") is None
+    assert "body" not in callback_body["card"]
+    assert "已选择：允许一次" in str(callback_body["card"])
     assert result.status == 200
     assert await result.json() == {
         "ok": True,
@@ -8555,8 +8592,72 @@ async def test_interaction_request_renders_buttons_and_callback_resolves(client)
         "choice_label": "允许一次",
         "interaction_id": "approval-1",
     }
-    assert feishu_client.updated[-1][0] == "feishu-message-2"
+    assert feishu_client.updated[-1][0] == "feishu-message-1"
     assert "已选择：允许一次" in str(feishu_client.updated[-1][1])
+
+
+async def test_interaction_keeps_v2_owner_and_returns_legacy_callback_card():
+    feishu_client = DialectAwareFeishuClient()
+    app = create_app(feishu_client)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    try:
+        await test_client.post("/events", json=event_payload("message.started", 0))
+        requested = await test_client.post(
+            "/events",
+            json=event_payload(
+                "interaction.requested",
+                1,
+                {
+                    "interaction_id": "dialect-choice",
+                    "kind": "clarify",
+                    "prompt": "请选择",
+                    "options": [
+                        {
+                            "label": "Alpha",
+                            "value": "alpha",
+                            "style": "primary",
+                        }
+                    ],
+                },
+            ),
+        )
+
+        assert requested.status == 200
+        assert app[FEISHU_MESSAGE_IDS_KEY]["hermes-message-1"] == "feishu-message-1"
+        assert feishu_client.dialects == {
+            "feishu-message-1": "v2",
+            "feishu-message-2": "legacy",
+        }
+        interaction_card = feishu_client.sent[-1][1]
+        action_value = interaction_buttons(interaction_card)[0]["value"]
+
+        callback = await test_client.post(
+            "/card/actions",
+            json={
+                "event": {
+                    "operator": {"open_id": "ou_bailey", "name": "Bailey"},
+                    "context": {"open_chat_id": "oc_abc"},
+                    "action": {"value": action_value},
+                }
+            },
+        )
+        callback_body = await callback.json()
+
+        assert callback.status == 200
+        assert callback_body["card"].get("schema") is None
+        assert "body" not in callback_body["card"]
+        assert "已选择：Alpha" in str(callback_body["card"])
+        assert any(
+            message_id == "feishu-message-1" and "已选择：Alpha" in str(card)
+            for message_id, card in feishu_client.updated
+        )
+        assert all(
+            message_id != "feishu-message-2"
+            for message_id, _card in feishu_client.updated
+        )
+    finally:
+        await test_client.close()
 
 
 async def test_runtime_interaction_admission_requires_actual_delivery_and_canonical_replay(client):
@@ -9002,7 +9103,7 @@ async def test_runtime_interaction_concurrent_same_and_conflicting_actions_compl
         listener.close()
 
 
-async def test_repeated_interactions_each_promote_a_fresh_latest_card(client):
+async def test_repeated_interactions_keep_one_v2_owner_and_fresh_legacy_cards(client):
     test_client, feishu_client = client
 
     await test_client.post("/events", json=event_payload("message.started", 0))
@@ -9029,17 +9130,24 @@ async def test_repeated_interactions_each_promote_a_fresh_latest_card(client):
         assert interaction_buttons(newest_card)
 
     assert feishu_client.sent[1][1] != feishu_client.sent[2][1]
-    for predecessor_message_id in ("feishu-message-1", "feishu-message-2"):
-        snapshots = [
-            card
-            for message_id, card in feishu_client.updated
-            if message_id == predecessor_message_id
-            and "已转入交互卡片" in str(card)
-        ]
-        assert len(snapshots) == 1
-        assert interaction_buttons(snapshots[0]) == []
-        assert "choice-1" not in str(snapshots[0])
-        assert "choice-2" not in str(snapshots[0])
+    snapshots = [
+        card
+        for message_id, card in feishu_client.updated
+        if message_id == "feishu-message-1"
+        and "已转入交互卡片" in str(card)
+    ]
+    assert len(snapshots) == 2
+    for snapshot in snapshots:
+        assert interaction_buttons(snapshot) == []
+        assert "choice-1" not in str(snapshot)
+        assert "choice-2" not in str(snapshot)
+    assert all(
+        message_id == "feishu-message-1"
+        for message_id, _card in feishu_client.updated
+    )
+    assert test_client.app[FEISHU_MESSAGE_IDS_KEY][
+        "hermes-message-1"
+    ] == "feishu-message-1"
 
     latest_card = feishu_client.sent[-1][1]
     assert "第 2 轮请选择" in str(latest_card)
@@ -9105,16 +9213,16 @@ async def test_completed_previous_interaction_choice_never_leaks_into_next_snaps
     predecessor_snapshots = [
         card
         for message_id, card in feishu_client.updated
-        if message_id == "feishu-message-2"
+        if message_id == "feishu-message-1"
         and "已转入交互卡片" in str(card)
     ]
-    assert len(predecessor_snapshots) == 1
-    snapshot_text = str(predecessor_snapshots[0])
+    assert len(predecessor_snapshots) == 2
+    snapshot_text = str(predecessor_snapshots[-1])
     assert old_label not in snapshot_text
     assert "已选择：" not in snapshot_text
 
 
-async def test_interaction_predecessor_update_failure_still_promotes_replacement(
+async def test_interaction_predecessor_update_failure_keeps_stable_owner(
     client,
 ):
     test_client, feishu_client = client
@@ -9139,7 +9247,7 @@ async def test_interaction_predecessor_update_failure_still_promotes_replacement
     assert requested.status == 200
     assert test_client.app[sidecar_server.FEISHU_MESSAGE_IDS_KEY][
         "hermes-message-1"
-    ] == "feishu-message-2"
+    ] == "feishu-message-1"
     result = await test_client.get("/interactions/fail-open-choice")
     assert await result.json() == {
         "ok": True,
@@ -9166,7 +9274,7 @@ async def test_interaction_predecessor_update_failure_still_promotes_replacement
     )
 
     assert callback.status == 200
-    assert feishu_client.updated[-1][0] == "feishu-message-2"
+    assert feishu_client.updated[-1][0] == "feishu-message-1"
     assert "已选择：继续" in str(feishu_client.updated[-1][1])
 
 
@@ -9595,9 +9703,13 @@ async def test_zero_timeout_interaction_rejects_late_choice_and_refreshes_card(c
     assert callback_body["ok"] is False
     assert callback_body["status"] == "failed"
     assert callback_body["toast"] == {"type": "warning", "content": "交互已过期"}
+    assert callback_body["card"].get("schema") is None
+    assert "body" not in callback_body["card"]
+    assert "交互已过期" in str(callback_body["card"])
     assert result.status == 200
     assert result_body["status"] == "failed"
     assert result_body["error"] == "交互已过期"
+    assert _message_id == "feishu-message-1"
     assert "已选择" not in str(expired_card)
 
 
