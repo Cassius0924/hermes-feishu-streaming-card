@@ -541,7 +541,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.3.1`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.3.2`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -549,7 +549,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.3.1
+export HFC_VERSION=v4.3.2
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -834,6 +834,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
+| [v4.3.2](release-notes-v4.3.2.md) | 2026-08-23 | Issue #227：稳定分离 schema 2.0 streaming owner 与 legacy interaction callback card，修复 `230099/200800` 与 `200673` |
 | [v4.3.1](release-notes-v4.3.1.md) | 2026-08-20 | 修复 Hermes 0.20 / 飞书 WebSocket 点击后的 profile/callback/流式恢复与 text fallback 首次回复，并修复 v4.3.0 persistent enable 对账 |
 | [v4.3.0](release-notes-v4.3.0.md) | 2026-08-19 | Hermes v2026.8.3 Hybrid 能力探测与 V3 installer、单 owner runtime interaction、fixed-tag restore、systemd linger 常驻及 Issues #210–#223 本地候选修复 |
 | [v4.2.12](release-notes-v4.2.12.md) | 2026-08-11 | 审批卡能力收敛与服务端选项校验；零工具卡保持稳定 reasoning timeline |
