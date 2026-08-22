@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.3.1`。本轮修复 Hermes 0.20 / 飞书 WebSocket 的 Issue #216 交互恢复链路，吸收 PR #226 的 persistent service 根因，并补齐历史贡献者署名。完整自动化、构建、CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过。
+当前发布候选为 `4.3.2`。本轮修复 Issue #227 中 schema 2.0 streaming message 与 legacy interaction callback message 被错误混用导致的 `230099/200800` 和 `200673`。完整自动化、构建、CI、exact merge SHA、public tag/install、Release assets 与真实飞书验收只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -146,6 +146,15 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - tag 后验证 macOS、Linux、Windows 与 checksums 四个 assets。
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
+
+## V4.3.2 发布门禁
+
+- Issue #227：原 schema 2.0 streaming message 必须始终保留为 `FEISHU_MESSAGE_IDS_KEY` owner；新发 legacy 交互卡只能接收 callback，绝不能成为 schema 2.0 PATCH 目标。
+- direct-select、custom-input form、runtime admission、连续 interaction 和过期路径都必须返回同方言 legacy 终态卡；Gateway 若收到 schema 2.0 callback card 必须降级为 success toast，不能生成 raw callback card。
+- 方言感知 fake 必须像飞书一样拒绝 cross-dialect PATCH；全部后续 answer/thinking/tool/terminal 更新只落在原 schema 2.0 message。
+- renderer/hook/server/Feishu SDK compatibility 联合回归：**已通过（`932 passed, 1 skipped`）**；`git diff --check`：**已通过**。
+- 完整 pytest：**已通过（`3253 passed, 5 skipped in 413.97s`）**。PEP 517 sdist/wheel、fresh Python 3.12 + `lark-oapi 1.6.8` wheel-only `site-packages` provenance、package/distribution `4.3.2`、唯一 Hermes plugin entrypoint、24 slices 与主 CLI/`enable`/`disable` help：**已通过**。
+- exact merge SHA、远端 CI、annotated tag、public install、Release assets/checksums 与真实飞书 direct choice/custom-input form：**发布流程中逐项记录**。
 
 ## V4.3.1 发布门禁
 

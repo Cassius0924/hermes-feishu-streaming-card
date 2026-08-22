@@ -2,6 +2,15 @@
 
 自动化测试不能完全证明 Feishu/Lark 客户端体验。涉及卡片 UX、topic、系统提示、命令卡片的版本，发布前需要真实飞书 smoke。
 
+## V4.3.2 Issue #227 卡片方言双轨验收
+
+- 在同一 turn 记录脱敏前后 counters，发起一次 direct choice clarify 和一次 custom-input form clarify；每轮只发送一张辅助 legacy 交互卡，原 schema 2.0 streaming card 必须保持为后续 PATCH owner。
+- 点击后 callback toast 显示“已选择”，辅助 legacy 卡原位变为无 button/form 的完成态；原 schema 2.0 卡从“已转入交互卡片”继续显示 answer/thinking/tool 更新并正常终结。
+- `/health.metrics.feishu_update_failures` 不新增，`last_update_error` 不出现 `230099`/`200800`；Gateway/客户端不出现 `200673`。不得用普通任务卡成功替代 clarify 交互卡本身的验证。
+- direct choice 与 custom-input form 都要覆盖；另复验 expired callback 的 legacy failed 卡，且 original schema 2.0 owner 只收到 schema 2.0 PATCH。
+- 若发布前没有可用的真实测试会话，只记录自动化、CI 与公开安装证据，Issue #227 保持 Open 并请报告者在 Hermes 0.20.0 + lark-oapi 1.6.8 + 飞书 WebSocket 环境复测。
+- 只记录计数、状态和脱敏版本信息；不保存真实 chat/message/user id、callback token、App Secret、用户答案、原始响应或私人截图。
+
 ## V4.3.1 Hermes 0.20 交互恢复验收
 
 - 在非 default profile 发起一次 clarify 和一次 approval；卡片按钮必须携带 exact profile，Hermes WebSocket action 转发后 sidecar runtime callback attempts/successes 各增加，failures 不增加。

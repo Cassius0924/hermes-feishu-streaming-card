@@ -10956,6 +10956,132 @@ def test_interaction_select_forwards_to_sidecar_and_returns_card(monkeypatch):
     assert response.card.data["header"]["template"] == "green"
 
 
+def test_interaction_select_schema2_card_returns_success_toast(monkeypatch):
+    class FakeToast:
+        def __init__(self):
+            self.type = None
+            self.content = None
+
+    class FakeP2Response:
+        _types = {"toast": FakeToast}
+
+        def __init__(self):
+            self.card = None
+            self.toast = None
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+    DummyFeishuAdapter.__module__ = hook_runtime.__name__
+    monkeypatch.setattr(
+        hook_runtime, "P2CardActionTriggerResponse", FakeP2Response, raising=False
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "load_runtime_config",
+        lambda: SimpleNamespace(event_url="http://127.0.0.1:8765/events"),
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "_post_json_sync_response",
+        lambda *_args: {
+            "ok": True,
+            "card": {
+                "schema": "2.0",
+                "config": {},
+                "body": {"elements": []},
+            },
+        },
+    )
+
+    response = hook_runtime._hfc_handle_interaction_select_action(
+        DummyFeishuAdapter(),
+        SimpleNamespace(
+            event=SimpleNamespace(
+                context=SimpleNamespace(open_chat_id="oc_abc"),
+                operator=SimpleNamespace(open_id="ou_user"),
+            )
+        ),
+        {
+            "interaction_id": "int-v2",
+            "choice": "approve",
+            "choice_label": "Approve",
+            "token": "tok-v2",
+        },
+    )
+
+    assert response.card is None
+    assert response.toast.type == "success"
+    assert response.toast.content == "已选择"
+
+
+@pytest.mark.parametrize(
+    ("card", "expects_raw"),
+    [
+        ({"config": {}, "header": {}, "elements": []}, True),
+        (
+            {
+                "schema": "2.0",
+                "config": {},
+                "body": {"elements": []},
+            },
+            False,
+        ),
+    ],
+)
+def test_form_submit_guards_callback_card_dialect(monkeypatch, card, expects_raw):
+    class FakeToast:
+        def __init__(self):
+            self.type = None
+            self.content = None
+
+    class FakeCallBackCard:
+        def __init__(self):
+            self.type = None
+            self.data = None
+
+    class FakeP2Response:
+        _types = {"toast": FakeToast}
+
+        def __init__(self):
+            self.card = None
+            self.toast = None
+
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+    DummyFeishuAdapter.__module__ = hook_runtime.__name__
+    monkeypatch.setattr(
+        hook_runtime, "P2CardActionTriggerResponse", FakeP2Response, raising=False
+    )
+    monkeypatch.setattr(hook_runtime, "CallBackCard", FakeCallBackCard, raising=False)
+    monkeypatch.setattr(
+        hook_runtime,
+        "load_runtime_config",
+        lambda: SimpleNamespace(event_url="http://127.0.0.1:8765/events"),
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "_post_json_sync_response",
+        lambda *_args: {"ok": True, "card": card},
+    )
+
+    response = hook_runtime._hfc_forward_form_submit_action(
+        DummyFeishuAdapter(),
+        SimpleNamespace(),
+        {"event": {"action": {"name": "hfc_confirm_token"}}},
+    )
+
+    if expects_raw:
+        assert response.card.type == "raw"
+        assert response.card.data == card
+        assert response.toast is None
+    else:
+        assert response.card is None
+        assert response.toast.type == "success"
+        assert response.toast.content == "已选择"
+
+
 def test_interaction_select_retries_fast_transient_disconnect_within_one_budget(
     monkeypatch,
 ):

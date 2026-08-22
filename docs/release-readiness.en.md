@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.3.1`. This cycle repairs the Hermes 0.20 / Feishu WebSocket Issue #216 interaction-resume path, incorporates PR #226's persistent-service root causes, and restores historical contributor credits. Full automation, build, CI, exact merge SHA, public tag/install, and Release assets are marked passed only after completion.
+Current release candidate: `4.3.2`. This cycle fixes Issue #227, where schema 2.0 streaming messages and legacy interaction callback messages were mixed and triggered `230099/200800` and `200673`. Full automation, build, CI, exact merge SHA, public tag/install, Release assets, and real Feishu acceptance are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -146,6 +146,15 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 - Verify macOS, Linux, Windows, and checksums assets after tagging.
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
+
+## V4.3.2 Release Gates
+
+- Issue #227: the original schema 2.0 streaming message must remain the `FEISHU_MESSAGE_IDS_KEY` owner. A newly sent legacy interaction card receives callbacks only and never becomes a schema 2.0 PATCH target.
+- Direct select, custom-input form, runtime admission, repeated interactions, and expiry must return same-dialect legacy terminal cards. If the Gateway receives a schema 2.0 callback card, it returns a success toast instead of a raw callback card.
+- The dialect-aware fake must reject cross-dialect PATCH operations like Feishu. Every later answer/thinking/tool/terminal update targets only the original schema 2.0 message.
+- Combined renderer/hook/server/Feishu SDK compatibility regression: **passed (`932 passed, 1 skipped`)**; `git diff --check`: **passed**.
+- Full pytest: **passed (`3253 passed, 5 skipped in 413.97s`)**. PEP 517 sdist/wheel, fresh Python 3.12 + `lark-oapi 1.6.8` wheel-only `site-packages` provenance, package/distribution `4.3.2`, unique Hermes plugin entrypoint, all 24 slices, and main CLI/`enable`/`disable` help: **passed**.
+- Exact merge SHA, remote CI, annotated tag, public install, Release assets/checksums, and real Feishu direct-choice/custom-input-form acceptance: **recorded during publication**.
 
 ## V4.3.1 Release Gates
 

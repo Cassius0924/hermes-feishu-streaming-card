@@ -4,6 +4,7 @@ from hermes_feishu_card.render import (
     _colored_model_label,
     render_card,
     render_card_result,
+    render_legacy_interaction_callback_card,
 )
 from hermes_feishu_card.session import CardSession, InteractionState, ToolState
 from hermes_feishu_card.status import StatusConfig
@@ -712,6 +713,51 @@ def test_render_completed_interaction_replaces_buttons_with_choice():
         },
     }
     assert "敏感命令详情" not in hover["hover_tips"]["content"]
+
+
+def test_render_completed_legacy_callback_card_removes_controls_and_credentials():
+    session = CardSession(conversation_id="c", message_id="m", chat_id="oc")
+    session.active_interaction = InteractionState(
+        interaction_id="clarify-1",
+        kind="clarify",
+        prompt="请选择",
+        status="completed",
+        callback_token="secret-token",
+        choice="alpha",
+        choice_label="Alpha",
+    )
+
+    card = render_legacy_interaction_callback_card(
+        session,
+        title="Hermes Agent",
+    )
+
+    assert "schema" not in card and "body" not in card
+    assert "已选择：Alpha" in str(card)
+    assert "secret-token" not in str(card)
+    assert not any(
+        item.get("tag") in {"action", "form"} for item in card["elements"]
+    )
+
+
+def test_render_failed_legacy_callback_card_is_noninteractive():
+    session = CardSession(conversation_id="c", message_id="m", chat_id="oc")
+    session.active_interaction = InteractionState(
+        interaction_id="clarify-1",
+        kind="clarify",
+        prompt="请选择",
+        status="failed",
+        error="交互已过期",
+    )
+
+    card = render_legacy_interaction_callback_card(
+        session,
+        title="Hermes Agent",
+    )
+
+    assert "schema" not in card and "body" not in card
+    assert "交互已过期" in str(card)
+    assert "action" not in {item.get("tag") for item in card["elements"]}
 
 
 def test_render_completed_card_shows_attachment_summary():

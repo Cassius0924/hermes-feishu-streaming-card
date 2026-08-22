@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.3.2 — 2026-08-23
+
+See also: [docs/release-notes-v4.3.2.md](docs/release-notes-v4.3.2.md)
+
+### Fixed
+- Issue #227: schema 2.0 streaming messages remain the stable PATCH owner while legacy clarify/approval messages remain on Feishu's callback-card rail, preventing `230099/200800` after a selection.
+- Completed and expired interaction callbacks return noninteractive legacy terminal cards without callback credentials; both standard and runtime-admission flows resume updates on the original schema 2.0 message.
+- Gateway direct-select and form-submit paths suppress an accidental schema 2.0 raw callback card and return a success toast instead, preventing `200673`.
+
+### Safety
+- Callback authentication, chat/operator/profile binding, expiry, idempotency, fail-open behavior, Hermes patch ownership, and the archived `legacy/` runtime are unchanged.
+- A dialect-aware Feishu fake rejects cross-dialect PATCH operations and covers standard/runtime interaction ownership, repeated interactions, expiry, predecessor failure, and streaming resume.
+- Empty-value `/card` fallback remains a separate follow-up.
+
+### Credits
+- Thanks @saulgoodmanngabriel for the complete Issue #227 reproduction and decisive ordinary-card versus interaction-card API comparison.
+- Thanks @lyp88997 for the toast-only `200673` fix direction and contrasting update evidence.
+
 ## V4.3.1 — 2026-08-20
 
 See also: [docs/release-notes-v4.3.1.md](docs/release-notes-v4.3.1.md)

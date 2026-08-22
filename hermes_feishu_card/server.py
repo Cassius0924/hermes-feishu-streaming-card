@@ -79,6 +79,7 @@ from .render import (
     _format_duration,
     _is_initial_loading,
     render_card_result,
+    render_legacy_interaction_callback_card,
     render_terminal_limit_handoff_card,
 )
 from .process import state_dir
@@ -1434,7 +1435,12 @@ async def _interaction_action(
                     and session.last_sequence == expiry_sequence
                 ),
             )
-        return _expired_interaction_response(expired_card)
+        callback_card = _render_interaction_callback_card_for_app(
+            request.app,
+            session,
+            session_key=session_key,
+        )
+        return _expired_interaction_response(callback_card)
     if post_lock_task is not None:
         await post_lock_task
     assert response is not None
@@ -1444,7 +1450,11 @@ async def _interaction_action(
         {
             "ok": True,
             "toast": {"type": "success", "content": "已选择"},
-            "card": _render_session_card(request, session),
+            "card": _render_interaction_callback_card_for_app(
+                request.app,
+                session,
+                session_key=session_key,
+            ),
         }
     )
 
@@ -5267,7 +5277,6 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 status=502,
             ), None
 
-        promoted_message_id = str(delivery.message_id)
         animation_task = request.app[CARD_ANIMATION_TASKS_KEY].pop(
             session_key, None
         )
@@ -5280,15 +5289,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 predecessor_snapshot=rollback_session_snapshot,
                 animation_task=animation_task,
             )
-        feishu_message_ids[session_key] = promoted_message_id
         _store_interaction_result(request.app, session)
-        _ensure_card_animation(
-            request.app,
-            session_key=session_key,
-            session=session,
-            feishu_message_id=promoted_message_id,
-            bot_id=bot_id,
-        )
         metrics.events_applied += 1
         if _session_has_runtime_admission(session):
             return web.json_response(
@@ -5719,11 +5720,9 @@ async def _complete_runtime_interaction_delivery(
                 status=409,
             )
 
-        promoted_message_id = str(delivery.message_id)
         animation_task = app[CARD_ANIMATION_TASKS_KEY].pop(
             reservation.session_key, None
         )
-        app[FEISHU_MESSAGE_IDS_KEY][reservation.session_key] = promoted_message_id
         _store_interaction_result(app, reservation.session)
         reservations.pop(reservation.session_key, None)
         committed = True
@@ -5742,13 +5741,6 @@ async def _complete_runtime_interaction_delivery(
             raise
         except Exception:
             logger.warning("interaction predecessor finalization failed")
-        _ensure_card_animation(
-            app,
-            session_key=reservation.session_key,
-            session=reservation.session,
-            feishu_message_id=str(delivery.message_id),
-            bot_id=reservation.bot_id,
-        )
         metrics.events_applied += 1
     return web.json_response(
         {
@@ -6293,26 +6285,19 @@ def _render_session_card_result_for_app(
     session_key: str | None = None,
 ) -> CardRenderResult:
     footer_fields = _footer_fields_for_session(app, session)
-    resolved_session_key = (
-        session_key
-        if session_key is not None
-        else _session_key_for_session(app, session)
-    )
-    card_config = app[SESSION_CARD_CONFIGS_KEY].get(
+    (
         resolved_session_key,
-        {},
+        card_config,
+        title,
+        interaction_profile_id,
+    ) = _session_card_render_context(
+        app,
+        session,
+        session_key=session_key,
     )
-    title = card_config.get("title", app[CARD_TITLE_KEY])
-    if not isinstance(title, str):
-        title = app[CARD_TITLE_KEY]
     interaction_mode = _interaction_mode_for_session_key(
         app,
         resolved_session_key,
-    )
-    interaction_profile_id = (
-        resolved_session_key.split(":", 1)[0]
-        if ":" in resolved_session_key
-        else "default"
     )
     raw_table_overflow_mode = card_config.get("table_overflow_mode", "compact")
     table_overflow_mode = (
@@ -6346,6 +6331,55 @@ def _render_session_card_result_for_app(
             else None
         ),
         table_overflow_mode=table_overflow_mode,
+    )
+
+
+def _render_interaction_callback_card_for_app(
+    app: web.Application,
+    session: CardSession,
+    *,
+    session_key: str | None = None,
+) -> dict[str, Any]:
+    _, _, title, interaction_profile_id = _session_card_render_context(
+        app,
+        session,
+        session_key=session_key,
+    )
+    return render_legacy_interaction_callback_card(
+        session,
+        title=title,
+        interaction_profile_id=interaction_profile_id,
+    )
+
+
+def _session_card_render_context(
+    app: web.Application,
+    session: CardSession,
+    *,
+    session_key: str | None = None,
+) -> tuple[str, dict[str, Any], str, str]:
+    resolved_session_key = (
+        session_key
+        if session_key is not None
+        else _session_key_for_session(app, session)
+    )
+    card_config = app[SESSION_CARD_CONFIGS_KEY].get(
+        resolved_session_key,
+        {},
+    )
+    title = card_config.get("title", app[CARD_TITLE_KEY])
+    if not isinstance(title, str):
+        title = app[CARD_TITLE_KEY]
+    interaction_profile_id = (
+        resolved_session_key.split(":", 1)[0]
+        if ":" in resolved_session_key
+        else "default"
+    )
+    return (
+        resolved_session_key,
+        card_config,
+        title,
+        interaction_profile_id,
     )
 
 

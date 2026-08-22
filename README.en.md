@@ -140,7 +140,7 @@ The compatibility matrix covers older Hermes starting at `v2026.4.23` and Hermes
 For an existing Hermes container:
 
 ```bash
-export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.3.1
+export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.3.2
 bash install-docker.sh
 ```
 
@@ -179,6 +179,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ## Latest Releases
 | Version | Highlights |
 |---|---|
+| [v4.3.2](docs/release-notes-v4.3.2.en.md) | Fixes Issue #227 by keeping schema 2.0 streaming cards and legacy interaction cards on stable rails, preventing `230099/200800`; the Gateway also rejects schema 2.0 raw callback cards to prevent `200673` |
 | [v4.3.1](docs/release-notes-v4.3.1.en.md) | Restores clarify/approval streaming after a Feishu WebSocket click on Hermes 0.20, wakes text fallback on the first reply, and fixes v4.3.0 persistent-service identity, systemd working-directory, and tokenless-health reconciliation |
 | [v4.3.0](docs/release-notes-v4.3.0.en.md) | Source-proven Hybrid Plugin/patch integration for Hermes `v2026.8.3`, idempotent and byte-restorable V3 install ownership, single-owner runtime interactions, and a linger-verified persistent systemd user service |
 | [v4.2.12](docs/release-notes-v4.2.12.en.md) | Makes approval cards follow Hermes capabilities and reject undeclared input, while zero-tool cards retain a stable collapsed timeline whenever reasoning display is enabled |

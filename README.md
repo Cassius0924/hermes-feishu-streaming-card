@@ -139,7 +139,7 @@ Hermes `v2026.4.23` 起的旧版和 Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0
 已有 Hermes 容器优先使用：
 
 ```bash
-export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.3.1
+export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.3.2
 bash install-docker.sh
 ```
 
@@ -178,6 +178,7 @@ bash install-docker.sh
 ## 最新版本
 | 版本 | 重点 |
 |---|---|
+| [v4.3.2](docs/release-notes-v4.3.2.md) | 修复 Issue #227：schema 2.0 流式卡与 legacy 交互卡保持稳定双轨，避免 clarify/approval 完成后触发 `230099/200800`；Gateway 拒绝把 schema 2.0 卡作为 callback raw card，避免 `200673` |
 | [v4.3.1](docs/release-notes-v4.3.1.md) | 修复 Hermes 0.20 / 飞书 WebSocket 下 clarify/approval 点击后 runtime 已继续但卡片流式更新消失的问题；修复 text fallback 首次回复不唤醒；修复 v4.3.0 persistent service identity、systemd 工作目录与 tokenless health 对账 |
 | [v4.3.0](docs/release-notes-v4.3.0.md) | Hermes `v2026.8.3` 使用源码能力证明的 Hybrid Plugin/patch 集成；V3 installer 可幂等安装与逐字恢复，runtime interaction 只有一个卡片 owner，并提供 linger 校验的 systemd 开机常驻 |
 | [v4.2.12](docs/release-notes-v4.2.12.md) | 审批卡按 Hermes 能力只展示可用授权范围并拒绝未声明输入；零工具调用的卡片在启用 reasoning timeline 时保持稳定折叠入口 |
