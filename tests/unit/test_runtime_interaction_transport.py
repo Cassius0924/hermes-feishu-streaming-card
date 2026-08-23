@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
+import queue
 import socket
 import subprocess
 import sys
@@ -839,25 +840,109 @@ def test_listener_daemon_thread_allows_process_exit_without_close():
     process that starts the listener without calling close() still exits
     cleanly.  Without daemon=True the non-daemon thread blocks interpreter
     shutdown, which is what caused hermes-doctor to hang after the HFC
-    plugin loaded."""
+    plugin loaded.
+
+    The child flushes a ``started daemon=...`` marker right after start() so
+    the parent can bound startup and post-start exit as two separate phases:
+    a slow cold import / loopback bind must not be mistaken for a post-start
+    shutdown hang, and the emitted daemon state proves the thread flag on the
+    exact runner that executed the child.
+    """
     child_script = (
+        "import sys\n"
         "from hermes_feishu_card.runtime_interaction_transport "
         "import RuntimeInteractionListener\n"
         "listener = RuntimeInteractionListener(b'i' * 32, lambda _p: True)\n"
         "listener.start()\n"
+        "sys.stdout.write('started daemon=' + str(listener._thread.daemon) + '\\n')\n"
+        "sys.stdout.flush()\n"
     )
+    # Bound the two phases independently: give cold import / bind room, but
+    # keep the post-start exit window tight so a non-daemon thread fails fast.
+    startup_timeout = 30.0
+    exit_timeout = 10.0
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout_lines = queue.Queue()
+    stderr_lines = queue.Queue()
+
+    def _pump(src, dst):
+        try:
+            for line in src:
+                dst.put(line)
+        finally:
+            dst.put(None)
+
+    def _drain(dst):
+        lines = []
+        while True:
+            try:
+                item = dst.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                break
+            lines.append(item)
+        return "".join(lines)
+
+    def _kill():
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    out_pump = Thread(target=_pump, args=(proc.stdout, stdout_lines), daemon=True)
+    err_pump = Thread(target=_pump, args=(proc.stderr, stderr_lines), daemon=True)
+    out_pump.start()
+    err_pump.start()
+
     try:
-        result = subprocess.run(
-            [sys.executable, "-c", child_script],
-            timeout=5,
-            capture_output=True,
+        # Phase 1: bounded startup — wait for the flushed marker.
+        marker = None
+        deadline = time.monotonic() + startup_timeout
+        while marker is None and time.monotonic() < deadline:
+            try:
+                line = stdout_lines.get(timeout=0.5)
+            except queue.Empty:
+                line = None
+            if line is None:
+                continue
+            if line.startswith("started daemon="):
+                marker = line.strip()
+                break
+        if marker is None:
+            _kill()
+            stderr = _drain(stderr_lines)
+            pytest.fail(
+                f"child did not emit started marker within "
+                f"{startup_timeout:.0f}s (exit code {proc.returncode}) — "
+                f"cold import or loopback bind too slow, or start() hung\n"
+                f"stderr: {stderr!r}"
+            )
+        daemon_flag = marker.split("=", 1)[1]
+        assert daemon_flag == "True", (
+            f"listener serve_forever thread must be daemon, got {marker!r}"
         )
-    except subprocess.TimeoutExpired:
-        pytest.fail(
-            "process did not exit within 5s without close() — "
-            "listener thread is likely not daemon"
+
+        # Phase 2: post-start exit — interpreter must exit without close().
+        try:
+            returncode = proc.wait(timeout=exit_timeout)
+        except subprocess.TimeoutExpired:
+            _kill()
+            pytest.fail(
+                f"process did not exit within {exit_timeout:.0f}s after "
+                f"start without close() — listener thread is not daemon\n"
+                f"marker: {marker!r}"
+            )
+        assert returncode == 0, (
+            f"expected exit 0, got {returncode}\n"
+            f"stderr: {_drain(stderr_lines)!r}"
         )
-    assert result.returncode == 0, (
-        f"expected exit 0, got {result.returncode}\n"
-        f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
-    )
+    finally:
+        _kill()
+        out_pump.join(timeout=1.0)
+        err_pump.join(timeout=1.0)
