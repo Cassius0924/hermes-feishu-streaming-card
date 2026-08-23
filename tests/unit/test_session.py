@@ -72,6 +72,35 @@ def test_started_message_uses_feishu_message_id_as_native_reply_anchor():
     assert session.reply_to_message_id == "om_user_message"
 
 
+def test_reply_in_thread_placement_is_sticky_within_session():
+    session = CardSession(
+        conversation_id="chat-1", message_id="om_user_message", chat_id="oc_abc"
+    )
+
+    assert session.apply(
+        event(
+            "message.started",
+            0,
+            {"reply_in_thread": "true"},
+            message_id="om_user_message",
+        )
+    )
+    assert session.apply(
+        event(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "placement-choice",
+                "prompt": "是否继续？",
+                "options": [{"label": "继续", "value": "yes"}],
+            },
+            message_id="om_user_message",
+        )
+    )
+
+    assert session.reply_in_thread is True
+
+
 @pytest.mark.parametrize(
     ("sender_open_id", "expected"),
     (

@@ -9346,16 +9346,56 @@ def _event_data(
             value = _first_string(local_vars, (source_key,)) or _first_attr_string(message_obj, (source_key,))
             if value:
                 data[data_key] = value
+        reply_in_thread = (
+            _truthy_value(local_vars.get("reply_in_thread"))
+            or _truthy_value(getattr(source_obj, "reply_in_thread", None))
+            or _truthy_value(getattr(message_obj, "reply_in_thread", None))
+            or _truthy_value(getattr(local_vars.get("event"), "reply_in_thread", None))
+        )
+        if reply_in_thread:
+            data["reply_in_thread"] = True
         reply_aliases = (
             "reply_to_message_id",
             "quote_message_id",
             "parent_message_id",
         )
         canonical_reply_id = (
-            _first_string(local_vars, reply_aliases)
+            _first_string(data, ("reply_to_message_id",))
+            or _first_string(local_vars, reply_aliases)
             or _first_attr_string(message_obj, reply_aliases)
             or _first_attr_string(local_vars.get("event"), reply_aliases)
         )
+        if not canonical_reply_id and reply_in_thread:
+            canonical_reply_id = (
+                _first_string(
+                    local_vars,
+                    ("reply_thread_anchor_message_id",),
+                )
+                or _first_attr_string(
+                    source_obj,
+                    ("reply_thread_anchor_message_id", "reply_to_message_id"),
+                )
+                or _first_attr_string(
+                    local_vars.get("event"),
+                    ("reply_thread_anchor_message_id", "reply_to_message_id"),
+                )
+                or _first_attr_string(
+                    message_obj,
+                    ("reply_thread_anchor_message_id", "reply_to_message_id"),
+                )
+                or _first_string(
+                    local_vars,
+                    ("message_id", "event_message_id"),
+                )
+                or _first_attr_string(
+                    source_obj,
+                    ("message_id", "event_message_id"),
+                )
+                or _first_attr_string(
+                    local_vars.get("event"),
+                    ("message_id",),
+                )
+            )
         if canonical_reply_id:
             data["reply_to_message_id"] = canonical_reply_id
         for reply_key in reply_aliases:
@@ -10056,6 +10096,14 @@ def _finite_float(value: Any) -> float | None:
     if not math.isfinite(number):
         return None
     return number
+
+
+def _truthy_value(value: Any) -> bool:
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return False
 
 
 def _fallback_message_id(

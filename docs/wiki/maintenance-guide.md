@@ -29,7 +29,7 @@
 高风险点：
 
 - 字段名必须贴合 Hermes 变量：`source`、`event`、`response`、`agent_result`、`event_message_id` 等。
-- Feishu topic 场景必须保留 `source.message_id` 和 `reply_to_message_id`。
+- Feishu topic 场景必须保留 `source.message_id` 和 `reply_to_message_id`；首回复建 thread 的 `reply_in_thread` 意图还必须进入 `CardSession`，并通过普通交互与 `RuntimeInteractionDeliveryReservation` 的所有新卡发送路径继续传递。
 - `message.started` 必须从真实入站 `event.message_id` 绑定 `turn_id`；同一 `source` 的 stream/tool/terminal 回调复用这个 immutable identity。显式 `turn_id` 是 canonical turn hard fence，不能被 `message_id` 或 `reply_to_message_id` alias 覆盖；无法在 `source` 绑定私有属性时保持 legacy fail-open。
 - stable tool lifecycle 与 legacy progress callback 不能同时投递同一调用；wrapper 检测必须读取 agent 当前实际 callback，显式 fallback 标记仅用于卡片路径未接受时恢复原生进度。
 - 已识别 `system.notice` 必须按 sidecar 结果分流：已有卡片异步更新的 `accepted` 与独立卡首次投递的 `delivered` 抑制原生文本，`not_sent` 回退原始通知文本，`unknown` 只尝试固定通用提示且不重复原始通知文本；`accepted` 必须同时带有 `applied=true`，不可解析响应一律视为 `unknown`。

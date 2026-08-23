@@ -162,12 +162,14 @@ class FeishuClient:
         thread_id: Optional[str] = None,
         reply_to_message_id: Optional[str] = None,
         delivery_uuid: Optional[str] = None,
+        reply_in_thread: bool = False,
     ) -> str:
         result = await self.send_card_delivery(
             chat_id,
             card,
             thread_id=thread_id,
             reply_to_message_id=reply_to_message_id,
+            reply_in_thread=reply_in_thread,
             delivery_uuid=delivery_uuid,
         )
         return result.message_id
@@ -179,7 +181,10 @@ class FeishuClient:
         thread_id: Optional[str] = None,
         reply_to_message_id: Optional[str] = None,
         delivery_uuid: Optional[str] = None,
+        reply_in_thread: bool = False,
     ) -> FeishuSendResult:
+        if reply_in_thread and not reply_to_message_id:
+            raise ValueError("reply_to_message_id is required for reply_in_thread")
         if delivery_uuid is not None:
             if not isinstance(delivery_uuid, str) or not delivery_uuid.strip():
                 raise ValueError("delivery_uuid must be a non-empty string")
@@ -207,7 +212,7 @@ class FeishuClient:
                         json_body={
                             "msg_type": payload["msg_type"],
                             "content": payload["content"],
-                            "reply_in_thread": bool(thread_id),
+                            "reply_in_thread": bool(thread_id or reply_in_thread),
                             **(
                                 {"uuid": delivery_uuid}
                                 if delivery_uuid is not None
@@ -282,6 +287,7 @@ class FeishuClient:
         text: str,
         thread_id: Optional[str] = None,
         reply_to_message_id: Optional[str] = None,
+        reply_in_thread: bool = False,
     ) -> str:
         if not isinstance(chat_id, str) or not chat_id.strip():
             raise ValueError("chat_id is required")
@@ -298,7 +304,7 @@ class FeishuClient:
                 json_body={
                     "msg_type": "text",
                     "content": content,
-                    "reply_in_thread": bool(thread_id),
+                    "reply_in_thread": bool(thread_id) or reply_in_thread,
                 },
             )
         else:

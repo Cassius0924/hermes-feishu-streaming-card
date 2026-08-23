@@ -36,6 +36,14 @@ def _now() -> float:
     return time.time()
 
 
+def _truthy_flag(value: Any) -> bool:
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return False
+
+
 def _exact_feishu_open_id(value: object) -> str:
     return (
         value
@@ -139,6 +147,7 @@ class CardSession:
     active_interaction: InteractionState | None = None
     delivery_kind: str = "chat"
     reply_to_message_id: str = ""
+    reply_in_thread: bool = False
     sender_open_id: str = ""
     completion_notify_state: str = "idle"
     notice_title: str = ""
@@ -197,6 +206,8 @@ class CardSession:
         if self.status in {"completed", "failed"}:
             return False
         self.last_sequence = max(self.last_sequence, event.sequence)
+        if _truthy_flag(event.data.get("reply_in_thread")):
+            self.reply_in_thread = True
 
         self.display_status = event.display_status
         self.display_status_source = "explicit" if event.display_status else "session"
