@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
 import re
+import socketserver
 import threading
 import time
 
@@ -30,6 +31,17 @@ class _RuntimeInteractionServer(ThreadingHTTPServer):
     allow_reuse_address = False
     daemon_threads = True
     block_on_close = False
+
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind() calls socket.getfqdn() to fill server_name,
+        # which can stall on a slow reverse-DNS resolver (observed on hosted
+        # macOS runners).  This listener is literal-loopback only, so the
+        # resolved hostname is never used; bind the socket and record the
+        # loopback address directly, keeping the startup path DNS-free.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
 
     def process_request(self, request, client_address) -> None:
         listener = self.listener  # type: ignore[attr-defined]

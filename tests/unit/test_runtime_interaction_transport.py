@@ -19,6 +19,7 @@ from hermes_feishu_card import hermes_plugin_runtime as plugin_runtime
 from hermes_feishu_card.runtime_interaction_transport import (
     MAX_RUNTIME_INTERACTION_BODY_BYTES,
     RUNTIME_INTERACTION_PATH,
+    RuntimeInteractionListener,
 )
 
 
@@ -966,6 +967,132 @@ def test_listener_daemon_thread_allows_process_exit_without_close():
             pytest.fail(
                 f"process did not exit within {exit_timeout:.0f}s after "
                 f"start without close() — listener thread is not daemon\n"
+                f"steps seen: {steps!r}\n"
+                f"stderr: {_drain(stderr_lines)!r}"
+            )
+        assert returncode == 0, (
+            f"expected exit 0, got {returncode}\n"
+            f"stderr: {_drain(stderr_lines)!r}"
+        )
+    finally:
+        _kill()
+        out_pump.join(timeout=1.0)
+        err_pump.join(timeout=1.0)
+
+
+def test_start_does_not_need_reverse_dns_for_loopback(monkeypatch):
+    """Regression for the hosted macOS stall: HTTPServer.server_bind() calls
+    socket.getfqdn() while binding, and reverse DNS on the runner can hang
+    well past any reasonable startup bound.  The literal-loopback listener
+    does not need a resolved hostname, so start() must not depend on it.
+
+    We emulate the stalled resolver by sleeping in getfqdn; with the
+    production path free of reverse DNS, the listener still starts in a
+    few seconds, and the emitted daemon marker stays correct.
+    """
+    child_script = (
+        "import faulthandler, signal, sys\n"
+        "try:\n"
+        "    faulthandler.register(signal.SIGUSR1)\n"
+        "except (AttributeError, ValueError):\n"
+        "    pass\n"
+        "import socket\n"
+        "original_getfqdn = socket.getfqdn\n"
+        "def stalled_getfqdn(host=''):\n"
+        "    time.sleep(300)\n"
+        "    return original_getfqdn(host)\n"
+        "socket.getfqdn = stalled_getfqdn\n"
+        "import time\n"
+        "sys.stdout.write('step:start\\n')\n"
+        "sys.stdout.flush()\n"
+        "from hermes_feishu_card.runtime_interaction_transport import RuntimeInteractionListener\n"
+        "sys.stdout.write('step:imported\\n')\n"
+        "sys.stdout.flush()\n"
+        "listener = RuntimeInteractionListener(b'i' * 32, lambda _p: True)\n"
+        "listener.start()\n"
+        "sys.stdout.write('step:started daemon=' + str(listener._thread.daemon) + '\\n')\n"
+        "sys.stdout.flush()\n"
+    )
+    # Same startup bound as the daemon regression: hosted runners can take a
+    # while for a cold interpreter import.  The stalled resolver sleeps far
+    # beyond that bound, so a reverse-DNS dependency can never slip through.
+    startup_timeout = 30.0
+    exit_timeout = 10.0
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout_lines = queue.Queue()
+    stderr_lines = queue.Queue()
+
+    def _pump(src, dst):
+        try:
+            for line in src:
+                dst.put(line)
+        finally:
+            dst.put(None)
+
+    def _drain(dst):
+        lines = []
+        while True:
+            try:
+                item = dst.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                break
+            lines.append(item)
+        return "".join(lines)
+
+    def _kill():
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    out_pump = Thread(target=_pump, args=(proc.stdout, stdout_lines), daemon=True)
+    err_pump = Thread(target=_pump, args=(proc.stderr, stderr_lines), daemon=True)
+    out_pump.start()
+    err_pump.start()
+
+    try:
+        steps = []
+        marker = None
+        deadline = time.monotonic() + startup_timeout
+        while marker is None and time.monotonic() < deadline:
+            try:
+                line = stdout_lines.get(timeout=0.5)
+            except queue.Empty:
+                line = None
+            if line is None:
+                continue
+            if line.startswith("step:"):
+                steps.append(line.strip())
+            if line.startswith("step:started daemon="):
+                marker = line.strip()
+                break
+        if marker is None:
+            _kill()
+            stderr = _drain(stderr_lines)
+            pytest.fail(
+                f"start() still depends on reverse DNS: no started marker within "
+                f"{startup_timeout:.0f}s while getfqdn sleeps 15s\n"
+                f"steps seen: {steps!r}\n"
+                f"stderr: {stderr!r}"
+            )
+        daemon_flag = marker.split("=", 1)[1]
+        assert daemon_flag == "True", (
+            f"listener serve_forever thread must be daemon, got {marker!r}"
+        )
+        try:
+            returncode = proc.wait(timeout=exit_timeout)
+        except subprocess.TimeoutExpired:
+            _kill()
+            pytest.fail(
+                f"process did not exit within {exit_timeout:.0f}s after start "
+                f"without close() — listener thread is not daemon\n"
                 f"steps seen: {steps!r}\n"
                 f"stderr: {_drain(stderr_lines)!r}"
             )
