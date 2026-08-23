@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.3.2`。本轮修复 Issue #227 中 schema 2.0 streaming message 与 legacy interaction callback message 被错误混用导致的 `230099/200800` 和 `200673`。完整自动化、构建、CI、exact merge SHA、public tag/install、Release assets 与真实飞书验收只有完成后才会标记通过。
+当前发布候选为 `4.3.3`。本轮固定首回复建 thread 的 `reply_in_thread` placement，并让缺少 `reply_to_message_id` 的显式 thread text reply fail-closed，避免 completion notification 静默退回群聊顶层。本地完整自动化、包构建及 PR #232 candidate CI 已通过；exact merge SHA、public tag/install、Release assets 与真实飞书验收只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -147,7 +147,15 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
 
-## V4.3.2 发布门禁
+## V4.3.3 发布门禁
+
+- 首回复在没有 concrete `thread_id` 时携带显式 `reply_in_thread=true` 和真实 `om_` anchor：streaming card、普通/重复/runtime-admission interaction 及 opt-in completion notification 必须保留在同一 thread。
+- `send_text_message()` 收到 `reply_in_thread=true` 或非空 `thread_id`、但缺少 `reply_to_message_id` 时，必须在 token/API 调用前拒绝，不能发送 top-level fallback；没有 thread placement intent 的默认路径继续兼容。
+- 本地回归与完整 pytest：**已通过（`3267 passed, 6 skipped`）**；`git diff --check`、sdist/wheel、fresh Python 3.12 wheel-only provenance、唯一 Hermes plugin entrypoint、24 个 provenance slices 与 CLI help smoke：**已通过**。
+- PR #232 candidate HEAD `f7de533d67f9e50afcd2c4d80fad89b572054605` 的 Tests run `32657674121`（10 个 job）与 CodeQL run `32657674120`：**已通过**。
+- exact merge SHA、public tag/install 与 Release assets/checksums 按发布流程继续记录；真实 Feishu/Lark 客户端验收当前未验证。
+
+## V4.3.2 发布门禁（历史记录）
 
 - Issue #227：原 schema 2.0 streaming message 必须始终保留为 `FEISHU_MESSAGE_IDS_KEY` owner；新发 legacy 交互卡只能接收 callback，绝不能成为 schema 2.0 PATCH 目标。
 - direct-select、custom-input form、runtime admission、连续 interaction 和过期路径都必须返回同方言 legacy 终态卡；Gateway 若收到 schema 2.0 callback card 必须降级为 success toast，不能生成 raw callback card。

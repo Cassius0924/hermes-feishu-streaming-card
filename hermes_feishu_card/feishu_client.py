@@ -293,6 +293,10 @@ class FeishuClient:
             raise ValueError("chat_id is required")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text must be a non-empty string")
+        if (thread_id or reply_in_thread) and (
+            not isinstance(reply_to_message_id, str) or not reply_to_message_id.strip()
+        ):
+            raise ValueError("reply_to_message_id is required for thread placement")
 
         token = await self._tenant_token()
         content = json.dumps({"text": text}, ensure_ascii=False)

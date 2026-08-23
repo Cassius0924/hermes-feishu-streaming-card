@@ -512,14 +512,14 @@ Use `install-docker.sh` inside an existing Hermes container. It defaults to
 script selects Hermes venv Python and does not fall back to system Python unless
 `HFC_PYTHON` is set.
 
-The Compose example defaults `HFC_VERSION` to `v4.3.2`.
+The Compose example defaults `HFC_VERSION` to `v4.3.3`.
 
 Example:
 
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.3.2
+export HFC_VERSION=v4.3.3
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -762,6 +762,7 @@ The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` /
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| [v4.3.3](release-notes-v4.3.3.en.md) | 2026-08-24 | Preserves the reply anchor and `reply_in_thread` placement when the first reply creates a thread; completion notifications remain in that thread, while an explicit thread text reply without an anchor fails closed |
 | [v4.3.2](release-notes-v4.3.2.en.md) | 2026-08-23 | Issue #227: keeps schema 2.0 streaming ownership separate from the legacy interaction callback card, fixing `230099/200800` and `200673` |
 | [v4.3.1](release-notes-v4.3.1.en.md) | 2026-08-20 | Fixes Hermes 0.20 / Feishu WebSocket profile, callback, and streaming resume after a click, the first text-fallback reply, and v4.3.0 persistent-enable reconciliation |
 | [v4.3.0](release-notes-v4.3.0.en.md) | 2026-08-19 | Hermes v2026.8.3 Hybrid capability proof and V3 installer, single-owner runtime interactions, fixed-tag restore, linger-backed systemd persistence, and local candidate fixes across Issues #210–#223 |
