@@ -268,6 +268,27 @@ async def test_send_text_message_rejects_reply_in_thread_without_valid_reply_anc
     assert requests == []
 
 
+async def test_send_text_message_rejects_thread_id_without_reply_anchor(feishu_api):
+    test_client, requests, token_calls = feishu_api
+    client = FeishuClient(
+        FeishuClientConfig(
+            app_id="cli_test",
+            app_secret="secret",
+            base_url=str(test_client.make_url("/")),
+        )
+    )
+
+    with pytest.raises(ValueError, match="reply_to_message_id"):
+        await client.send_text_message(
+            "oc_abc",
+            "thread completion notice",
+            thread_id="omt_thread",
+        )
+
+    assert token_calls() == 0
+    assert requests == []
+
+
 async def test_send_text_message_keeps_plain_reply_default_for_message_anchor(
     feishu_api,
 ):

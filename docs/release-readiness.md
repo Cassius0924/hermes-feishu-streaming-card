@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.3.3`。本轮固定首回复建 thread 的 `reply_in_thread` placement，并让缺少 `reply_to_message_id` 的显式 thread text reply fail-closed，避免 completion notification 静默退回群聊顶层。完整自动化、构建、CI、exact merge SHA、public tag/install、Release assets 与真实飞书验收只有完成后才会标记通过。
+当前发布候选为 `4.3.3`。本轮固定首回复建 thread 的 `reply_in_thread` placement，并让缺少 `reply_to_message_id` 的显式 thread text reply fail-closed，避免 completion notification 静默退回群聊顶层。本地完整自动化与包构建已通过；CI、exact merge SHA、public tag/install、Release assets 与真实飞书验收只有完成后才会标记通过。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -150,8 +150,9 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 ## V4.3.3 发布门禁
 
 - 首回复在没有 concrete `thread_id` 时携带显式 `reply_in_thread=true` 和真实 `om_` anchor：streaming card、普通/重复/runtime-admission interaction 及 opt-in completion notification 必须保留在同一 thread。
-- `send_text_message(reply_in_thread=true)` 缺少 `reply_to_message_id` 必须在 token/API 调用前拒绝，不能发送 top-level fallback；默认 `false` 路径继续兼容。
-- 本地回归、完整 pytest、远端 CI、exact merge SHA、包构建、public tag/install、Release assets/checksums 与真实 Feishu/Lark smoke 按发布流程逐项记录；真实客户端验收当前未验证。
+- `send_text_message()` 收到 `reply_in_thread=true` 或非空 `thread_id`、但缺少 `reply_to_message_id` 时，必须在 token/API 调用前拒绝，不能发送 top-level fallback；没有 thread placement intent 的默认路径继续兼容。
+- 本地回归与完整 pytest：**已通过（`3267 passed, 6 skipped`）**；`git diff --check`、sdist/wheel、fresh Python 3.12 wheel-only provenance、唯一 Hermes plugin entrypoint、24 个 provenance slices 与 CLI help smoke：**已通过**。
+- 远端 CI、exact merge SHA、public tag/install 与 Release assets/checksums 按发布流程继续记录；真实 Feishu/Lark 客户端验收当前未验证。
 
 ## V4.3.2 发布门禁（历史记录）
 

@@ -11,7 +11,7 @@ See also: [docs/release-notes-v4.3.3.md](docs/release-notes-v4.3.3.md)
 
 ### Fixed
 - First replies that explicitly request `reply_in_thread` before Feishu supplies a concrete `thread_id` now retain their verified reply anchor and placement for the streaming card, ordinary/repeated/runtime-admission interaction cards, and opt-in completion notification.
-- `send_text_message` now rejects an explicit `reply_in_thread` send without `reply_to_message_id`; it no longer silently falls back to a top-level chat text message. The default `reply_in_thread=false` path remains compatible.
+- `send_text_message` now rejects any text thread placement requested by `reply_in_thread` or a non-empty `thread_id` when `reply_to_message_id` is missing; it no longer silently falls back to a top-level chat text message. The default path with no thread-placement intent remains compatible.
 
 ### Safety
 - The original schema 2.0 streaming message remains the only PATCH owner; legacy interaction-card dialect, callback authentication/binding, expiry, idempotency, Hermes patch ownership, and archived `legacy/` runtime are unchanged.
