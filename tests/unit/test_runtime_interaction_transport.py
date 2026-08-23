@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
 import socket
+import subprocess
+import sys
 from threading import Barrier, Event, Thread
 import time
 from urllib import error, request
@@ -830,3 +832,32 @@ def test_late_claim_is_rejected_while_deferred_cleanup_owns_turn(monkeypatch):
     assert runtime._patch_interactions == {}
     assert runtime.register_patch_interaction(*args) is False
     runtime.close()
+
+
+def test_listener_daemon_thread_allows_process_exit_without_close():
+    """Regression for CLI hang: the serve_forever thread must be daemon so a
+    process that starts the listener without calling close() still exits
+    cleanly.  Without daemon=True the non-daemon thread blocks interpreter
+    shutdown, which is what caused hermes-doctor to hang after the HFC
+    plugin loaded."""
+    child_script = (
+        "from hermes_feishu_card.runtime_interaction_transport "
+        "import RuntimeInteractionListener\n"
+        "listener = RuntimeInteractionListener(b'i' * 32, lambda _p: True)\n"
+        "listener.start()\n"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", child_script],
+            timeout=5,
+            capture_output=True,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            "process did not exit within 5s without close() — "
+            "listener thread is likely not daemon"
+        )
+    assert result.returncode == 0, (
+        f"expected exit 0, got {result.returncode}\n"
+        f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
+    )
