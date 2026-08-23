@@ -147,6 +147,69 @@ def test_build_message_payload_keeps_chat_id_for_thread_reply_anchor():
     assert json.loads(payload["content"]) == card
 
 
+@pytest.mark.asyncio
+async def test_send_card_uses_reply_api_for_reply_in_thread_without_thread_id(monkeypatch):
+    cfg = FeishuClientConfig(app_id="cli_a", app_secret="sec")
+    client = FeishuClient(cfg)
+    card = {"schema": "2.0", "header": {"title": "hello"}}
+    calls = []
+
+    async def fake_token():
+        return "tenant-token"
+
+    async def fake_request(method, path, *, token=None, params=None, json_body=None):
+        calls.append(
+            {
+                "method": method,
+                "path": path,
+                "token": token,
+                "params": params,
+                "json_body": json_body,
+            }
+        )
+        return {"code": 0, "data": {"message_id": "om_card"}}
+
+    monkeypatch.setattr(client, "_tenant_token", fake_token)
+    monkeypatch.setattr(client, "_request_json", fake_request)
+
+    message_id = await client.send_card(
+        "oc_abc",
+        card,
+        reply_to_message_id="om_user_message",
+        reply_in_thread=True,
+    )
+
+    assert message_id == "om_card"
+    assert calls == [
+        {
+            "method": "POST",
+            "path": "/im/v1/messages/om_user_message/reply",
+            "token": "tenant-token",
+            "params": None,
+            "json_body": {
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
+                "reply_in_thread": True,
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_card_rejects_reply_in_thread_without_reply_anchor(monkeypatch):
+    cfg = FeishuClientConfig(app_id="cli_a", app_secret="sec")
+    client = FeishuClient(cfg)
+    card = {"schema": "2.0", "header": {"title": "hello"}}
+
+    async def unexpected_token():
+        raise AssertionError("token lookup must not run without a reply anchor")
+
+    monkeypatch.setattr(client, "_tenant_token", unexpected_token)
+
+    with pytest.raises(ValueError, match="reply_to_message_id"):
+        await client.send_card("oc_abc", card, reply_in_thread=True)
+
+
 def test_build_message_payload_preserves_non_ascii_content():
     cfg = FeishuClientConfig(app_id="cli_a", app_secret="sec")
     client = FeishuClient(cfg)

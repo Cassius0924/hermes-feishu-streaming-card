@@ -24,6 +24,8 @@ Hermes 最小 hook 向 sidecar 发送消息生命周期事件。第二阶段 hoo
 
 所有事件都保留 `conversation_id`、`message_id` 和 `chat_id` 三个必填字段。V3.6.4 起，事件还可以携带可选 `thread_id` 字段；当它是飞书 `om_` / `omt_` thread 上下文时，sidecar 会在创建初始卡片时使用飞书 reply API，把卡片发回用户所在的同一 thread。后续更新仍然 PATCH 这条已创建的卡片消息。
 
+当 Hermes 只有“从当前消息创建 thread”的意图、尚未拿到 `thread_id` 时，hook 可以同时发送 `data.reply_in_thread=true` 与 `data.reply_to_message_id`。sidecar 会把该意图保存在当前 `CardSession`，因此后续 approval/clarify 交互卡以及 runtime-admission 延迟投递仍使用同一 reply API 和锚点，不会回落到群聊顶层。
+
 `turn_id` 是可选字段，用来稳定标识一次 Agent turn；`message_id` 保留当前事件、stream 或 reply identity，`data.reply_to_message_id` 只表示飞书回复锚点。当 `turn_id` 存在时，session ownership、事件排序、delivery policy 和 native handoff 都使用 `turn_id`，不会通过 `reply_to_message_id` alias 改写所属 turn。
 
 缺少 `turn_id` 时，sidecar 保持兼容：以 `message_id` 作为 turn identity，并继续允许后续 stream 事件通过 `reply_to_message_id` alias 路由到已有 active session。

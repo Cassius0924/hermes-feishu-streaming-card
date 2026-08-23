@@ -1535,6 +1535,28 @@ def test_build_stream_event_carries_topic_reply_anchor_from_source_message_id():
     assert payload["data"]["reply_to_message_id"] == "om_topic_user"
 
 
+def test_build_started_event_carries_reply_in_thread_anchor_from_source():
+    class ThreadReplySourceObject:
+        platform = "feishu"
+        chat_id = "oc_source"
+        reply_in_thread = True
+        reply_thread_anchor_message_id = "om_trigger"
+
+    payload = hook_runtime.build_event(
+        "message.started",
+        {
+            "source": ThreadReplySourceObject(),
+            "session_id": "agent:main:feishu:group:oc_source:u_user",
+            "message_id": "om_runtime_identity",
+        },
+    )
+
+    assert payload["chat_id"] == "oc_source"
+    assert payload["thread_id"] == ""
+    assert payload["data"]["reply_in_thread"] is True
+    assert payload["data"]["reply_to_message_id"] == "om_trigger"
+
+
 def test_build_tool_event_carries_arguments_duration_and_error():
     payload = hook_runtime.build_event(
         "tool.updated",

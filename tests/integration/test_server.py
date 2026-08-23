@@ -158,6 +158,7 @@ async def test_after_eof_runs_once_on_successful_repeated_write_eof(monkeypatch)
 class FakeFeishuClient:
     def __init__(self):
         self.sent = []
+        self.sent_reply_in_thread = []
         self.updated = []
         self.texts = []
         self.operations = []
@@ -168,12 +169,20 @@ class FakeFeishuClient:
         self.update_error_message = "update unavailable"
         self.update_delay = 0.0
 
-    async def send_card(self, chat_id, card, thread_id=None, reply_to_message_id=None):
+    async def send_card(
+        self,
+        chat_id,
+        card,
+        thread_id=None,
+        reply_to_message_id=None,
+        reply_in_thread=False,
+    ):
         if self.send_delay:
             await asyncio.sleep(self.send_delay)
         if self.fail_send:
             raise RuntimeError("send unavailable")
         self.sent.append((chat_id, card, thread_id, reply_to_message_id))
+        self.sent_reply_in_thread.append(reply_in_thread)
         return f"feishu-message-{len(self.sent)}"
 
     async def update_card_message(self, message_id, card):
@@ -210,12 +219,14 @@ class DialectAwareFeishuClient(FakeFeishuClient):
         card,
         thread_id=None,
         reply_to_message_id=None,
+        reply_in_thread=False,
     ):
         message_id = await super().send_card(
             chat_id,
             card,
             thread_id,
             reply_to_message_id,
+            reply_in_thread,
         )
         self.dialects[message_id] = (
             "v2" if card.get("schema") == "2.0" else "legacy"
@@ -2693,7 +2704,14 @@ async def test_hfc_command_request_returns_before_slow_feishu_send():
             self.started = asyncio.Event()
             self.release = asyncio.Event()
 
-        async def send_card(self, chat_id, card, thread_id=None, reply_to_message_id=None):
+        async def send_card(
+            self,
+            chat_id,
+            card,
+            thread_id=None,
+            reply_to_message_id=None,
+            reply_in_thread=False,
+        ):
             self.started.set()
             await self.release.wait()
             return await super().send_card(
@@ -2701,6 +2719,7 @@ async def test_hfc_command_request_returns_before_slow_feishu_send():
                 card,
                 thread_id=thread_id,
                 reply_to_message_id=reply_to_message_id,
+                reply_in_thread=reply_in_thread,
             )
 
     feishu_client = BlockingFeishuClient()
@@ -7575,6 +7594,44 @@ async def test_v4_interaction_restores_cached_preview_on_stable_v2_card(client):
     assert feishu_client.updated[-1][0] == "feishu-message-1"
 
 
+async def test_interaction_promotion_preserves_session_thread_placement(client):
+    test_client, feishu_client = client
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {
+                "reply_in_thread": True,
+                "reply_to_message_id": "om_explicit_anchor",
+            },
+            message_id="om_runtime_identity",
+            turn_id="turn-placement",
+        ),
+    )
+    requested = await test_client.post(
+        "/events",
+        json=event_payload(
+            "interaction.requested",
+            1,
+            {
+                "interaction_id": "approval-session-placement",
+                "kind": "approval",
+                "prompt": "是否继续？",
+                "options": [{"label": "继续", "value": "yes"}],
+            },
+            message_id="om_interaction_identity",
+            turn_id="turn-placement",
+        ),
+    )
+
+    assert started.status == 200
+    assert requested.status == 200
+    assert feishu_client.sent_reply_in_thread == [True, True]
+    assert feishu_client.sent[-1][3] == "om_explicit_anchor"
+
+
 async def test_interaction_promotion_finalizes_predecessor_snapshot(client):
     test_client, feishu_client = client
 
@@ -8078,6 +8135,53 @@ async def test_message_started_sends_card_as_thread_reply(client):
     assert feishu_client.sent[0][0] == "oc_abc"
     assert feishu_client.sent[0][2] == "omt_thread"
     assert feishu_client.sent[0][3] == "om_user_message"
+    assert feishu_client.sent_reply_in_thread == [False]
+
+
+async def test_message_started_can_create_thread_from_reply_in_thread_flag(client):
+    test_client, feishu_client = client
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {
+                "reply_in_thread": True,
+                "reply_to_message_id": "om_explicit_anchor",
+            },
+            conversation_id="conversation-1",
+            message_id="om_runtime_identity",
+        ),
+    )
+
+    assert started.status == 200
+    assert await started.json() == DELIVERED_RESPONSE
+    assert len(feishu_client.sent) == 1
+    assert feishu_client.sent[0][0] == "oc_abc"
+    assert feishu_client.sent[0][2] is None
+    assert feishu_client.sent[0][3] == "om_explicit_anchor"
+    assert feishu_client.sent_reply_in_thread == [True]
+
+
+async def test_message_started_does_not_fall_back_to_top_level_without_thread_anchor(
+    client,
+):
+    test_client, feishu_client = client
+
+    started = await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {"reply_in_thread": True},
+            conversation_id="conversation-1",
+            message_id="runtime-identity-without-feishu-anchor",
+        ),
+    )
+
+    assert started.status == 502
+    assert len(feishu_client.sent) == 0
 
 
 async def test_message_started_uses_user_message_as_normal_chat_reply_anchor(client):
@@ -8702,6 +8806,10 @@ async def test_runtime_interaction_keeps_v2_owner_and_never_patches_legacy_card(
             json=event_payload(
                 "message.started",
                 0,
+                {
+                    "reply_in_thread": True,
+                    "reply_to_message_id": "om_user_message",
+                },
                 turn_id="turn-runtime",
                 created_at=time.time(),
             ),
@@ -8717,6 +8825,7 @@ async def test_runtime_interaction_keeps_v2_owner_and_never_patches_legacy_card(
             "feishu-message-1": "v2",
             "feishu-message-2": "legacy",
         }
+        assert feishu_client.sent_reply_in_thread == [True, True]
         action_value = interaction_buttons(feishu_client.sent[-1][1])[0]["value"]
 
         callback = await test_client.post(
@@ -9167,7 +9276,17 @@ async def test_runtime_interaction_concurrent_same_and_conflicting_actions_compl
 async def test_repeated_interactions_keep_one_v2_owner_and_fresh_legacy_cards(client):
     test_client, feishu_client = client
 
-    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {
+                "reply_in_thread": True,
+                "reply_to_message_id": "om_user_message",
+            },
+        ),
+    )
     for sequence, interaction_id in ((1, "choice-1"), (2, "choice-2")):
         requested = await test_client.post(
             "/events",
@@ -9191,6 +9310,7 @@ async def test_repeated_interactions_keep_one_v2_owner_and_fresh_legacy_cards(cl
         assert interaction_buttons(newest_card)
 
     assert feishu_client.sent[1][1] != feishu_client.sent[2][1]
+    assert feishu_client.sent_reply_in_thread == [True, True, True]
     snapshots = [
         card
         for message_id, card in feishu_client.updated
@@ -9404,12 +9524,25 @@ async def test_interaction_promotion_failure_restores_session_for_retry(client):
         },
     )
 
-    await test_client.post("/events", json=event_payload("message.started", 0))
+    await test_client.post(
+        "/events",
+        json=event_payload(
+            "message.started",
+            0,
+            {
+                "reply_in_thread": True,
+                "reply_to_message_id": "om_user_message",
+            },
+        ),
+    )
     feishu_client.fail_send = True
     failed = await test_client.post("/events", json=payload)
 
     assert failed.status == 502
     assert len(feishu_client.sent) == 1
+    assert test_client.app[sidecar_server.SESSIONS_KEY][
+        "hermes-message-1"
+    ].reply_in_thread is True
 
     feishu_client.fail_send = False
     retried = await test_client.post("/events", json=payload)
@@ -9417,6 +9550,7 @@ async def test_interaction_promotion_failure_restores_session_for_retry(client):
     assert retried.status == 200
     assert (await retried.json())["applied"] is True
     assert len(feishu_client.sent) == 2
+    assert feishu_client.sent_reply_in_thread == [True, True]
 
 
 def test_interaction_operator_name_never_falls_back_to_feishu_ids():

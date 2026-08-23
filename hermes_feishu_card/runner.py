@@ -45,6 +45,7 @@ class NoopFeishuClient:
         card: dict[str, Any],
         thread_id: str | None = None,
         reply_to_message_id: str | None = None,
+        reply_in_thread: bool = False,
     ) -> str:
         raise FeishuAPIError(
             "Feishu delivery is disabled in no-op mode",

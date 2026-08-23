@@ -24,6 +24,8 @@ The minimal Hermes hook sends message lifecycle events to the sidecar. The hook 
 
 All events keep the required `conversation_id`, `message_id`, and `chat_id` fields. From V3.6.4, events may also carry an optional `thread_id`; when it represents a Feishu `om_` / `omt_` thread context, the sidecar uses the Feishu reply API to create the initial card in the same thread where the user sent the message. Later updates still PATCH the created card message.
 
+When Hermes only has the intent to create a thread from the current message and no concrete `thread_id` yet, the hook may send `data.reply_in_thread=true` together with `data.reply_to_message_id`. The sidecar keeps this intent in the current `CardSession`, so later approval/clarify cards and deferred runtime-admission deliveries continue using the same reply API and anchor instead of falling back to the chat top level.
+
 `turn_id` is optional and provides the stable identity of one Agent turn. `message_id` remains the identity of the current event, stream, or reply, while `data.reply_to_message_id` is only the Feishu reply anchor. When `turn_id` is present, session ownership, event ordering, delivery policy, and native handoff use it and never let a `reply_to_message_id` alias change the owning turn.
 
 When `turn_id` is absent, the sidecar preserves the legacy fallback: `message_id` is the turn identity and later stream events may still use a `reply_to_message_id` alias to reach an existing active session.

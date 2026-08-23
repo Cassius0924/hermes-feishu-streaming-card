@@ -295,6 +295,7 @@ class RuntimeInteractionDeliveryReservation:
     bot_id: str | None
     thread_id: str | None
     reply_to_message_id: str | None
+    reply_in_thread: bool
     predecessor_message_id: str
     delivery_key: str
 
@@ -4452,6 +4453,12 @@ def _thread_id_for_event(event: SidecarEvent) -> str | None:
 def _reply_to_message_id_for_event(event: SidecarEvent) -> str | None:
     data = event.data if isinstance(event.data, dict) else {}
     reply_to = data.get("reply_to_message_id")
+    if (
+        _reply_in_thread_for_event(event)
+        and isinstance(reply_to, str)
+        and reply_to.startswith("om_")
+    ):
+        return reply_to
     if _thread_id_for_event(event):
         if isinstance(reply_to, str) and reply_to.startswith("om_"):
             return reply_to
@@ -4463,6 +4470,16 @@ def _reply_to_message_id_for_event(event: SidecarEvent) -> str | None:
     if isinstance(reply_to, str) and reply_to.startswith("om_"):
         return reply_to
     return None
+
+
+def _reply_in_thread_for_event(event: SidecarEvent) -> bool:
+    data = event.data if isinstance(event.data, dict) else {}
+    value = data.get("reply_in_thread")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return False
 
 
 async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tuple[web.Response, Any]:
@@ -4862,6 +4879,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 route.bot_id,
                 thread_id=_thread_id_for_event(event),
                 reply_to_message_id=_reply_to_message_id_for_event(event),
+                reply_in_thread=_reply_in_thread_for_event(event),
                 delivery_key=session_key,
                 delivery_kind=_delivery_kind(event) or "chat",
             )
@@ -5030,6 +5048,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                     route.bot_id,
                     thread_id=_thread_id_for_event(event),
                     reply_to_message_id=_reply_to_message_id_for_event(event),
+                    reply_in_thread=_reply_in_thread_for_event(event),
                     delivery_key=session_key,
                     delivery_kind=_delivery_kind(event)
                     or ("notice" if event.event == "system.notice" else "chat"),
@@ -5212,8 +5231,15 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             interaction.interaction_id if interaction is not None else "pending"
         )
         bot_id = message_bot_ids.get(session_key)
+        sticky_reply_to_message_id = (
+            session.reply_to_message_id
+            if session.reply_in_thread
+            and session.reply_to_message_id.startswith("om_")
+            else ""
+        )
         reply_to_message_id = (
-            _reply_to_message_id_for_event(incoming_event)
+            sticky_reply_to_message_id
+            or _reply_to_message_id_for_event(incoming_event)
             or session.reply_to_message_id
             or None
         )
@@ -5247,6 +5273,10 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 bot_id=bot_id,
                 thread_id=_thread_id_for_event(incoming_event),
                 reply_to_message_id=reply_to_message_id,
+                reply_in_thread=(
+                    _reply_in_thread_for_event(incoming_event)
+                    or session.reply_in_thread
+                ),
                 predecessor_message_id=feishu_message_id,
                 delivery_key=f"{session_key}:interaction:{interaction_id}",
             )
@@ -5261,6 +5291,10 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             bot_id,
             thread_id=_thread_id_for_event(incoming_event),
             reply_to_message_id=reply_to_message_id,
+            reply_in_thread=(
+                _reply_in_thread_for_event(incoming_event)
+                or session.reply_in_thread
+            ),
             delivery_key=f"{session_key}:interaction:{interaction_id}",
             delivery_kind="interaction",
         )
@@ -5651,6 +5685,7 @@ async def _complete_runtime_interaction_delivery(
         reservation.bot_id,
         thread_id=reservation.thread_id,
         reply_to_message_id=reservation.reply_to_message_id,
+        reply_in_thread=reservation.reply_in_thread,
         delivery_key=reservation.delivery_key,
         delivery_kind="interaction",
     )
@@ -6508,6 +6543,7 @@ async def _send_card(
     bot_id: str | None,
     thread_id: str | None = None,
     reply_to_message_id: str | None = None,
+    reply_in_thread: bool = False,
     delivery_key: str = "",
     delivery_kind: str = "chat",
 ) -> CardDeliveryResult:
@@ -6518,6 +6554,7 @@ async def _send_card(
         bot_id,
         thread_id=thread_id,
         reply_to_message_id=reply_to_message_id,
+        reply_in_thread=reply_in_thread,
         delivery_key=delivery_key,
         delivery_kind=delivery_kind,
     )
@@ -6530,11 +6567,21 @@ async def _send_card_for_app(
     bot_id: str | None,
     thread_id: str | None = None,
     reply_to_message_id: str | None = None,
+    reply_in_thread: bool = False,
     delivery_key: str = "",
     delivery_kind: str = "chat",
 ) -> CardDeliveryResult:
     metrics: SidecarMetrics = app[METRICS_KEY]
     metrics.feishu_send_attempts += 1
+    if reply_in_thread and not reply_to_message_id:
+        result = CardDeliveryResult(
+            message_id=None,
+            outcome="not_sent",
+            error_kind="ReplyThreadAnchorMissing",
+        )
+        metrics.feishu_send_failures += 1
+        _record_send_error(app, result, bot_id=bot_id)
+        return result
     if app[NOOP_MODE_KEY]:
         result = CardDeliveryResult(
             message_id=None,
@@ -6556,22 +6603,24 @@ async def _send_card_for_app(
     try:
         send_delivery = getattr(client, "send_card_delivery", None)
         if callable(send_delivery):
-            send_result = await send_delivery(
-                chat_id,
-                card,
-                thread_id=thread_id,
-                reply_to_message_id=reply_to_message_id,
-                delivery_uuid=delivery_uuid,
-            )
+            send_kwargs: dict[str, Any] = {
+                "thread_id": thread_id,
+                "reply_to_message_id": reply_to_message_id,
+                "delivery_uuid": delivery_uuid,
+            }
+            if reply_in_thread:
+                send_kwargs["reply_in_thread"] = True
+            send_result = await send_delivery(chat_id, card, **send_kwargs)
             message_id = str(getattr(send_result, "message_id", "") or "")
             retry_count = int(getattr(send_result, "retry_count", 0) or 0)
         else:
-            message_id = await client.send_card(
-                chat_id,
-                card,
-                thread_id=thread_id,
-                reply_to_message_id=reply_to_message_id,
-            )
+            send_kwargs = {
+                "thread_id": thread_id,
+                "reply_to_message_id": reply_to_message_id,
+            }
+            if reply_in_thread:
+                send_kwargs["reply_in_thread"] = True
+            message_id = await client.send_card(chat_id, card, **send_kwargs)
             retry_count = 0
         if not isinstance(message_id, str) or not message_id:
             raise FeishuAPIError(
