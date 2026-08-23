@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
 import queue
+import signal
 import socket
 import subprocess
 import sys
@@ -846,15 +847,28 @@ def test_listener_daemon_thread_allows_process_exit_without_close():
     the parent can bound startup and post-start exit as two separate phases:
     a slow cold import / loopback bind must not be mistaken for a post-start
     shutdown hang, and the emitted daemon state proves the thread flag on the
-    exact runner that executed the child.
+    exact runner that executed the child.  Earlier ``step:...`` markers
+    (interpreter start, module import, start() complete) let the parent report
+    exactly how far a stuck child got before the timeout, so a macOS-specific
+    startup stall is distinguishable from a shutdown hang.
     """
     child_script = (
-        "import sys\n"
+        # Register a SIGUSR1 handler so the parent can ask a stuck child to
+        # dump its thread stack to stderr before killing it (macOS diagnosis).
+        "import faulthandler, signal, sys\n"
+        "try:\n"
+        "    faulthandler.register(signal.SIGUSR1)\n"
+        "except (AttributeError, ValueError):\n"
+        "    pass\n"
+        "sys.stdout.write('step:start\\n')\n"
+        "sys.stdout.flush()\n"
         "from hermes_feishu_card.runtime_interaction_transport "
         "import RuntimeInteractionListener\n"
+        "sys.stdout.write('step:imported\\n')\n"
+        "sys.stdout.flush()\n"
         "listener = RuntimeInteractionListener(b'i' * 32, lambda _p: True)\n"
         "listener.start()\n"
-        "sys.stdout.write('started daemon=' + str(listener._thread.daemon) + '\\n')\n"
+        "sys.stdout.write('step:started daemon=' + str(listener._thread.daemon) + '\\n')\n"
         "sys.stdout.flush()\n"
     )
     # Bound the two phases independently: give cold import / bind room, but
@@ -895,13 +909,24 @@ def test_listener_daemon_thread_allows_process_exit_without_close():
             proc.kill()
             proc.wait()
 
+    def _dump_stack():
+        # Ask a stuck child to dump its thread stack to stderr before kill.
+        if hasattr(signal, "SIGUSR1"):
+            try:
+                proc.send_signal(signal.SIGUSR1)
+            except (ProcessLookupError, PermissionError):
+                pass
+            time.sleep(1.0)
+
     out_pump = Thread(target=_pump, args=(proc.stdout, stdout_lines), daemon=True)
     err_pump = Thread(target=_pump, args=(proc.stderr, stderr_lines), daemon=True)
     out_pump.start()
     err_pump.start()
 
     try:
-        # Phase 1: bounded startup — wait for the flushed marker.
+        # Phase 1: bounded startup — wait for the flushed started marker,
+        # collecting every step marker so a stuck child is pinpointed.
+        steps = []
         marker = None
         deadline = time.monotonic() + startup_timeout
         while marker is None and time.monotonic() < deadline:
@@ -911,16 +936,20 @@ def test_listener_daemon_thread_allows_process_exit_without_close():
                 line = None
             if line is None:
                 continue
-            if line.startswith("started daemon="):
+            if line.startswith("step:"):
+                steps.append(line.strip())
+            if line.startswith("step:started daemon="):
                 marker = line.strip()
                 break
         if marker is None:
+            _dump_stack()
             _kill()
             stderr = _drain(stderr_lines)
             pytest.fail(
                 f"child did not emit started marker within "
                 f"{startup_timeout:.0f}s (exit code {proc.returncode}) — "
                 f"cold import or loopback bind too slow, or start() hung\n"
+                f"steps seen: {steps!r}\n"
                 f"stderr: {stderr!r}"
             )
         daemon_flag = marker.split("=", 1)[1]
@@ -932,11 +961,13 @@ def test_listener_daemon_thread_allows_process_exit_without_close():
         try:
             returncode = proc.wait(timeout=exit_timeout)
         except subprocess.TimeoutExpired:
+            _dump_stack()
             _kill()
             pytest.fail(
                 f"process did not exit within {exit_timeout:.0f}s after "
                 f"start without close() — listener thread is not daemon\n"
-                f"marker: {marker!r}"
+                f"steps seen: {steps!r}\n"
+                f"stderr: {_drain(stderr_lines)!r}"
             )
         assert returncode == 0, (
             f"expected exit 0, got {returncode}\n"
