@@ -5552,12 +5552,13 @@ async def _maybe_send_completion_notify(
         f"✅ 任务已完成{suffix}"
     )
     try:
-        await send_text(
-            session.chat_id,
-            text,
-            thread_id=_thread_id_for_event(event) or None,
-            reply_to_message_id=session.reply_to_message_id or None,
-        )
+        send_kwargs: dict[str, Any] = {
+            "thread_id": _thread_id_for_event(event) or None,
+            "reply_to_message_id": session.reply_to_message_id or None,
+        }
+        if session.reply_in_thread:
+            send_kwargs["reply_in_thread"] = True
+        await send_text(session.chat_id, text, **send_kwargs)
     except asyncio.CancelledError:
         session.completion_notify_state = "idle"
         raise

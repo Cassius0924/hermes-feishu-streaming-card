@@ -287,6 +287,7 @@ class FeishuClient:
         text: str,
         thread_id: Optional[str] = None,
         reply_to_message_id: Optional[str] = None,
+        reply_in_thread: bool = False,
     ) -> str:
         if not isinstance(chat_id, str) or not chat_id.strip():
             raise ValueError("chat_id is required")
@@ -303,7 +304,7 @@ class FeishuClient:
                 json_body={
                     "msg_type": "text",
                     "content": content,
-                    "reply_in_thread": bool(thread_id),
+                    "reply_in_thread": bool(thread_id) or reply_in_thread,
                 },
             )
         else:

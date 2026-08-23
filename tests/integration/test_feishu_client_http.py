@@ -208,6 +208,32 @@ async def test_send_text_message_replies_in_thread_when_anchor_present(feishu_ap
     assert "任务已完成" in json.loads(reply_request[2]["content"])["text"]
 
 
+async def test_send_text_message_can_create_thread_without_thread_id(feishu_api):
+    test_client, requests, token_calls = feishu_api
+    client = FeishuClient(
+        FeishuClientConfig(
+            app_id="cli_test",
+            app_secret="s",
+            base_url=str(test_client.make_url("/")),
+        )
+    )
+
+    message_id = await client.send_text_message(
+        "oc_abc",
+        '<at user_id="ou_sender"></at> ✅ 任务已完成',
+        reply_to_message_id="om_user_message",
+        reply_in_thread=True,
+    )
+
+    assert message_id == "om_reply_1"
+    assert token_calls() == 1
+    reply_request = requests[1]
+    assert reply_request[0] == "reply"
+    assert reply_request[1] == "om_user_message"
+    assert reply_request[2]["msg_type"] == "text"
+    assert reply_request[2]["reply_in_thread"] is True
+
+
 @pytest.mark.parametrize("delivery_uuid", ["", "   ", "x" * 51, 123])
 async def test_send_card_delivery_rejects_invalid_uuid(feishu_api, delivery_uuid):
     test_client, _, _ = feishu_api

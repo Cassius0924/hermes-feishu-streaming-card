@@ -161,6 +161,7 @@ class FakeFeishuClient:
         self.sent_reply_in_thread = []
         self.updated = []
         self.texts = []
+        self.texts_reply_in_thread = []
         self.operations = []
         self.fail_send = False
         self.fail_text = False
@@ -200,10 +201,12 @@ class FakeFeishuClient:
         text,
         thread_id=None,
         reply_to_message_id=None,
+        reply_in_thread=False,
     ):
         if self.fail_text:
             raise RuntimeError("text send unavailable")
         self.texts.append((chat_id, text, thread_id, reply_to_message_id))
+        self.texts_reply_in_thread.append(reply_in_thread)
         self.operations.append("text")
         return f"feishu-text-{len(self.texts)}"
 
@@ -7890,6 +7893,58 @@ async def test_completion_notify_updates_card_then_mentions_once_when_enabled(
         ]
         session = app[SESSIONS_KEY]["hermes-message-1"]
         assert session.completion_notify_state == "sent"
+    finally:
+        await test_client.close()
+
+
+async def test_completion_notify_preserves_reply_in_thread_without_thread_id(
+    tmp_path,
+):
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        card_config={"completion_notify": {"enabled": True}},
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        started = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {
+                    "sender_open_id": "ou_sender-01",
+                    "reply_in_thread": True,
+                    "reply_to_message_id": "om_user_message",
+                },
+            ),
+        )
+        completed = await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.completed",
+                1,
+                {
+                    "answer": "done",
+                    "sender_open_id": "ou_sender-01",
+                },
+            ),
+        )
+
+        assert started.status == 200
+        assert completed.status == 200
+        assert feishu_client.texts == [
+            (
+                "oc_abc",
+                '<at user_id="ou_sender-01"></at> ✅ 任务已完成',
+                None,
+                "om_user_message",
+            )
+        ]
+        assert feishu_client.texts_reply_in_thread == [True]
     finally:
         await test_client.close()
 
