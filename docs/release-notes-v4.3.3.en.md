@@ -20,7 +20,8 @@ V4.3.3 fixes delivery continuity when Hermes explicitly asks to create a thread 
 
 - Local regressions cover card/interaction/completion placement when the first reply has no concrete `thread_id`, plus the missing-anchor text-send path with no token lookup or Feishu API request.
 - Local full pytest passed with **`3267 passed, 6 skipped`**. `git diff --check`, sdist/wheel builds, and a fresh Python 3.12 wheel-only provenance check covering the single Hermes plugin entry point, all 24 provenance slices, and CLI help smoke also passed.
-- Remote CI, the exact merge SHA, public tag/install, Release assets/checksums, and real Feishu/Lark client acceptance are not yet complete for this release candidate. Automation is not represented as real-client evidence.
+- Remote Tests run `32657674121` (10 jobs) and CodeQL run `32657674120` passed for PR #232 candidate HEAD `f7de533d67f9e50afcd2c4d80fad89b572054605`.
+- The exact merge SHA, public tag/install, Release assets/checksums, and real Feishu/Lark client acceptance are not yet complete for this release candidate. Automation is not represented as real-client evidence.
 
 ## Real Feishu acceptance still required
 

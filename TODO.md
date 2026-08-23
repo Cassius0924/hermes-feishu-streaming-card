@@ -12,7 +12,8 @@
 - [x] `reply_in_thread=true` 或非空 `thread_id` 表示 text thread placement；缺少 `reply_to_message_id` 时在 API 边界拒绝，不再静默发到群聊顶层；没有 thread placement intent 的默认路径保持兼容。
 - [x] 单元与 HTTP 回归覆盖首回复无 concrete `thread_id`、completion notification thread placement，以及缺 anchor 时不请求 token/不发 API 请求。
 - [x] 本地完整 pytest `3267 passed, 6 skipped`；`git diff --check`、sdist/wheel、fresh Python 3.12 wheel-only provenance、唯一 Hermes plugin entrypoint、24 slices 与 CLI help smoke 通过。
-- [ ] 远端 CI、exact merge SHA、annotated tag、public install 与 Release assets/checksums。
+- [x] PR #232 candidate HEAD `f7de533d67f9e50afcd2c4d80fad89b572054605`：Tests run `32657674121`（10 jobs）与 CodeQL run `32657674120` 通过。
+- [ ] exact merge SHA、annotated tag、public install 与 Release assets/checksums。
 - [ ] 真实飞书首回复建 thread / missing-anchor smoke（自动化不替代真实客户端证据）。
 
 ### V4.3.2：Issue #227 卡片方言双轨热修（发布候选）

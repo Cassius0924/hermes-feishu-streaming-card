@@ -20,7 +20,8 @@ V4.3.3 修复首回复需要从当前飞书消息创建 thread、但 Hermes 尚�
 
 - 本地回归覆盖首回复没有 concrete `thread_id` 时的 card/interaction/completion placement，以及 text-send 缺 anchor 时不获取 token、不调用 Feishu API。
 - 本地完整 pytest **`3267 passed, 6 skipped`**，`git diff --check`、sdist/wheel 构建与全新 Python 3.12 venv 的 wheel-only provenance、唯一 Hermes plugin entrypoint、24 个 provenance slices 和 CLI help smoke 均已通过。
-- 远端 CI、exact merge SHA、公开 tag/install、Release assets/checksums 与真实 Feishu/Lark 客户端验收尚未在本 release candidate 中完成；自动化不替代真实客户端证据。
+- PR #232 candidate HEAD `f7de533d67f9e50afcd2c4d80fad89b572054605` 的远端 Tests run `32657674121`（10 个 job）与 CodeQL run `32657674120` 均已通过。
+- exact merge SHA、公开 tag/install、Release assets/checksums 与真实 Feishu/Lark 客户端验收尚未在本 release candidate 中完成；自动化不替代真实客户端证据。
 
 ## 真实飞书待验收
 

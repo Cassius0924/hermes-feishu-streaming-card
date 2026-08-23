@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.3.3`. This cycle fixes first-reply thread placement through explicit `reply_in_thread` and makes an explicit thread text reply without `reply_to_message_id` fail closed, preventing a completion notification from silently falling back to the top-level chat. Local full automation and package builds have passed; CI, the exact merge SHA, public tag/install, Release assets, and real Feishu acceptance are marked passed only after completion.
+Current release candidate: `4.3.3`. This cycle fixes first-reply thread placement through explicit `reply_in_thread` and makes an explicit thread text reply without `reply_to_message_id` fail closed, preventing a completion notification from silently falling back to the top-level chat. Local full automation, package builds, and PR #232 candidate CI have passed; the exact merge SHA, public tag/install, Release assets, and real Feishu acceptance are marked passed only after completion.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -152,7 +152,8 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 - When the first reply has no concrete `thread_id` but has explicit `reply_in_thread=true` and a verified `om_` anchor, the streaming card, ordinary/repeated/runtime-admission interactions, and opt-in completion notification must remain in one thread.
 - `send_text_message()` with either `reply_in_thread=true` or a non-empty `thread_id`, but without `reply_to_message_id`, must reject before token/API work and must not post a top-level fallback; the default path with no thread-placement intent remains compatible.
 - Local regressions and full pytest: **passed (`3267 passed, 6 skipped`)**. `git diff --check`, sdist/wheel builds, fresh Python 3.12 wheel-only provenance, the single Hermes plugin entry point, all 24 provenance slices, and CLI help smoke: **passed**.
-- Remote CI, the exact merge SHA, public tag/install, and Release assets/checksums remain recorded during publication; real Feishu/Lark client acceptance is currently unverified.
+- Tests run `32657674121` (10 jobs) and CodeQL run `32657674120` for PR #232 candidate HEAD `f7de533d67f9e50afcd2c4d80fad89b572054605`: **passed**.
+- The exact merge SHA, public tag/install, and Release assets/checksums remain recorded during publication; real Feishu/Lark client acceptance is currently unverified.
 
 ## V4.3.2 Release Gates (historical record)
 
