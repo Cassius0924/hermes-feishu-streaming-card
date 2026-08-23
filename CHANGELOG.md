@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.3.3 — 2026-08-24
+
+See also: [docs/release-notes-v4.3.3.md](docs/release-notes-v4.3.3.md)
+
+### Fixed
+- First replies that explicitly request `reply_in_thread` before Feishu supplies a concrete `thread_id` now retain their verified reply anchor and placement for the streaming card, ordinary/repeated/runtime-admission interaction cards, and opt-in completion notification.
+- `send_text_message` now rejects an explicit `reply_in_thread` send without `reply_to_message_id`; it no longer silently falls back to a top-level chat text message. The default `reply_in_thread=false` path remains compatible.
+
+### Safety
+- The original schema 2.0 streaming message remains the only PATCH owner; legacy interaction-card dialect, callback authentication/binding, expiry, idempotency, Hermes patch ownership, and archived `legacy/` runtime are unchanged.
+- Real Feishu/Lark client acceptance for first-reply thread creation and the missing-anchor rejection remains unverified at release-candidate preparation time.
+
 ## V4.3.2 — 2026-08-23
 
 See also: [docs/release-notes-v4.3.2.md](docs/release-notes-v4.3.2.md)

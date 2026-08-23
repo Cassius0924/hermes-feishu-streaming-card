@@ -7,6 +7,7 @@
 - 在测试群顶层发送一条触发消息，让 Hermes 在尚无 `thread_id` 时请求 `reply_in_thread`；首张 schema 2.0 流式卡必须出现在该消息新建的 thread 中，主群不得出现 top-level fallback 卡。
 - 在同一 turn 依次触发普通 approval/clarify 和 runtime-admission interaction；每张辅助 legacy 交互卡都必须留在同一 thread，原 schema 2.0 卡继续作为唯一 stream PATCH owner。
 - 连续触发两轮 interaction，并受控让第一轮交互卡发送失败后重试；session 的 reply anchor 与 thread placement 不得被后续 event message identity 覆盖，重试也不得降级为主群新卡。
+- 显式 `reply_in_thread=true` 但缺少 reply anchor 时，确认 card 或 completion notification 不发送 top-level fallback；只保留脱敏拒绝分类，不记录真实标识符或正文。
 - 记录前后脱敏 counters，要求 `feishu_send_failures`、`feishu_update_failures` 和 `last_route_error` 不新增；不得保存真实 chat/message/user id、callback token、回答正文或私人截图。
 
 ## V4.3.2 Issue #227 卡片方言双轨验收
