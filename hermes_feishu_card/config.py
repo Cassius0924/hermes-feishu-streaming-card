@@ -44,6 +44,12 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "max_tool_result_chars": 600,
         "table_overflow_mode": "compact",
         "completion_notify": {"enabled": False},
+        # Per-kind @ mention switches in interaction cards (clarify /
+        # approval). The default is UNSET (None): the resolving helpers fall
+        # back to the legacy global ``mentions_in_cards`` key (when present)
+        # and then to enabled. Injecting an explicit default mapping here
+        # would shadow ``mentions_in_cards: false`` after the config merge.
+        "interaction_mentions": None,
         "footer_fields": [
             "duration",
             "model",
@@ -155,6 +161,100 @@ def merge_card_config(
         else:
             resolved["text_sizes"] = copy.deepcopy(incoming_sizes)
     return resolved
+
+
+def _mention_switch_value(raw: object, *, path: str) -> bool | None:
+    """Normalize a mention switch to bool, or ``None`` when unset/malformed.
+
+    ``None`` keeps the caller on the next resolution step, so malformed
+    values degrade gracefully instead of crashing card rendering.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return _normalize_boolean(raw, path)
+        except ValueError:
+            return None
+    return None
+
+
+def card_interaction_mention_enabled(
+    card_config: Mapping[str, Any] | None, *, kind: str
+) -> bool:
+    """Whether interaction cards may @ mention the requester for a given kind.
+
+    Resolution order:
+
+    1. Legacy global ``card.mentions_in_cards`` when explicitly ``false``:
+       THE GLOBAL OFF SWITCH — it disables every @ mention regardless of
+       per-kind settings (so ``mentions_in_cards: false`` always wins).
+    2. ``card.interaction_mentions.<kind>`` when the mapping is present and
+       the key resolves to a boolean (explicit per-kind switch; an absent
+       kind falls through to the global / default).
+    3. Legacy global ``card.mentions_in_cards`` when explicitly ``true``.
+    4. Default: enabled for ``approval`` / ``clarify`` kinds, disabled for
+       anything else (defense in depth: callers should gate on kind too).
+    """
+    if not isinstance(card_config, Mapping):
+        return _default_interaction_mention(kind)
+    legacy = _mention_switch_value(
+        card_config.get("mentions_in_cards"),
+        path="card.mentions_in_cards",
+    )
+    if legacy is False:
+        return False
+    raw_mentions = card_config.get("interaction_mentions")
+    if isinstance(raw_mentions, Mapping) and kind in raw_mentions:
+        resolved = _mention_switch_value(
+            raw_mentions.get(kind),
+            path=f"card.interaction_mentions.{kind}",
+        )
+        if resolved is not None:
+            return resolved
+    if legacy is True:
+        return True
+    return _default_interaction_mention(kind)
+
+
+def _default_interaction_mention(kind: str) -> bool:
+    return kind in {"approval", "clarify"}
+
+
+def card_completion_mention_enabled(
+    card_config: Mapping[str, Any] | None,
+) -> bool:
+    """Whether the completion notification may @ mention the requester.
+
+    Resolution order:
+
+    1. Legacy global ``card.mentions_in_cards`` when explicitly ``false``:
+       THE GLOBAL OFF SWITCH.
+    2. ``card.completion_notify.mention`` when set and boolean (explicit).
+    3. Legacy global ``card.mentions_in_cards`` when explicitly ``true``.
+    4. Default: enabled (matches the pre-configuration behaviour).
+    """
+    if not isinstance(card_config, Mapping):
+        return True
+    legacy = _mention_switch_value(
+        card_config.get("mentions_in_cards"),
+        path="card.mentions_in_cards",
+    )
+    if legacy is False:
+        return False
+    notify = card_config.get("completion_notify")
+    if isinstance(notify, Mapping) and "mention" in notify:
+        resolved = _mention_switch_value(
+            notify.get("mention"),
+            path="card.completion_notify.mention",
+        )
+        if resolved is not None:
+            return resolved
+    if legacy is True:
+        return True
+    return True
 
 
 def _normalize_text_size_value(value: object, path: str) -> str:
@@ -334,6 +434,26 @@ def _normalize_card_config(value: object, *, path: str) -> None:
         value["table_overflow_mode"] = normalize_table_overflow_mode(
             value["table_overflow_mode"], path=f"{path}.table_overflow_mode"
         )
+    if "mentions_in_cards" in value and value["mentions_in_cards"] is not None:
+        value["mentions_in_cards"] = _normalize_boolean(
+            value["mentions_in_cards"], f"{path}.mentions_in_cards"
+        )
+    if "interaction_mentions" in value and value["interaction_mentions"] is not None:
+        raw_mentions = value["interaction_mentions"]
+        if not isinstance(raw_mentions, Mapping):
+            raise ValueError(f"{path}.interaction_mentions must be a mapping")
+        normalized = {}
+        for kind, raw in raw_mentions.items():
+            normalized[str(kind)] = _normalize_boolean(
+                raw, f"{path}.interaction_mentions.{kind}"
+            )
+        value["interaction_mentions"] = normalized
+    if "completion_notify" in value and isinstance(value["completion_notify"], dict):
+        notify = value["completion_notify"]
+        if "mention" in notify and notify["mention"] is not None:
+            notify["mention"] = _normalize_boolean(
+                notify["mention"], f"{path}.completion_notify.mention"
+            )
 
 
 def _merge_sections(config: dict[str, dict[str, Any]], loaded: dict[str, Any]) -> None:

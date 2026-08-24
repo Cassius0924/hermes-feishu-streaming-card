@@ -49,6 +49,21 @@ card:
   # @mentions the initiating Feishu user. Card edits themselves do not notify.
   completion_notify:
     enabled: false
+    # Explicit @ mention toggle for the completion notification. Absent =
+    # fall back to the global mentions_in_cards switch (absent = enabled).
+    mention: true
+  # Global switch for @ mentions of the initiating Feishu user inside
+  # interaction cards (approval / clarify) and in the completion notification.
+  # Set to false to disable the feature entirely (this is the master OFF
+  # switch and wins over per-kind settings). Absent key = enabled.
+  # Per-kind overrides below (interaction_mentions) only apply when the
+  # global switch is not disabled.
+  mentions_in_cards: true
+  # Per-kind @ mention switches for interaction cards. Absent key falls back
+  # to mentions_in_cards (absent = enabled). Uncomment to configure:
+  # interaction_mentions:
+  #   clarify: true
+  #   approval: true
   # Optional role-based CardKit text sizes. Roles: body, reasoning, tool,
   # notice, footer. Values may be scalar or default/pc/mobile mappings.
   # card width/height are controlled by the Feishu/Lark client.
