@@ -4313,6 +4313,149 @@ def test_native_feishu_system_notice_edit_updates_same_card(monkeypatch):
     assert "iteration 2/90" in posted[1]["data"]["content"]
 
 
+def test_native_feishu_stream_edit_drops_metadata_when_original_does_not_accept_it():
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        def __init__(self):
+            self._client = object()
+            self.edited = []
+
+        async def edit_message(
+            self,
+            chat_id,
+            message_id,
+            content,
+            *,
+            finalize=False,
+        ):
+            self.edited.append((chat_id, message_id, content, finalize))
+            return SimpleNamespace(success=True, message_id=message_id)
+
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+
+    result = asyncio.run(
+        adapter.edit_message(
+            chat_id="oc_abc",
+            message_id="om_stream_preview",
+            content="普通流式正文",
+            finalize=True,
+            metadata={"thread_id": "omt_abc"},
+        )
+    )
+
+    assert result.success is True
+    assert adapter.edited == [
+        ("oc_abc", "om_stream_preview", "普通流式正文", True)
+    ]
+
+
+def test_native_feishu_stream_edit_does_not_hide_unknown_keywords():
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        def __init__(self):
+            self._client = object()
+
+        async def edit_message(
+            self,
+            chat_id,
+            message_id,
+            content,
+            *,
+            finalize=False,
+        ):
+            return SimpleNamespace(success=True, message_id=message_id)
+
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+
+    with pytest.raises(TypeError, match="unrelated_typo"):
+        asyncio.run(
+            adapter.edit_message(
+                chat_id="oc_abc",
+                message_id="om_stream_preview",
+                content="普通流式正文",
+                finalize=True,
+                metadata={"thread_id": "omt_abc"},
+                unrelated_typo=True,
+            )
+        )
+
+
+def test_native_feishu_stream_edit_preserves_supported_metadata():
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        def __init__(self):
+            self._client = object()
+            self.edited = []
+
+        async def edit_message(
+            self,
+            chat_id,
+            message_id,
+            content,
+            *,
+            metadata=None,
+        ):
+            self.edited.append(metadata)
+            return SimpleNamespace(success=True, message_id=message_id)
+
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    metadata = {"thread_id": "omt_abc"}
+
+    result = asyncio.run(
+        adapter.edit_message(
+            chat_id="oc_abc",
+            message_id="om_stream_preview",
+            content="普通流式正文",
+            metadata=metadata,
+        )
+    )
+
+    assert result.success is True
+    assert adapter.edited == [metadata]
+
+
+def test_native_feishu_stream_edit_preserves_var_kwargs():
+    class DummyFeishuAdapter:
+        name = "feishu"
+
+        def __init__(self):
+            self._client = object()
+            self.edited = []
+
+        async def edit_message(self, chat_id, message_id, content, **kwargs):
+            self.edited.append(kwargs)
+            return SimpleNamespace(success=True, message_id=message_id)
+
+    adapter = DummyFeishuAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+    metadata = {"thread_id": "omt_abc"}
+
+    result = asyncio.run(
+        adapter.edit_message(
+            chat_id="oc_abc",
+            message_id="om_stream_preview",
+            content="普通流式正文",
+            metadata=metadata,
+            future_option="preserved",
+        )
+    )
+
+    assert result.success is True
+    assert adapter.edited == [
+        {"metadata": metadata, "future_option": "preserved"}
+    ]
+
+
 def test_heartbeat_after_unknown_delivery_reuses_independent_card(monkeypatch):
     posted = []
     responses = [

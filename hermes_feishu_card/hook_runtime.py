@@ -6023,7 +6023,20 @@ async def _hfc_edit_message_with_system_notice_card(self: Any, *args: Any, **kwa
         if getattr(notice_result, "success", False):
             return notice_result
     if callable(original):
-        return await original(self, *args, **kwargs)
+        forwarded_kwargs = dict(kwargs)
+        try:
+            parameters = inspect.signature(original).parameters
+            accepts_var_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            if not accepts_var_kwargs and "metadata" not in parameters:
+                forwarded_kwargs.pop("metadata", None)
+        except (TypeError, ValueError):
+            # ``metadata`` is consumed by this wrapper for card routing. Some
+            # Hermes Feishu adapters do not accept it on ``edit_message``.
+            forwarded_kwargs.pop("metadata", None)
+        return await original(self, *args, **forwarded_kwargs)
     return _send_result(False, error="original Feishu edit_message unavailable")
 
 
