@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.3.4 — 2026-08-24
+
+See also: [docs/release-notes-v4.3.4.md](docs/release-notes-v4.3.4.md)
+
+### Fixed
+- PR #229: runtime interaction listener startup no longer performs reverse DNS, and its `serve_forever` thread is a daemon so a short-lived CLI process can exit without explicitly closing the listener.
+- Issue #233: `doctor --json` validates `manifest_version: 3` Hybrid installs through the V3 runtime binding, plugin entrypoint, and fixed-tag inspector instead of emitting Legacy manifest/hash/path diagnostics.
+- Hosted macOS now verifies blocked-delivery close with a bounded Future deadline rather than a raw wall-clock threshold that included runner scheduling overhead; the production close timeout is unchanged.
+
+### Safety
+- V3 phase/config/target/backup/runtime-identity drift fails closed with V3-specific findings and never exposes Legacy automatic repair for a V3 manifest.
+- Runtime interaction authentication, loopback binding policy, callback ownership, Feishu card/API delivery semantics, and the archived `legacy/` runtime are unchanged.
+
 ## V4.3.3 — 2026-08-24
 
 See also: [docs/release-notes-v4.3.3.md](docs/release-notes-v4.3.3.md)
