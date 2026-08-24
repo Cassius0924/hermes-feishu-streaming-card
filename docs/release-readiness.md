@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-当前发布候选为 `4.3.3`。本轮固定首回复建 thread 的 `reply_in_thread` placement，并让缺少 `reply_to_message_id` 的显式 thread text reply fail-closed，避免 completion notification 静默退回群聊顶层。本地完整自动化、包构建及 PR #232 candidate CI 已通过；exact merge SHA、public tag/install、Release assets 与真实飞书验收只有完成后才会标记通过。
+当前发布候选为 `4.3.4`。本轮合入 PR #229，消除 runtime interaction listener 启动阶段的 reverse-DNS 阻塞并确保未显式 close 时不阻止 CLI 进程退出；同时修复 Issue #233，让 `doctor --json` 对 `manifest_version: 3` Hybrid 安装只走 V3 inspector，不再混用 Legacy recovery/integrity 诊断。完整自动化、包构建、PR CI、exact merge SHA、public tag/install 与 Release assets 只有完成后才会标记通过；本轮不修改飞书卡片/API 语义，不把自动化表述为真实客户端验收。
 
 V3.9.0 和 V3.9.1 已于 2026-07-11 发布。V4.0.13 的通用命令链仍保持“重启前反馈进入命令卡”的历史契约；V4.2.0 只把私聊裸 `/update` 收束到更严格的专用维护卡。
 
@@ -147,7 +147,18 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 
 `v3.9.0` tag 的 release-assets workflow 会发布 4 个 assets：macOS tarball、Linux tarball、Windows zip 和 checksums 文件，分别为 `hermes-feishu-card-v3.9.0-macos.tar.gz`、`hermes-feishu-card-v3.9.0-linux.tar.gz`、`hermes-feishu-card-v3.9.0-windows.zip`、`hermes-feishu-card-v3.9.0-checksums.txt`。
 
-## V4.3.3 发布门禁
+## V4.3.4 发布门禁
+
+- PR #229：runtime interaction listener 的 bind 路径不得调用 reverse DNS；`serve_forever` thread 必须是 daemon，未显式 `close()` 的短命令进程仍可退出。
+- Issue #233：有效的 `manifest_version: 3` Hybrid 安装必须由 V3 runtime binding、plugin entrypoint 与 fixed-tag inspector 校验，并报告 `installed`；不得调用 Legacy install diagnosis、recovery 或 integrity repair planner。
+- V3 phase/config/target/backup/runtime identity 漂移必须 fail-closed，输出 V3-specific finding、禁止 Legacy 自动 repair，并引导使用官方 V3 restore/reinstall 流程。
+- hosted macOS 的 blocked-delivery close 回归以 Future deadline 验证有界完成，不再把 runner 调度开销混入 `<0.25s` 原始 wall-clock 断言；生产超时不放宽。
+- #229/#233/diagnostics/CLI/macOS timing 联合回归：**已通过（`191 passed`）**；一次性 4.3.4 venv 完整 pytest：**已通过（`3275 passed, 6 skipped in 634.95s`）**；`git diff --check`：**已通过**。
+- PEP 517 sdist/wheel 与 fresh Python 3.12 wheel-only provenance：**已通过**。package/distribution `4.3.4`、隔离 `site-packages` import、唯一 Hermes plugin entrypoint、24 个 provenance slices、主 CLI 与 `enable/disable --help` 均已验证。
+- PR #234 candidate HEAD `435ea4e355719e0f2d904cf1bac986ff18f70876`：Tests run `32710110323`（10 jobs）与 CodeQL run `32710110375` **已通过**；exact merge/tag 与 Release assets/checksums：**发布前继续执行**。
+- 本轮不改 Feishu card/API delivery semantics，因此不发送额外真实飞书测试消息；这不替代 V4.3.3 尚未完成的 first-reply thread 客户端验收。
+
+## V4.3.3 发布门禁（历史记录）
 
 - 首回复在没有 concrete `thread_id` 时携带显式 `reply_in_thread=true` 和真实 `om_` anchor：streaming card、普通/重复/runtime-admission interaction 及 opt-in completion notification 必须保留在同一 thread。
 - `send_text_message()` 收到 `reply_in_thread=true` 或非空 `thread_id`、但缺少 `reply_to_message_id` 时，必须在 token/API 调用前拒绝，不能发送 top-level fallback；没有 thread placement intent 的默认路径继续兼容。

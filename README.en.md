@@ -140,7 +140,7 @@ The compatibility matrix covers older Hermes starting at `v2026.4.23` and Hermes
 For an existing Hermes container:
 
 ```bash
-export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.3.3
+export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.3.4
 bash install-docker.sh
 ```
 
@@ -179,6 +179,7 @@ High-frequency stream tuning usually needs no change. For DeepSeek burst, token-
 ## Latest Releases
 | Version | Highlights |
 |---|---|
+| [v4.3.4](docs/release-notes-v4.3.4.en.md) | Prevents reverse-DNS stalls while starting the runtime interaction listener and lets a process exit when that listener is not explicitly closed; `doctor --json` now validates V3 Hybrid installs with the V3 inspector instead of reporting Legacy manifest/hash/path failures |
 | [v4.3.3](docs/release-notes-v4.3.3.en.md) | Preserves the reply anchor and `reply_in_thread` placement when the first reply creates a thread; completion notifications stay in that thread, while an explicit thread reply without an anchor fails closed instead of posting top-level text |
 | [v4.3.2](docs/release-notes-v4.3.2.en.md) | Fixes Issue #227 by keeping schema 2.0 streaming cards and legacy interaction cards on stable rails, preventing `230099/200800`; the Gateway also rejects schema 2.0 raw callback cards to prevent `200673` |
 | [v4.3.1](docs/release-notes-v4.3.1.en.md) | Restores clarify/approval streaming after a Feishu WebSocket click on Hermes 0.20, wakes text fallback on the first reply, and fixes v4.3.0 persistent-service identity, systemd working-directory, and tokenless-health reconciliation |

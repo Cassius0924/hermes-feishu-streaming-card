@@ -101,6 +101,15 @@ _FINDING_COPY = {
     "cron_source_missing": ("缺少定时任务来源文件", "建议检查定时任务安装状态。"),
     "cron_symlink_refused": ("定时任务链接状态不安全", "建议检查定时任务安装目录。"),
     "cron_unsupported_anchors": ("定时任务缺少兼容锚点", "建议检查定时任务兼容性。"),
+    "v3_backup_changed": ("V3 备份状态已变化", "请使用官方 V3 恢复或重新安装流程。"),
+    "v3_config_changed": ("V3 插件配置已变化", "请确认配置变更后使用官方 V3 恢复流程。"),
+    "v3_inspection_failed": ("V3 安装状态无法确认", "请重新检测并按官方 V3 流程处理。"),
+    "v3_install_incomplete": ("V3 安装状态不完整", "请查看 V3 诊断后执行官方恢复或重新安装。"),
+    "v3_manifest_invalid": ("V3 安装记录不可用", "请勿使用旧版自动修复；请按官方 V3 流程处理。"),
+    "v3_manifest_recovery_required": ("V3 安装事务需要恢复", "请使用官方 V3 恢复流程完成事务。"),
+    "v3_patch_invalid": ("V3 补丁归属不一致", "请人工确认后使用官方 V3 恢复或重新安装。"),
+    "v3_runtime_binding_changed": ("V3 运行环境已变化", "请确认 Hermes 环境后重新执行 V3 安装。"),
+    "v3_target_changed": ("V3 受管文件已变化", "请确认本地改动后使用官方 V3 恢复流程。"),
 }
 _UNKNOWN_FINDING_COPY = ("检测到需要检查的项目", "建议重新检测后再决定下一步。")
 
