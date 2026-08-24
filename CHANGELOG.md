@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.2.0.html).
 
+## V4.3.5 — 2026-08-24
+
+See also: [docs/release-notes-v4.3.5.md](docs/release-notes-v4.3.5.md)
+
+### Fixed
+- PR #235: the HFC Feishu `edit_message` wrapper no longer forwards its internal `metadata` routing keyword to the Hermes v2026.8.3 Feishu adapter when the original method does not accept it, preventing the completion/streaming fallback `TypeError`.
+
+### Safety
+- Signature-aware forwarding preserves `metadata` for adapters that explicitly support it or accept `**kwargs`; unrelated unknown keywords are not swallowed and continue to raise `TypeError`.
+- Card ownership, thread placement, callback authentication, Feishu API payloads, Hermes patch ownership, and the archived `legacy/` runtime are unchanged.
+
+### Credits
+- Thanks @Lite-G for reporting, reproducing, testing, and implementing PR #235.
+
 ## V4.3.4 — 2026-08-24
 
 See also: [docs/release-notes-v4.3.4.md](docs/release-notes-v4.3.4.md)

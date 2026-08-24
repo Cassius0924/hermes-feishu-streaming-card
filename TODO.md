@@ -2,11 +2,20 @@
 
 当前 active runtime 是 `hermes_feishu_card/`。legacy adapter、dual mode、旧 `sidecar/`、旧 `patch/` 和 `installer_v2.py` 不是 active runtime，仅保留作历史参考。
 
-## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3 / V4.2.4 / V4.2.5 / V4.2.6 / V4.2.7 / V4.2.8 / V4.2.9 / V4.2.10 / V4.2.11 / V4.2.12 / V4.3.0 / V4.3.1 / V4.3.2 / V4.3.3 / V4.3.4
+## V3.8 / V3.9 / V3.10 / V4 系列路线：V3.8.0 / V3.8.1 / V3.8.2 / V3.8.3 / V3.8.4 / V3.8.5 / V3.8.6 / V3.8.7 / V3.8.8 / V3.8.9 / V3.8.10 / V3.8.11 / V3.8.12 / V3.8.13 / V3.8.14 / V3.8.15 / V3.8.16 / V3.8.17 / V3.8.18 / V3.9.0 / V3.9.1 / V3.10.0 / V4.0.0 / V4.0.1 / V4.0.2 / V4.0.3 / V4.0.4 / V4.0.5 / V4.0.6 / V4.0.7 / V4.0.8 / V4.0.9 / V4.0.10 / V4.0.11 / V4.0.12 / V4.0.13 / V4.0.14 / V4.0.15 / V4.0.16 / V4.0.17 / V4.0.18 / V4.0.19 / V4.0.20 / V4.0.21 / V4.1.0 / V4.1.1 / V4.1.2 / V4.1.3 / V4.1.4 / V4.2.0 / V4.2.1 / V4.2.2 / V4.2.3 / V4.2.4 / V4.2.5 / V4.2.6 / V4.2.7 / V4.2.8 / V4.2.9 / V4.2.10 / V4.2.11 / V4.2.12 / V4.3.0 / V4.3.1 / V4.3.2 / V4.3.3 / V4.3.4 / V4.3.5
 
 详细路线见 [docs/superpowers/specs/2026-06-30-v3-8-design.md](docs/superpowers/specs/2026-06-30-v3-8-design.md) 和 [docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md](docs/superpowers/plans/2026-06-30-v3-8-card-ux-stability.md)。
 
-### V4.3.4：runtime listener 与 V3 doctor 热修（发布候选）
+### V4.3.5：Feishu edit fallback metadata 兼容热修（发布候选）
+
+- [x] 合入 PR #235：HFC wrapper 仅在原 `edit_message` 明确不支持时移除内部 `metadata`，兼容 Hermes v2026.8.3 Feishu adapter。
+- [x] 支持显式 `metadata` 或 `**kwargs` 的 adapter 继续接收原参数；无关未知关键字仍抛 `TypeError`，不被兼容层吞掉。
+- [x] 独立本地回归 `4 passed`，hook/server 热区 `841 passed`，精确 PR HEAD 完整 pytest `3279 passed, 6 skipped`。
+- [x] PR #235 HEAD `5b3bf428eb688df4b95607cba1a4ce50e2eeb8d0`：Tests run `32719244038`（attempt 3，10 jobs）与 CodeQL run `32719244032` 通过；exact merge `d56555bf9e716de67ed14f8ed992df1ec55cea21`。
+- [x] docs/package/native provenance 聚焦门禁 `99 passed`；一次性 wheel 环境完整 pytest `3280 passed, 5 skipped in 555.86s`；sdist/wheel、fresh `site-packages` provenance、唯一 plugin entrypoint、24 slices 与 CLI help 通过。
+- [ ] release PR CI、exact release merge、annotated tag 与 Release assets/checksums。
+
+### V4.3.4：runtime listener 与 V3 doctor 热修（已发布）
 
 - [x] 合入 PR #229：listener bind 不调用 reverse DNS；`serve_forever` thread 使用 daemon，不显式 `close()` 的短命令仍可退出。
 - [x] 修复 Issue #233：有效 V3 Hybrid 安装的 `doctor --json` 只走 V3 runtime binding、plugin entrypoint 与 fixed-tag inspector，不再触发 Legacy recovery/integrity 误报。
@@ -15,7 +24,7 @@
 - [x] #229/#233/diagnostics/CLI/macOS timing 联合回归 `191 passed`。
 - [x] 一次性 4.3.4 venv 完整 pytest `3275 passed, 6 skipped in 634.95s`；`git diff --check`、sdist/wheel、fresh-wheel `site-packages` provenance、唯一 plugin entrypoint、24 slices 与 CLI help 通过。
 - [x] PR #234 candidate HEAD `435ea4e355719e0f2d904cf1bac986ff18f70876`：Tests run `32710110323`（10 jobs）与 CodeQL run `32710110375` 通过。
-- [ ] exact merge、annotated tag 与 Release assets/checksums。
+- [x] exact merge `2f1abcfcad50997c615103e3cdf1302c61f94c91`、annotated tag、Release assets/checksums 与公开下载校验完成。
 
 ### V4.3.3：首回复建 thread 锚点与 text fail-closed 热修（发布候选）
 
