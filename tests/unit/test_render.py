@@ -179,7 +179,7 @@ def test_pending_interaction_has_priority_over_compaction_phase():
 
     card = render_card(session, title="研发助手")
 
-    assert card["header"]["title"]["content"] == "允许继续执行吗？"
+    assert card["header"]["title"]["content"] == "待审批：允许继续执行吗？"
     assert "正在压缩上下文" not in str(card["header"])
 
 
@@ -259,7 +259,7 @@ def test_v4_waiting_prompt_moves_to_header_without_body_duplication():
         if item.get("tag") == "markdown"
     )
 
-    assert card["header"]["title"]["content"] == "允许覆盖文件吗？"
+    assert card["header"]["title"]["content"] == "待审批：允许覆盖文件吗？"
     assert "subtitle" not in card["header"]
     assert str(card).count("允许覆盖文件吗？") == 1
     assert "目标文件：report.html" in str(card)
