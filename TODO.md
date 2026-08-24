@@ -14,7 +14,8 @@
 - [x] hosted macOS blocked-delivery close 使用 Future deadline 验证有界完成，不放宽生产 timeout。
 - [x] #229/#233/diagnostics/CLI/macOS timing 联合回归 `191 passed`。
 - [x] 一次性 4.3.4 venv 完整 pytest `3275 passed, 6 skipped in 634.95s`；`git diff --check`、sdist/wheel、fresh-wheel `site-packages` provenance、唯一 plugin entrypoint、24 slices 与 CLI help 通过。
-- [ ] 远端 PR CI、exact merge、annotated tag 与 Release assets/checksums。
+- [x] PR #234 candidate HEAD `435ea4e355719e0f2d904cf1bac986ff18f70876`：Tests run `32710110323`（10 jobs）与 CodeQL run `32710110375` 通过。
+- [ ] exact merge、annotated tag 与 Release assets/checksums。
 
 ### V4.3.3：首回复建 thread 锚点与 text fail-closed 热修（发布候选）
 

@@ -21,5 +21,6 @@ V4.3.4 修复 runtime interaction listener 的启动/退出可靠性，并让 `d
 - #229 listener/daemon、#233 V3 install/doctor 正常与篡改矩阵、diagnostics/CLI 以及 hosted-macOS timing 联合回归：**`191 passed`**。
 - 一次性 4.3.4 venv 的完整 pytest：**`3275 passed, 6 skipped in 634.95s`**；`git diff --check`：**通过**。
 - PEP 517 sdist/wheel 构建与 fresh Python 3.12 wheel-only provenance：**通过**。package/distribution 均为 `4.3.4`，import 来自隔离 `site-packages`，只有一个 `hermes_agent.plugins` entrypoint，24 个 provenance slices 完整，主 CLI 与 `enable/disable --help` 均为 exit 0。
-- 远端 PR CI、exact merge/tag 与 Release assets/checksums 按发布门禁继续执行，完成前不标记通过。
+- PR #234 candidate HEAD `435ea4e355719e0f2d904cf1bac986ff18f70876` 的 Tests run `32710110323`（10 jobs）与 CodeQL run `32710110375`：**通过**，覆盖 Ubuntu Python 3.9–3.12、macOS、Windows、PowerShell installer、Docker Compose、Feishu SDK 与 fixed Hermes fixture。
+- exact merge/tag 与 Release assets/checksums 按发布门禁继续执行，完成前不标记通过。
 - 本轮不修改飞书卡片或 API delivery semantics，因此不发送额外真实飞书测试消息；这不替代 V4.3.3 尚未完成的 first-reply thread 客户端验收。

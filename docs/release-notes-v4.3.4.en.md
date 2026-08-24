@@ -21,5 +21,6 @@ V4.3.4 fixes runtime interaction listener startup/exit reliability and makes `do
 - Combined #229 listener/daemon, #233 valid/tampered V3 install and doctor, diagnostics/CLI, and hosted-macOS timing regressions: **`191 passed`**.
 - Full pytest in a disposable 4.3.4 venv: **`3275 passed, 6 skipped in 634.95s`**. `git diff --check`: **passed**.
 - PEP 517 sdist/wheel and fresh Python 3.12 wheel-only provenance: **passed**. Package and distribution versions are `4.3.4`, import comes from isolated `site-packages`, exactly one `hermes_agent.plugins` entrypoint is present, all 24 provenance slices are packaged, and the main CLI plus `enable/disable --help` exit 0.
-- Remote PR CI, the exact merge/tag, and Release assets/checksums continue as publication gates and are not marked passed before completion.
+- Tests run `32710110323` (10 jobs) and CodeQL run `32710110375` passed for PR #234 candidate HEAD `435ea4e355719e0f2d904cf1bac986ff18f70876`, covering Ubuntu Python 3.9–3.12, macOS, Windows, the PowerShell installer, Docker Compose, Feishu SDK, and the fixed Hermes fixture.
+- The exact merge/tag and Release assets/checksums continue as publication gates and are not marked passed before completion.
 - This cycle changes no Feishu card or API delivery semantics, so no additional real Feishu test message is sent. It does not replace V4.3.3's outstanding first-reply thread client acceptance.

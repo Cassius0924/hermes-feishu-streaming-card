@@ -155,7 +155,7 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 - The hosted-macOS blocked-delivery close regression uses a Future deadline to verify bounded completion instead of including runner scheduling overhead in a raw `<0.25s` wall-clock assertion. The production timeout is unchanged.
 - Combined #229/#233/diagnostics/CLI/macOS-timing regressions: **passed (`191 passed`)**. Full pytest in a disposable 4.3.4 venv: **passed (`3275 passed, 6 skipped in 634.95s`)**. `git diff --check`: **passed**.
 - PEP 517 sdist/wheel and fresh Python 3.12 wheel-only provenance: **passed**. Package/distribution `4.3.4`, isolated `site-packages` import, the single Hermes plugin entrypoint, all 24 provenance slices, and the main CLI plus `enable/disable --help` are verified.
-- Remote CI, the exact merge/tag, and Release assets/checksums continue before publication.
+- PR #234 candidate HEAD `435ea4e355719e0f2d904cf1bac986ff18f70876`: Tests run `32710110323` (10 jobs) and CodeQL run `32710110375` **passed**. The exact merge/tag and Release assets/checksums continue before publication.
 - This cycle changes no Feishu card/API delivery semantics and sends no additional real Feishu test message. It does not replace V4.3.3's outstanding first-reply thread client acceptance.
 
 ## V4.3.3 Release Gates (historical record)
