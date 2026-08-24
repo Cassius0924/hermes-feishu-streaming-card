@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -475,3 +476,237 @@ def test_cli_v3_restore_dispatches_before_legacy_binding_free_path(
         f"{command} ok",
         "gateway.restart_required: hermes gateway start",
     ]
+
+
+def test_doctor_uses_v3_inspector_without_legacy_recovery_diagnostics(
+    tmp_path, monkeypatch, capsys
+):
+    root, binding, _entrypoint, decision = _fixture(tmp_path)
+    entrypoint = plugin.PluginEntrypointProbe(
+        status="verified",
+        reason="verified",
+        version=cli.PACKAGE_VERSION,
+        module_origin=binding.purelib / "hermes_feishu_card" / "hermes_plugin.py",
+    )
+    monkeypatch.setattr(plugin, "_run_official_enable", _official_enable)
+    v3.execute_fixed_tag_hybrid_install(
+        binding=binding,
+        entrypoint=entrypoint,
+        decision=decision,
+        source_commit=v3.FIXED_TAG_COMMIT,
+        plugin_evidence_sha256="sha256:" + "a" * 64,
+        package_version=cli.PACKAGE_VERSION,
+    )
+    detection = cli.detect_hermes(root)
+    assert detection.supported is True
+    binding_calls = []
+
+    def resolve_binding(**kwargs):
+        binding_calls.append(kwargs)
+        return binding
+
+    monkeypatch.setattr(cli, "resolve_runtime_binding", resolve_binding)
+    monkeypatch.setattr(
+        cli, "probe_plugin_entrypoint", lambda *args, **kwargs: entrypoint
+    )
+    monkeypatch.setattr(
+        cli,
+        "_diagnose_install_state",
+        lambda _detection: pytest.fail("V3 doctor must not use Legacy install diagnosis"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "plan_recovery",
+        lambda _detection: pytest.fail("V3 doctor must not use Legacy recovery"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "plan_integrity_repair",
+        lambda _detection: pytest.fail("V3 doctor must not use Legacy integrity planning"),
+    )
+    monkeypatch.setattr(cli, "status_sidecar", lambda _config: {})
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("server:\n  port: 9013\n", encoding="utf-8")
+
+    report = cli._build_doctor_report(
+        config_path,
+        {
+            "server": {"host": "127.0.0.1", "port": 9013},
+            "feishu": {"app_id": "app", "app_secret": "secret"},
+        },
+        SimpleNamespace(
+            skip_hermes=False,
+            hermes_dir=str(root),
+            hermes_home=str(binding.hermes_home),
+            profile_id=None,
+            _profile_id="default",
+            _profile_source="fallback_default",
+            _event_url="http://127.0.0.1:9013/events",
+        ),
+    )
+
+    assert report.install_state["contract"] == "v3"
+    assert report.install_state["status"] == "installed"
+    assert report.install_state["recovery_state"] == "installed"
+    assert binding_calls == [
+        {
+            "checkout_root": detection.root,
+            "hermes_home": str(binding.hermes_home),
+            "profile_id": None,
+        }
+    ]
+    finding_codes = {finding.code for finding in report.findings}
+    assert "install_state_installed" in finding_codes
+    assert not finding_codes & {
+        "install_state_incomplete",
+        "manifest_current_hash_invalid",
+        "manifest_backup_hash_invalid",
+        "manifest_path_mismatch",
+        "backup_source_mismatch",
+        "cron_backup_source_mismatch",
+        "base_install_state_incomplete",
+    }
+
+    binding_calls.clear()
+    exit_code = cli.main(
+        [
+            "doctor",
+            "--config",
+            str(config_path),
+            "--hermes-dir",
+            str(root),
+            "--hermes-home",
+            str(binding.hermes_home),
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["install_state"]["contract"] == "v3"
+    assert payload["install_state"]["status"] == "installed"
+    assert binding_calls == [
+        {
+            "checkout_root": detection.root,
+            "hermes_home": str(binding.hermes_home),
+            "profile_id": None,
+        }
+    ]
+    cli_finding_codes = {finding["code"] for finding in payload["findings"]}
+    assert "install_state_installed" in cli_finding_codes
+    assert "install_state_incomplete" not in cli_finding_codes
+
+
+@pytest.mark.parametrize(
+    ("tamper", "expected_code"),
+    [
+        ("phase", "v3_manifest_recovery_required"),
+        ("config", "v3_config_changed"),
+        ("target", "v3_target_changed"),
+        ("backup", "v3_backup_changed"),
+        ("runtime_identity", "v3_runtime_binding_changed"),
+    ],
+)
+def test_doctor_reports_v3_specific_fail_closed_findings(
+    tmp_path, monkeypatch, tamper, expected_code
+):
+    root, binding, _entrypoint, decision = _fixture(tmp_path)
+    entrypoint = plugin.PluginEntrypointProbe(
+        status="verified",
+        reason="verified",
+        version=cli.PACKAGE_VERSION,
+        module_origin=binding.purelib / "hermes_feishu_card" / "hermes_plugin.py",
+    )
+    monkeypatch.setattr(plugin, "_run_official_enable", _official_enable)
+    v3.execute_fixed_tag_hybrid_install(
+        binding=binding,
+        entrypoint=entrypoint,
+        decision=decision,
+        source_commit=v3.FIXED_TAG_COMMIT,
+        plugin_evidence_sha256="sha256:" + "a" * 64,
+        package_version=cli.PACKAGE_VERSION,
+    )
+    resolved_binding = binding
+    if tamper == "phase":
+        manifest_path = root / ".hermes_feishu_card_manifest"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["phase"] = "plugin_enabled"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif tamper == "config":
+        binding.config_path.write_text(
+            binding.config_path.read_text(encoding="utf-8") + "changed: true\n",
+            encoding="utf-8",
+        )
+    elif tamper == "target":
+        with (root / v3.HYBRID_PATCH_TARGET_ORDER[0]).open("ab") as handle:
+            handle.write(b"\n# changed\n")
+    elif tamper == "backup":
+        backup = root / (
+            v3.HYBRID_PATCH_TARGET_ORDER[0] + ".hermes_feishu_card.bak"
+        )
+        with backup.open("ab") as handle:
+            handle.write(b"\n# changed\n")
+    elif tamper == "runtime_identity":
+        resolved_binding = replace(binding, python_identity="sha256:" + "e" * 64)
+
+    detection = cli.detect_hermes(root)
+    assert detection.supported is True
+    monkeypatch.setattr(
+        cli, "resolve_runtime_binding", lambda **kwargs: resolved_binding
+    )
+    monkeypatch.setattr(
+        cli, "probe_plugin_entrypoint", lambda *args, **kwargs: entrypoint
+    )
+    monkeypatch.setattr(
+        cli,
+        "_diagnose_install_state",
+        lambda _detection: pytest.fail("V3 doctor must not use Legacy install diagnosis"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "plan_recovery",
+        lambda _detection: pytest.fail("V3 doctor must not use Legacy recovery"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "plan_integrity_repair",
+        lambda _detection: pytest.fail("V3 doctor must not use Legacy integrity planning"),
+    )
+    monkeypatch.setattr(cli, "status_sidecar", lambda _config: {})
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("server:\n  port: 9013\n", encoding="utf-8")
+
+    report = cli._build_doctor_report(
+        config_path,
+        {
+            "server": {"host": "127.0.0.1", "port": 9013},
+            "feishu": {"app_id": "app", "app_secret": "secret"},
+        },
+        SimpleNamespace(
+            skip_hermes=False,
+            hermes_dir=str(root),
+            hermes_home=str(binding.hermes_home),
+            profile_id=None,
+            _profile_id="default",
+            _profile_source="fallback_default",
+            _event_url="http://127.0.0.1:9013/events",
+        ),
+    )
+
+    assert report.install_state["contract"] == "v3"
+    assert report.install_state["status"] == "incomplete"
+    assert report.install_state["manual_action_required"] is True
+    assert report.install_state["recovery_executable"] is False
+    assert report.install_state["recovery_actions"] == []
+    finding_codes = {finding.code for finding in report.findings}
+    assert expected_code in finding_codes
+    assert "v3_install_incomplete" in finding_codes
+    assert not finding_codes & {
+        "install_state_incomplete",
+        "manifest_current_hash_invalid",
+        "manifest_backup_hash_invalid",
+        "manifest_path_mismatch",
+        "backup_source_mismatch",
+        "cron_backup_source_mismatch",
+        "base_install_state_incomplete",
+    }

@@ -2871,6 +2871,14 @@ def _safe_message(code: str) -> str:
         "reapplication_invalid": "The current hook cannot be validated in memory.",
         "symlink_refused": "Recovery does not operate on symbolic links.",
         "unsupported_anchors": "Verified source does not support the current hook strategy.",
+        "v3_backup_changed": "A V3-owned Hermes backup changed since install.",
+        "v3_config_changed": "The V3-owned Hermes plugin configuration changed since install.",
+        "v3_inspection_failed": "The V3 install could not be verified safely.",
+        "v3_manifest_invalid": "The V3 install manifest is missing or invalid.",
+        "v3_manifest_recovery_required": "The V3 install transaction is not in the installed phase.",
+        "v3_patch_invalid": "The V3 Hybrid patch ownership is inconsistent.",
+        "v3_runtime_binding_changed": "The V3 runtime or plugin binding changed since install.",
+        "v3_target_changed": "A V3-owned Hermes target changed since install.",
     }
     return messages.get(code, "Recovery evidence requires review.")
 

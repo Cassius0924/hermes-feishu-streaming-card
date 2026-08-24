@@ -212,6 +212,15 @@ _CARD_FINDING_CODES = {
     "streaming_not_detected",
     "symlink_refused",
     "unsupported_anchors",
+    "v3_backup_changed",
+    "v3_config_changed",
+    "v3_inspection_failed",
+    "v3_install_incomplete",
+    "v3_manifest_invalid",
+    "v3_manifest_recovery_required",
+    "v3_patch_invalid",
+    "v3_runtime_binding_changed",
+    "v3_target_changed",
 }
 
 
@@ -814,13 +823,20 @@ def _append_install_finding(
             )
         )
     elif status in {"changed", "incomplete", "error"}:
-        code = "install_state_changed" if status == "changed" else "install_state_incomplete"
-        automatic = bool(install_state.get("automatic_repair_available"))
-        action = (
-            "Run repair --hermes-dir PATH --yes to rebuild known-safe backup/manifest state, then rerun doctor."
-            if automatic
-            else "Back up the Hermes directory, inspect gateway/run.py and the manifest, then restore or reinstall only after confirming the local edits are intentional."
-        )
+        if install_state.get("contract") == "v3":
+            code = "v3_install_incomplete"
+            action = (
+                "Review the V3 finding, then use the official V3 restore or reinstall "
+                "flow; do not run Legacy repair against this manifest."
+            )
+        else:
+            code = "install_state_changed" if status == "changed" else "install_state_incomplete"
+            automatic = bool(install_state.get("automatic_repair_available"))
+            action = (
+                "Run repair --hermes-dir PATH --yes to rebuild known-safe backup/manifest state, then rerun doctor."
+                if automatic
+                else "Back up the Hermes directory, inspect gateway/run.py and the manifest, then restore or reinstall only after confirming the local edits are intentional."
+            )
         findings.append(
             DiagnosticFinding(
                 code,
