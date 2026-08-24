@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.3.3`. This cycle fixes first-reply thread placement through explicit `reply_in_thread` and makes an explicit thread text reply without `reply_to_message_id` fail closed, preventing a completion notification from silently falling back to the top-level chat. Local full automation, package builds, and PR #232 candidate CI have passed; the exact merge SHA, public tag/install, Release assets, and real Feishu acceptance are marked passed only after completion.
+Current release candidate: `4.3.4`. This cycle merges PR #229 to remove reverse-DNS blocking while starting the runtime interaction listener and to keep an unclosed listener from preventing CLI process exit. It also fixes Issue #233 so `doctor --json` validates `manifest_version: 3` Hybrid installs only through the V3 inspector rather than mixing in Legacy recovery/integrity diagnostics. Full automation, package builds, PR CI, the exact merge SHA, public tag/install, and Release assets are marked passed only after completion. This cycle does not change Feishu card/API semantics, and automation is not represented as real-client acceptance.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -147,7 +147,18 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
 
-## V4.3.3 Release Gates
+## V4.3.4 Release Gates
+
+- PR #229: the runtime interaction listener bind path must not invoke reverse DNS; its `serve_forever` thread must be a daemon so a short-lived command can exit without explicitly calling `close()`.
+- Issue #233: a valid `manifest_version: 3` Hybrid install must be checked through the V3 runtime binding, plugin entrypoint, and fixed-tag inspector and reported as `installed`; no Legacy install diagnosis, recovery, or integrity-repair planner may run.
+- V3 phase/config/target/backup/runtime-identity drift must fail closed with a V3-specific finding, must not expose Legacy automatic repair, and must direct operators to the official V3 restore/reinstall flow.
+- The hosted-macOS blocked-delivery close regression uses a Future deadline to verify bounded completion instead of including runner scheduling overhead in a raw `<0.25s` wall-clock assertion. The production timeout is unchanged.
+- Combined #229/#233/diagnostics/CLI/macOS-timing regressions: **passed (`191 passed`)**. Full pytest in a disposable 4.3.4 venv: **passed (`3275 passed, 6 skipped in 634.95s`)**. `git diff --check`: **passed**.
+- PEP 517 sdist/wheel and fresh Python 3.12 wheel-only provenance: **passed**. Package/distribution `4.3.4`, isolated `site-packages` import, the single Hermes plugin entrypoint, all 24 provenance slices, and the main CLI plus `enable/disable --help` are verified.
+- PR #234 candidate HEAD `435ea4e355719e0f2d904cf1bac986ff18f70876`: Tests run `32710110323` (10 jobs) and CodeQL run `32710110375` **passed**. The exact merge/tag and Release assets/checksums continue before publication.
+- This cycle changes no Feishu card/API delivery semantics and sends no additional real Feishu test message. It does not replace V4.3.3's outstanding first-reply thread client acceptance.
+
+## V4.3.3 Release Gates (historical record)
 
 - When the first reply has no concrete `thread_id` but has explicit `reply_in_thread=true` and a verified `om_` anchor, the streaming card, ordinary/repeated/runtime-admission interactions, and opt-in completion notification must remain in one thread.
 - `send_text_message()` with either `reply_in_thread=true` or a non-empty `thread_id`, but without `reply_to_message_id`, must reject before token/API work and must not post a top-level fallback; the default path with no thread-placement intent remains compatible.

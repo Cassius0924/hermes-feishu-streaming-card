@@ -70,6 +70,8 @@ from hermes_feishu_card.install.integrity import (
     render_integrity_manifest_migration,
 )
 from hermes_feishu_card.install.recovery import (
+    RecoveryFinding,
+    RecoveryPlan,
     RecoveryRefused,
     _first_refusal,
     execute_recovery,
@@ -1146,12 +1148,16 @@ def _build_doctor_report(
             }
         )
 
-    install_state = _diagnose_install_state(detection)
-    recovery_plan = plan_recovery(detection)
-    try:
-        integrity_plan = plan_integrity_repair(detection)
-    except (IntegrityRepairRefused, OSError, RuntimeError, ValueError):
+    if _manifest_version_candidate(_manifest_path(detection.root)) == 3:
+        install_state, recovery_plan = _diagnose_v3_install_state(detection, args)
         integrity_plan = None
+    else:
+        install_state = _diagnose_install_state(detection)
+        recovery_plan = plan_recovery(detection)
+        try:
+            integrity_plan = plan_integrity_repair(detection)
+        except (IntegrityRepairRefused, OSError, RuntimeError, ValueError):
+            integrity_plan = None
     profile_id = str(getattr(args, "_profile_id", "") or "")
     route = _diagnostic_route(config, profile_id)
     try:
@@ -2047,6 +2053,133 @@ def _diagnose_install_state(detection: HermesDetection) -> dict[str, Any]:
         "message": "No Hermes Feishu hook install state was found.",
         "manual_action_required": False,
     }
+
+
+def _diagnose_v3_install_state(
+    detection: HermesDetection,
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], RecoveryPlan]:
+    manifest_path = _manifest_path(detection.root)
+    try:
+        binding = resolve_runtime_binding(
+            checkout_root=detection.root,
+            hermes_home=getattr(args, "hermes_home", None),
+            profile_id=getattr(args, "profile_id", None),
+        )
+        entrypoint = probe_plugin_entrypoint(
+            binding,
+            expected_version=PACKAGE_VERSION,
+        )
+        inspected = inspect_fixed_tag_hybrid_install(
+            binding=binding,
+            entrypoint=entrypoint,
+            package_version=PACKAGE_VERSION,
+        )
+    except (
+        FixedTagInstallRefused,
+        RuntimeBindingRefused,
+        OSError,
+        UnicodeError,
+        ValueError,
+    ) as exc:
+        code = _v3_install_finding_code(exc)
+        message = _v3_install_finding_message(code)
+        fingerprint = _v3_doctor_fingerprint(manifest_path, code)
+        return (
+            {
+                "checked": True,
+                "contract": "v3",
+                "status": "incomplete",
+                "message": message,
+                "manifest_exists": manifest_path.exists() or manifest_path.is_symlink(),
+                "manual_action_required": True,
+                "automatic_repair_available": False,
+            },
+            RecoveryPlan(
+                root=detection.root,
+                state="refused",
+                executable=False,
+                fingerprint=fingerprint,
+                actions=(),
+                findings=(RecoveryFinding(code, "error", message),),
+            ),
+        )
+    manifest_path = inspected.manifest_path
+    fingerprint = hashlib.sha256(
+        b"hfc-doctor-v3-installed\0" + manifest_path.read_bytes()
+    ).hexdigest()
+    return (
+        {
+            "checked": True,
+            "contract": "v3",
+            "status": "installed",
+            "message": "Hermes fixed-tag V3 Hybrid install is complete and consistent.",
+            "manifest_exists": True,
+            "manual_action_required": False,
+            "automatic_repair_available": False,
+        },
+        RecoveryPlan(
+            root=detection.root,
+            state="installed",
+            executable=False,
+            fingerprint=fingerprint,
+            actions=(),
+            findings=(),
+        ),
+    )
+
+
+def _v3_install_finding_code(exc: Exception) -> str:
+    if isinstance(exc, RuntimeBindingRefused):
+        return "v3_runtime_binding_changed"
+    message = str(exc).lower()
+    if "requires recovery" in message:
+        return "v3_manifest_recovery_required"
+    if "plugin config changed" in message or "config is missing" in message:
+        return "v3_config_changed"
+    if "target hash changed" in message or "target is missing" in message:
+        return "v3_target_changed"
+    if "backup hash changed" in message or "backup is missing" in message:
+        return "v3_backup_changed"
+    if "binding or mode changed" in message or "entry point" in message:
+        return "v3_runtime_binding_changed"
+    if "manifest" in message:
+        return "v3_manifest_invalid"
+    if "patch" in message or "ownership" in message:
+        return "v3_patch_invalid"
+    return "v3_inspection_failed"
+
+
+def _v3_install_finding_message(code: str) -> str:
+    messages = {
+        "v3_manifest_recovery_required": "The V3 install transaction is not in the installed phase.",
+        "v3_config_changed": "The V3-owned Hermes plugin configuration changed since install.",
+        "v3_target_changed": "A V3-owned Hermes target changed since install.",
+        "v3_backup_changed": "A V3-owned Hermes backup changed since install.",
+        "v3_runtime_binding_changed": "The V3 runtime or plugin binding changed since install.",
+        "v3_manifest_invalid": "The V3 install manifest is missing or invalid.",
+        "v3_patch_invalid": "The V3 Hybrid patch ownership is inconsistent.",
+        "v3_inspection_failed": "The V3 install could not be verified safely.",
+    }
+    return messages.get(code, messages["v3_inspection_failed"])
+
+
+def _v3_doctor_fingerprint(manifest_path: Path, code: str) -> str:
+    evidence = b""
+    try:
+        metadata = manifest_path.lstat()
+        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
+            evidence = manifest_path.read_bytes()
+        else:
+            evidence = b"unsafe-manifest"
+    except OSError:
+        evidence = b"unavailable-manifest"
+    return hashlib.sha256(
+        b"hfc-doctor-v3-refused\0"
+        + code.encode("ascii", errors="strict")
+        + b"\0"
+        + evidence
+    ).hexdigest()
 
 
 def _install_state_status_from_error(message: str) -> str:

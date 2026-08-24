@@ -1709,10 +1709,11 @@ def test_task4_coordinator_close_is_bounded_when_delivery_is_blocked():
     )
     assert coordinator.submit_observer({"event": "tool.updated"}, producer="plugin")
     assert entered.wait(timeout=0.5)
-    started = __import__("time").monotonic()
-    coordinator.close()
-    assert __import__("time").monotonic() - started < 0.25
-    release.set()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(coordinator.close).result(timeout=0.5) is None
+    finally:
+        release.set()
 
 
 def native_terminal_response(descriptor=None):
