@@ -139,7 +139,7 @@ Hermes `v2026.4.23` 起的旧版和 Hermes 0.13.0+/0.14.0/0.15.x/0.17.x/0.18.x/0
 已有 Hermes 容器优先使用：
 
 ```bash
-export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.3.4
+export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx HFC_VERSION=v4.3.5
 bash install-docker.sh
 ```
 
@@ -178,6 +178,7 @@ bash install-docker.sh
 ## 最新版本
 | 版本 | 重点 |
 |---|---|
+| [v4.3.5](docs/release-notes-v4.3.5.md) | 兼容 Hermes v2026.8.3 Feishu adapter 的 `edit_message` 无 `metadata` 形参：wrapper 只移除原方法明确不支持的内部 metadata，支持 metadata/`**kwargs` 的 adapter 继续透传，无关未知参数仍正常抛出 `TypeError` |
 | [v4.3.4](docs/release-notes-v4.3.4.md) | 修复 runtime interaction listener 启动时的 reverse-DNS 阻塞与未关闭 listener 导致的 CLI 退出挂起；V3 Hybrid 安装改由 V3 inspector 驱动 `doctor --json`，避免误报 Legacy manifest/hash/path 问题 |
 | [v4.3.3](docs/release-notes-v4.3.3.md) | 首回复建 thread 时固定 reply anchor 与 `reply_in_thread` placement；completion notification 保持同一 thread，显式 thread 回复缺 anchor 则 fail-closed，绝不退回群聊顶层文本 |
 | [v4.3.2](docs/release-notes-v4.3.2.md) | 修复 Issue #227：schema 2.0 流式卡与 legacy 交互卡保持稳定双轨，避免 clarify/approval 完成后触发 `230099/200800`；Gateway 拒绝把 schema 2.0 卡作为 callback raw card，避免 `200673` |

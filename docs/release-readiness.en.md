@@ -2,7 +2,7 @@
 
 [中文](release-readiness.md) | [English](release-readiness.en.md)
 
-Current release candidate: `4.3.4`. This cycle merges PR #229 to remove reverse-DNS blocking while starting the runtime interaction listener and to keep an unclosed listener from preventing CLI process exit. It also fixes Issue #233 so `doctor --json` validates `manifest_version: 3` Hybrid installs only through the V3 inspector rather than mixing in Legacy recovery/integrity diagnostics. Full automation, package builds, PR CI, the exact merge SHA, public tag/install, and Release assets are marked passed only after completion. This cycle does not change Feishu card/API semantics, and automation is not represented as real-client acceptance.
+Current release candidate: `4.3.5`. This cycle merges PR #235 to prevent the HFC `edit_message` wrapper from forwarding its internal `metadata` keyword to the Hermes v2026.8.3 Feishu adapter, whose original method does not accept it and raises `TypeError`. The wrapper uses the original signature to decide whether to remove that internal keyword; adapters that explicitly support `metadata` or `**kwargs` keep receiving it, while unrelated unknown keywords continue to fail closed. Full automation, package builds, the release PR, exact merge SHA, public tag/install, and Release assets are marked passed only after completion; automation is not represented as real Feishu/Lark client acceptance.
 
 V3.9.0 was released on 2026-07-11, and V3.9.1 was released on 2026-07-11. The V4.0.13 all-command lifecycle remains intact; V4.2.0 narrows only a private-chat bare `/update` into the stricter dedicated maintenance card.
 
@@ -147,7 +147,18 @@ Acceptance also exposed an upstream Hermes `cron run` status-reporting bug: a su
 
 The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, Linux tarball, Windows zip, and checksums file: `hermes-feishu-card-v3.9.0-macos.tar.gz`, `hermes-feishu-card-v3.9.0-linux.tar.gz`, `hermes-feishu-card-v3.9.0-windows.zip`, and `hermes-feishu-card-v3.9.0-checksums.txt`.
 
-## V4.3.4 Release Gates
+## V4.3.5 Release Gates
+
+- PR #235: the Hermes v2026.8.3 Feishu adapter exposes `edit_message(chat_id, message_id, content, *, finalize=False)` without `metadata`; when card routing does not take ownership, the HFC wrapper may remove only that wrapper-owned internal keyword before calling the original method.
+- If the original method explicitly accepts `metadata` or `**kwargs`, forwarding must remain intact. Unrelated unknown keywords must not be swallowed and must still raise `TypeError` from the original method.
+- Independent direct regressions: **passed (`4 passed`)**. Hook/server hot-area suites: **passed (`841 passed`)**. Full pytest on the exact PR head: **passed (`3279 passed, 6 skipped in 599.42s`)**.
+- Focused v4.3.5 docs/package/native-provenance gate: **passed (`99 passed`)**. Full pytest in a disposable wheel environment: **passed (`3280 passed, 5 skipped in 555.86s`)**. `git diff --check`: **passed**.
+- PEP 517 sdist/wheel and fresh Python 3.12 wheel-only provenance: **passed**. Package/distribution `4.3.5`, isolated `site-packages` import, the single Hermes plugin entrypoint, all 24 provenance slices, and the main CLI plus `enable/disable --help` are verified.
+- PR #235 HEAD `5b3bf428eb688df4b95607cba1a4ce50e2eeb8d0`: Tests run `32719244038` attempt 3 and CodeQL run `32719244032` **passed**. Attempts 1 and 2 failed only because the fixed Hermes fixture clone received GitHub HTTP 429; the third attempt passed the fixture and every platform job.
+- Exact PR merge `d56555bf9e716de67ed14f8ed992df1ec55cea21` is confirmed. The release PR, exact release merge, annotated tag, public install, and Release assets/checksums remain in the release workflow.
+- This cycle does not change card ownership, thread placement, callback authentication, Feishu API payloads, Hermes patch ownership, or the archived `legacy/` runtime.
+
+## V4.3.4 Release Gates (historical)
 
 - PR #229: the runtime interaction listener bind path must not invoke reverse DNS; its `serve_forever` thread must be a daemon so a short-lived command can exit without explicitly calling `close()`.
 - Issue #233: a valid `manifest_version: 3` Hybrid install must be checked through the V3 runtime binding, plugin entrypoint, and fixed-tag inspector and reported as `installed`; no Legacy install diagnosis, recovery, or integrity-repair planner may run.
@@ -155,7 +166,7 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 - The hosted-macOS blocked-delivery close regression uses a Future deadline to verify bounded completion instead of including runner scheduling overhead in a raw `<0.25s` wall-clock assertion. The production timeout is unchanged.
 - Combined #229/#233/diagnostics/CLI/macOS-timing regressions: **passed (`191 passed`)**. Full pytest in a disposable 4.3.4 venv: **passed (`3275 passed, 6 skipped in 634.95s`)**. `git diff --check`: **passed**.
 - PEP 517 sdist/wheel and fresh Python 3.12 wheel-only provenance: **passed**. Package/distribution `4.3.4`, isolated `site-packages` import, the single Hermes plugin entrypoint, all 24 provenance slices, and the main CLI plus `enable/disable --help` are verified.
-- PR #234 candidate HEAD `435ea4e355719e0f2d904cf1bac986ff18f70876`: Tests run `32710110323` (10 jobs) and CodeQL run `32710110375` **passed**. The exact merge/tag and Release assets/checksums continue before publication.
+- PR #234 candidate HEAD `435ea4e355719e0f2d904cf1bac986ff18f70876`: Tests run `32710110323` (10 jobs) and CodeQL run `32710110375` **passed**. Exact merge `2f1abcfcad50997c615103e3cdf1302c61f94c91`, tag, and Release assets/checksums are complete.
 - This cycle changes no Feishu card/API delivery semantics and sends no additional real Feishu test message. It does not replace V4.3.3's outstanding first-reply thread client acceptance.
 
 ## V4.3.3 Release Gates (historical record)

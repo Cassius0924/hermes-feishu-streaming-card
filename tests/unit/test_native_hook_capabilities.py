@@ -984,7 +984,7 @@ def test_release_git_tag_install_provenance_is_verified(installed_fixed_runtime)
             "vcs_info": {
                 "vcs": "git",
                 "commit_id": "b13fccbf72f912890d452ec0cfc126b0adc07c88",
-                "requested_revision": "v4.3.4",
+                "requested_revision": "v4.3.5",
             },
         },
     )

@@ -541,7 +541,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 | `HERMES_DIR` | `/opt/hermes` | 容器内 Hermes Agent Gateway 目录 |
 | `HFC_CONFIG` | `/opt/data/config.yaml` | sidecar 配置路径 |
 | `HFC_ENV_FILE` | `/opt/data/.env` | 飞书凭据文件 |
-| `HFC_VERSION` | `latest`（脚本）/ `v4.3.4`（Compose 示例） | 指定安装 tag 或分支 |
+| `HFC_VERSION` | `latest`（脚本）/ `v4.3.5`（Compose 示例） | 指定安装 tag 或分支 |
 | `HFC_PYTHON` | 自动检测 Hermes venv | 显式指定容器内 Python |
 
 示例：
@@ -549,7 +549,7 @@ python3 -m hermes_feishu_card.cli status --config ~/.hermes/config.yaml
 ```bash
 export FEISHU_APP_ID=cli_xxx
 export FEISHU_APP_SECRET=xxx
-export HFC_VERSION=v4.3.4
+export HFC_VERSION=v4.3.5
 bash install-docker.sh --profile-id child --event-url http://hfc-sidecar:8765/events
 ```
 
@@ -834,6 +834,7 @@ Hermes hook 将事件 fail-open 转发给 sidecar。sidecar 持有完整会话�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
+| [v4.3.5](release-notes-v4.3.5.md) | 2026-08-24 | 修复 HFC `edit_message` wrapper 向 Hermes v2026.8.3 Feishu adapter 转发不受支持的内部 `metadata` 所触发的 `TypeError`，并保留支持该参数的 adapter 与其他未知关键字的原有语义 |
 | [v4.3.4](release-notes-v4.3.4.md) | 2026-08-24 | runtime interaction listener 避免 reverse-DNS 启动阻塞并允许未显式 close 时进程退出；V3 Hybrid `doctor --json` 改用 V3 inspector，消除 Legacy manifest/hash/path 误报 |
 | [v4.3.3](release-notes-v4.3.3.md) | 2026-08-24 | 首回复建 thread 固定 reply anchor 与 `reply_in_thread` placement；completion notification 保持 thread，缺 anchor 的显式 thread text reply fail-closed |
 | [v4.3.2](release-notes-v4.3.2.md) | 2026-08-23 | Issue #227：稳定分离 schema 2.0 streaming owner 与 legacy interaction callback card，修复 `230099/200800` 与 `200673` |
