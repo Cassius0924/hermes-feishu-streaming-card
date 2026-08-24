@@ -153,7 +153,9 @@ The `v3.9.0` release-assets workflow publishes four assets: the macOS tarball, L
 - Issue #233: a valid `manifest_version: 3` Hybrid install must be checked through the V3 runtime binding, plugin entrypoint, and fixed-tag inspector and reported as `installed`; no Legacy install diagnosis, recovery, or integrity-repair planner may run.
 - V3 phase/config/target/backup/runtime-identity drift must fail closed with a V3-specific finding, must not expose Legacy automatic repair, and must direct operators to the official V3 restore/reinstall flow.
 - The hosted-macOS blocked-delivery close regression uses a Future deadline to verify bounded completion instead of including runner scheduling overhead in a raw `<0.25s` wall-clock assertion. The production timeout is unchanged.
-- Combined #229/#233/diagnostics/CLI/macOS-timing regressions: **passed (`191 passed`)**. Full pytest, `git diff --check`, package/provenance checks, remote CI, exact merge/tag, and Release assets continue before publication.
+- Combined #229/#233/diagnostics/CLI/macOS-timing regressions: **passed (`191 passed`)**. Full pytest in a disposable 4.3.4 venv: **passed (`3275 passed, 6 skipped in 634.95s`)**. `git diff --check`: **passed**.
+- PEP 517 sdist/wheel and fresh Python 3.12 wheel-only provenance: **passed**. Package/distribution `4.3.4`, isolated `site-packages` import, the single Hermes plugin entrypoint, all 24 provenance slices, and the main CLI plus `enable/disable --help` are verified.
+- Remote CI, the exact merge/tag, and Release assets/checksums continue before publication.
 - This cycle changes no Feishu card/API delivery semantics and sends no additional real Feishu test message. It does not replace V4.3.3's outstanding first-reply thread client acceptance.
 
 ## V4.3.3 Release Gates (historical record)

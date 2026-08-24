@@ -153,7 +153,9 @@ python3 -m hermes_feishu_card.cli restore --hermes-dir ~/.hermes/hermes-agent --
 - Issue #233：有效的 `manifest_version: 3` Hybrid 安装必须由 V3 runtime binding、plugin entrypoint 与 fixed-tag inspector 校验，并报告 `installed`；不得调用 Legacy install diagnosis、recovery 或 integrity repair planner。
 - V3 phase/config/target/backup/runtime identity 漂移必须 fail-closed，输出 V3-specific finding、禁止 Legacy 自动 repair，并引导使用官方 V3 restore/reinstall 流程。
 - hosted macOS 的 blocked-delivery close 回归以 Future deadline 验证有界完成，不再把 runner 调度开销混入 `<0.25s` 原始 wall-clock 断言；生产超时不放宽。
-- #229/#233/diagnostics/CLI/macOS timing 联合回归：**已通过（`191 passed`）**；完整 pytest、`git diff --check`、包/provenance、远端 CI、exact merge/tag/Release assets：**发布前继续执行**。
+- #229/#233/diagnostics/CLI/macOS timing 联合回归：**已通过（`191 passed`）**；一次性 4.3.4 venv 完整 pytest：**已通过（`3275 passed, 6 skipped in 634.95s`）**；`git diff --check`：**已通过**。
+- PEP 517 sdist/wheel 与 fresh Python 3.12 wheel-only provenance：**已通过**。package/distribution `4.3.4`、隔离 `site-packages` import、唯一 Hermes plugin entrypoint、24 个 provenance slices、主 CLI 与 `enable/disable --help` 均已验证。
+- 远端 CI、exact merge/tag 与 Release assets/checksums：**发布前继续执行**。
 - 本轮不改 Feishu card/API delivery semantics，因此不发送额外真实飞书测试消息；这不替代 V4.3.3 尚未完成的 first-reply thread 客户端验收。
 
 ## V4.3.3 发布门禁（历史记录）
