@@ -3,7 +3,11 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
+import queue
+import signal
 import socket
+import subprocess
+import sys
 from threading import Barrier, Event, Thread
 import time
 from urllib import error, request
@@ -15,6 +19,7 @@ from hermes_feishu_card import hermes_plugin_runtime as plugin_runtime
 from hermes_feishu_card.runtime_interaction_transport import (
     MAX_RUNTIME_INTERACTION_BODY_BYTES,
     RUNTIME_INTERACTION_PATH,
+    RuntimeInteractionListener,
 )
 
 
@@ -830,3 +835,272 @@ def test_late_claim_is_rejected_while_deferred_cleanup_owns_turn(monkeypatch):
     assert runtime._patch_interactions == {}
     assert runtime.register_patch_interaction(*args) is False
     runtime.close()
+
+
+def test_listener_daemon_thread_allows_process_exit_without_close():
+    """Regression for CLI hang: the serve_forever thread must be daemon so a
+    process that starts the listener without calling close() still exits
+    cleanly.  Without daemon=True the non-daemon thread blocks interpreter
+    shutdown, which is what caused hermes-doctor to hang after the HFC
+    plugin loaded.
+
+    The child flushes a ``started daemon=...`` marker right after start() so
+    the parent can bound startup and post-start exit as two separate phases:
+    a slow cold import / loopback bind must not be mistaken for a post-start
+    shutdown hang, and the emitted daemon state proves the thread flag on the
+    exact runner that executed the child.  Earlier ``step:...`` markers
+    (interpreter start, module import, start() complete) let the parent report
+    exactly how far a stuck child got before the timeout, so a macOS-specific
+    startup stall is distinguishable from a shutdown hang.
+    """
+    child_script = (
+        # Register a SIGUSR1 handler so the parent can ask a stuck child to
+        # dump its thread stack to stderr before killing it (macOS diagnosis).
+        "import faulthandler, signal, sys\n"
+        "try:\n"
+        "    faulthandler.register(signal.SIGUSR1)\n"
+        "except (AttributeError, ValueError):\n"
+        "    pass\n"
+        "sys.stdout.write('step:start\\n')\n"
+        "sys.stdout.flush()\n"
+        "from hermes_feishu_card.runtime_interaction_transport "
+        "import RuntimeInteractionListener\n"
+        "sys.stdout.write('step:imported\\n')\n"
+        "sys.stdout.flush()\n"
+        "listener = RuntimeInteractionListener(b'i' * 32, lambda _p: True)\n"
+        "listener.start()\n"
+        "sys.stdout.write('step:started daemon=' + str(listener._thread.daemon) + '\\n')\n"
+        "sys.stdout.flush()\n"
+    )
+    # Bound the two phases independently: give cold import / bind room, but
+    # keep the post-start exit window tight so a non-daemon thread fails fast.
+    startup_timeout = 30.0
+    exit_timeout = 10.0
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout_lines = queue.Queue()
+    stderr_lines = queue.Queue()
+
+    def _pump(src, dst):
+        try:
+            for line in src:
+                dst.put(line)
+        finally:
+            dst.put(None)
+
+    def _drain(dst):
+        lines = []
+        while True:
+            try:
+                item = dst.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                break
+            lines.append(item)
+        return "".join(lines)
+
+    def _kill():
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    def _dump_stack():
+        # Ask a stuck child to dump its thread stack to stderr before kill.
+        if hasattr(signal, "SIGUSR1"):
+            try:
+                proc.send_signal(signal.SIGUSR1)
+            except (ProcessLookupError, PermissionError):
+                pass
+            time.sleep(1.0)
+
+    out_pump = Thread(target=_pump, args=(proc.stdout, stdout_lines), daemon=True)
+    err_pump = Thread(target=_pump, args=(proc.stderr, stderr_lines), daemon=True)
+    out_pump.start()
+    err_pump.start()
+
+    try:
+        # Phase 1: bounded startup — wait for the flushed started marker,
+        # collecting every step marker so a stuck child is pinpointed.
+        steps = []
+        marker = None
+        deadline = time.monotonic() + startup_timeout
+        while marker is None and time.monotonic() < deadline:
+            try:
+                line = stdout_lines.get(timeout=0.5)
+            except queue.Empty:
+                line = None
+            if line is None:
+                continue
+            if line.startswith("step:"):
+                steps.append(line.strip())
+            if line.startswith("step:started daemon="):
+                marker = line.strip()
+                break
+        if marker is None:
+            _dump_stack()
+            _kill()
+            stderr = _drain(stderr_lines)
+            pytest.fail(
+                f"child did not emit started marker within "
+                f"{startup_timeout:.0f}s (exit code {proc.returncode}) — "
+                f"cold import or loopback bind too slow, or start() hung\n"
+                f"steps seen: {steps!r}\n"
+                f"stderr: {stderr!r}"
+            )
+        daemon_flag = marker.split("=", 1)[1]
+        assert daemon_flag == "True", (
+            f"listener serve_forever thread must be daemon, got {marker!r}"
+        )
+
+        # Phase 2: post-start exit — interpreter must exit without close().
+        try:
+            returncode = proc.wait(timeout=exit_timeout)
+        except subprocess.TimeoutExpired:
+            _dump_stack()
+            _kill()
+            pytest.fail(
+                f"process did not exit within {exit_timeout:.0f}s after "
+                f"start without close() — listener thread is not daemon\n"
+                f"steps seen: {steps!r}\n"
+                f"stderr: {_drain(stderr_lines)!r}"
+            )
+        assert returncode == 0, (
+            f"expected exit 0, got {returncode}\n"
+            f"stderr: {_drain(stderr_lines)!r}"
+        )
+    finally:
+        _kill()
+        out_pump.join(timeout=1.0)
+        err_pump.join(timeout=1.0)
+
+
+def test_start_does_not_need_reverse_dns_for_loopback(monkeypatch):
+    """Regression for the hosted macOS stall: HTTPServer.server_bind() calls
+    socket.getfqdn() while binding, and reverse DNS on the runner can hang
+    well past any reasonable startup bound.  The literal-loopback listener
+    does not need a resolved hostname, so start() must not depend on it.
+
+    We emulate the stalled resolver by sleeping in getfqdn; with the
+    production path free of reverse DNS, the listener still starts in a
+    few seconds, and the emitted daemon marker stays correct.
+    """
+    child_script = (
+        "import faulthandler, signal, sys\n"
+        "try:\n"
+        "    faulthandler.register(signal.SIGUSR1)\n"
+        "except (AttributeError, ValueError):\n"
+        "    pass\n"
+        "import socket\n"
+        "original_getfqdn = socket.getfqdn\n"
+        "def stalled_getfqdn(host=''):\n"
+        "    time.sleep(300)\n"
+        "    return original_getfqdn(host)\n"
+        "socket.getfqdn = stalled_getfqdn\n"
+        "import time\n"
+        "sys.stdout.write('step:start\\n')\n"
+        "sys.stdout.flush()\n"
+        "from hermes_feishu_card.runtime_interaction_transport import RuntimeInteractionListener\n"
+        "sys.stdout.write('step:imported\\n')\n"
+        "sys.stdout.flush()\n"
+        "listener = RuntimeInteractionListener(b'i' * 32, lambda _p: True)\n"
+        "listener.start()\n"
+        "sys.stdout.write('step:started daemon=' + str(listener._thread.daemon) + '\\n')\n"
+        "sys.stdout.flush()\n"
+    )
+    # Same startup bound as the daemon regression: hosted runners can take a
+    # while for a cold interpreter import.  The stalled resolver sleeps far
+    # beyond that bound, so a reverse-DNS dependency can never slip through.
+    startup_timeout = 30.0
+    exit_timeout = 10.0
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout_lines = queue.Queue()
+    stderr_lines = queue.Queue()
+
+    def _pump(src, dst):
+        try:
+            for line in src:
+                dst.put(line)
+        finally:
+            dst.put(None)
+
+    def _drain(dst):
+        lines = []
+        while True:
+            try:
+                item = dst.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                break
+            lines.append(item)
+        return "".join(lines)
+
+    def _kill():
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    out_pump = Thread(target=_pump, args=(proc.stdout, stdout_lines), daemon=True)
+    err_pump = Thread(target=_pump, args=(proc.stderr, stderr_lines), daemon=True)
+    out_pump.start()
+    err_pump.start()
+
+    try:
+        steps = []
+        marker = None
+        deadline = time.monotonic() + startup_timeout
+        while marker is None and time.monotonic() < deadline:
+            try:
+                line = stdout_lines.get(timeout=0.5)
+            except queue.Empty:
+                line = None
+            if line is None:
+                continue
+            if line.startswith("step:"):
+                steps.append(line.strip())
+            if line.startswith("step:started daemon="):
+                marker = line.strip()
+                break
+        if marker is None:
+            _kill()
+            stderr = _drain(stderr_lines)
+            pytest.fail(
+                f"start() still depends on reverse DNS: no started marker within "
+                f"{startup_timeout:.0f}s while getfqdn sleeps 15s\n"
+                f"steps seen: {steps!r}\n"
+                f"stderr: {stderr!r}"
+            )
+        daemon_flag = marker.split("=", 1)[1]
+        assert daemon_flag == "True", (
+            f"listener serve_forever thread must be daemon, got {marker!r}"
+        )
+        try:
+            returncode = proc.wait(timeout=exit_timeout)
+        except subprocess.TimeoutExpired:
+            _kill()
+            pytest.fail(
+                f"process did not exit within {exit_timeout:.0f}s after start "
+                f"without close() — listener thread is not daemon\n"
+                f"steps seen: {steps!r}\n"
+                f"stderr: {_drain(stderr_lines)!r}"
+            )
+        assert returncode == 0, (
+            f"expected exit 0, got {returncode}\n"
+            f"stderr: {_drain(stderr_lines)!r}"
+        )
+    finally:
+        _kill()
+        out_pump.join(timeout=1.0)
+        err_pump.join(timeout=1.0)
