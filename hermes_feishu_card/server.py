@@ -5535,14 +5535,25 @@ async def _maybe_send_completion_notify(
         if type(card_config) is dict
         else None
     )
+    # The @ mention is optional: when disabled (completion_notify.mention=false
+    # or the global mentions_in_cards off switch), the plain completion
+    # notification must be sent even without a (valid) sender open_id --
+    # system/background turns have no requester to mention. Only when the
+    # mention is enabled do we require and validate the sender open_id.
+    mention_enabled = card_completion_mention_enabled(card_config)
     if (
         type(notify_config) is not dict
         or notify_config.get("enabled") is not True
         or session.status != "completed"
         or session.delivery_kind != "chat"
         or session.completion_notify_state != "idle"
-        or re.fullmatch(r"ou_[A-Za-z0-9_-]{1,128}", session.sender_open_id)
-        is None
+        or (
+            mention_enabled
+            and re.fullmatch(
+                r"ou_[A-Za-z0-9_-]{1,128}", session.sender_open_id
+            )
+            is None
+        )
     ):
         return
     client = _client_for_bot(app, app[MESSAGE_BOT_IDS_KEY].get(session_key))
@@ -5555,7 +5566,7 @@ async def _maybe_send_completion_notify(
     suffix = f"（用时 {duration_text}）" if duration_text else ""
     mention_prefix = (
         f'<at user_id="{session.sender_open_id}"></at> '
-        if card_completion_mention_enabled(card_config)
+        if mention_enabled
         else ""
     )
     text = f"{mention_prefix}✅ 任务已完成{suffix}"

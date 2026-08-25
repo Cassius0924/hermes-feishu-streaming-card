@@ -7897,6 +7897,94 @@ async def test_completion_notify_updates_card_then_mentions_once_when_enabled(
         await test_client.close()
 
 
+async def test_completion_notify_sends_plain_without_sender_when_mention_disabled(
+    tmp_path,
+):
+    """mention=false must send the plain completion notify even without a
+    sender_open_id (system/background turns have no requester to @)."""
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        card_config={"completion_notify": {"enabled": True, "mention": False}},
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {
+                    # No sender_open_id: system / background turn.
+                    "reply_to_message_id": "",
+                },
+                thread_id="omt_thread",
+            ),
+        )
+        feishu_client.operations.clear()
+        completed_payload = event_payload(
+            "message.completed",
+            1,
+            {"answer": "done"},
+            thread_id="omt_thread",
+        )
+        first = await test_client.post("/events", json=completed_payload)
+        replay = await test_client.post("/events", json=completed_payload)
+
+        assert first.status == 200
+        assert replay.status == 200
+        assert feishu_client.texts == [
+            ("oc_abc", "✅ 任务已完成", "omt_thread", None)
+        ]
+        session = app[SESSIONS_KEY]["hermes-message-1"]
+        assert session.completion_notify_state == "sent"
+    finally:
+        await test_client.close()
+
+
+async def test_completion_notify_rejects_invalid_sender_when_mention_enabled(
+    tmp_path,
+):
+    """mention=true (default) still refuses to send when the sender_open_id
+    is present but invalid -- no plain fallback notification."""
+    feishu_client = FakeFeishuClient()
+    app = create_app(
+        feishu_client,
+        card_config={"completion_notify": {"enabled": True}},
+        native_handoff_store=NativeHandoffStore(tmp_path / "handoff-state"),
+    )
+    server = TestServer(app)
+    test_client = TestClient(server)
+    await test_client.start_server()
+    try:
+        await test_client.post(
+            "/events",
+            json=event_payload(
+                "message.started",
+                0,
+                {"sender_open_id": "user_not_an_ou", "reply_to_message_id": ""},
+                thread_id="omt_thread",
+            ),
+        )
+        feishu_client.operations.clear()
+        completed_payload = event_payload(
+            "message.completed",
+            1,
+            {"answer": "done", "sender_open_id": "user_not_an_ou"},
+            thread_id="omt_thread",
+        )
+        await test_client.post("/events", json=completed_payload)
+
+        assert feishu_client.texts == []
+        session = app[SESSIONS_KEY]["hermes-message-1"]
+        assert session.completion_notify_state == "idle"
+    finally:
+        await test_client.close()
+
+
 async def test_completion_notify_preserves_reply_in_thread_without_thread_id(
     tmp_path,
 ):
