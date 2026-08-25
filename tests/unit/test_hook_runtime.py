@@ -9006,6 +9006,37 @@ class _NativeAckRaisingAdapter(_NativeAckAdapter):
         raise RuntimeError("adapter escaped")
 
 
+@pytest.mark.asyncio
+async def test_adapter_thread_create_without_reply_anchor_falls_back_to_chat_create():
+    adapter = _NativeAckAdapter()
+    runner = SimpleNamespace(adapters={"feishu": adapter})
+    assert hook_runtime.install_feishu_command_card_adapter_methods(runner)
+
+    result = await adapter.send(
+        "oc_native",
+        "topic notice",
+        metadata={"thread_id": "omt_topic", "trace": "preserved"},
+    )
+
+    assert result.success is True
+    assert adapter.raw_calls == [
+        ("{\"text\": \"topic\"}", "text", "create", "random-create"),
+        ("{\"text\": \" noti\"}", "text", "create", "random-create"),
+        ("{\"text\": \"ce\"}", "text", "create", "random-create"),
+    ]
+
+    adapter.raw_calls.clear()
+    reply_result = await adapter.send(
+        "oc_native",
+        "reply",
+        reply_to="om_parent",
+        metadata={"thread_id": "omt_topic"},
+    )
+
+    assert reply_result.success is True
+    assert adapter.raw_calls[-1][2] == "thread"
+
+
 def _install_native_ack_context(
     adapter,
     content,
@@ -9078,6 +9109,33 @@ def _install_native_ack_context(
     )
     assert registered is (descriptor["expires_at"] > time.time())
     return descriptor
+
+
+@pytest.mark.asyncio
+async def test_native_handoff_thread_create_uses_chat_fallback_with_stable_uuid():
+    content = "same"
+    adapter = _NativeAckAdapter()
+    _install_native_ack_context(adapter, content, thread_id="omt_topic")
+
+    first = await adapter.send(
+        "oc_native",
+        content,
+        metadata={"thread_id": "omt_topic"},
+    )
+    first_call = adapter.raw_calls[-1]
+    adapter.raw_calls.clear()
+    second = await adapter.send(
+        "oc_native",
+        content,
+        metadata={"thread_id": "omt_topic"},
+    )
+    second_call = adapter.raw_calls[-1]
+
+    assert first.success is True
+    assert second.success is True
+    assert first_call[2] == "create"
+    assert first_call[3] != "random-create"
+    assert first_call[3] == second_call[3]
 
 
 def test_exact_native_handoff_rejects_old_sidecar_v1_descriptor():
@@ -9398,7 +9456,7 @@ async def test_native_handoff_uses_canonical_create_routes_and_format_scoped_uui
     thread_uuid = thread_adapter.raw_calls[-1][3]
 
     assert create_uuid == canonical_create_uuid
-    assert thread_adapter.raw_calls[-1][2] == "thread"
+    assert thread_adapter.raw_calls[-1][2] == "create"
     assert create_uuid != thread_uuid
 
     fallback = _NativeAckPostFallbackAdapter(

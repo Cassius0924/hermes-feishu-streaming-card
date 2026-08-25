@@ -154,6 +154,33 @@ async def test_send_card_replies_in_thread_when_reply_anchor_present(feishu_api)
     assert reply_request[3]["Authorization"] == "Bearer tenant-token-1"
 
 
+async def test_send_card_without_reply_anchor_falls_back_to_chat_create(feishu_api):
+    test_client, requests, token_calls = feishu_api
+    client = FeishuClient(
+        FeishuClientConfig(
+            app_id="cli_test",
+            app_secret="secret",
+            base_url=str(test_client.make_url("/")),
+        )
+    )
+
+    result = await client.send_card_delivery(
+        "oc_abc",
+        {"schema": "2.0", "body": "topic notice"},
+        thread_id="omt_thread",
+        delivery_uuid="hfc_" + "a" * 40,
+    )
+
+    assert result.message_id == "om_message_1"
+    assert result.retry_count == 0
+    assert token_calls() == 1
+    send_request = requests[1]
+    assert send_request[0] == "send"
+    assert send_request[1] == "chat_id"
+    assert send_request[2]["receive_id"] == "oc_abc"
+    assert send_request[2]["uuid"] == "hfc_" + "a" * 40
+
+
 async def test_send_text_message_posts_text_with_mention(feishu_api):
     test_client, requests, token_calls = feishu_api
     client = FeishuClient(
