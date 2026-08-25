@@ -5754,17 +5754,26 @@ async def _hfc_send_raw_message_with_native_handoff_route(self: Any, **kwargs: A
     original = getattr(type(self), "_hfc_original_send_raw_message", None)
     if not callable(original):
         raise RuntimeError("original Feishu raw send unavailable")
-    if _HFC_NATIVE_HANDOFF_SEND_TRACKER.get() is None:
-        return await original(self, **kwargs)
     metadata = kwargs.get("metadata")
     thread_id = _metadata_thread_id(metadata if isinstance(metadata, dict) else None)
+    send_kwargs = kwargs
+    if thread_id and not kwargs.get("reply_to"):
+        # Feishu's create API accepts chat_id but not thread_id. Preserve the
+        # logical topic binding for native-handoff identity/UUID derivation,
+        # while making the actual unanchored create fall back to the parent chat.
+        send_kwargs = dict(kwargs)
+        send_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        send_metadata.pop("thread_id", None)
+        send_kwargs["metadata"] = send_metadata
+    if _HFC_NATIVE_HANDOFF_SEND_TRACKER.get() is None:
+        return await original(self, **send_kwargs)
     if thread_id:
         route = "thread-reply" if kwargs.get("reply_to") else "thread-create"
     else:
         route = "reply" if kwargs.get("reply_to") else "create"
     token = _HFC_NATIVE_HANDOFF_ROUTE.set(route)
     try:
-        return await original(self, **kwargs)
+        return await original(self, **send_kwargs)
     finally:
         _HFC_NATIVE_HANDOFF_ROUTE.reset(token)
 

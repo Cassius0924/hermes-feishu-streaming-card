@@ -146,11 +146,11 @@ class FeishuClient:
         if not isinstance(card, dict):
             raise TypeError("card must be a dict")
 
-        receive_id = chat_id
-        if thread_id and not reply_to_message_id:
-            receive_id = thread_id
         return {
-            "receive_id": receive_id,
+            # Feishu's create API does not accept thread_id as a receive target.
+            # Topic placement requires the reply API and a message anchor; when
+            # no anchor exists, deliver to the parent chat instead.
+            "receive_id": chat_id,
             "msg_type": "interactive",
             "content": serialize_card_for_delivery(card),
         }
@@ -221,12 +221,11 @@ class FeishuClient:
                         },
                     )
                 else:
-                    receive_id_type = "thread_id" if thread_id else "chat_id"
                     body = await self._request_json(
                         "POST",
                         "/im/v1/messages",
                         token=token,
-                        params={"receive_id_type": receive_id_type},
+                        params={"receive_id_type": "chat_id"},
                         json_body=payload,
                     )
                 data = body.get("data")
