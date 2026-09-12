@@ -4340,6 +4340,21 @@ def _find_decomposed_base_patch_locations(tree, lines):
             (final_send.lineno - 1, _line_indent(lines, final_send.lineno - 1)))
 
 
+def _first_exact(exact, scope, sources):
+    """Return the first candidate source whose AST matches inside scope.
+
+    Anchor call sites are version-specific; keeping candidates explicit lets a
+    single new keyword in upstream Hermes be tolerated without weakening the
+    structural checks that guard the delivery ledger.
+    """
+    for source in sources:
+        try:
+            return exact(scope, source)
+        except ValueError:
+            continue
+    raise ValueError("could not find safe BasePlatformAdapter contract")
+
+
 def _find_split_decomposed_base_patch_locations(tree, lines):
     """Verify decomposed Hermes after its ledger helper was extracted."""
     error = "could not find safe BasePlatformAdapter contract"
@@ -4445,9 +4460,14 @@ def _find_split_decomposed_base_patch_locations(tree, lines):
     )
     if guard.body != [delegated]:
         raise ValueError(error)
-    attachments = exact(
+    # Hermes 0.21.2 added record_delivery=_record_delivery to this call.
+    attachments = _first_exact(
+        exact,
         process,
-        "await self._deliver_attachments(event, extracted, _final_thread_metadata, anything_sent=delivery_attempted or _tts_caption_delivered)",
+        (
+            "await self._deliver_attachments(event, extracted, _final_thread_metadata, anything_sent=delivery_attempted or _tts_caption_delivered, record_delivery=_record_delivery)",
+            "await self._deliver_attachments(event, extracted, _final_thread_metadata, anything_sent=delivery_attempted or _tts_caption_delivered)",
+        ),
     )
     ordered([extracted, assigned, metadata, tts_default, guard, attachments])
     branches = [
