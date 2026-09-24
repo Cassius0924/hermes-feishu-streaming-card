@@ -2531,6 +2531,20 @@ return result, delivery_adapter
             for block in owned_hooks
         ):
             continue
+        # Hermes 0.21.5 released the turn marker inside the ledger bracket
+        # (the ledger now owns crash recovery); accept that owned seam too.
+        if (len(body) == 2 and isinstance(node, ast.If)
+                and _same_expression(node.test, "obligation_id is not None")
+                and not node.orelse
+                and len(node.body) == 1
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Await)
+                and isinstance(node.body[0].value.value, ast.Call)
+                and _call_function(node.body[0].value.value) == ("self", "_release_turn_marker")
+                and len(node.body[0].value.value.args) == 1
+                and _same_expression(node.body[0].value.value.args[0], "event")
+                and not node.body[0].value.value.keywords):
+            continue
         body.append(node)
     args = ledger.args
     if (args.vararg or args.kwarg or args.posonlyargs

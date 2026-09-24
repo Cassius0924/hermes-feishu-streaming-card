@@ -30,6 +30,45 @@ def test_split_ledger_contract_rejects_the_old_inline_ledger_shape() -> None:
         patcher.apply_base_patch(broken)
 
 
+TURN_MARKER_ANCHOR = (
+    "            obligation_id = await self._record_delivery_obligation(\n\n"
+    "                event, session_key, text_content, delivery_adapter, is_ephemeral_response)\n\n"
+)
+TURN_MARKER_RELEASE = (
+    "            if obligation_id is not None:\n"
+    "                await self._release_turn_marker(event)  # the ledger now owns the crash recovery\n\n"
+)
+
+
+def test_split_ledger_accepts_turn_marker_release_statement() -> None:
+    """Hermes 0.21.5 releases the turn marker inside the ledger bracket.
+
+    The ledger now owns crash recovery, so the release is an owned seam of the
+    bracket: it must bind (and stay reversible) instead of failing install.
+    """
+    original = FIXTURE.read_text(encoding="utf-8")
+    assert original.count(TURN_MARKER_ANCHOR) == 1
+    extended = original.replace(TURN_MARKER_ANCHOR, TURN_MARKER_ANCHOR + TURN_MARKER_RELEASE)
+    installed = patcher.apply_base_patch(extended)
+    assert patcher.EXACT_BASE_FINAL_DELIVERY_PATCH_BEGIN in installed
+    assert patcher.apply_base_patch(installed) == installed
+    compile(installed, str(FIXTURE), "exec")
+    assert patcher.remove_base_patch(installed) == extended
+
+
+def test_split_ledger_rejects_variant_turn_marker_release() -> None:
+    """Only the exact ``_release_turn_marker(event)`` call is tolerated."""
+    original = FIXTURE.read_text(encoding="utf-8")
+    drifted = original.replace(
+        TURN_MARKER_ANCHOR,
+        TURN_MARKER_ANCHOR
+        + "            if obligation_id is not None:\n"
+        + "                await self._release_turn_marker(event, force=True)\n\n",
+    )
+    with pytest.raises(ValueError, match="safe BasePlatformAdapter contract"):
+        patcher.apply_base_patch(drifted)
+
+
 ATTACHMENT_KWARG_TAIL = "anything_sent=delivery_attempted or _tts_caption_delivered)"
 ATTACHMENT_KWARG_TAIL_EXTENDED = (
     "anything_sent=delivery_attempted or _tts_caption_delivered, "
